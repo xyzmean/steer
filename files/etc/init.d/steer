@@ -22,10 +22,12 @@ start_service() {
 
     steer apply --spec "$SPEC" || echo "steer: apply failed — see the message above"
 
-    # Only run the resolver when a channel actually matches domains: with none, it
-    # would sit on port 5300 doing nothing, and the generated ruleset has no
-    # redirect pointing at it.
-    grep -q '"domains_file"' "$SPEC" || return 0
+    # Ask the ENGINE whether the resolver is needed. Never grep the spec for a
+    # literal key: this line used to look for `"domains_file"`, the spec gained the
+    # plural `domains_files`, and the match quietly stopped working — the resolver
+    # did not start while apply still installed the DNS redirect, so every LAN
+    # query went to a closed port and DNS died with nothing in the log to say why.
+    steer needs-dnsd --spec "$SPEC" || return 0
 
     procd_open_instance
     procd_set_param command steer dnsd --spec "$SPEC"

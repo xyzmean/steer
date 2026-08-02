@@ -554,6 +554,7 @@ int main(int argc, char **argv) {
     if (argc < 2) {
         fputs("usage: steer apply [--dry-run] [--spec FILE]\n"
               "       steer dnsd  [--spec FILE]   (resolver for domain channels)\n"
+              "       steer needs-dnsd            (exit 0 if the spec has domain channels)\n"
               "       steer status [--spec FILE]\n"
               "       steer explain ADDRESS [--spec FILE]\n", stderr);
         return 2;
@@ -565,6 +566,18 @@ int main(int argc, char **argv) {
         else if (!strcmp(argv[i], "--dry-run")) dry = 1;
         else if (!strcmp(argv[i], "--state-dir") && i + 1 < argc) g_state_dir = argv[++i];
         else arg = argv[i];
+    }
+    /* Does this spec need the resolver? Asked by the init script instead of guessing
+     * from the file's text — it used to grep for the literal `"domains_file"`, and when
+     * the spec gained the plural `domains_files` the match silently stopped working:
+     * the resolver never started while apply still installed the DNS redirect, so
+     * every LAN query went to a closed port and DNS died. The engine is the only thing
+     * that knows what it will generate, so it answers. */
+    if (!strcmp(cmd, "needs-dnsd")) {
+        load_spec(spec);
+        registry_assign();
+        build_groups();
+        return has_domains() ? 0 : 1;
     }
     if (!strcmp(cmd, "dnsd")) return dnsd_main(argc - 2, argv + 2);
     if (!strcmp(cmd, "apply")) return cmd_apply(spec, dry);

@@ -170,6 +170,25 @@ EOF
 "$BIN" apply --dry-run --spec "$tmp/xspec.json" --state-dir "$tmp/state-m" >/dev/null 2>&1
 check "refuses addresses and domains in one channel" "2" "$?"
 
+# ---- does the spec need the resolver ----------------------------------------
+# The init script asks the engine this. It used to grep the spec for the literal
+# `"domains_file"`, and when the plural `domains_files` arrived the match stopped
+# matching: the resolver did not start while apply still installed the DNS redirect,
+# so every LAN query went to a closed port. DNS died on a live router.
+"$BIN" needs-dnsd --spec "$tmp/dspec.json" --state-dir "$tmp/state-n" >/dev/null 2>&1
+check "needs-dnsd: yes for a domain channel" "0" "$?"
+"$BIN" needs-dnsd --spec "$tmp/spec.json" --state-dir "$tmp/state-n" >/dev/null 2>&1
+check "needs-dnsd: no for address channels only" "1" "$?"
+
+# And the shipped init script must ASK rather than guess, or the same trap returns
+# the next time a key is renamed.
+init=../files/etc/init.d/steer
+if [ -f "$init" ]; then
+    check "init script asks the engine" "1" "$(grep -c 'needs-dnsd' "$init")"
+    check "init script does not grep the spec for keys" "0" \
+        "$(grep -c "grep -q '\"domains" "$init")"
+fi
+
 # ---- refusals ---------------------------------------------------------------
 # Guessing at an unknown schema would mean compiling a config we do not understand
 # into firewall rules.
