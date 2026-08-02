@@ -121,6 +121,30 @@ int vision_unwrap(struct vision *v, const unsigned char *in, size_t n,
         return 0;
     }
 
+    /* Первый кадр ОТ СЕРВЕРА тоже начинается с UUID — точно так же, как наш к нему.
+     * Симметрия протокола: UUID здесь служит признаком начала обёрнутого потока, и
+     * сервер им пользуется в обе стороны.
+     *
+     * Первая версия ждала сразу команду и получала первый байт UUID (0x96) как её
+     * значение: команда выходила недопустимой, unwrap возвращал EPROTO, и ответ
+     * терялся целиком. Проявлялось как «сервер не отвечает», хотя данные приходили. */
+    if (!v->recv_uuid_seen) {
+        if (n < 16 + 5) return VISION_EAGAIN;
+        if (memcmp(in, v->uuid, 16) != 0) {
+            /* UUID не наш — значит обёртки нет вовсе, поток идёт открытым. Это законно:
+             * сервер оборачивает не всегда. */
+            v->recv_done = 1;
+            *consumed = n;
+            *payload = in;
+            *payload_n = n;
+            return 0;
+        }
+        in += 16;
+        n -= 16;
+        v->recv_uuid_seen = 1;
+        *consumed = 16;
+    }
+
     if (n < 5) return VISION_EAGAIN;
     unsigned char cmd = in[0];
     size_t len = ((size_t)in[1] << 8) | in[2];
@@ -128,9 +152,27 @@ int vision_unwrap(struct vision *v, const unsigned char *in, size_t n,
     if (cmd > VISION_CMD_DIRECT) return VISION_EPROTO;
     if (n < 5 + len + pad) return VISION_EAGAIN;
 
-    *consumed = 5 + len + pad;
+    *consumed += 5 + len + pad;
     *payload = in + 5;
     *payload_n = len;
     if (cmd == VISION_CMD_END || cmd == VISION_CMD_DIRECT) v->recv_done = 1;
     return 0;
+}
+
+/* Сколько байт полезных данных в буфере, если развернуть все кадры. Нужно вызывающему,
+ * чтобы собрать их в один TCP-пакет: отдавать клиенту по пакету на кадр значит дробить
+ * поток на куски по 200 байт там, где сервер прислал 1400. */
+size_t vision_payload_total(struct vision *v, const unsigned char *in, size_t n) {
+    struct vision probe = *v;      /* копия: подсчёт не должен менять состояние */
+    size_t total = 0;
+    while (n) {
+        size_t used = 0;
+        const unsigned char *pl = NULL;
+        size_t pl_n = 0;
+        if (vision_unwrap(&probe, in, n, &used, &pl, &pl_n) != 0 || !used) break;
+        total += pl_n;
+        in += used;
+        n -= used;
+    }
+    return total;
 }

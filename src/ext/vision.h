@@ -15,6 +15,7 @@ struct vision {
     /* UUID идёт только в первом кадре: он и есть признак начала потока, а повторять его
      * значило бы отдавать наблюдателю неизменную последовательность байт. */
     int need_uuid;
+    int recv_uuid_seen;      /* UUID в первом кадре от сервера уже снят */
     int recv_done;           /* сервер прислал end — дальше поток без обёртки */
     unsigned long sent_frames;
 };
@@ -24,4 +25,5 @@ size_t vision_wrap(struct vision *v, const unsigned char *data, size_t n,
                    unsigned char *out, size_t cap);
 int vision_unwrap(struct vision *v, const unsigned char *in, size_t n,
                   size_t *consumed, const unsigned char **payload, size_t *payload_n);
+size_t vision_payload_total(struct vision *v, const unsigned char *in, size_t n);
 #endif
