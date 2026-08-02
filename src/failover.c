@@ -20,6 +20,7 @@
 #include <unistd.h>
 #include <sys/wait.h>
 #include <fcntl.h>
+#include <time.h>
 #include "spec.h"
 
 /* Таблица и приоритет правила для проб. Далеко от 300+, которые раздаёт реестр:
@@ -198,6 +199,56 @@ static void active_save(void) {
     fclose(f);
 }
 
+/* Поднять залипший туннель.
+ *
+ * Обязательно ifdown+ifup, а не просто ifup: в netifd `ifup` на уже поднятом
+ * интерфейсе — no-op, поэтому залипший туннель сам не оживёт НИКОГДА, и сторож
+ * просидит в резерве даже после того, как сервер вернулся. Лечится этим то, что
+ * иначе не лечится: netifd разрешает имя эндпоинта один раз при подъёме (переезд по
+ * DDNS не подхватывается), сокет остаётся привязан к отмершему пути UDP/CGNAT, а
+ * состояние proto-error само не снимается.
+ *
+ * Безопасно, потому что делается только с устройством, которое НЕ несёт трафик:
+ * либо оно и так не отвечает, либо маршруты указывают на другое.
+ *
+ * Отдельная защита от циклов: перезапуск не чаще раза в NN секунд на устройство.
+ * Мёртвый пир иначе получал бы ifdown/ifup каждую минуту, и туннель никогда не
+ * успевал бы завершить рукопожатие. */
+#define RESTART_COOLDOWN 300
+
+static int restart_allowed(const char *dev) {
+    char path[256];
+    snprintf(path, sizeof(path), "%s/restart-%.32s", g_state_dir, dev);
+    FILE *f = fopen(path, "r");
+    long last = 0;
+    if (f) { if (fscanf(f, "%ld", &last) != 1) last = 0; fclose(f); }
+    long now = (long)time(NULL);
+    if (last && now - last < RESTART_COOLDOWN) return 0;
+    f = fopen(path, "w");
+    if (f) { fprintf(f, "%ld\n", now); fclose(f); }
+    return 1;
+}
+
+static int revive(const char *dev, int verbose) {
+    if (!restart_allowed(dev)) {
+        if (verbose)
+            fprintf(stderr, "steer: %s: перезапуск был недавно, пропускаю\n", dev);
+        return 0;
+    }
+    fprintf(stderr, "steer: %s: не отвечает — перезапускаю интерфейс\n", dev);
+    const char *down[] = { "ifdown", dev, NULL };
+    const char *up[] = { "ifup", dev, NULL };
+    run_quiet(down);
+    run_quiet(up);
+    /* Рукопожатию нужно время: проверить сразу — значит объявить мёртвым то, что
+     * ещё поднимается. Ждём короткими шагами, чтобы не держать проход дольше нужного. */
+    for (int i = 0; i < 10; i++) {
+        sleep(1);
+        if (device_healthy(dev)) return 1;
+    }
+    return 0;
+}
+
 int cmd_failover(const char *spec, int verbose) {
     load_spec(spec);
     registry_assign();
@@ -211,11 +262,20 @@ int cmd_failover(const char *spec, int verbose) {
         active_get(o->name, was, sizeof(was));
 
         const char *chosen = NULL;
+        /* Сначала все по одному разу без перезапусков: если запасной здоров, поднимать
+         * основной незачем — трафик уже пойдёт. Перезапуск дороже проверки и на
+         * секунды роняет то, что перезапускают. */
         for (size_t k = 0; k < o->devices_n; k++) {
             if (device_healthy(o->devices[k])) { chosen = o->devices[k]; break; }
             if (verbose)
                 fprintf(stderr, "steer: %s: %s не отвечает\n", o->name, o->devices[k]);
         }
+
+        /* Ни одно не ответило — вот теперь можно тратить время на оживление. Порядок
+         * тот же, поэтому основной туннель получает попытку первым. */
+        if (!chosen)
+            for (size_t k = 0; k < o->devices_n; k++)
+                if (revive(o->devices[k], verbose)) { chosen = o->devices[k]; break; }
 
         if (chosen) {
             snprintf(o->device, sizeof(o->device), "%s", chosen);
