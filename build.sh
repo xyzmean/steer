@@ -44,31 +44,35 @@ for spec in $ISAS; do
     cp files/etc/init.d/steer "$root/etc/init.d/steer"
     chmod 0755 "$root/usr/sbin/steer" "$root/etc/init.d/steer"
 
-    # Enable on install, and re-apply so an upgrade does not leave the old ruleset
-    # live under a new binary.
-    cat > "$root/.post-install" <<'EOF'
+    # OUTSIDE the package root: anything inside it ships as a FILE, so a
+    # .post-install written there arrives on the router as /.post-install and
+    # collides with every other package doing the same — apk refused the install of a
+    # second package with "trying to overwrite .post-install owned by steer". The
+    # script belongs to --script, not to the payload.
+    mkdir -p build/scripts
+    cat > build/scripts/post-install <<'EOF'
 #!/bin/sh
 [ -n "${IPKG_INSTROOT}" ] && exit 0
 /etc/init.d/steer enable 2>/dev/null
 [ -f /etc/steer/spec.json ] && /etc/init.d/steer restart 2>/dev/null
 exit 0
 EOF
-    cat > "$root/.pre-deinstall" <<'EOF'
+    cat > build/scripts/pre-deinstall <<'EOF'
 #!/bin/sh
 [ -n "${IPKG_INSTROOT}" ] && exit 0
 /etc/init.d/steer stop 2>/dev/null
 /etc/init.d/steer disable 2>/dev/null
 exit 0
 EOF
-    chmod +x "$root/.post-install" "$root/.pre-deinstall"
+    chmod +x build/scripts/post-install build/scripts/pre-deinstall
 
     docker run --rm -v "$PWD":/w -w /w alpine:latest sh -c \
         "apk add --no-cache apk-tools >/dev/null 2>&1; apk mkpkg \
            --info name:steer --info version:$VERSION-r1 \
            --info description:'policy routing engine: channels in, nftables out' \
            --info arch:$arch --info depends:'nftables ip-full' \
-           --script post-install:$root/.post-install \
-           --script pre-deinstall:$root/.pre-deinstall \
+           --script post-install:build/scripts/post-install \
+           --script pre-deinstall:build/scripts/pre-deinstall \
            -F $root -o $OUT/steer-$VERSION-1_$arch.apk" >/dev/null 2>&1 \
         || echo "    (apk packaging failed for $arch)"
 done
