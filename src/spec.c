@@ -267,6 +267,42 @@ void load_spec(const char *path) {
         fprintf(stderr, "steer: spec schema %ld is not supported (this build speaks 1)\n", schema);
         exit(2);
     }
+    /* Auto-detect the LAN subnet when from_default is not set.
+     *
+     * Without this, every new install ships with no IPv4 DNS redirect: the rule is
+     * generated from from_default, an empty field makes no rule, and clients querying
+     * IPv4 go straight to dnsmasq — fake-IP silently does nothing. The symptom is
+     * "works from the router but not from devices", with no error, because the chain
+     * is syntactically fine, just missing a rule.
+     *
+     * The spec author should not have to know the LAN subnet: the engine has the box
+     * in front of it. Reads the lan_device's address, derives the network, same as
+     * OpenWrt's own uci. Overridable by setting from_default explicitly. */
+    if (!g_from_default_n) {
+        char cmd[128];
+        snprintf(cmd, sizeof(cmd), "ip -4 -o addr show %s 2>/dev/null", g_lan_device);
+        FILE *pf = popen(cmd, "r");
+        if (pf) {
+            char line[256];
+            while (g_from_default_n < MAX_FROM && fgets(line, sizeof(line), pf)) {
+                char ifname[32], addr[64];
+                if (sscanf(line, "%*d: %31s inet %63s", ifname, addr) != 2) continue;
+                char *slash = strchr(addr, '/');
+                if (!slash) continue;
+                int plen = atoi(slash + 1);
+                *slash = '\0';
+                unsigned a, b, c, d;
+                if (sscanf(addr, "%u.%u.%u.%u", &a, &b, &c, &d) != 4) continue;
+                unsigned ip = (a << 24) | (b << 16) | (c << 8) | d;
+                unsigned mask = plen ? (0xFFFFFFFFu << (32 - plen)) : 0;
+                ip &= mask;
+                snprintf(g_from_default[g_from_default_n], 64, "%u.%u.%u.%u/%u",
+                         (ip >> 24) & 255, (ip >> 16) & 255, (ip >> 8) & 255, ip & 255, plen);
+                g_from_default_n++;
+            }
+            pclose(pf);
+        }
+    }
     /* Пустая спека законна, и отказ на ней запирал настройку наглухо: чтобы завести
      * канал, нужен выход, а сохранить выход без каналов движок не давал — тупик, из
      * которого нельзя выйти изнутри интерфейса.
