@@ -23,6 +23,8 @@
 #include <string.h>
 #include <errno.h>
 #include <unistd.h>
+#include <sys/ioctl.h>
+#include <sys/socket.h>
 
 #include "mbedtls/sha256.h"
 #include "mbedtls/sha512.h"
@@ -103,9 +105,35 @@ static int read_full(int fd, unsigned char *buf, size_t n) {
     return 0;
 }
 
-/* Одна TLS-запись: 5 байт заголовка, затем тело. */
+/* Одна TLS-запись: 5 байт заголовка, затем тело.
+ *
+ * Сначала СПРАШИВАЕМ, пришла ли запись целиком, и только потом читаем. Это главное здесь.
+ *
+ * Запись в 8 КБ приезжает шестью-семью сегментами TCP. Начав читать по первому из них, мы
+ * засыпали в read() до прихода последнего — а сокет блокирующий, и цикл у нас один на все
+ * соединения. То есть один недособранный кадр останавливал ВСЁ. Измерено на роутере:
+ * poll простаивал 1%, процессор 14%, скорость стояла на 39 Мбит/с — остальные 85% времени
+ * процесс спал вот здесь.
+ *
+ * FIONREAD плюс подглядывание заголовка через MSG_PEEK отвечают на вопрос без буферов:
+ * недостающую запись оставляем в сокете и уходим к другим соединениям. Буфер на каждое
+ * соединение стоил бы 16 КБ × 64, то есть мегабайт на коробке с пятнадцатью. */
 static int read_record(int fd, unsigned char *type, unsigned char *body, size_t cap,
-                       size_t *body_n) {
+                       size_t *body_n, int may_wait) {
+    /* may_wait — для РУКОПОЖАТИЯ. Оно синхронное по своей природе: ServerHello приходит
+     * когда придёт, и вернуть «пока нечего» там некому — вызывающий не умеет продолжить с
+     * середины. Первая версия этого различия не делала, и рукопожатие падало на первой же
+     * недособранной записи: соединение не открывалось, клиенту уходил RST, а выглядело это
+     * как «узел перестал работать». */
+    int avail = 0;
+    if (!may_wait && ioctl(fd, FIONREAD, &avail) == 0) {
+        if (avail < 5) return TLS13_EAGAIN;
+        unsigned char peek[5];
+        ssize_t pk = recv(fd, peek, 5, MSG_PEEK);
+        if (pk < 5) return TLS13_EAGAIN;
+        size_t want = ((size_t)peek[3] << 8) | peek[4];
+        if ((size_t)avail < 5 + want) return TLS13_EAGAIN;
+    }
     unsigned char h[5];
     int rc = read_full(fd, h, 5);
     if (rc) return rc;
@@ -205,7 +233,7 @@ int tls13_handshake(struct tls13 *t, int fd,
     size_t n;
 
     /* ServerHello. */
-    int rc = read_record(fd, &type, rec, sizeof(rec), &n);
+    int rc = read_record(fd, &type, rec, sizeof(rec), &n, 1);
     if (rc) return rc;
     if (type != 0x16 || n < 44 || rec[0] != 0x02) return TLS13_EBADREC;
     tr_add(t, rec, n);
@@ -307,7 +335,7 @@ int tls13_handshake(struct tls13 *t, int fd,
     int got_finished = 0;
     unsigned char server_finished[32];
     for (int guard = 0; guard < 16 && !got_finished; guard++) {
-        rc = read_record(fd, &type, rec, sizeof(rec), &n);
+        rc = read_record(fd, &type, rec, sizeof(rec), &n, 1);
         if (rc) return rc;
         if (type == 0x14) continue;             /* ChangeCipherSpec: игнор в 1.3 */
         if (type != 0x17) return TLS13_EBADREC;
@@ -472,7 +500,9 @@ int tls13_read(struct tls13 *t, unsigned char *out, size_t cap, size_t *got) {
     unsigned char rec[TLS13_MAX_REC];
     unsigned char type;
     size_t n;
-    int rc = read_record(t->fd, &type, rec, sizeof(rec), &n);
+    int rc = read_record(t->fd, &type, rec, sizeof(rec), &n, 0);
+    /* Записи целиком нет — это «пока нечего», а не сбой: вызывающий просто придёт снова. */
+    if (rc == TLS13_EAGAIN) return 0;
     if (rc) return rc;
     if (type == 0x14) return 0;                /* ChangeCipherSpec: в 1.3 смысла не несёт */
     if (type != 0x17) return TLS13_EBADREC;

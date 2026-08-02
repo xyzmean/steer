@@ -157,10 +157,114 @@ static void emit_from(FILE *f, const struct group *g) {
 /* Elements come straight from the list files: the fitter (steer-aggregate) has
  * already decided what fits, and re-parsing them here would only add a second place
  * for the two to disagree. */
+/* Похожа ли строка на адрес или префикс IPv4. Только форма, без проверки диапазонов:
+ * нам надо отличить «1.2.3.0/24» от «amazon.com», а не проверять корректность маски —
+ * второе сделает nft, и его сообщение об одном плохом элементе понятно. */
+static int looks_like_addr(const char *s) {
+    int digits = 0, dots = 0, slash = 0;
+    for (const char *p = s; *p; p++) {
+        if (*p >= '0' && *p <= '9') { digits++; continue; }
+        if (*p == '.') { dots++; continue; }
+        if (*p == '/') { slash++; continue; }
+        return 0;                       /* буква, дефис, двоеточие — это не IPv4 */
+    }
+    return digits > 0 && dots == 3 && slash <= 1;
+}
+
+/* Прочитать список и посчитать, сколько строк в нём НЕ адреса.
+ *
+ * Отдельным проходом, до генерации: сообщение об ошибке должно появиться раньше, чем
+ * мы начнём собирать набор, и раньше, чем что-либо будет применено. */
+static void count_list(const char *path, size_t *total, size_t *bad,
+                       char *first_bad, size_t first_bad_n, size_t *first_bad_line) {
+    FILE *in = fopen(path, "r");
+    if (!in) die("%s: cannot read a channel's list", path);
+    char line[512];
+    size_t lineno = 0;
+    *total = *bad = 0;
+    if (first_bad_n) first_bad[0] = '\0';
+    while (fgets(line, sizeof(line), in)) {
+        lineno++;
+        char *nl = strpbrk(line, "\r\n");
+        if (nl) *nl = '\0';
+        char *p = line;
+        while (*p == ' ' || *p == '\t') p++;
+        if (!*p || *p == '#' || *p == ';') continue;
+        (*total)++;
+        if (looks_like_addr(p)) continue;
+        if (!(*bad)++ && first_bad_n) {
+            /* Точность в формате, а не только размер буфера: строка из файла бывает
+             * длиннее образца, и обрезать её надо явно, а не «как получится». */
+            snprintf(first_bad, first_bad_n, "%.100s", p);
+            if (first_bad_line) *first_bad_line = lineno;
+        }
+    }
+    fclose(in);
+}
+
+/* Проверить списки адресных каналов ДО того, как что-то применится.
+ *
+ * Зачем это здесь, а не «пусть nft разберётся». nft разбирается плохо: один доменный
+ * список, подключённый как адресный, даёт «syntax error, unexpected string» с указанием
+ * на середину строки в восемь тысяч символов — и отвергает НАБОР ЦЕЛИКОМ, то есть вся
+ * маршрутизация остаётся на прежних правилах, а человек видит, что его выбор не подействовал,
+ * без единого намёка на причину. Так и случилось: список «Хостинги и CDN» у издателя лежит
+ * в адресных категориях и обещает 5444 подсети, а внутри 250 доменов и ни одного адреса.
+ *
+ * Поэтому разделяем два случая, и это не педантизм:
+ *   весь список не адреса  — это НЕ ТОТ список, отказываемся и говорим, что делать;
+ *   несколько строк плохие — это мусор в файле, предупреждаем и пропускаем их, потому что
+ *                            ронять канал из 19 тысяч префиксов из-за одной строки хуже. */
+static void check_address_lists(void) {
+    for (size_t i = 0; i < g_grp_n; i++) {
+        struct group *g = &g_grp[i];
+        if (g->domains) continue;               /* доменный набор заполняет резолвер */
+        for (size_t k = 0; k < g->files_n; k++) {
+            size_t total = 0, bad = 0, bad_line = 0;
+            char sample[128];
+            count_list(g->files[k], &total, &bad, sample, sizeof(sample), &bad_line);
+            if (!total) {
+                fprintf(stderr, "steer: %s: список пуст — канал «%s» ничего не поймает\n",
+                        g->files[k], g->members_n ? g->members[0] : g->name);
+                continue;
+            }
+            if (bad == total) {
+                /* die принимает одну подстановку, поэтому сообщение собирается здесь.
+                 * Собрать его надо целиком: половина сведений («не тот список») без второй
+                 * («какой именно файл и что в нём») не даёт человеку сделать шаг. */
+                static char msg[1024];
+                /* Называем КАНАЛ из спеки, а не имя группы: человек выбирал канал, а
+                 * «vpn_ip» — наше внутреннее имя набора, по нему в интерфейсе искать
+                 * нечего. Каналов в группе может быть несколько, поэтому берём первый и
+                 * говорим, сколько их всего. */
+                char who[128];
+                if (g->members_n > 1)
+                    snprintf(who, sizeof(who), "%.60s (и ещё %zu в том же наборе)",
+                             g->members[0], g->members_n - 1);
+                else
+                    snprintf(who, sizeof(who), "%.60s",
+                             g->members_n ? g->members[0] : g->name);
+                snprintf(msg, sizeof(msg),
+                         "%.400s: это доменный список — %zu имён, адресов нет. Канал «%s» "
+                         "адресный, ему нужны подсети. Подключите список как доменный "
+                         "или выберите другой. Первая строка: «%.100s»",
+                         g->files[k], total, who, sample);
+                die("%s", msg);
+            }
+            if (bad)
+                fprintf(stderr, "steer: %s: строк не-адресов %zu из %zu, пропускаю их "
+                                "(первая — %zu: «%s»)\n",
+                        g->files[k], bad, total, bad_line, sample);
+        }
+    }
+}
+
 static size_t emit_elements(FILE *f, const char *path, size_t already) {
     FILE *in = fopen(path, "r");
     if (!in) die("%s: cannot read a channel's list", path);
-    char line[128];
+    /* 512, а не 128: строка длиннее просто обрезалась бы посередине, и в набор уехал бы
+     * обломок адреса — то есть тихо не тот адрес. */
+    char line[512];
     size_t n = already;
     while (fgets(line, sizeof(line), in)) {
         char *nl = strpbrk(line, "\r\n");
@@ -168,6 +272,9 @@ static size_t emit_elements(FILE *f, const char *path, size_t already) {
         char *p = line;
         while (*p == ' ' || *p == '\t') p++;
         if (!*p || *p == '#' || *p == ';') continue;
+        /* Не-адреса пропускаем молча: про них уже сказал check_address_lists, а nft на
+         * них отвергает ВЕСЬ набор, а не одну строку. */
+        if (!looks_like_addr(p)) continue;
         fprintf(f, "%s%s", n ? ", " : "", p);
         n++;
     }
@@ -446,6 +553,12 @@ static int cmd_apply(const char *spec, int dry) {
     load_spec(spec);
     registry_assign();
     build_groups();
+    /* Проверка списков — ДО генерации и до dry-run.
+     *
+     * До dry-run намеренно: интерфейс проверяет спеку именно им, перед записью на диск.
+     * Значит человек узнает про не тот список сразу при сохранении, а не потом, когда
+     * apply молча не подействует. */
+    check_address_lists();
     /* Ни одной группы — таблица всё равно ставится, с пустой цепочкой: так status
      * продолжает отвечать, а следующий apply не зависит от того, была ли таблица
      * раньше. */

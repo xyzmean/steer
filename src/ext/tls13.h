@@ -18,6 +18,9 @@
 #define TLS13_EBADSUITE    (-17)
 #define TLS13_EFINISHED    (-18)   /* Finished не совпал: транскрипт или ключи неверны */
 #define TLS13_ESTATE       (-19)
+/* Записи целиком ещё нет в сокете. НЕ ошибка: чтение отказалось блокироваться, потому что
+ * блокировка посреди записи останавливает не одно соединение, а весь цикл. */
+#define TLS13_EAGAIN       (-20)
 
 enum tls13_aead { TLS13_AEAD_AES128, TLS13_AEAD_AES256, TLS13_AEAD_CHACHA };
 

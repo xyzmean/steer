@@ -94,7 +94,60 @@ static uint32_t client_room(const struct conn *c) {
  * окно сервера не закрывалось, и мало, чтобы соседи ждали дольше миллисекунд. */
 #define DRAIN_MAX_RECORDS 8
 
+/* Сколько пакетов забираем из TUN за один проход. Подтверждения клиента идут густо, и по
+ * одному за проход они ограничивали скорость числом проходов цикла. Предел оставлен, чтобы
+ * поток от одного клиента не заморозил чтение у серверов. */
+#define TUN_DRAIN_MAX 64
+
 static struct conn g_conns[MAX_CONNS];
+
+/* ---- счётчики цикла ---------------------------------------------------------
+ *
+ * Включаются STEER_TUN_STATS=1, печатаются раз в две секунды. Появились не «на всякий
+ * случай»: скорость упиралась в потолок при 14% одного ядра и криптографии, которая на
+ * этом железе держит 800 Мбит/с. Когда процессор свободен, а быстрее не едет — значит мы
+ * где-то ЖДЁМ, и найти это место можно только измерив.
+ *
+ * Считаем то, что различает возможные ответы: сколько раз прошли цикл, сколько простояли в
+ * poll, сколько прочитали у сервера и какими порциями, сколько записали клиенту и по чём,
+ * и сколько раз не стали читать из-за окна клиента. */
+static int g_stats;
+static struct {
+    uint64_t iters, poll_ns, tun_reads, tun_writes, tun_write_ns;
+    uint64_t recs, rec_bytes, win_skips, drain_full;
+    /* Окно клиента, каким мы его посчитали, и сколько было в пути в момент отказа: без
+     * этих двух чисел «ждали окна» не отличить от «неверно прочитали окно». */
+    uint32_t win_min, win_max, inflight_max;
+    uint8_t wscale_seen;
+} g_st;
+
+static uint64_t now_ns(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec;
+}
+
+static void stats_dump(uint64_t window_ns) {
+    double s = (double)window_ns / 1e9;
+    if (s <= 0) return;
+    fprintf(stderr,
+            "tun-stats: %.1f МБ/с | циклов %.0f/с | poll %.0f%% | чтений у сервера %.0f/с "
+            "(по %.1f КБ) | записей клиенту %.0f/с (%.0f мкс) | ждали окна %.0f/с | "
+            "предел чтения %.0f/с | окно клиента %u..%u (масштаб %u), в пути до %u\n",
+            (double)g_st.rec_bytes / s / 1048576.0,
+            (double)g_st.iters / s,
+            100.0 * (double)g_st.poll_ns / (double)window_ns,
+            (double)g_st.recs / s,
+            g_st.recs ? (double)g_st.rec_bytes / (double)g_st.recs / 1024.0 : 0.0,
+            (double)g_st.tun_writes / s,
+            g_st.tun_writes ? (double)g_st.tun_write_ns / (double)g_st.tun_writes / 1000.0 : 0.0,
+            (double)g_st.win_skips / s,
+            (double)g_st.drain_full / s,
+            g_st.win_min == 0xFFFFFFFFu ? 0 : g_st.win_min, g_st.win_max,
+            g_st.wscale_seen, g_st.inflight_max);
+    memset(&g_st, 0, sizeof(g_st));
+    g_st.win_min = 0xFFFFFFFFu;
+}
 
 /* Диагностика включается переменной окружения: в обычной работе поток пакетов заливает
  * лог, а при разборе «почему соединение не встаёт» видеть каждый шаг необходимо. */
@@ -194,6 +247,7 @@ static int downstream_pump(struct conn *c, const struct vless_node *node, int tu
      * «правильно» разошлись молча. */
     TR("чтение conn#%ld fd=%d\n", (long)(c - g_conns), c->v.fd);
     int rc = vless_recv(&c->v, buf, sizeof(buf), &got);
+    if (g_stats) { g_st.recs++; g_st.rec_bytes += got; }
     if (rc) { TR("чтение от сервера: rc=%d\n", rc); return rc; }
     /* Ноль байт — законно: приехал служебный кадр HTTP/2, данных пока нет. Принять это за
      * конец потока значило бы разрывать соединение на первом же SETTINGS. */
@@ -289,10 +343,12 @@ static int downstream_pump(struct conn *c, const struct vless_node *node, int tu
                                c->our_seq, c->client_seq, TCP_ACK | TCP_PSH,
                                payload + sent, chunk, 65535, 0);
         if (!len) return -1;
+        uint64_t w0 = g_stats ? now_ns() : 0;
         if (write(tun_fd, pkt, len) < 0) {
             TR("запись в TUN не удалась (%zu байт): %s\n", len, strerror(errno));
             return -1;
         }
+        if (g_stats) { g_st.tun_writes++; g_st.tun_write_ns += now_ns() - w0; }
         c->our_seq += (uint32_t)chunk;
         sent += chunk;
     }
@@ -335,8 +391,13 @@ static void handle_packet(int tun_fd, const struct vless_node *node,
         vision_init(&c->vis, c->uuid);
 
         TR("SYN: открываю поток к серверу\n");
-        if (vless_connect(node, &c->v, 8) != 0) {
-            TR("поток не открылся, отвечаю RST\n");
+        int cr = vless_connect(node, &c->v, 8);
+        if (cr != 0) {
+            /* С причиной, а не «не открылся». Без неё разбор упирается в стену: код
+             * различает «TCP не соединился», «сервер не признал ключ» и «сервер не
+             * согласился на HTTP/2», а в логе всё это выглядело одинаково. */
+            fprintf(stderr, "steer tunnel: поток к %s не открылся: %s (rc=%d)\n",
+                    node->host, vless_strerror(cr), cr);
             /* Сервер недоступен — отвечаем RST, а не молчим: клиент иначе будет ждать
              * до таймаута, и «сайт не открывается» вместо «отказано в соединении». */
             unsigned char rst[64];
@@ -469,6 +530,10 @@ int tunnel_run(struct output *o, const struct vless_node *node) {
     const char *dev = o->device;
     int tun_fd = tun_open(dev);
     if (tun_fd < 0) return tun_fd;
+    /* Неблокирующее чтение: цикл вычерпывает устройство до EAGAIN, и без этого флага
+     * последнее чтение засыпало бы, останавливая все соединения. */
+    int fl = fcntl(tun_fd, F_GETFL, 0);
+    if (fl >= 0) fcntl(tun_fd, F_SETFL, fl | O_NONBLOCK);
     tun_bring_up(dev, o->table);
 
     /* Привязываем таблицу выхода к устройству ЗДЕСЬ, а не в apply.
@@ -484,6 +549,9 @@ int tunnel_run(struct output *o, const struct vless_node *node) {
             node->host, node->port, node->type, node->flow[0] ? " +vision" : "");
 
     g_trace = getenv("STEER_TUN_TRACE") != NULL;
+    g_stats = getenv("STEER_TUN_STATS") != NULL;
+    g_st.win_min = 0xFFFFFFFFu;
+    uint64_t stats_at = g_stats ? now_ns() : 0;
     memset(g_conns, 0, sizeof(g_conns));
     unsigned char pkt[TUNNEL_BUF];
 
@@ -504,23 +572,54 @@ int tunnel_run(struct output *o, const struct vless_node *node) {
              * навсегда: клиент подтверждает старое, мы отдаём новое, и никто не сходится.
              *
              * Замер: на роутере без этой проверки передача вставала на втором мегабайте. */
-            if (g_conns[i].our_seq - g_conns[i].client_ack >= client_room(&g_conns[i]))
+            if (g_conns[i].our_seq - g_conns[i].client_ack >= client_room(&g_conns[i])) {
+                if (g_stats) {
+                    uint32_t room = client_room(&g_conns[i]);
+                    uint32_t infl = g_conns[i].our_seq - g_conns[i].client_ack;
+                    g_st.win_skips++;
+                    if (room < g_st.win_min) g_st.win_min = room;
+                    if (room > g_st.win_max) g_st.win_max = room;
+                    if (infl > g_st.inflight_max) g_st.inflight_max = infl;
+                    g_st.wscale_seen = g_conns[i].client_wscale;
+                }
                 continue;
+            }
             pf[nf].fd = g_conns[i].v.fd;
             pf[nf].events = POLLIN;
             map[nf - 1] = &g_conns[i];
             nf++;
         }
 
+        uint64_t p0 = g_stats ? now_ns() : 0;
         int r = poll(pf, (unsigned)nf, 1000);
+        if (g_stats) {
+            uint64_t t = now_ns();
+            g_st.poll_ns += t - p0;
+            g_st.iters++;
+            if (t - stats_at >= 2000000000ull) { stats_dump(t - stats_at); stats_at = t; }
+        }
         if (r < 0) {
             if (errno == EINTR) continue;
             break;
         }
 
         if (pf[0].revents & POLLIN) {
-            ssize_t rn = read(tun_fd, pkt, sizeof(pkt));
-            if (rn > 0) handle_packet(tun_fd, node, pkt, (size_t)rn);
+            /* ВЫЧЕРПЫВАЕМ устройство, а не читаем по пакету за проход.
+             *
+             * Во время скачивания из TUN приходят подтверждения клиента, и именно они
+             * открывают окно. Читая по одному за проход, мы ограничивали скорость числом
+             * проходов цикла: замерено 1900 проходов в секунду × ~2920 байт на
+             * подтверждение = 5,5 МБ/с, ровно тот потолок, который и наблюдался.
+             *
+             * Устройство переведено в неблокирующий режим, поэтому «больше нечего» приходит
+             * как EAGAIN, а не как сон. Предел на проход всё равно нужен: иначе поток
+             * пакетов от одного клиента не даст дойти до чтения у серверов. */
+            for (int k = 0; k < TUN_DRAIN_MAX; k++) {
+                ssize_t rn = read(tun_fd, pkt, sizeof(pkt));
+                if (rn <= 0) break;
+                if (g_stats) g_st.tun_reads++;
+                handle_packet(tun_fd, node, pkt, (size_t)rn);
+            }
         }
         for (int i = 1; i < nf; i++) {
             if (!(pf[i].revents & (POLLIN | POLLHUP | POLLERR))) continue;
@@ -551,7 +650,7 @@ int tunnel_run(struct output *o, const struct vless_node *node) {
                     conn_drop(c);
                     break;
                 }
-                if (++drained >= DRAIN_MAX_RECORDS) break;
+                if (++drained >= DRAIN_MAX_RECORDS) { if (g_stats) g_st.drain_full++; break; }
                 if (c->our_seq - c->client_ack >= client_room(c)) break;
                 /* Есть ли ещё что читать. Без этой проверки следующее чтение заблокируется
                  * на таймауте сокета и остановит весь цикл на секунды. */
