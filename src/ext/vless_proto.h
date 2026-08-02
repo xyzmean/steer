@@ -12,9 +12,11 @@ enum { VLESS_ADDR_IPV4 = 1, VLESS_ADDR_DOMAIN = 2, VLESS_ADDR_IPV6 = 3 };
 
 int vless_uuid_parse(const char *s, unsigned char out[16]);
 
+/* flow — имя потока (xtls-rprx-vision) или NULL/"" для обычного VLESS. */
 size_t vless_build_request(const unsigned char uuid[16], enum vless_cmd cmd,
                            const char *host, const unsigned char ip4[4],
-                           uint16_t port, unsigned char *out, size_t cap);
+                           uint16_t port, const char *flow,
+                           unsigned char *out, size_t cap);
 
 int vless_parse_response(const unsigned char *buf, size_t n, size_t *skip);
 

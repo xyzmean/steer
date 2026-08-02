@@ -33,6 +33,12 @@
 
 #include "tls13.h"
 
+/* Из reality.c: тот же X25519, но со вторым множителем из ServerHello. Общая функция, а
+ * не копия, потому что копия крипто-кода — это два места, где может разойтись прижатие
+ * скаляра или порядок байт. */
+int x25519_shared_ext(const unsigned char priv[32], const unsigned char peer[32],
+                      unsigned char out[32]);
+
 /* ---- HKDF-Expand-Label из RFC 8446 §7.1 ------------------------------------ */
 /* Своя обёртка, потому что метка склеивается по строгому формату: длина вывода,
  * "tls13 "+label, контекст. Ошибка в одном байте здесь даёт ключи, отличные от
@@ -177,7 +183,7 @@ static int aead_seal(struct tls13_keys *k, uint64_t seq,
  * Возвращается с готовыми ключами трафика. */
 int tls13_handshake(struct tls13 *t, int fd,
                     const unsigned char *client_hello, size_t hello_n,
-                    const unsigned char *shared_secret) {
+                    const unsigned char *our_priv) {
     memset(t, 0, sizeof(*t));
     t->fd = fd;
     const mbedtls_md_info_t *md = mbedtls_md_info_from_type(MBEDTLS_MD_SHA256);
@@ -258,9 +264,22 @@ int tls13_handshake(struct tls13 *t, int fd,
     if (mbedtls_hkdf_extract(md, NULL, 0, zeros, H, early) != 0) return TLS13_ECRYPTO;
     if (expand_label(md, early, H, "derived", empty_hash, H, derived, H) != 0) return TLS13_ECRYPTO;
 
-    /* Общий секрет из Reality — это и есть ECDHE-вход расписания: наша эфемерная пара
-     * из key_share и серверный постоянный ключ дали его ещё в reality.c. */
-    if (mbedtls_hkdf_extract(md, derived, H, shared_secret, 32, hs_secret) != 0)
+    /* ECDHE-вход расписания — секрет с ЭФЕМЕРНЫМ ключом сервера из ServerHello, а не
+     * тот, что посчитан в reality.c.
+     *
+     * Это разные величины, и путать их — ровно та ошибка, из-за которой рукопожатие
+     * доходило до конца, а AEAD не сходился:
+     *
+     *   Reality-секрет = наш эфемерный x постоянный ключ сервера (pbk из ссылки).
+     *                    Он нужен ТОЛЬКО для аутентификатора в session_id;
+     *   TLS-секрет     = наш эфемерный x эфемерный ключ сервера (key_share в ServerHello).
+     *                    На нём стоит всё расписание ключей.
+     *
+     * Сервер, обслуживая нас как VLESS, всё равно проводит обычный TLS 1.3 со своим
+     * эфемерным ключом — иначе поток не был бы неотличим от настоящего HTTPS. */
+    unsigned char ecdhe[32];
+    if (x25519_shared_ext(our_priv, server_pub, ecdhe) != 0) return TLS13_ECRYPTO;
+    if (mbedtls_hkdf_extract(md, derived, H, ecdhe, 32, hs_secret) != 0)
         return TLS13_ECRYPTO;
 
     unsigned char th[32];

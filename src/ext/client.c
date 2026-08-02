@@ -91,7 +91,9 @@ int vless_connect(const struct vless_node *node, struct vless_conn *conn, int ti
         sent += (size_t)w;
     }
 
-    rc = tls13_handshake(&conn->tls, fd, hello, hello_n, conn->rst.shared);
+    /* Передаётся наш ПРИВАТНЫЙ ключ, а не готовый секрет: TLS-расписание строится на
+     * обмене с эфемерным ключом сервера, который приедет только в ServerHello. */
+    rc = tls13_handshake(&conn->tls, fd, hello, hello_n, conn->rst.priv);
     if (rc) { close(fd); conn->fd = -1; return rc; }
     return 0;
 }
@@ -149,7 +151,7 @@ int vless_probe(const struct vless_node *node, int timeout_s, char *why, size_t 
     unsigned char req[512];
     unsigned char probe_ip[4] = { 1, 1, 1, 1 };
     size_t req_n = vless_build_request(uuid, VLESS_CMD_TCP, NULL, probe_ip, 80,
-                                       req, sizeof(req));
+                                       node->flow, req, sizeof(req));
     if (!req_n) { vless_close(&c); snprintf(why, why_n, "заголовок не собрался"); return VLESS_CONN_EIO; }
 
     /* Минимальный HTTP-запрос вместе с заголовком: сервер не отвечает, пока не получит

@@ -42,12 +42,34 @@ int vless_uuid_parse(const char *s, unsigned char out[16]) {
  * нет — там уже адрес, и передаётся он как адрес. */
 size_t vless_build_request(const unsigned char uuid[16], enum vless_cmd cmd,
                            const char *host, const unsigned char ip4[4],
-                           uint16_t port, unsigned char *out, size_t cap) {
+                           uint16_t port, const char *flow,
+                           unsigned char *out, size_t cap) {
     size_t i = 0;
     if (cap < 24) return 0;
     out[i++] = 0;                       /* версия протокола */
     memcpy(out + i, uuid, 16); i += 16;
-    out[i++] = 0;                       /* длина дополнительных данных: их нет */
+
+    /* Дополнительные данные. Для XTLS-Vision это protobuf-сообщение Addons со строкой
+     * flow в поле 1 — схема из addons.proto Xray:
+     *
+     *   message Addons { string Flow = 1; bytes Seed = 2; }
+     *
+     * protobuf здесь кодируется вручную, потому что сообщение из одного строкового поля
+     * — это три байта плюс само имя, и тащить генератор ради этого было бы несоразмерно:
+     *   0x0A (поле 1, тип 2) | длина | байты строки
+     *
+     * Без этого сервер с flow=xtls-rprx-vision не отвечает вовсе: он ждёт Vision, а
+     * получает обычный VLESS. Именно так и выглядела ошибка — «ответ 0 байт». */
+    if (flow && flow[0]) {
+        size_t fl = strlen(flow);
+        if (fl > 120 || i + 3 + fl > cap) return 0;
+        out[i++] = (unsigned char)(2 + fl);   /* длина protobuf-сообщения */
+        out[i++] = 0x0A;                      /* поле 1, wire type 2 (строка) */
+        out[i++] = (unsigned char)fl;
+        memcpy(out + i, flow, fl); i += fl;
+    } else {
+        out[i++] = 0;                         /* дополнительных данных нет */
+    }
     out[i++] = (unsigned char)cmd;
     out[i++] = (unsigned char)(port >> 8);
     out[i++] = (unsigned char)port;

@@ -144,6 +144,9 @@ out:
     return rc;
 }
 
+int x25519_shared_ext(const unsigned char priv[32], const unsigned char peer[32],
+                      unsigned char out[32]);
+
 static int x25519_shared(const unsigned char priv[32], const unsigned char peer[32],
                          unsigned char out[32]) {
     mbedtls_ecp_group grp;
@@ -214,44 +217,19 @@ int reality_build_hello(const struct reality_cfg *cfg, struct reality_state *st,
     if (x25519_keypair(st->priv, st->pub) != 0) return REALITY_ECRYPTO;
     if (x25519_shared(st->priv, pbk, st->shared) != 0) return REALITY_ECRYPTO;
 
-    /* session_id несёт аутентификатор. Он выводится из общего секрета, поэтому посчитать
-     * его может только тот, кто знает приватный ключ — свой или серверный.
-     *
-     * Формат: версия(1) | время(4) | short_id(8) | резерв(19), затем всё это
-     * зашифровывается AES-GCM на ключе из общего секрета. Так сервер отличает нас от
-     * случайного клиента, у которого в session_id просто случайные байты. */
+    /* Аутентификатор считается ПОСЛЕ сборки Hello — см. ниже, где он вписывается на
+     * место. Причина: он подписывает весь ClientHello целиком, поэтому раньше его
+     * посчитать нечем. Здесь только заготовка: 16 значимых байт и 16 нулей под тег. */
     unsigned char sess[32] = {0};
-    sess[0] = 0;                                   /* версия протокола Reality */
+    /* Версия клиента Reality — из core.Version_{x,y,z} Xray. Сервер её не проверяет
+     * строго, но она входит в подписываемые 16 байт, так что должна быть осмысленной. */
+    sess[0] = 26; sess[1] = 7; sess[2] = 28; sess[3] = 0;
     uint32_t now = (uint32_t)time(NULL);
-    sess[1] = (unsigned char)(now >> 24);
-    sess[2] = (unsigned char)(now >> 16);
-    sess[3] = (unsigned char)(now >> 8);
-    sess[4] = (unsigned char)now;
-    if (sid_n > 0) memcpy(sess + 5, sid, (size_t)(sid_n > 8 ? 8 : sid_n));
-    if (fill_random(sess + 13, 19) != 0) return REALITY_ECRYPTO;
-
-    /* Ключ шифрования session_id: HKDF от общего секрета. */
-    unsigned char authkey[32];
-    const mbedtls_md_info_t *md = mbedtls_md_info_from_type(MBEDTLS_MD_SHA256);
-    if (!md) return REALITY_ECRYPTO;
-    if (mbedtls_hkdf(md, (const unsigned char *)cfg->sni, strlen(cfg->sni),
-                     st->shared, 32, NULL, 0, authkey, 32) != 0)
-        return REALITY_ECRYPTO;
-
-    mbedtls_gcm_context gcm;
-    mbedtls_gcm_init(&gcm);
-    int crc = mbedtls_gcm_setkey(&gcm, MBEDTLS_CIPHER_ID_AES, authkey, 128);
-    if (crc == 0) {
-        unsigned char tag[16];
-        /* Шифруем первые 16 байт, тег кладём во вторые: session_id ровно 32 байта, и
-         * оба поля должны выглядеть случайными для наблюдателя. */
-        crc = mbedtls_gcm_crypt_and_tag(&gcm, MBEDTLS_GCM_ENCRYPT, 16,
-                                       st->pub, 12,          /* nonce из своего pub */
-                                       NULL, 0, sess, sess, 16, tag);
-        if (crc == 0) memcpy(sess + 16, tag, 16);
-    }
-    mbedtls_gcm_free(&gcm);
-    if (crc != 0) return REALITY_ECRYPTO;
+    sess[4] = (unsigned char)(now >> 24);
+    sess[5] = (unsigned char)(now >> 16);
+    sess[6] = (unsigned char)(now >> 8);
+    sess[7] = (unsigned char)now;
+    if (sid_n > 0) memcpy(sess + 8, sid, (size_t)(sid_n > 8 ? 8 : sid_n));
     memcpy(st->session_id, sess, 32);
 
     /* ---- собственно Hello ---- */
@@ -372,5 +350,81 @@ int reality_build_hello(const struct reality_cfg *cfg, struct reality_state *st,
     out[rec_len_at + 1] = (unsigned char)rec_len;
 
     *out_len = b.len;
+
+    /* ---- аутентификатор Reality ------------------------------------------------
+     *
+     * Формат взят из реализации Xray, а не выведен из общих соображений — угадать его
+     * нельзя, и моя первая догадка (соль = SNI, nonce = свой pub, пустой AAD) давала
+     * рукопожатие, после которого сервер отвечал маскировочным сайтом.
+     *
+     *   ключ   = HKDF-SHA256(ikm = ECDH(наш приватный, pbk сервера),
+     *                        salt = Random[0..20), info = "REALITY")
+     *   nonce  = Random[20..32)
+     *   данные = первые 16 байт session_id (версия, время, short id)
+     *   AAD    = ВЕСЬ ClientHello как handshake-сообщение, с нулями на месте тега
+     *
+     * AAD и есть причина, по которой это делается здесь: пока Hello не собран, подписывать
+     * нечего. Сервер повторит тот же расчёт своим приватным ключом и сверит тег — так он и
+     * отличает нас от постороннего, не отвечая при этом ничего отличимого. */
+    {
+        const unsigned char *raw = out + 5;              /* handshake без заголовка записи */
+        const unsigned char *random = raw + 4 + 2;       /* после type+len24+version */
+        unsigned char *sid_at = out + 5 + 4 + 2 + 32 + 1;
+
+        /* AAD — это Hello с НУЛЯМИ на месте session_id: Xray обнуляет его до подписи
+         * (`copy(hello.Raw[39:], hello.SessionId)` при пустом SessionId), и сервер
+         * повторяет расчёт так же. С заполненным session_id в AAD тег не сходится, и
+         * сервер молча отвечает маскировочным сайтом — то есть ошибка неотличима от
+         * неверного ключа. Смещение 39 в Xray и наше совпадают: 4+2+32+1 = 39. */
+        /* Открытый текст — 16 значимых байт session_id. Сохраняем их ДО обнуления:
+         * mbedtls шифрует на месте, а обнуление нужно только в AAD.
+         *
+         * Первая версия обнуляла sid_at перед вызовом и подписывала нули вместо версии,
+         * времени и short id. Сервер, естественно, не признавал такую подпись — и, как
+         * всегда с Reality, отвечал маскировочным сайтом, то есть ошибка выглядела как
+         * неверный ключ. Нашлось только сверкой C с независимой реализацией на Python:
+         * их подписи не расшифровывались одним ключом, хотя X25519 у обоих совпадал. */
+        unsigned char plain[16];
+        memcpy(plain, sid_at, 16);
+
+        /* AAD — Hello с НУЛЯМИ на месте session_id: Xray обнуляет его до подписи
+         * (`copy(hello.Raw[39:], hello.SessionId)` при ещё пустом SessionId), и сервер
+         * повторяет расчёт так же. Копируем Hello, чтобы обнулить в копии: сам Hello
+         * должен уехать серверу с подписью, а не с нулями. */
+        static unsigned char aad[4096];
+        size_t aad_n = b.len - 5;
+        if (aad_n > sizeof(aad)) return REALITY_ETOOBIG;
+        memcpy(aad, raw, aad_n);
+        memset(aad + (4 + 2 + 32 + 1), 0, 32);
+
+        unsigned char authkey[32];
+        const mbedtls_md_info_t *md = mbedtls_md_info_from_type(MBEDTLS_MD_SHA256);
+        if (!md) return REALITY_ECRYPTO;
+        if (mbedtls_hkdf(md, random, 20, st->shared, 32,
+                         (const unsigned char *)"REALITY", 7, authkey, 32) != 0)
+            return REALITY_ECRYPTO;
+
+        unsigned char tag[16];
+        mbedtls_gcm_context gcm;
+        mbedtls_gcm_init(&gcm);
+        int crc = mbedtls_gcm_setkey(&gcm, MBEDTLS_CIPHER_ID_AES, authkey, 256);
+        if (crc == 0)
+            crc = mbedtls_gcm_crypt_and_tag(&gcm, MBEDTLS_GCM_ENCRYPT, 16,
+                                            random + 20, 12,
+                                            aad, aad_n,
+                                            plain, sid_at, 16, tag);
+        mbedtls_gcm_free(&gcm);
+        if (crc != 0) return REALITY_ECRYPTO;
+        memcpy(sid_at + 16, tag, 16);
+        memcpy(st->session_id, sid_at, 32);
+    }
     return 0;
+}
+
+/* Тот же обмен, доступный из tls13.c: там нужен секрет с эфемерным ключом сервера из
+ * ServerHello, тогда как reality.c считает секрет с его постоянным ключом. Две разные
+ * величины, один и тот же примитив. */
+int x25519_shared_ext(const unsigned char priv[32], const unsigned char peer[32],
+                      unsigned char out[32]) {
+    return x25519_shared(priv, peer, out);
 }
