@@ -5,14 +5,19 @@ CFLAGS ?= -O2 -Wall -Wextra
 BUILD  := build
 
 .PHONY: all test clean
-all: $(BUILD)/steer-aggregate
+all: $(BUILD)/steer-aggregate $(BUILD)/steer
 
 $(BUILD)/steer-aggregate: src/aggregate.c
 	@mkdir -p $(BUILD)
 	$(CC) $(CFLAGS) -o $@ $<
 
+$(BUILD)/steer: src/steer.c
+	@mkdir -p $(BUILD)
+	$(CC) $(CFLAGS) -o $@ $<
+
 test: all
 	@sh tests/run.sh
+	@sh tests/gen.sh
 
 clean:
 	rm -rf $(BUILD)
