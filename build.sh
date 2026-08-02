@@ -3,12 +3,24 @@
 #
 # Same zig cross-toolchain splify uses: a static binary means no libc version to
 # match against the router's, and one build serves every OpenWrt release for that
-# ISA. The image is the splify-dnsd builder — reused rather than duplicated.
+# ISA.
 set -eu
 
 VERSION="$(cat VERSION 2>/dev/null || echo 0.1.0)"
 OUT=out
-IMAGE="${STEER_BUILDER_IMAGE:-splify-dnsd-builder:zig-0.13.0}"
+# Свой образ, а не образ сборщика splify: в том нет исходников mbedtls, и расширенная
+# сборка в нём падает на «mbedtls/sha256.h не найден», тогда как базовая проходит.
+# Незаметная поломка: `./build.sh` печатает архитектуры, пакеты появляются, и только
+# extended молча отсутствует.
+IMAGE="${STEER_BUILDER_IMAGE:-steer-builder:mbedtls}"
+
+# Собрать образ, если его нет. Иначе первая же сборка на чужой машине упирается в
+# «Unable to find image», и человек ищет, откуда его взять, — а он описан прямо здесь,
+# в build/Dockerfile.
+if ! docker image inspect "$IMAGE" >/dev/null 2>&1; then
+    echo "образ $IMAGE отсутствует — собираю из build/Dockerfile"
+    docker build -t "$IMAGE" build/ || { echo "не удалось собрать образ"; exit 1; }
+fi
 
 # id:target:mcpu — the ISAs OpenWrt actually ships. Package arch names below map
 # several OpenWrt targets onto one ISA build, which is why the two lists differ.

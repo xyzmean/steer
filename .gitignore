@@ -1,7 +1,11 @@
-build/
-out/
-build/libmbed-*.a
+# Артефакты сборки — но НЕ каталог build целиком: в нём живут Dockerfile и
+# build-ext.sh, без которых `./build.sh` из свежего клона не работает. Строка
+# `build/` их и прятала: сборка собиралась только там, где эти файлы уже лежали
+# на диске, то есть у одного человека.
+build/steer
 build/steer-*
+build/libmbed-*.a
 build/*.err
 build/pkg/
 build/scripts/
+out/
