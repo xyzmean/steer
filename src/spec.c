@@ -267,8 +267,13 @@ void load_spec(const char *path) {
         fprintf(stderr, "steer: spec schema %ld is not supported (this build speaks 1)\n", schema);
         exit(2);
     }
-    if (!g_out_n) die("spec has no outputs", NULL);
-    if (!g_ch_n) die("spec has no channels", NULL);
+    /* Пустая спека законна, и отказ на ней запирал настройку наглухо: чтобы завести
+     * канал, нужен выход, а сохранить выход без каналов движок не давал — тупик, из
+     * которого нельзя выйти изнутри интерфейса.
+     *
+     * "Выходы есть, каналов нет" — это осмысленное состояние: steer настроен, но
+     * ничего не направляет. Оно же и правильное начальное: угадывать, какие списки
+     * человеку нужны, хуже, чем не направлять ничего. */
     for (size_t i = 0; i < g_ch_n; i++) {
         size_t k = 0;
         for (; k < g_out_n; k++) if (!strcmp(g_ch[i].out, g_out[k].name)) break;

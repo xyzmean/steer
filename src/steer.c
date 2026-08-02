@@ -389,6 +389,9 @@ static int cmd_apply(const char *spec, int dry) {
     load_spec(spec);
     registry_assign();
     build_groups();
+    /* Ни одной группы — таблица всё равно ставится, с пустой цепочкой: так status
+     * продолжает отвечать, а следующий apply не зависит от того, была ли таблица
+     * раньше. */
     if (dry) { generate(stdout); return 0; }
 
     char tmp[] = "/tmp/steer-ruleset.XXXXXX";

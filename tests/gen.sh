@@ -189,6 +189,19 @@ if [ -f "$init" ]; then
         "$(grep -c "grep -q '\"domains" "$init")"
 fi
 
+# ---- пустая спека законна ----------------------------------------------------
+# Отказ на ней запирал настройку наглухо: чтобы завести канал, нужен выход, а сохранить
+# выход без каналов движок не давал. Из такого тупика нельзя выйти изнутри интерфейса.
+printf '{"schema":1,"outputs":{},"channels":[]}' > "$tmp/empty.json"
+"$BIN" apply --dry-run --spec "$tmp/empty.json" --state-dir "$tmp/state-e" >"$tmp/eo" 2>&1
+check "пустая спека компилируется" "0" "$?"
+check "и даёт таблицу с пустой цепочкой" "1" "$(grep -c 'chain prerouting_mark' "$tmp/eo")"
+check "без наборов" "0" "$(grep -c '    set ' "$tmp/eo")"
+
+printf '{"schema":1,"outputs":{"vpn":{"kind":"interface","device":"wg0"}},"channels":[]}' > "$tmp/only.json"
+"$BIN" apply --dry-run --spec "$tmp/only.json" --state-dir "$tmp/state-e" >/dev/null 2>&1
+check "выходы без каналов — законное состояние" "0" "$?"
+
 # ---- refusals ---------------------------------------------------------------
 # Guessing at an unknown schema would mean compiling a config we do not understand
 # into firewall rules.
