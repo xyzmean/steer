@@ -26,6 +26,7 @@
 #include "spec.h"
 
 int dnsd_main(int argc, char **argv);
+int cmd_failover(const char *spec, int verbose);
 
 /* ---- coalescing: one interface, at most two sets ---------------------------
  *
@@ -346,6 +347,9 @@ static void report_output_deps(void) {
 }
 
 /* ---- apply ---------------------------------------------------------------- */
+/* Экспортируется для failover.c: он запускает те же ip/ping, и второй такой же
+ * помощник означал бы два места, где решается, куда девать вывод. */
+int run_quiet(const char *const argv[]);
 static int run(const char *const argv[]) {
     pid_t p = fork();
     if (p < 0) return -1;
@@ -361,6 +365,8 @@ static int run(const char *const argv[]) {
     waitpid(p, &st, 0);
     return WIFEXITED(st) ? WEXITSTATUS(st) : -1;
 }
+
+int run_quiet(const char *const argv[]) { return run(argv); }
 
 /* Policy routing for interface outputs. Rules are removed before being added so a
  * re-apply cannot stack duplicates — `ip rule add` is happy to add the same rule
@@ -379,9 +385,22 @@ static void apply_routing(void) {
         run(flush);
         const char *route[] = { "ip", "route", "add", "default", "dev", g_out[i].device,
                                 "table", table, NULL };
-        if (run(route) != 0)
+        if (run(route) != 0) {
             fprintf(stderr, "steer: output %s: cannot route via %s — is the device up?\n",
                     g_out[i].name, g_out[i].device);
+            /* Пустая таблица — это не «нет маршрута», а «ищи дальше»: помеченный
+             * пакет провалится в следующую таблицу и уйдёт напрямую, то есть ровно
+             * туда, куда его не пускали. При on_fail=drop окно между apply и первым
+             * тиком failover обязано быть закрыто, иначе защита работает не всегда,
+             * а это хуже, чем не работает вовсе. */
+            if (g_out[i].on_fail == FAIL_DROP) {
+                const char *bh[] = { "ip", "route", "add", "blackhole", "default",
+                                     "table", table, NULL };
+                run(bh);
+                fprintf(stderr, "steer: output %s: трафик остановлен до появления "
+                                "рабочего устройства (on_fail=drop)\n", g_out[i].name);
+            }
+        }
     }
 }
 
@@ -451,6 +470,14 @@ static int cmd_status(const char *spec) {
                    ",\"in_firewall\":%s,\"nat\":%s",
                    g_out[i].device, up ? "true" : "false", g_out[i].mark, g_out[i].table,
                    c.in_firewall ? "true" : "false", c.masqueraded ? "true" : "false");
+            /* Кандидаты и режим отказа: без них failover не виден из интерфейса, и
+             * человек не может понять, почему выход вдруг ведёт в другое устройство. */
+            printf(",\"devices\":[");
+            for (size_t d = 0; d < g_out[i].devices_n; d++)
+                printf("%s\"%s\"", d ? "," : "", g_out[i].devices[d]);
+            printf("],\"on_fail\":\"%s\"",
+                   g_out[i].on_fail == FAIL_DROP ? "drop" :
+                   g_out[i].on_fail == FAIL_ZAPRET ? "zapret" : "direct");
         }
         printf("}");
     }
@@ -557,16 +584,18 @@ int main(int argc, char **argv) {
     if (argc < 2) {
         fputs("usage: steer apply [--dry-run] [--spec FILE]\n"
               "       steer dnsd  [--spec FILE]   (resolver for domain channels)\n"
+              "       steer failover [--spec FILE] [-v]   (pick a live device per output)\n"
               "       steer needs-dnsd            (exit 0 if the spec has domain channels)\n"
               "       steer status [--spec FILE]\n"
               "       steer explain ADDRESS [--spec FILE]\n", stderr);
         return 2;
     }
     const char *cmd = argv[1], *arg = NULL;
-    int dry = 0;
+    int dry = 0, verbose = 0;
     for (int i = 2; i < argc; i++) {
         if (!strcmp(argv[i], "--spec") && i + 1 < argc) spec = argv[++i];
         else if (!strcmp(argv[i], "--dry-run")) dry = 1;
+        else if (!strcmp(argv[i], "-v") || !strcmp(argv[i], "--verbose")) verbose = 1;
         else if (!strcmp(argv[i], "--state-dir") && i + 1 < argc) g_state_dir = argv[++i];
         else arg = argv[i];
     }
@@ -582,6 +611,7 @@ int main(int argc, char **argv) {
         build_groups();
         return has_domains() ? 0 : 1;
     }
+    if (!strcmp(cmd, "failover")) return cmd_failover(spec, verbose);
     if (!strcmp(cmd, "dnsd")) return dnsd_main(argc - 2, argv + 2);
     if (!strcmp(cmd, "apply")) return cmd_apply(spec, dry);
     if (!strcmp(cmd, "status")) return cmd_status(spec);

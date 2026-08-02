@@ -11,9 +11,9 @@ $(BUILD)/steer-aggregate: src/aggregate.c
 	@mkdir -p $(BUILD)
 	$(CC) $(CFLAGS) -o $@ $<
 
-$(BUILD)/steer: src/steer.c src/spec.c src/dnsd.c src/spec.h
+$(BUILD)/steer: src/steer.c src/spec.c src/dnsd.c src/failover.c src/spec.h
 	@mkdir -p $(BUILD)
-	$(CC) $(CFLAGS) -o $@ src/steer.c src/spec.c src/dnsd.c
+	$(CC) $(CFLAGS) -o $@ src/steer.c src/spec.c src/dnsd.c src/failover.c
 
 test: all
 	@sh tests/run.sh

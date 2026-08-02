@@ -202,6 +202,49 @@ printf '{"schema":1,"outputs":{"vpn":{"kind":"interface","device":"wg0"}},"chann
 "$BIN" apply --dry-run --spec "$tmp/only.json" --state-dir "$tmp/state-e" >/dev/null 2>&1
 check "выходы без каналов — законное состояние" "0" "$?"
 
+# ---- защита от конфигураций, отрезающих роутер -------------------------------
+# Всё это компилируется и применяется без жалоб, а замечается как "роутер пропал".
+# Отказать дешевле, чем объяснять, как чинить коробку, до которой не достучаться.
+cat > "$tmp/all.json" <<EOF
+{ "schema": 1, "outputs": { "o": { "kind": "interface", "device": "wg0" } },
+  "channels": [ { "name": "все", "match": { "any": true }, "out": "o" } ] }
+EOF
+"$BIN" apply --dry-run --spec "$tmp/all.json" --state-dir "$tmp/state-g" >/dev/null 2>&1
+check "канал any без списка отвергается" "2" "$?"
+
+# ...но остаётся выразимым, когда это правда то, что нужно.
+sed 's/"any": true/"any": true, "allow_all": true/' "$tmp/all.json" > "$tmp/allok.json"
+"$BIN" apply --dry-run --spec "$tmp/allok.json" --state-dir "$tmp/state-g" >/dev/null 2>&1
+check "с allow_all он проходит" "0" "$?"
+
+sed 's/"device": "wg0"/"device": "br-lan"/' "$tmp/allok.json" > "$tmp/loop.json"
+"$BIN" apply --dry-run --spec "$tmp/loop.json" --state-dir "$tmp/state-g" >/dev/null 2>&1
+check "выход в локальный мост отвергается" "2" "$?"
+
+sed 's/"device": "wg0"/"devices": ["wg0","wg0"]/' "$tmp/allok.json" > "$tmp/dup.json"
+"$BIN" apply --dry-run --spec "$tmp/dup.json" --state-dir "$tmp/state-g" >/dev/null 2>&1
+check "дубликат устройства отвергается" "2" "$?"
+
+# Сообщение обязано называть виновника: "steer: " без текста — это отказ, из
+# которого нельзя понять, что чинить.
+msg="$("$BIN" apply --dry-run --spec "$tmp/loop.json" --state-dir "$tmp/state-g" 2>&1 | tail -1)"
+check "и объясняет, что не так" "1" "$(printf '%s' "$msg" | grep -c 'br-lan')"
+
+# ---- failover ----------------------------------------------------------------
+# devices — это приоритет, и единственное число остаётся сокращением для одного,
+# чтобы прежние спеки не сломались.
+cat > "$tmp/fo.json" <<EOF
+{ "schema": 1,
+  "outputs": { "o": { "kind": "interface", "devices": ["wg0", "wg1"], "on_fail": "drop" } },
+  "channels": [ { "name": "c", "match": { "domains_files": ["$tmp/d.lst"] }, "out": "o" } ] }
+EOF
+"$BIN" apply --dry-run --spec "$tmp/fo.json" --state-dir "$tmp/state-f" >/dev/null 2>&1
+check "список устройств принимается" "0" "$?"
+
+sed 's/"on_fail": "drop"/"on_fail": "чепуха"/' "$tmp/fo.json" > "$tmp/fobad.json"
+"$BIN" apply --dry-run --spec "$tmp/fobad.json" --state-dir "$tmp/state-f" >/dev/null 2>&1
+check "неизвестный on_fail отвергается" "2" "$?"
+
 # ---- refusals ---------------------------------------------------------------
 # Guessing at an unknown schema would mean compiling a config we do not understand
 # into firewall rules.

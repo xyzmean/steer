@@ -149,6 +149,32 @@ static void parse_outputs(struct js *j) {
             js_lit(j, ':');
             if (!strcmp(key, "kind")) js_str(j, kind, sizeof(kind));
             else if (!strcmp(key, "device")) js_str(j, o.device, sizeof(o.device));
+            else if (!strcmp(key, "devices")) {
+                /* Кандидаты в порядке предпочтения. Единственное число остаётся
+                 * сокращением для одного — прежние спеки не ломаются. */
+                if (js_lit(j, '[') == 0) {
+                    js_ws(j);
+                    if (*j->p == ']') j->p++;
+                    else for (;;) {
+                        char t[32];
+                        if (js_str(j, t, sizeof(t)) != 0) break;
+                        if (o.devices_n < MAX_DEVICES)
+                            snprintf(o.devices[o.devices_n++], 32, "%s", t);
+                        js_ws(j);
+                        if (*j->p == ',') { j->p++; continue; }
+                        js_lit(j, ']');
+                        break;
+                    }
+                }
+            }
+            else if (!strcmp(key, "on_fail")) {
+                char m[16];
+                js_str(j, m, sizeof(m));
+                if (!strcmp(m, "drop")) o.on_fail = FAIL_DROP;
+                else if (!strcmp(m, "direct")) o.on_fail = FAIL_DIRECT;
+                else if (!strcmp(m, "zapret")) o.on_fail = FAIL_ZAPRET;
+                else die("outputs.%s: unknown on_fail (want drop, direct or zapret)", o.name);
+            }
             else js_skip(j);
             js_ws(j);
             if (*j->p == ',') { j->p++; js_ws(j); }
@@ -157,6 +183,11 @@ static void parse_outputs(struct js *j) {
         if (!strcmp(kind, "direct")) o.kind = OUT_DIRECT;
         else if (!strcmp(kind, "interface")) {
             o.kind = OUT_INTERFACE;
+            /* device и devices описывают одно и то же с разных сторон: device — что
+             * работает сейчас, devices — из чего выбирать. Задан один, выводится
+             * второй, чтобы дальше по коду не было двух путей. */
+            if (!o.devices_n && o.device[0]) snprintf(o.devices[o.devices_n++], 32, "%s", o.device);
+            if (!o.device[0] && o.devices_n) snprintf(o.device, sizeof(o.device), "%s", o.devices[0]);
             if (!o.device[0]) die("outputs.%s: kind interface needs a device", o.name);
         } else die("outputs.%s: unknown kind (want direct or interface)", o.name);
         if (g_out_n >= MAX_OUTPUTS) die("too many outputs", NULL);
@@ -207,6 +238,7 @@ static void parse_channels(struct js *j) {
                         else if (strcmp(m, "fakeip") != 0) die("channels: unknown mode %s (want fakeip or realip)", m);
                     }
                     else if (!strcmp(mk, "any")) { js_ws(j); c.any = (*j->p == 't'); js_skip(j); }
+                    else if (!strcmp(mk, "allow_all")) { js_ws(j); c.allow_all = (*j->p == 't'); js_skip(j); }
                     else js_skip(j);
                     js_ws(j);
                     if (*j->p == ',') { j->p++; js_ws(j); }
@@ -314,6 +346,52 @@ void load_spec(const char *path) {
         size_t k = 0;
         for (; k < g_out_n; k++) if (!strcmp(g_ch[i].out, g_out[k].name)) break;
         if (k == g_out_n) die("channel %s points at an output that does not exist", g_ch[i].name);
+    }
+
+    /* ---- защита от конфигураций, которые отрежут доступ к роутеру -----------
+     *
+     * Всё ниже — про ошибки, которые компилируются и применяются без единой
+     * жалобы, а замечаются как «роутер пропал». Отказать на них дешевле, чем
+     * потом объяснять, как чинить коробку, до которой уже не достучаться.
+     * Каждая проверка отвечает на «что человек сделает случайно», а не на
+     * «что запрещено стандартом». */
+    for (size_t i = 0; i < g_out_n; i++) {
+        struct output *o = &g_out[i];
+        if (o->kind != OUT_INTERFACE) continue;
+
+        /* Выход в локальный мост — это петля: помеченный пакет получает маршрут
+         * обратно в ту же сеть, откуда пришёл. */
+        if (!strcmp(o->device, g_lan_device)) {
+            char msg[160];
+            snprintf(msg, sizeof(msg),
+                     "выход %s ведёт в %s — это локальная сеть, трафик закольцуется",
+                     o->name, g_lan_device);
+            die("%s", msg);
+        }
+
+        /* Дубликат устройства внутри одного выхода делает failover бессмысленным:
+         * второй кандидат ничем не отличается от первого. */
+        for (size_t a = 0; a < o->devices_n; a++)
+            for (size_t b = a + 1; b < o->devices_n; b++)
+                if (!strcmp(o->devices[a], o->devices[b])) {
+                    char msg[160];
+                    snprintf(msg, sizeof(msg), "выход %s: устройство %s указано дважды",
+                             o->name, o->devices[a]);
+                    die("%s", msg);
+                }
+    }
+
+    for (size_t i = 0; i < g_ch_n; i++) {
+        struct channel *c = &g_ch[i];
+        struct output *o = out_by_name(c->out);
+        if (!o || o->kind != OUT_INTERFACE) continue;
+
+        /* Канал `any` в туннель уводит ВЕСЬ трафик клиентов, включая их доступ к
+         * самому роутеру и к его DNS. Это законная конфигурация, но только
+         * осознанная: без явного признака она почти всегда описка вместо списка. */
+        if (c->any && !c->prefixes_n && !c->domains_n && !c->allow_all)
+            die("канал %s забирает ВЕСЬ трафик в туннель. Если это правда нужно, "
+                "добавьте \"allow_all\": true — иначе выберите список", c->name);
     }
 }
 
