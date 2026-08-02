@@ -75,6 +75,7 @@ int ip_parse(const unsigned char *p, size_t n, struct flow_key *k, size_t *paylo
         size_t doff = (size_t)(t[12] >> 4) * 4;
         if (doff < 20 || n < ihl + doff) return -1;
         k->tcp_flags = t[13];
+        k->window = (uint16_t)((t[14] << 8) | t[15]);
         k->seq = ((uint32_t)t[4] << 24) | ((uint32_t)t[5] << 16) |
                  ((uint32_t)t[6] << 8) | t[7];
         k->ack = ((uint32_t)t[8] << 24) | ((uint32_t)t[9] << 16) |

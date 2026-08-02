@@ -52,8 +52,27 @@ struct conn {
     uint32_t our_seq;         /* следующий, который отправим клиенту */
     int header_sent;          /* заголовок VLESS уже ушёл серверу */
     int established;
+    /* Сколько из отправленного клиент подтвердил и сколько он готов принять. Нужно потому,
+     * что повторной передачи у нас нет: сегмент, потерянный из-за переполнения очереди
+     * устройства, не будет отправлен заново никогда, и соединение повиснет навсегда —
+     * клиент будет подтверждать старое, а мы отдавать новое. */
+    uint32_t client_ack;
+    uint16_t client_win;
     time_t last;
 };
+
+/* Сколько неподтверждённых байт разрешаем себе держать в пути.
+ *
+ * Не «сколько объявил клиент», а МИНИМУМ из его окна и этого числа. Окно клиента бывает
+ * мегабайтным, а очередь устройства TUN — около пятисот пакетов: обогнав её, мы теряем
+ * сегменты, и без повторной передачи это конец соединения. Тридцать два килобайта — это
+ * ~22 пакета в пути, что очередь держит с запасом, а на локальной сети хватает для полной
+ * скорости: при задержке в доли миллисекунды окно в 32 КБ это сотни мегабит.
+ *
+ * Замерено, почему это вообще нужно: на роутере без ограничения передача вставала на
+ * втором мегабайте, на быстрой машине доходила до гигабайта и больше. Разница — в том, как
+ * быстро стек успевает разгребать очередь. */
+#define CLIENT_INFLIGHT_CAP (32 * 1024)
 
 static struct conn g_conns[MAX_CONNS];
 
@@ -80,6 +99,7 @@ static struct conn *conn_new(void) {
 }
 
 static void conn_drop(struct conn *c) {
+    TR("закрываю conn#%ld fd=%d\n", (long)(c - g_conns), c->v.fd);
     if (c->used) vless_close(&c->v);
     memset(c, 0, sizeof(*c));
 }
@@ -152,6 +172,7 @@ static int downstream_pump(struct conn *c, const struct vless_node *node, int tu
      * HTTP/2, и чтение мимо него отдавало бы кадры вместо данных. Прямой вызов работал,
      * пока транспорт был единственный, и это ровно тот случай, когда «работает» и
      * «правильно» разошлись молча. */
+    TR("чтение conn#%ld fd=%d\n", (long)(c - g_conns), c->v.fd);
     int rc = vless_recv(&c->v, buf, sizeof(buf), &got);
     if (rc) { TR("чтение от сервера: rc=%d\n", rc); return rc; }
     /* Ноль байт — законно: приехал служебный кадр HTTP/2, данных пока нет. Принять это за
@@ -196,10 +217,10 @@ static int downstream_pump(struct conn *c, const struct vless_node *node, int tu
             size_t pl_n = 0;
             int ur = vision_unwrap(&c->vis, cur, left, &used, &pl, &pl_n);
             if (ur != 0 || !used) {
-                /* Кадр пришёл не целиком. Остаток бросаем: собирать его между чтениями
-                 * значило бы держать буфер на каждое соединение, а TLS-записи и так
-                 * приходят целиком — этот случай возможен только при кадре больше записи. */
-                TR("кадр не целиком: ur=%d осталось %zu\n", ur, left);
+                /* Разбор больше не может «не хватить данных»: он потоковый и переносит
+                 * состояние между вызовами. Сюда попадаем только на настоящей ошибке —
+                 * недопустимой команде в кадре. */
+                TR("кадр не разобран: ur=%d осталось %zu\n", ur, left);
                 break;
             }
             p = pl;
@@ -219,18 +240,44 @@ static int downstream_pump(struct conn *c, const struct vless_node *node, int tu
         }
     }
 
+    /* Сервер объявил прямое копирование — сообщаем об этом соединению, чтобы следующее
+     * чтение шло мимо расшифровки. Ставится ЗДЕСЬ, потому что команда живёт в кадрах
+     * Vision, а про них знает только этот код. */
+    if (c->vis.recv_direct && !c->v.rx_direct) {
+        c->v.rx_direct = 1;
+        TR("сервер перешёл на прямое копирование — читаем сокет как есть\n");
+    }
+
     if (!total) { TR("после разбора данных нет\n"); return 0; }
 
-    unsigned char pkt[TUNNEL_BUF];
-    /* Отвечаем от имени сервера: адреса и порты наоборот. */
-    size_t len = tcp_build(pkt, sizeof(pkt), c->key.dst, c->key.src,
-                           c->key.dport, c->key.sport,
-                           c->our_seq, c->client_seq, TCP_ACK | TCP_PSH,
-                           payload, total, 65535, 0);
-    if (!len) return -1;
-    c->our_seq += (uint32_t)total;
-    TR("клиенту %zu байт (seq=%u)\n", total, c->our_seq - (uint32_t)total);
-    if (write(tun_fd, pkt, len) < 0) return -1;
+    /* Нарезаем на сегменты по MSS. Обязательно: за один раз от сервера приезжает до целой
+     * записи TLS — шестнадцать килобайт, — а MTU устройства 1500. Пакет больше MTU ядро в
+     * TUN не принимает, write возвращает ошибку, и данные пропадают.
+     *
+     * Именно так и ломалось: короткие ответы проходили, а длинная передача встаёт, как
+     * только сервер переходит на записи полного размера. Локально спотыкалось на 34 МБ, на
+     * роутере на 16 — то есть «работает, но не до конца», причём место обрыва каждый раз
+     * другое. Отдавать клиенту гигантский сегмент нельзя ещё и по существу: мы синтезируем
+     * TCP, и MSS для него не рекомендация. */
+    static unsigned char pkt[TUNNEL_BUF];
+    size_t sent = 0;
+    while (sent < total) {
+        size_t chunk = total - sent > TUN_MSS ? (size_t)TUN_MSS : total - sent;
+        /* Отвечаем от имени сервера: адреса и порты наоборот. */
+        size_t len = tcp_build(pkt, sizeof(pkt), c->key.dst, c->key.src,
+                               c->key.dport, c->key.sport,
+                               c->our_seq, c->client_seq, TCP_ACK | TCP_PSH,
+                               payload + sent, chunk, 65535, 0);
+        if (!len) return -1;
+        if (write(tun_fd, pkt, len) < 0) {
+            TR("запись в TUN не удалась (%zu байт): %s\n", len, strerror(errno));
+            return -1;
+        }
+        c->our_seq += (uint32_t)chunk;
+        sent += chunk;
+    }
+    TR("клиенту %zu байт (%zu сегментов, seq до %u)\n",
+       total, (total + TUN_MSS - 1) / TUN_MSS, c->our_seq);
     return 0;
 }
 
@@ -260,6 +307,8 @@ static void handle_packet(int tun_fd, const struct vless_node *node,
         c->key = k;
         c->client_seq = k.seq + 1;                  /* SYN занимает один номер */
         c->our_seq = 1;                             /* свой поток начинаем с 1 */
+        c->client_ack = 1;                          /* столько он уже подтвердил (SYN-ACK) */
+        c->client_win = k.window ? k.window : 8192;
         c->last = time(NULL);
         if (vless_uuid_parse(node->uuid, c->uuid) != 0) { conn_drop(c); return; }
         vision_init(&c->vis, c->uuid);
@@ -288,6 +337,15 @@ static void handle_packet(int tun_fd, const struct vless_node *node,
 
     if (!c) return;                                 /* данные без соединения — игнор */
     c->last = time(NULL);
+
+    /* Учитываем подтверждения и окно клиента с ЛЮБОГО его пакета, включая чистые ACK: без
+     * этого мы не знаем, сколько он принял, и продолжаем лить в устройство. Именно чистые
+     * ACK и приходят во время скачивания — данных от клиента там нет вовсе. */
+    if (k.tcp_flags & TCP_ACK) {
+        /* Сравнение с учётом переполнения счётчика: разность как знаковая. */
+        if ((int32_t)(k.ack - c->client_ack) > 0) c->client_ack = k.ack;
+        c->client_win = k.window;
+    }
 
     if (k.tcp_flags & (TCP_RST | TCP_FIN)) {
         if (k.tcp_flags & TCP_FIN) {
@@ -355,9 +413,52 @@ static void handle_packet(int tun_fd, const struct vless_node *node,
     if (al) write(tun_fd, ackp, al);
 }
 
-int tunnel_run(const char *dev, const struct vless_node *node) {
+int run_quiet(const char *const argv[]);   /* из steer.c */
+
+/* Поднять устройство и дать ему адрес.
+ *
+ * Делает это движок, а не управляющий слой, потому что устройство создаёт тоже движок:
+ * между «TUN появился» и «TUN готов нести трафик» нет никого, кому это можно было бы
+ * поручить. Без этого apply не находит рабочего устройства, ставит blackhole (при
+ * on_fail=drop) и трафик стоит — притом что процесс запущен, узел выбран и в логе всё
+ * выглядит успешным. Ровно тот случай, когда «настроено» и «работает» расходятся молча.
+ *
+ * Адрес нужен не нам: наш клиент читает из TUN пакеты и открывает по ним потоки, source
+ * в них не участвует вовсе. Нужен он ядру и фаерволу — маршрут на устройство без адреса
+ * ядро считает непригодным для локально порождённых пакетов.
+ *
+ * 198.51.100.0/24 — это TEST-NET-2 из RFC 5737: диапазон, отведённый под документацию и
+ * НЕ маршрутизируемый в интернете. Поэтому он не может столкнуться ни с чужим сервисом,
+ * ни с локальной сетью, которую кто-то себе выбрал. Пул fake-IP (198.18.0.0/15) здесь
+ * брать нельзя — он занят под другую задачу, и пересечение перепутало бы одно с другим.
+ *
+ * Номер адреса берётся из таблицы маршрутизации выхода: она уже уникальна и уже лежит в
+ * реестре, то есть переживает перезагрузку. Выдумывать для этого второй счётчик значило
+ * бы завести второе место, где номера могут разъехаться. */
+static void tun_bring_up(const char *dev, int table) {
+    char addr[40];
+    snprintf(addr, sizeof(addr), "198.51.100.%d/32", 1 + (table % 200));
+    const char *a[] = { "ip", "addr", "replace", addr, "dev", dev, NULL };
+    run_quiet(a);
+    const char *u[] = { "ip", "link", "set", "dev", dev, "up", NULL };
+    run_quiet(u);
+}
+
+int tunnel_run(struct output *o, const struct vless_node *node) {
+    const char *dev = o->device;
     int tun_fd = tun_open(dev);
     if (tun_fd < 0) return tun_fd;
+    tun_bring_up(dev, o->table);
+
+    /* Привязываем таблицу выхода к устройству ЗДЕСЬ, а не в apply.
+     *
+     * Apply уже прошёл к этому моменту и, не найдя устройства, поставил запрет — иначе и
+     * нельзя: пока туннеля нет, пускать в него трафик некуда. Дождаться устройства снаружи
+     * невозможно: procd запускает этот процесс только после того, как init-скрипт вернул
+     * управление, то есть уже после apply. Значит привязать может только тот, кто знает
+     * момент готовности, — а это мы. */
+    bind_device(o, dev);
+    fprintf(stderr, "steer tunnel: %s привязан к таблице %d\n", dev, o->table);
     fprintf(stderr, "steer tunnel: %s -> %s (%s:%u %s%s)\n", dev, node->name,
             node->host, node->port, node->type, node->flow[0] ? " +vision" : "");
 
@@ -374,6 +475,18 @@ int tunnel_run(const char *dev, const struct vless_node *node) {
         nf++;
         for (int i = 0; i < MAX_CONNS; i++) {
             if (!g_conns[i].used) continue;
+            /* Не спрашиваем сервер о новых данных, пока клиент не разгрёб прежние.
+             *
+             * Это и есть управление потоком, которого у нас иначе нет: прочитав, мы обязаны
+             * сразу записать в устройство, а очередь устройства не бесконечна. Переполнив
+             * её, мы теряем сегмент — и без повторной передачи соединение подвисает
+             * навсегда: клиент подтверждает старое, мы отдаём новое, и никто не сходится.
+             *
+             * Замер: на роутере без этой проверки передача вставала на втором мегабайте. */
+            uint32_t inflight = g_conns[i].our_seq - g_conns[i].client_ack;
+            uint32_t room = g_conns[i].client_win < CLIENT_INFLIGHT_CAP
+                          ? g_conns[i].client_win : CLIENT_INFLIGHT_CAP;
+            if (inflight >= room) continue;
             pf[nf].fd = g_conns[i].v.fd;
             pf[nf].events = POLLIN;
             map[nf - 1] = &g_conns[i];
@@ -591,5 +704,8 @@ int cmd_vless(const char *spec_path, const char *out_name) {
         return 1;
     }
 
-    return tunnel_run(o->device, &nodes[chosen]);
+    /* Реестр — чтобы узнать таблицу выхода: из неё берётся адрес устройства. Вызов
+     * идемпотентен и с apply не спорит: тот же файл, те же номера. */
+    registry_assign();
+    return tunnel_run(o, &nodes[chosen]);
 }

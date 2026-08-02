@@ -28,8 +28,9 @@ start_service() {
     # Выходы kind=vless поднимаются ПЕРЕД apply: их TUN-устройства должны существовать к
     # моменту, когда apply будет привязывать к ним таблицы маршрутизации. Иначе первый
     # apply не находит устройство, ставит blackhole (при on_fail=drop), и трафик стоит до
-    # следующего тика сторожа.
-    for out in $(steer outputs --kind vless --spec "$SPEC" 2>/dev/null); do
+    # следующего тика сторожа — то есть до минуты после каждого перезапуска.
+    vless_outs="$(steer outputs --kind vless --spec "$SPEC" 2>/dev/null)"
+    for out in $vless_outs; do
         procd_open_instance "vless_$out"
         procd_set_param command /usr/sbin/steer vless "$out" --spec "$SPEC"
         procd_set_param respawn 3600 5 0
@@ -38,6 +39,15 @@ start_service() {
         procd_close_instance
     done
 
+    # Ждать здесь появления устройства НЕЛЬЗЯ, и это не осторожность, а свойство procd:
+    # procd_open_instance только описывает экземпляр, а запускает его procd после возврата
+    # из start_service. Внутри этой функции процесса ещё нет, поэтому ожидание устройства
+    # гарантированно истекло бы впустую — проверено, ждало двадцать секунд и не дождалось.
+    #
+    # Поэтому таблицу маршрутизации к своему устройству привязывает сам процесс vless,
+    # когда устройство создано и поднято: он единственный, кто знает этот момент. Здешний
+    # apply до тех пор держит на выходе запрет (при on_fail=drop) — и это правильно: пока
+    # туннеля нет, трафику там делать нечего.
     steer apply --spec "$SPEC" || echo "steer: apply failed — see the message above"
 
     # Ask the ENGINE whether the resolver is needed. Never grep the spec for a
@@ -61,7 +71,11 @@ start_service() {
     procd_set_param stderr 1
     procd_close_instance
 
-    procd_open_instance
+    # Экземпляр НАЗВАН, а не безымянный: reload_dnsd должен уметь послать сигнал ровно
+    # ему. Без имени приходилось сигналить '*', то есть всем экземплярам сразу — включая
+    # процессы vless. Каждое «Сохранить и применить» из интерфейса убивало туннель, procd
+    # поднимал его заново через паузу, и трафик пропадал на секунды после каждой правки.
+    procd_open_instance dnsd
     # Абсолютный путь: команду экземпляра запускает procd, а не эта оболочка, и его
     # PATH — не наш. Голое имя работало только там, где сервис поднимали из шелла.
     procd_set_param command /usr/sbin/steer dnsd --spec "$SPEC"
@@ -98,8 +112,15 @@ reload_dnsd() {
     # затем настроили через интерфейс, и apply поставил правила напрямую. Тогда
     # маршрутизация работает, а резолвер не запущен — и fake-IP "не заводится" без
     # единой ошибки. Поэтому: нет экземпляра — поднимаем сервис, а не сигналим.
-    if ubus call service list "{\"name\":\"steer\"}" 2>/dev/null | grep -q instances; then
-        procd_send_signal steer '*' TERM 2>/dev/null
+    #
+    # Сигнал уходит ИМЕННО резолверу. Раньше здесь стояло '*' — то есть все экземпляры, в
+    # том числе клиенты vless и сторож. Каждое «Сохранить и применить» из интерфейса
+    # убивало туннель, procd поднимал его заново с паузой, и трафик через vless пропадал
+    # на несколько секунд после каждой правки списка. Подписка при этом перечитывалась
+    # заново и узел мог оказаться другим — то есть правка списка меняла ещё и выходной
+    # адрес, чего никто не просил.
+    if ubus call service list "{\"name\":\"steer\"}" 2>/dev/null | grep -q '"dnsd"'; then
+        procd_send_signal steer dnsd TERM 2>/dev/null
     else
         start
     fi

@@ -76,7 +76,9 @@ static int io_write(void *ctx, const unsigned char *d, size_t n) {
 
 static int io_read(void *ctx, unsigned char *d, size_t cap, size_t *got) {
     struct vless_conn *c = ctx;
-    if (c->plain) {
+    /* Прямое копирование: сервер перестал шифровать в нашу сторону, и расшифровывать
+     * теперь нечего — в сокете лежит поток целевого соединения. Читаем как есть. */
+    if (c->plain || c->rx_direct) {
         ssize_t r = read(c->fd, d, cap);
         if (r <= 0) return r == 0 ? VLESS_CONN_ECLOSED : VLESS_CONN_EIO;
         *got = (size_t)r;

@@ -366,6 +366,16 @@ static void report_output_deps(void) {
             fprintf(stderr, "steer: output %s: %s is not mentioned by the firewall at all — "
                             "traffic steered there will not come back until it is in a zone\n",
                     g_out[i].name, g_out[i].device);
+        /* Выходу vless NAT не нужен, и предупреждать о нём — значит посылать человека
+         * настраивать то, чему нечего транслировать: клиент завершает TCP у себя и
+         * соединяется с сервером обычным сокетом, поэтому адрес клиента наружу не уезжает
+         * вовсе. Предупреждение «нет masquerade» здесь было ложной тревогой, а ложная
+         * тревога дороже отсутствующей: по ней настраивают лишнее и перестают верить
+         * настоящим. Про зону предупреждать всё равно надо — без неё fw4 не пропускает
+         * транзит, и это проверено с настоящего клиента. */
+        else if (g_out[i].kind == OUT_VLESS) {
+            /* нечего проверять */
+        }
         else if (!c.masqueraded)
             fprintf(stderr, "steer: output %s: no masquerade/snat rule found for %s — "
                             "if that path needs NAT, packets leave with LAN addresses and "

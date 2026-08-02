@@ -113,4 +113,9 @@ void load_spec(const char *path);
 void registry_assign(void);
 struct output *out_by_name(const char *n);
 
+/* Привязать таблицу выхода к устройству: правило по метке и маршрут по умолчанию. Живёт в
+ * failover.c, но нужна и клиенту VLESS: он привязывает своё устройство сам, потому что
+ * только он знает момент, когда оно готово нести трафик. */
+void bind_device(struct output *o, const char *dev);
+
 #endif

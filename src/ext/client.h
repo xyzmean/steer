@@ -46,6 +46,10 @@ struct grpc_de {
 struct vless_conn {
     int fd;
     int plain;                 /* security=none: TLS нет вовсе */
+    /* Сервер перешёл на прямое копирование (команда direct в Vision): в сокете больше не
+     * наши записи TLS, а поток целевого соединения как есть. Ставится извне — тем, кто
+     * разбирает кадры Vision, потому что команда живёт в них. */
+    int rx_direct;
     struct reality_state rst;
     struct tls13 tls;
     enum vless_transport tr;

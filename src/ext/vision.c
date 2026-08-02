@@ -200,6 +200,13 @@ int vision_unwrap(struct vision *v, const unsigned char *in, size_t n,
     v->rx_data_left = ((uint32_t)v->rx_hdr[1] << 8) | v->rx_hdr[2];
     v->rx_pad_left = ((uint32_t)v->rx_hdr[3] << 8) | v->rx_hdr[4];
     v->rx_end_after = (cmd == VISION_CMD_END || cmd == VISION_CMD_DIRECT);
+    /* direct — не «end с другим номером». Сервер сообщает, что дальше пишет в сокет поток
+     * целевого соединения БЕЗ своего TLS, и читать его надо в обход расшифровки. Считать
+     * это концом набивки и продолжать разбирать записи — значит принимать чужие записи за
+     * свои: длины выходят бессмысленные, AEAD не сходится, и соединение умирает посреди
+     * передачи. Именно так и ломался любой https через узел с Vision, причём место обрыва
+     * каждый раз было другим — оно зависит от того, когда сервер разглядел TLS внутри. */
+    if (cmd == VISION_CMD_DIRECT) v->recv_direct = 1;
     v->rx_hdr_n = 0;
     /* Кадр без данных и без набивки: сервер так закрывает набивку. */
     if (!v->rx_data_left && !v->rx_pad_left && v->rx_end_after) v->recv_done = 1;

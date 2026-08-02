@@ -135,7 +135,13 @@ static int aead_open(struct tls13_keys *k, uint64_t seq,
     unsigned char nonce[12];
     aead_nonce(k->iv, seq, nonce);
     size_t ct = n - 16;
-    const unsigned char *tag = buf + ct;
+    /* Тег КОПИРУЕТСЯ, а не читается из того же буфера. Расшифровка идёт на месте, и тег
+     * лежит сразу за шифротекстом — то есть в области, которую реализация вправе задеть,
+     * дописывая последний неполный блок. Проверено отдельным тестом (tests/gcm-size.c),
+     * что эта mbedtls так не делает ни на одном размере записи, — но зависеть от её
+     * внутреннего устройства незачем, а копия в шестнадцать байт стоит ничего. */
+    unsigned char tag[16];
+    memcpy(tag, buf + ct, 16);
     if (k->aead == TLS13_AEAD_CHACHA) {
         mbedtls_chachapoly_context c;
         mbedtls_chachapoly_init(&c);
