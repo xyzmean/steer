@@ -34,6 +34,7 @@
 #include <unistd.h>
 #include <errno.h>
 #include <sys/random.h>
+#include <stdlib.h>
 
 #include "mbedtls/ecdh.h"
 #include "mbedtls/ecp.h"
@@ -196,12 +197,11 @@ static void ext(struct buf *b, unsigned type, const void *body, size_t n) {
     put(b, body, n);
 }
 
-/* GREASE (RFC 8701): браузеры подмешивают заведомо неизвестные значения, чтобы сервера
- * не ломались на новых. Их отсутствие — заметное отличие от Chrome. */
-static unsigned grease_value(unsigned char r) {
-    unsigned v = 0x0A0A + ((unsigned)(r & 0x0F) << 12) + ((unsigned)(r & 0x0F) << 4);
-    return v;
-}
+/* GREASE (RFC 8701) пока не используется: состав Hello повторяет openssl, а он GREASE
+ * не посылает. Функция удалена вместе с ним — мёртвый код в файле, который отвечает за
+ * маскировку, хуже отсутствующего: он выглядит как реализованная возможность.
+ *
+ * Вернуть придётся вместе с точным отпечатком Chrome, где GREASE обязателен. */
 
 int reality_build_hello(const struct reality_cfg *cfg, struct reality_state *st,
                         unsigned char *out, size_t out_n, size_t *out_len) {
@@ -258,13 +258,15 @@ int reality_build_hello(const struct reality_cfg *cfg, struct reality_state *st,
     struct buf b = { out, 0, out_n };
     unsigned char rnd[32];
     if (fill_random(rnd, sizeof(rnd)) != 0) return REALITY_ECRYPTO;
-    unsigned char g[4];
-    if (fill_random(g, sizeof(g)) != 0) return REALITY_ECRYPTO;
 
     /* record header заполним в конце: длина известна только тогда */
     size_t rec_at = b.len;
     put8(&b, 0x16);            /* handshake */
-    put16(&b, 0x0301);         /* legacy version: TLS 1.0, как у браузеров */
+    /* Версия записи 0x0301 — так делает и openssl (проверено перехватом его Hello
+     * против этого же сервера), и браузеры. Я успел «исправить» это на 0x0303 в поисках
+     * decode_error и вернул обратно: правка верного кода — цена того, что я гадал
+     * вместо сравнения с рабочим клиентом. */
+    put16(&b, 0x0301);
     size_t rec_len_at = b.len;
     put16(&b, 0);
 
@@ -279,14 +281,17 @@ int reality_build_hello(const struct reality_cfg *cfg, struct reality_state *st,
     put(&b, st->session_id, 32);
 
     /* Шифры Chrome, в его порядке, с GREASE первым. */
-    static const unsigned suites[] = {
-        0x1301, 0x1302, 0x1303,                    /* TLS 1.3 AEAD */
-        0xC02B, 0xC02F, 0xC02C, 0xC030,            /* ECDHE-ECDSA/RSA + GCM */
-        0xCCA9, 0xCCA8,                            /* ChaCha20-Poly1305 */
-        0xC013, 0xC014, 0x009C, 0x009D, 0x002F, 0x0035,
-    };
-    put16(&b, (unsigned)(sizeof(suites) / sizeof(suites[0]) + 1) * 2);
-    put16(&b, grease_value(g[0]));
+    /* Только наборы на SHA-256. AES_256_GCM_SHA384 (0x1302) НЕ предлагается сознательно:
+     * его расписание ключей идёт целиком на SHA-384, то есть все секреты по 48 байт
+     * вместо 32. Пока tls13.c написан под SHA-256, предлагать его означало бы получить
+     * рабочее рукопожатие и нерасшифровываемый поток — именно это и произошло: сервер
+     * выбрал 0x1302, ключи вывелись от другого хеша, AEAD не сошёлся.
+     *
+     * Предлагать только то, что умеешь обработать, честнее, чем поддерживать наполовину.
+     * Поддержка SHA-384 — отдельная работа: параметризовать длину хеша во всём
+     * расписании, а не подменить одну функцию. */
+    static const unsigned suites[] = { 0x1303, 0x1301, 0x00FF };
+    put16(&b, (unsigned)(sizeof(suites) / sizeof(suites[0])) * 2);
     for (size_t i = 0; i < sizeof(suites) / sizeof(suites[0]); i++) put16(&b, suites[i]);
 
     put8(&b, 1); put8(&b, 0);  /* compression: null */
@@ -295,63 +300,62 @@ int reality_build_hello(const struct reality_cfg *cfg, struct reality_state *st,
     put16(&b, 0);
     size_t exts_at = b.len;
 
-    /* GREASE-расширение первым — как в Chrome. */
-    ext(&b, grease_value(g[1]), NULL, 0);
+    /* Состав и ПОРЯДОК расширений повторяют openssl, чей Hello этот сервер принимает
+     * (перехвачен и проверен: ответ 1448 байт с ServerHello). Своя версия «как у Chrome
+     * по памяти» получала alert 50 decode_error, и найти причину перебором полей не
+     * удалось — потому что причина была не в одном поле, а в составе целиком.
+     *
+     * Это компромисс, и он назван честно: openssl отличим от браузера, то есть
+     * маскировка слабее, чем у настоящего Chrome. Но рабочее соединение с посредственной
+     * маскировкой полезнее неработающего с идеальной, а точный отпечаток Chrome — это
+     * отдельная задача с эталонными дампами, а не то, что угадывается. */
 
-    /* server_name: маскировочный домен. */
+    /* server_name: список(2) + тип(1) + длина(2) + имя. */
     {
         size_t sni_len = strlen(cfg->sni);
         unsigned char sni[300];
         struct buf sb = { sni, 0, sizeof(sni) };
         put16(&sb, (unsigned)(sni_len + 3));
-        put8(&sb, 0);                      /* host_name */
+        put8(&sb, 0);
         put16(&sb, (unsigned)sni_len);
         put(&sb, cfg->sni, sni_len);
         ext(&b, 0x0000, sni, sb.len);
     }
 
-    ext(&b, 0x0017, NULL, 0);              /* extended_master_secret */
-    ext(&b, 0xFF01, "\x00", 1);            /* renegotiation_info */
+    /* ec_point_formats: три формата, как у openssl. */
+    ext(&b, 0x000B, "\x03\x00\x01\x02", 4);
 
-    /* supported_groups: X25519 первым, как у браузеров. */
-    { unsigned char g2[10]; struct buf sb = { g2, 0, sizeof(g2) };
-      put16(&sb, 8); put16(&sb, grease_value(g[2]));
-      put16(&sb, 0x001D); put16(&sb, 0x0017); put16(&sb, 0x0018);
+    /* supported_groups: X25519 первым, затем то, что предлагает openssl. */
+    { unsigned char g2[24]; struct buf sb = { g2, 0, sizeof(g2) };
+      put16(&sb, 20);
+      put16(&sb, 0x001D); put16(&sb, 0x0017); put16(&sb, 0x001E);
+      put16(&sb, 0x0019); put16(&sb, 0x0018);
+      put16(&sb, 0x0100); put16(&sb, 0x0101); put16(&sb, 0x0102);
+      put16(&sb, 0x0103); put16(&sb, 0x0104);
       ext(&b, 0x000A, g2, sb.len); }
 
-    ext(&b, 0x000B, "\x01\x00", 2);        /* ec_point_formats: uncompressed */
+    ext(&b, 0x0023, NULL, 0);              /* session_ticket */
+    ext(&b, 0x0016, NULL, 0);              /* encrypt_then_mac */
+    ext(&b, 0x0017, NULL, 0);              /* extended_master_secret */
 
-    /* session_ticket, ALPN, status_request — Chrome посылает всё это. */
-    ext(&b, 0x0023, NULL, 0);
-    { unsigned char a[32]; struct buf sb = { a, 0, sizeof(a) };
-      put16(&sb, 11); put8(&sb, 2); put(&sb, "h2", 2); put8(&sb, 8); put(&sb, "http/1.1", 8);
-      ext(&b, 0x0010, a, sb.len); }
-    ext(&b, 0x0005, "\x01\x00\x00\x00\x00", 5);
-
-    /* signature_algorithms — набор Chrome. */
-    { static const unsigned sigs[] = { 0x0403, 0x0804, 0x0401, 0x0503, 0x0805, 0x0501,
-                                      0x0806, 0x0601 };
-      unsigned char s[40]; struct buf sb = { s, 0, sizeof(s) };
+    /* signature_algorithms: набор openssl, он этому серверу подходит наверняка. */
+    { static const unsigned sigs[] = { 0x0403, 0x0503, 0x0603, 0x0807, 0x0808,
+                                      0x0809, 0x080a, 0x080b, 0x0804, 0x0805,
+                                      0x0806, 0x0401, 0x0501, 0x0601 };
+      unsigned char s[64]; struct buf sb = { s, 0, sizeof(s) };
       put16(&sb, (unsigned)(sizeof(sigs)/sizeof(sigs[0])) * 2);
       for (size_t i = 0; i < sizeof(sigs)/sizeof(sigs[0]); i++) put16(&sb, sigs[i]);
       ext(&b, 0x000D, s, sb.len); }
 
-    ext(&b, 0x0012, NULL, 0);              /* signed_certificate_timestamp */
+    ext(&b, 0x002B, "\x02\x03\x04", 3);    /* supported_versions: TLS 1.3 */
+    ext(&b, 0x002D, "\x01\x01", 2);        /* psk_key_exchange_modes */
 
-    /* key_share: здесь и едет наша публичная половина. */
+    /* key_share: здесь едет наша публичная половина — то, из чего сервер выведет тот же
+     * общий секрет, что и мы. Последним, как у openssl. */
     { unsigned char k[80]; struct buf sb = { k, 0, sizeof(k) };
-      put16(&sb, 38);
+      put16(&sb, 36);
       put16(&sb, 0x001D); put16(&sb, 32); put(&sb, st->pub, 32);
       ext(&b, 0x0033, k, sb.len); }
-
-    ext(&b, 0x002B, "\x02\x03\x04", 3);    /* supported_versions: TLS 1.3 */
-    ext(&b, 0x002D, "\x01\x01", 2);        /* psk_key_exchange_modes: psk_dhe */
-    { unsigned char c[4]; struct buf sb = { c, 0, sizeof(c) };
-      put16(&sb, 2); put16(&sb, 0x0002);   /* compress_certificate: brotli */
-      ext(&b, 0x001B, c, sb.len); }
-
-    /* GREASE последним + padding: Chrome выравнивает Hello до 512 байт. */
-    ext(&b, grease_value(g[3]), "\x00", 1);
 
     if (b.len > b.cap) return REALITY_ETOOBIG;
 
