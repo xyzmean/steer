@@ -30,10 +30,15 @@ for spec in $ISAS; do
     printf '  %-26s ' "$arch"
     if docker run --rm -v "$PWD:/src" -w /src "$IMAGE" \
             cc -target "$target" -mcpu="$mcpu" -static -Os -Wall -Wextra \
-               -o "build/steer-$arch" src/steer.c src/spec.c src/dnsd.c 2>"build/$arch.err"; then
+               -o "build/steer-$arch" src/steer.c src/spec.c src/dnsd.c src/failover.c \
+               2>"build/$arch.err"; then
         echo "$(stat -c %s "build/steer-$arch") bytes"
     else
-        echo "FAILED — $(head -1 "build/$arch.err")"
+        # Старый бинарник обязан исчезнуть: иначе упаковка молча положит в пакет
+        # сборку от прошлого раза, и ошибка компиляции превратится в «версия
+        # обновилась, а поведение прежнее» — самый дорогой вид тихого сбоя.
+        rm -f "build/steer-$arch"
+        echo "FAILED — $(grep -m1 error "build/$arch.err" || head -1 "build/$arch.err")"
         continue
     fi
 
