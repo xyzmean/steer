@@ -44,11 +44,13 @@ table inet steer {
     set ch_keep {
         type ipv4_addr
         flags interval
+        auto-merge
         elements = { 198.51.100.5 }
     }
     set ch_blocked {
         type ipv4_addr
         flags interval
+        auto-merge
         elements = { 203.0.113.0/24, 198.51.100.5 }
     }
     chain prerouting_mark {
@@ -129,6 +131,39 @@ check "untracks time-exceeded when asked" "1" \
 check "leaves dest-unreachable tracked" "0" \
     "$(printf '%s\n' "$tout" | grep -c 'destination-unreachable')"
 check "off by default" "0" "$(printf '%s\n' "$dout" | grep -c notrack)"
+
+# ---- several lists in one channel -------------------------------------------
+# Enabling "youtube" and "google" must not force two channels: as far as routing is
+# concerned they are one destination. The lists are read as several files rather than
+# concatenated by the caller — duplicating list bytes to express "and" costs overlay
+# space on the box that has least of it.
+printf '10.1.0.0/24\n' > "$tmp/m1.lst"
+printf '10.2.0.0/24\n10.1.0.0/24\n' > "$tmp/m2.lst"
+cat > "$tmp/mspec.json" <<EOF
+{ "schema": 1, "from_default": ["192.168.1.0/24"],
+  "outputs": { "vpn": { "kind": "interface", "device": "wg0" } },
+  "channels": [ { "name": "many",
+                  "match": { "prefixes_files": ["$tmp/m1.lst", "$tmp/m2.lst"] },
+                  "out": "vpn" } ] }
+EOF
+mout="$("$BIN" apply --dry-run --spec "$tmp/mspec.json" --state-dir "$tmp/state-m")"
+check "one set from several lists" "1" "$(printf '%s\n' "$mout" | grep -c 'set ch_many')"
+check "all three entries present" "1" \
+    "$(printf '%s\n' "$mout" | grep -c 'elements = { 10.1.0.0/24, 10.2.0.0/24, 10.1.0.0/24 }')"
+# The duplicate is not deduplicated in text on purpose: the kernel folds it via
+# auto-merge, which is cheaper than us rewriting the list.
+check "auto-merge lets the kernel fold the duplicate" "1" \
+    "$(printf '%s\n' "$mout" | grep -A3 'set ch_many' | grep -c 'auto-merge')"
+
+# A channel cannot hold both kinds: they reach the set by different routes.
+cat > "$tmp/xspec.json" <<EOF
+{ "schema": 1, "outputs": { "vpn": { "kind": "interface", "device": "wg0" } },
+  "channels": [ { "name": "mixed",
+                  "match": { "prefixes_files": ["$tmp/m1.lst"], "domains_files": ["$tmp/d.lst"] },
+                  "out": "vpn" } ] }
+EOF
+"$BIN" apply --dry-run --spec "$tmp/xspec.json" --state-dir "$tmp/state-m" >/dev/null 2>&1
+check "refuses addresses and domains in one channel" "2" "$?"
 
 # ---- refusals ---------------------------------------------------------------
 # Guessing at an unknown schema would mean compiling a config we do not understand

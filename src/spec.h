@@ -14,6 +14,12 @@
 #define MAX_CHANNELS 64
 #define MAX_OUTPUTS  16
 #define MAX_FROM     16
+/* Several lists can feed ONE channel. Enabling "youtube" and "google" must not force
+ * two channels with two rules and two sets — they are one destination as far as
+ * routing is concerned. Read as several files rather than concatenated into one by
+ * the caller: on a box with 6MB of overlay, duplicating list bytes to express "and"
+ * is a cost with nothing to show for it. */
+#define MAX_FILES    16
 
 enum out_kind { OUT_DIRECT, OUT_INTERFACE };
 
@@ -28,8 +34,10 @@ struct output {
 struct channel {
     char name[32];
     char out[32];
-    char prefixes_file[256];
-    char domains_file[256];
+    char prefixes_files[MAX_FILES][256];
+    size_t prefixes_n;
+    char domains_files[MAX_FILES][256];
+    size_t domains_n;
     /* fake-IP (default) or real-IP for a domain channel. See dnsd.c: fake-IP is
      * precise per domain but makes every traceroute hop show the fake address,
      * because the kernel rewrites ICMP errors to look like they came from the

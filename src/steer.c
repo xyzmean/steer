@@ -40,11 +40,11 @@ static void emit_from(FILE *f, const struct channel *c) {
 /* Elements come straight from the list file: the fitter (steer-aggregate) has
  * already decided what fits, and re-parsing 10 000 prefixes here would only add a
  * second place for the two to disagree. */
-static size_t emit_elements(FILE *f, const char *path) {
+static size_t emit_elements(FILE *f, const char *path, size_t already) {
     FILE *in = fopen(path, "r");
     if (!in) die("%s: cannot read the channel's list", path);
     char line[128];
-    size_t n = 0;
+    size_t n = already;
     while (fgets(line, sizeof(line), in)) {
         char *nl = strpbrk(line, "\r\n");
         if (nl) *nl = '\0';
@@ -55,11 +55,11 @@ static size_t emit_elements(FILE *f, const char *path) {
         n++;
     }
     fclose(in);
-    return n;
+    return n - already;
 }
 
 static int has_domains(void) {
-    for (size_t i = 0; i < g_ch_n; i++) if (g_ch[i].domains_file[0]) return 1;
+    for (size_t i = 0; i < g_ch_n; i++) if (g_ch[i].domains_n) return 1;
     return 0;
 }
 
@@ -68,20 +68,25 @@ static int has_domains(void) {
  * needs the DNS redirect but no translation at all. */
 static int has_fakeip(void) {
     for (size_t i = 0; i < g_ch_n; i++)
-        if (g_ch[i].domains_file[0] && !g_ch[i].realip) return 1;
+        if (g_ch[i].domains_n && !g_ch[i].realip) return 1;
     return 0;
 }
 
 static void generate(FILE *f) {
     fprintf(f, "table inet steer {\n");
     for (size_t i = 0; i < g_ch_n; i++) {
-        if (g_ch[i].prefixes_file[0]) {
-            fprintf(f, "    set ch_%s {\n        type ipv4_addr\n        flags interval\n",
-                    g_ch[i].name);
+        if (g_ch[i].prefixes_n) {
+            /* auto-merge: several lists feeding one channel WILL overlap (an address
+             * list and a service list cover the same hosting), and the kernel folding
+             * duplicates into one element is cheaper than us deduplicating text. */
+            fprintf(f, "    set ch_%s {\n        type ipv4_addr\n"
+                       "        flags interval\n        auto-merge\n", g_ch[i].name);
             fprintf(f, "        elements = { ");
-            emit_elements(f, g_ch[i].prefixes_file);
+            size_t written = 0;
+            for (size_t k = 0; k < g_ch[i].prefixes_n; k++)
+                written += emit_elements(f, g_ch[i].prefixes_files[k], written);
             fprintf(f, " }\n    }\n");
-        } else if (g_ch[i].domains_file[0]) {
+        } else if (g_ch[i].domains_n) {
             /* Declared EMPTY on purpose: the resolver fills it as answers arrive,
              * and a set with no inline `elements =` keeps its contents across a
              * reload. Timeouts come from each answer's TTL, so an address a CDN
@@ -105,7 +110,7 @@ static void generate(FILE *f) {
          * the resolver instead of from a file. Emitting the daddr match only for
          * the prefix kind left a domain channel matching EVERYTHING from the LAN
          * and marking it into that channel's tunnel. Only `any` matches all. */
-        if (g_ch[i].prefixes_file[0] || g_ch[i].domains_file[0])
+        if (g_ch[i].prefixes_n || g_ch[i].domains_n)
             fprintf(f, "ip daddr @ch_%s ", g_ch[i].name);
         if (o->kind == OUT_INTERFACE) fprintf(f, "meta mark set 0x%08x ", o->mark);
         /* `return` and not `accept`: it ends OUR chain, letting the rest of the
@@ -464,7 +469,7 @@ static int cmd_explain(const char *spec, const char *addr) {
          * only the prefix channels made explain answer "no channel matches" for
          * every fake IP, i.e. exactly the addresses a user is most likely to ask
          * about. Same oversight the generator had one commit earlier. */
-        if (!hit && (g_ch[i].prefixes_file[0] || g_ch[i].domains_file[0])) {
+        if (!hit && (g_ch[i].prefixes_n || g_ch[i].domains_n)) {
             char setname[40], elem[32];
             /* Which sets were consulted, in order — the difference between "no
              * channel matches" meaning "not listed" and meaning "explain never

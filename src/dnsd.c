@@ -160,19 +160,24 @@ static int ruleset_add(struct ruleset *rs, const char *raw) {
     return 0;
 }
 
-static int load_rules(const char *path, struct ruleset *rs) {
-    struct ruleset tmp = {0};
+/* APPENDS, so several lists can feed one channel. The caller clears the ruleset
+ * before the first file — reloading must not accumulate the previous generation. */
+static int load_rules_into(const char *path, struct ruleset *rs) {
     FILE *f = fopen(path, "r");
-    if (!f) return -1; /* missing file: caller keeps empty ruleset, not an error */
+    if (!f) return -1; /* missing file: caller keeps what it has, not an error */
     char line[512];
     while (fgets(line, sizeof(line), f)) {
         if (!clean_line(line)) continue;
-        ruleset_add(&tmp, line);
+        ruleset_add(rs, line);
     }
     fclose(f);
-    ruleset_free(rs);
-    *rs = tmp;
     return 0;
+}
+
+static int load_rules(const char *path, struct ruleset *rs) {
+    ruleset_free(rs);
+    memset(rs, 0, sizeof(*rs));
+    return load_rules_into(path, rs);
 }
 
 /* namespace match: exact hostname match, or hostname ends with "." + pattern */
@@ -987,7 +992,8 @@ static int g_listen_fd = -1;
 /* One entry per channel that matches domains, in SPEC ORDER. */
 struct dchan {
     char set[64];               /* the nft set the compiler generated for it */
-    const char *rules_path;     /* the channel's domains_file */
+    const char *rules_path[MAX_FILES];
+    size_t rules_n;
     struct ruleset rules;
     int realip;                 /* put the real answers in the set, do not fake */
 };
@@ -1001,8 +1007,12 @@ static void on_sighup(int sig) { (void)sig; g_reload_pending = 1; }
 static void on_sigterm(int sig) { (void)sig; g_running = 0; }
 
 static void reload_rules(void) {
-    for (size_t i = 0; i < g_dch_n; i++)
-        if (g_dch[i].rules_path) load_rules(g_dch[i].rules_path, &g_dch[i].rules);
+    for (size_t i = 0; i < g_dch_n; i++) {
+        ruleset_free(&g_dch[i].rules);
+        memset(&g_dch[i].rules, 0, sizeof(g_dch[i].rules));
+        for (size_t k = 0; k < g_dch[i].rules_n; k++)
+            load_rules_into(g_dch[i].rules_path[k], &g_dch[i].rules);
+    }
     for (size_t i = 0; i < g_dch_n; i++)
         fprintf(stderr, "steer dnsd: channel %s: %zu rule(s)\n",
                 g_dch[i].set, g_dch[i].rules.n);
@@ -1253,7 +1263,7 @@ static int run_proxy(int listen_port, int upstream_port) {
             perror("bind");
             return 1;
         }
-        fprintf(stderr, "splify-dnsd: no IPv6 on this kernel — listening on IPv4 only\n");
+        fprintf(stderr, "steer dnsd: no IPv6 on this kernel — listening on IPv4 only\n");
     }
 
     g_epfd = epoll_create1(0);
@@ -1297,7 +1307,7 @@ static int run_proxy(int listen_port, int upstream_port) {
                 restored++;
         }
     }
-    fprintf(stderr, "splify-dnsd: listening on :%d -> upstream 127.0.0.1:%d "
+    fprintf(stderr, "steer dnsd: listening on :%d -> upstream 127.0.0.1:%d "
             "(netlink:%s fakeip:%zu loaded, %zu map rehydrated)\n",
             listen_port, upstream_port, nk_open == 0 ? "ok" : "FAILED",
             g_fakeip.n, restored);
@@ -1482,9 +1492,11 @@ int dnsd_main(int argc, char **argv) {
      * generated. */
     load_spec(spec);
     for (size_t i = 0; i < g_ch_n && g_dch_n < MAX_CHANNELS; i++) {
-        if (!g_ch[i].domains_file[0]) continue;
+        if (!g_ch[i].domains_n) continue;
         snprintf(g_dch[g_dch_n].set, sizeof(g_dch[g_dch_n].set), "ch_%.31s", g_ch[i].name);
-        g_dch[g_dch_n].rules_path = g_ch[i].domains_file;
+        for (size_t k = 0; k < g_ch[i].domains_n; k++)
+            g_dch[g_dch_n].rules_path[k] = g_ch[i].domains_files[k];
+        g_dch[g_dch_n].rules_n = g_ch[i].domains_n;
         g_dch[g_dch_n].realip = g_ch[i].realip;
         g_dch_n++;
     }

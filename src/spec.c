@@ -96,6 +96,26 @@ static void js_skip(struct js *j) {
     while (*j->p && *j->p != ',' && *j->p != '}' && *j->p != ']') j->p++;
 }
 
+/* Same as str_array but for the 256-byte path arrays. Kept separate rather than
+ * templated: two element widths in C means two functions, and a void*+stride version
+ * would trade a compiler-checked bound for a runtime one. */
+static size_t str_list(struct js *j, char dst[][256], size_t max) {
+    if (js_lit(j, '[') != 0) return 0;
+    size_t n = 0;
+    js_ws(j);
+    if (*j->p == ']') { j->p++; return 0; }
+    for (;;) {
+        char t[256];
+        if (js_str(j, t, sizeof(t)) != 0) return n;
+        if (n < max) snprintf(dst[n++], 256, "%s", t);
+        js_ws(j);
+        if (*j->p == ',') { j->p++; continue; }
+        break;
+    }
+    js_lit(j, ']');
+    return n;
+}
+
 static int str_array(struct js *j, char dst[][64], size_t max, size_t *n) {
     if (js_lit(j, '[') != 0) return -1;
     *n = 0;
@@ -170,8 +190,17 @@ static void parse_channels(struct js *j) {
                     char mk[32];
                     js_str(j, mk, sizeof(mk));
                     js_lit(j, ':');
-                    if (!strcmp(mk, "prefixes_file")) js_str(j, c.prefixes_file, sizeof(c.prefixes_file));
-                    else if (!strcmp(mk, "domains_file")) js_str(j, c.domains_file, sizeof(c.domains_file));
+                    /* Singular is shorthand for a one-element list, so a spec written
+                     * before this stayed valid. */
+                    if (!strcmp(mk, "prefixes_file")) {
+                        if (js_str(j, c.prefixes_files[0], 256) == 0) c.prefixes_n = 1;
+                    } else if (!strcmp(mk, "domains_file")) {
+                        if (js_str(j, c.domains_files[0], 256) == 0) c.domains_n = 1;
+                    } else if (!strcmp(mk, "prefixes_files")) {
+                        c.prefixes_n = str_list(j, c.prefixes_files, MAX_FILES);
+                    } else if (!strcmp(mk, "domains_files")) {
+                        c.domains_n = str_list(j, c.domains_files, MAX_FILES);
+                    }
                     else if (!strcmp(mk, "mode")) {
                         char m[16]; js_str(j, m, sizeof(m));
                         if (!strcmp(m, "realip")) c.realip = 1;
@@ -191,10 +220,12 @@ static void parse_channels(struct js *j) {
         j->p++;
         if (!c.name[0]) die("a channel has no name", NULL);
         if (!c.out[0]) die("channel %s has no out", c.name);
-        if (!c.prefixes_file[0] && !c.domains_file[0] && !c.any)
-            die("channel %s matches nothing (want prefixes_file, domains_file or any)", c.name);
-        if (c.prefixes_file[0] && c.domains_file[0])
-            die("channel %s mixes prefixes_file and domains_file — split it in two", c.name);
+        if (!c.prefixes_n && !c.domains_n && !c.any)
+            die("channel %s matches nothing (want prefixes_files, domains_files or any)", c.name);
+        /* Addresses and domains reach the set by different routes — one from a file,
+         * one from the resolver — so one channel cannot hold both. */
+        if (c.prefixes_n && c.domains_n)
+            die("channel %s mixes addresses and domains — split it in two", c.name);
         if (g_ch_n >= MAX_CHANNELS) die("too many channels", NULL);
         g_ch[g_ch_n++] = c;
         js_ws(j);
