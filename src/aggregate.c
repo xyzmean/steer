@@ -279,7 +279,7 @@ static void read_file(const char *path, struct list *l, unsigned long *bad) {
 }
 
 static void usage(void) {
-    fputs("usage: steer-aggregate [--budget N] [--exclude FILE] [--min-count N]\n"
+    fputs("usage: steer fit [--budget N] [--exclude FILE] [--min-count N]\n"
           "                       [--report FILE] [--levels 'LVL:MIN ...'] [--truncate]\n"
           "                       [--punch-out FILE] [IN]\n"
           "\n"
@@ -293,7 +293,10 @@ static void usage(void) {
     exit(2);
 }
 
-int main(int argc, char **argv) {
+/* Подкомандой, а не отдельным бинарником: фиттер и компилятор обязаны ехать вместе.
+ * Раздельная поставка означала бы роутер, где движок есть, а подогнать список нечем —
+ * ровно тот случай, для которого фиттер и написан. */
+int aggregate_main(int argc, char **argv) {
     const char *in = "-", *excl_path = NULL, *report_path = NULL, *punch_path = NULL;
     const char *levels = "24:2 22:4 20:8 16:16";
     size_t budget = 0, min_count = 2;

@@ -27,6 +27,7 @@
 
 int dnsd_main(int argc, char **argv);
 int cmd_failover(const char *spec, int verbose);
+int aggregate_main(int argc, char **argv);
 
 /* ---- coalescing: one interface, at most two sets ---------------------------
  *
@@ -585,6 +586,7 @@ int main(int argc, char **argv) {
         fputs("usage: steer apply [--dry-run] [--spec FILE]\n"
               "       steer dnsd  [--spec FILE]   (resolver for domain channels)\n"
               "       steer failover [--spec FILE] [-v]   (pick a live device per output)\n"
+              "       steer fit --budget N [IN]   (подогнать список под память)\n"
               "       steer needs-dnsd            (exit 0 if the spec has domain channels)\n"
               "       steer status [--spec FILE]\n"
               "       steer explain ADDRESS [--spec FILE]\n", stderr);
@@ -611,6 +613,9 @@ int main(int argc, char **argv) {
         build_groups();
         return has_domains() ? 0 : 1;
     }
+    /* Раньше остальных: у fit свои аргументы, и разбирать их общим циклом значило бы
+     * молча съесть, например, --budget. */
+    if (!strcmp(cmd, "fit")) return aggregate_main(argc - 1, argv + 1);
     if (!strcmp(cmd, "failover")) return cmd_failover(spec, verbose);
     if (!strcmp(cmd, "dnsd")) return dnsd_main(argc - 2, argv + 2);
     if (!strcmp(cmd, "apply")) return cmd_apply(spec, dry);

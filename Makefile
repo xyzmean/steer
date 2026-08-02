@@ -5,15 +5,11 @@ CFLAGS ?= -O2 -Wall -Wextra
 BUILD  := build
 
 .PHONY: all test clean
-all: $(BUILD)/steer-aggregate $(BUILD)/steer
+all: $(BUILD)/steer
 
-$(BUILD)/steer-aggregate: src/aggregate.c
+$(BUILD)/steer: src/steer.c src/spec.c src/dnsd.c src/failover.c src/aggregate.c src/spec.h
 	@mkdir -p $(BUILD)
-	$(CC) $(CFLAGS) -o $@ $<
-
-$(BUILD)/steer: src/steer.c src/spec.c src/dnsd.c src/failover.c src/spec.h
-	@mkdir -p $(BUILD)
-	$(CC) $(CFLAGS) -o $@ src/steer.c src/spec.c src/dnsd.c src/failover.c
+	$(CC) $(CFLAGS) -o $@ src/steer.c src/spec.c src/dnsd.c src/failover.c src/aggregate.c
 
 test: all
 	@sh tests/run.sh
