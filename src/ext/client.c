@@ -26,6 +26,7 @@
 #include "reality.h"
 #include "tls13.h"
 #include "vless_proto.h"
+#include "vision.h"
 #include "client.h"
 
 static int tcp_connect(const char *host, uint16_t port, int timeout_s) {
@@ -162,7 +163,37 @@ int vless_probe(const struct vless_node *node, int timeout_s, char *why, size_t 
         req_n += sizeof(http) - 1;
     }
 
-    rc = conn_write(&c, req, req_n);
+    /* Заголовок VLESS и данные с Vision — РАЗНЫЕ вещи, и порядок здесь не произволен.
+     *
+     * Заголовок уходит сырым, сразу за ним первый кадр Vision с данными. В Xray это видно
+     * по XtlsPadding: обёртка применяется к буферам ДАННЫХ, а комментарий «we do a long
+     * padding to hide vless header» означает, что заголовок прячет набивка СЛЕДУЮЩЕГО
+     * кадра, попадая с ним в одну TLS-запись — а не что заголовок лежит внутри кадра.
+     *
+     * Первая версия заворачивала заголовок внутрь кадра. Сервер тогда читал UUID (он
+     * совпадал), брал следующие 5 байт как команду и длины — а там была версия VLESS и
+     * начало UUID из заголовка. Длины выходили бессмысленные, и сервер закрывал
+     * соединение: read возвращал -11, то есть выглядело как отказ по ключу. */
+    if (node->flow[0]) {
+        struct vision vis;
+        vless_uuid_parse(node->uuid, uuid);
+        vision_init(&vis, uuid);
+        static unsigned char framed[8192];
+        /* Заголовок VLESS занимает первые header_n байт req — остальное это HTTP-данные. */
+        size_t header_n = req_n - (sizeof(http) - 1);
+        size_t fn = vision_wrap(&vis, req + header_n, req_n - header_n,
+                                framed, sizeof(framed));
+        if (!fn) { vless_close(&c); snprintf(why, why_n, "кадр Vision не собрался"); return VLESS_CONN_EIO; }
+        /* Одной записью: заголовок и кадр должны уехать вместе, иначе их разделение по
+         * записям само становится признаком. */
+        static unsigned char together[8704];
+        if (header_n + fn > sizeof(together)) { vless_close(&c); snprintf(why, why_n, "не влезло"); return VLESS_CONN_EIO; }
+        memcpy(together, req, header_n);
+        memcpy(together + header_n, framed, fn);
+        rc = conn_write(&c, together, header_n + fn);
+    } else {
+        rc = conn_write(&c, req, req_n);
+    }
     if (rc) { vless_close(&c); snprintf(why, why_n, "запрос не ушёл: %s", vless_strerror(rc)); return rc; }
 
     unsigned char buf[4096];
@@ -170,8 +201,24 @@ int vless_probe(const struct vless_node *node, int timeout_s, char *why, size_t 
     rc = conn_read(&c, buf, sizeof(buf), &got);
     if (rc) { vless_close(&c); snprintf(why, why_n, "ответа нет: %s", vless_strerror(rc)); return rc; }
 
+    /* Ответ Vision тоже в кадрах, и первым в них идёт заголовок VLESS. Разворачиваем
+     * до разбора: иначе version-байт читался бы из поля команды кадра. */
+    const unsigned char *body = buf;
+    size_t body_n = got;
+    if (node->flow[0]) {
+        struct vision rv;
+        memset(&rv, 0, sizeof(rv));
+        size_t used = 0;
+        const unsigned char *pl = NULL;
+        size_t pl_n = 0;
+        if (vision_unwrap(&rv, buf, got, &used, &pl, &pl_n) == 0 && pl) {
+            body = pl;
+            body_n = pl_n;
+        }
+    }
+
     size_t skip = 0;
-    int pr = vless_parse_response(buf, got, &skip);
+    int pr = vless_parse_response(body, body_n, &skip);
     vless_close(&c);
 
     if (pr == VLESS_EPROTO) {

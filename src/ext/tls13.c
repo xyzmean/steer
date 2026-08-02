@@ -444,6 +444,11 @@ int tls13_read(struct tls13 *t, unsigned char *out, size_t cap, size_t *got) {
         if (inner == 0x15) return TLS13_ECLOSED;   /* alert */
         if (inner != 0x17) continue;
 
+        /* Пустая запись — законное явление: TLS 1.3 разрешает записи без данных, и Vision
+         * ими пользуется. Возврат нуля как успеха выглядел бы для вызывающего как «сервер
+         * ответил пустотой», то есть как отказ; продолжаем читать до настоящих данных. */
+        if (pt == 0) continue;
+
         if (pt > cap) return TLS13_ETOOBIG;
         memcpy(out, rec, pt);
         *got = pt;
