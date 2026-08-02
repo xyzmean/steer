@@ -376,7 +376,7 @@ void load_spec(const char *path) {
      * «что запрещено стандартом». */
     for (size_t i = 0; i < g_out_n; i++) {
         struct output *o = &g_out[i];
-        if (o->kind != OUT_INTERFACE) continue;
+        if (!out_has_device(o)) continue;
 
         /* Выход в локальный мост — это петля: помеченный пакет получает маршрут
          * обратно в ту же сеть, откуда пришёл. */
@@ -403,7 +403,12 @@ void load_spec(const char *path) {
     for (size_t i = 0; i < g_ch_n; i++) {
         struct channel *c = &g_ch[i];
         struct output *o = out_by_name(c->out);
-        if (!o || o->kind != OUT_INTERFACE) continue;
+        /* Через out_has_device, а не сравнением с OUT_INTERFACE: у выхода kind=vless
+         * последствие ровно то же — весь трафик клиента, включая доступ к роутеру и
+         * его DNS, уходит в туннель. Проверка, знающая про один вид выхода, молча
+         * пропускала бы вторую половину случаев, а «защита от дурака», работающая
+         * через раз, хуже отсутствующей: на неё рассчитывают. */
+        if (!o || !out_has_device(o)) continue;
 
         /* Канал `any` в туннель уводит ВЕСЬ трафик клиентов, включая их доступ к
          * самому роутеру и к его DNS. Это законная конфигурация, но только

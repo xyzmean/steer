@@ -194,7 +194,7 @@ static void active_save(void) {
     FILE *f = fopen(path, "w");
     if (!f) return;
     for (size_t i = 0; i < g_out_n; i++)
-        if (g_out[i].kind == OUT_INTERFACE)
+        if (out_has_device(&g_out[i]))
             fprintf(f, "%s %s\n", g_out[i].name, g_out[i].device[0] ? g_out[i].device : "-");
     fclose(f);
 }
