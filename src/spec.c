@@ -168,6 +168,11 @@ static void parse_channels(struct js *j) {
                     js_lit(j, ':');
                     if (!strcmp(mk, "prefixes_file")) js_str(j, c.prefixes_file, sizeof(c.prefixes_file));
                     else if (!strcmp(mk, "domains_file")) js_str(j, c.domains_file, sizeof(c.domains_file));
+                    else if (!strcmp(mk, "mode")) {
+                        char m[16]; js_str(j, m, sizeof(m));
+                        if (!strcmp(m, "realip")) c.realip = 1;
+                        else if (strcmp(m, "fakeip") != 0) die("channels: unknown mode %s (want fakeip or realip)", m);
+                    }
                     else if (!strcmp(mk, "any")) { js_ws(j); c.any = (*j->p == 't'); js_skip(j); }
                     else js_skip(j);
                     js_ws(j);

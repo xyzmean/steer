@@ -30,6 +30,12 @@ struct channel {
     char out[32];
     char prefixes_file[256];
     char domains_file[256];
+    /* fake-IP (default) or real-IP for a domain channel. See dnsd.c: fake-IP is
+     * precise per domain but makes every traceroute hop show the fake address,
+     * because the kernel rewrites ICMP errors to look like they came from the
+     * address the client addressed. real-IP keeps hops legible and loses precision
+     * only where two domains share one backend address. */
+    int realip;
     char from[MAX_FROM][64];
     size_t from_n;
     int any;

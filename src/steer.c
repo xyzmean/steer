@@ -63,6 +63,15 @@ static int has_domains(void) {
     return 0;
 }
 
+/* The fake-IP map and its DNAT chain are only worth generating when some channel
+ * actually hands out fake addresses. A spec whose domain channels are all realip
+ * needs the DNS redirect but no translation at all. */
+static int has_fakeip(void) {
+    for (size_t i = 0; i < g_ch_n; i++)
+        if (g_ch[i].domains_file[0] && !g_ch[i].realip) return 1;
+    return 0;
+}
+
 static void generate(FILE *f) {
     fprintf(f, "table inet steer {\n");
     for (size_t i = 0; i < g_ch_n; i++) {
@@ -112,11 +121,13 @@ static void generate(FILE *f) {
      * to the router. That address has to be translated back on the way out, which
      * is what the map and this chain do — filled live by `steer dnsd`. */
     if (has_domains()) {
-        fprintf(f, "\n    map fakeip { type ipv4_addr : ipv4_addr; }\n");
-        fprintf(f, "    chain prerouting_dnat {\n"
-                   "        type nat hook prerouting priority dstnat; policy accept;\n"
-                   "        ip daddr 198.18.0.0/15 dnat ip to ip daddr map @fakeip\n"
-                   "    }\n");
+        if (has_fakeip()) {
+            fprintf(f, "\n    map fakeip { type ipv4_addr : ipv4_addr; }\n");
+            fprintf(f, "    chain prerouting_dnat {\n"
+                       "        type nat hook prerouting priority dstnat; policy accept;\n"
+                       "        ip daddr 198.18.0.0/15 dnat ip to ip daddr map @fakeip\n"
+                       "    }\n");
+        }
         /* The resolver only sees what is steered to it. IPv6 as well as IPv4: the
          * router advertises itself as an IPv6 resolver by default and clients
          * prefer that server, so an IPv4-only redirect catches almost nothing —

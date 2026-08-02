@@ -99,6 +99,26 @@ check "explain queries domain channels too" "1" \
     "$(STEER_EXPLAIN_TRACE=1 "$BIN" explain 198.18.0.1 --spec "$tmp/dspec.json" \
         --state-dir "$tmp/state-dom" 2>&1 | grep -c 'ch_dom')"
 
+# realip mode exists so traceroute stays legible: no DNAT means the kernel does not
+# rewrite ICMP errors, so hops show real routers instead of the fake address.
+cat > "$tmp/rspec.json" <<EOF
+{ "schema": 1, "from_default": ["192.168.1.0/24"], "lan_device": "br-lan",
+  "outputs": { "geo": { "kind": "interface", "device": "tun0" } },
+  "channels": [ { "name": "dom", "match": { "domains_file": "$tmp/d.lst", "mode": "realip" }, "out": "geo" } ] }
+EOF
+rout="$("$BIN" apply --dry-run --spec "$tmp/rspec.json" --state-dir "$tmp/state-r")"
+check "realip needs no fake-IP translation" "0" "$(printf '%s\n' "$rout" | grep -c 'fakeip')"
+# Two rules, not one: IPv4 by subnet and IPv6 by device — a client that prefers the
+# router's IPv6 resolver must not slip past the proxy.
+check "realip still redirects DNS on both families" "2" \
+    "$(printf '%s\n' "$rout" | grep -c 'udp dport 53 counter redirect')"
+check "realip channel still has its set" "1" \
+    "$(printf '%s\n' "$rout" | grep -c 'ip daddr @ch_dom')"
+
+sed 's/"mode": "realip"/"mode": "nonsense"/' "$tmp/rspec.json" > "$tmp/rbad.json"
+"$BIN" apply --dry-run --spec "$tmp/rbad.json" --state-dir "$tmp/state-r" >/dev/null 2>&1
+check "refuses an unknown mode" "2" "$?"
+
 # ---- refusals ---------------------------------------------------------------
 # Guessing at an unknown schema would mean compiling a config we do not understand
 # into firewall rules.

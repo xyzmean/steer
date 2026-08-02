@@ -989,6 +989,7 @@ struct dchan {
     char set[64];               /* the nft set the compiler generated for it */
     const char *rules_path;     /* the channel's domains_file */
     struct ruleset rules;
+    int realip;                 /* put the real answers in the set, do not fake */
 };
 static struct dchan g_dch[MAX_CHANNELS];
 static size_t g_dch_n;
@@ -1135,6 +1136,20 @@ static void handle_upstream_response(struct pending *p) {
         size_t len = build_rewritten_response(buf, qend, out, sizeof(out), 0, 0);
         sendto(g_listen_fd, len ? out : buf, len ? len : (size_t)n, 0,
                (struct sockaddr *)&p->client, p->client_len);
+        return;
+    }
+
+    /* real-IP mode: the answer goes to the client untouched and every address in it
+     * joins the channel's set with its own TTL. No DNAT is involved, so ICMP errors
+     * are not rewritten and a traceroute shows the actual hops — which is the whole
+     * reason this mode exists. The cost is precision: two domains behind one address
+     * become one entry, and if they belong to different channels the first one to be
+     * resolved decides for both. */
+    if (g_dch[hit].realip) {
+        if (qtype == DNS_TYPE_A)
+            for (int k = 0; k < nips; k++)
+                nft_add_element(g_dch[hit].set, ntohl(ips[k].addr), ips[k].ttl);
+        sendto(g_listen_fd, buf, (size_t)n, 0, (struct sockaddr *)&p->client, p->client_len);
         return;
     }
 
@@ -1470,6 +1485,7 @@ int dnsd_main(int argc, char **argv) {
         if (!g_ch[i].domains_file[0]) continue;
         snprintf(g_dch[g_dch_n].set, sizeof(g_dch[g_dch_n].set), "ch_%.31s", g_ch[i].name);
         g_dch[g_dch_n].rules_path = g_ch[i].domains_file;
+        g_dch[g_dch_n].realip = g_ch[i].realip;
         g_dch_n++;
     }
     if (!g_dch_n) {
