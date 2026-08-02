@@ -27,6 +27,19 @@
 
 int dnsd_main(int argc, char **argv);
 int cmd_failover(const char *spec, int verbose);
+/* Клиент VLESS есть только в расширенной сборке (steer-extended). В базовой команда
+ * отвечает внятным отказом, а не отсутствует: «неизвестная команда» на steer vless
+ * заставила бы искать опечатку вместо того, чтобы поставить нужный пакет. */
+#ifdef STEER_EXTENDED
+int cmd_vless(const char *spec_path, const char *out_name);
+#else
+static int cmd_vless(const char *spec_path, const char *out_name) {
+    (void)spec_path; (void)out_name;
+    fprintf(stderr, "steer: клиент VLESS в этой сборке отсутствует — "
+                    "нужен пакет steer-extended\n");
+    return 2;
+}
+#endif
 int aggregate_main(int argc, char **argv);
 
 /* ---- coalescing: one interface, at most two sets ---------------------------
@@ -185,7 +198,7 @@ static void generate(FILE *f) {
         fprintf(f, "        ");
         emit_from(f, g);
         if (g->files_n || g->domains) fprintf(f, "ip daddr @%s ", g->name);
-        if (o->kind == OUT_INTERFACE) fprintf(f, "meta mark set 0x%08x ", o->mark);
+        if (out_has_device(o)) fprintf(f, "meta mark set 0x%08x ", o->mark);
         /* `return` and not `accept`: it ends OUR chain, letting the rest of the
          * firewall proceed, while making the first matching group the winner. */
         fprintf(f, "counter return comment \"steer:%s\"\n", g->name);
@@ -305,7 +318,7 @@ static void report_traceroute_dep(void) {
     /* Say the useless case out loud rather than leaving the operator to discover it
      * as a column of asterisks. */
     for (size_t i = 0; i < g_out_n; i++) {
-        if (g_out[i].kind != OUT_INTERFACE) continue;
+        if (!out_has_device(&g_out[i])) continue;
         if (fw_check(g_out[i].device).masqueraded) {
             fprintf(stderr, "steer: traceroute_hops cannot work for output %s: %s "
                             "masquerades, so ICMP errors come addressed to the router "
@@ -333,7 +346,7 @@ static void report_traceroute_dep(void) {
 
 static void report_output_deps(void) {
     for (size_t i = 0; i < g_out_n; i++) {
-        if (g_out[i].kind != OUT_INTERFACE) continue;
+        if (!out_has_device(&g_out[i])) continue;
         struct fwcheck c = fw_check(g_out[i].device);
         if (!c.in_firewall)
             fprintf(stderr, "steer: output %s: %s is not mentioned by the firewall at all — "
@@ -374,7 +387,7 @@ int run_quiet(const char *const argv[]) { return run(argv); }
  * twice, and the second copy is invisible until someone deletes the first. */
 static void apply_routing(void) {
     for (size_t i = 0; i < g_out_n; i++) {
-        if (g_out[i].kind != OUT_INTERFACE) continue;
+        if (!out_has_device(&g_out[i])) continue;
         char mark[24], table[16];
         snprintf(mark, sizeof(mark), "0x%08x", g_out[i].mark);
         snprintf(table, sizeof(table), "%d", g_out[i].table);
@@ -454,7 +467,7 @@ static int cmd_status(const char *spec) {
     for (size_t i = 0; i < g_out_n; i++) {
         char devpath[128];
         int up = 0;
-        if (g_out[i].kind == OUT_INTERFACE) {
+        if (out_has_device(&g_out[i])) {
             snprintf(devpath, sizeof(devpath), "/sys/class/net/%s/operstate", g_out[i].device);
             FILE *df = fopen(devpath, "r");
             if (df) {
@@ -464,8 +477,9 @@ static int cmd_status(const char *spec) {
             }
         }
         printf("%s\"%s\":{\"kind\":\"%s\"", i ? "," : "", g_out[i].name,
-               g_out[i].kind == OUT_DIRECT ? "direct" : "interface");
-        if (g_out[i].kind == OUT_INTERFACE) {
+               g_out[i].kind == OUT_DIRECT ? "direct" :
+               g_out[i].kind == OUT_VLESS ? "vless" : "interface");
+        if (out_has_device(&g_out[i])) {
             struct fwcheck c = fw_check(g_out[i].device);
             printf(",\"device\":\"%s\",\"up\":%s,\"mark\":\"0x%08x\",\"table\":%d"
                    ",\"in_firewall\":%s,\"nat\":%s",
@@ -570,7 +584,7 @@ static int cmd_explain(const char *spec, const char *addr) {
         if (!o) die("group %s points at a missing output", g_grp[i].name);
         printf("%s -> %s \"%s\" -> output \"%s\"", addr,
                g_grp[i].domains ? "domain set" : "address set", g_grp[i].name, o->name);
-        if (o->kind == OUT_INTERFACE)
+        if (out_has_device(o))
             printf(" -> dev %s (mark 0x%08x, table %d)\n", o->device, o->mark, o->table);
         else
             printf(" -> direct\n");
@@ -587,6 +601,8 @@ int main(int argc, char **argv) {
               "       steer dnsd  [--spec FILE]   (resolver for domain channels)\n"
               "       steer failover [--spec FILE] [-v]   (pick a live device per output)\n"
               "       steer fit --budget N [IN]   (подогнать список под память)\n"
+              "       steer vless OUTPUT          (поднять TUN для выхода kind=vless)\n"
+              "       steer outputs [--kind K]    (перечислить выходы)\n"
               "       steer needs-dnsd            (exit 0 if the spec has domain channels)\n"
               "       steer status [--spec FILE]\n"
               "       steer explain ADDRESS [--spec FILE]\n", stderr);
@@ -607,6 +623,22 @@ int main(int argc, char **argv) {
      * the resolver never started while apply still installed the DNS redirect, so
      * every LAN query went to a closed port and DNS died. The engine is the only thing
      * that knows what it will generate, so it answers. */
+    /* Перечислить выходы заданного вида. Init-скрипту нужно знать, для каких выходов
+     * поднимать процесс, и спрашивать об этом движок — то же правило, что с needs-dnsd:
+     * grep по ключу в JSON ломается при первом же переименовании поля, причём молча. */
+    if (!strcmp(cmd, "outputs")) {
+        const char *want = NULL;
+        for (int i = 2; i < argc; i++)
+            if (!strcmp(argv[i], "--kind") && i + 1 < argc) want = argv[i + 1];
+        load_spec(spec);
+        for (size_t i = 0; i < g_out_n; i++) {
+            const char *k = g_out[i].kind == OUT_DIRECT ? "direct" :
+                            g_out[i].kind == OUT_VLESS ? "vless" : "interface";
+            if (want && strcmp(want, k) != 0) continue;
+            printf("%s\n", g_out[i].name);
+        }
+        return 0;
+    }
     if (!strcmp(cmd, "needs-dnsd")) {
         load_spec(spec);
         registry_assign();
@@ -616,6 +648,10 @@ int main(int argc, char **argv) {
     /* Раньше остальных: у fit свои аргументы, и разбирать их общим циклом значило бы
      * молча съесть, например, --budget. */
     if (!strcmp(cmd, "fit")) return aggregate_main(argc - 1, argv + 1);
+    if (!strcmp(cmd, "vless")) {
+        if (!arg) die("нужно имя выхода: steer vless <output>", NULL);
+        return cmd_vless(spec, arg);
+    }
     if (!strcmp(cmd, "failover")) return cmd_failover(spec, verbose);
     if (!strcmp(cmd, "dnsd")) return dnsd_main(argc - 2, argv + 2);
     if (!strcmp(cmd, "apply")) return cmd_apply(spec, dry);

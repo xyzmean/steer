@@ -25,6 +25,19 @@ boot() {
 start_service() {
     [ -f "$SPEC" ] || { echo "steer: no $SPEC — nothing to apply"; return 0; }
 
+    # Выходы kind=vless поднимаются ПЕРЕД apply: их TUN-устройства должны существовать к
+    # моменту, когда apply будет привязывать к ним таблицы маршрутизации. Иначе первый
+    # apply не находит устройство, ставит blackhole (при on_fail=drop), и трафик стоит до
+    # следующего тика сторожа.
+    for out in $(steer outputs --kind vless --spec "$SPEC" 2>/dev/null); do
+        procd_open_instance "vless_$out"
+        procd_set_param command /usr/sbin/steer vless "$out" --spec "$SPEC"
+        procd_set_param respawn 3600 5 0
+        procd_set_param stdout 1
+        procd_set_param stderr 1
+        procd_close_instance
+    done
+
     steer apply --spec "$SPEC" || echo "steer: apply failed — see the message above"
 
     # Ask the ENGINE whether the resolver is needed. Never grep the spec for a

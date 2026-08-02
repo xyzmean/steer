@@ -256,7 +256,7 @@ int cmd_failover(const char *spec, int verbose) {
     int changed = 0;
     for (size_t i = 0; i < g_out_n; i++) {
         struct output *o = &g_out[i];
-        if (o->kind != OUT_INTERFACE) continue;
+        if (!out_has_device(o)) continue;
 
         char was[32];
         active_get(o->name, was, sizeof(was));

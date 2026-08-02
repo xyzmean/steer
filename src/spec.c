@@ -138,6 +138,7 @@ static void parse_outputs(struct js *j) {
     if (*j->p == '}') { j->p++; return; }
     for (;;) {
         struct output o = {0};
+        o.node_index = -1;                  /* по умолчанию: первый рабочий узел */
         if (js_str(j, o.name, sizeof(o.name)) != 0) die("outputs: expected a name", NULL);
         if (js_lit(j, ':') != 0) die("outputs.%s: expected ':'", o.name);
         if (js_lit(j, '{') != 0) die("outputs.%s: expected an object", o.name);
@@ -167,6 +168,8 @@ static void parse_outputs(struct js *j) {
                     }
                 }
             }
+            else if (!strcmp(key, "sub_file")) js_str(j, o.sub_file, sizeof(o.sub_file));
+            else if (!strcmp(key, "node")) o.node_index = (int)js_num(j);
             else if (!strcmp(key, "on_fail")) {
                 char m[16];
                 js_str(j, m, sizeof(m));
@@ -181,6 +184,22 @@ static void parse_outputs(struct js *j) {
         }
         j->p++;
         if (!strcmp(kind, "direct")) o.kind = OUT_DIRECT;
+        else if (!strcmp(kind, "vless")) {
+#ifndef STEER_EXTENDED
+            /* Отказываем СРАЗУ, а не при подъёме: иначе спека применяется, правила
+             * встают, и выход молча никуда не ведёт — то есть человек видит рабочую
+             * конфигурацию, в которой трафик пропадает. */
+            die("outputs.%s: kind vless требует пакет steer-extended", o.name);
+#endif
+            o.kind = OUT_VLESS;
+            if (!o.sub_file[0])
+                die("outputs.%s: kind vless нужен sub_file с подпиской", o.name);
+            /* Имя устройства выводится из имени выхода: держать его отдельным полем
+             * значило бы дать двум именам расходиться, а никакой пользы от их различия
+             * нет. Ограничение в 15 символов — предел IFNAMSIZ. */
+            if (!o.device[0]) snprintf(o.device, sizeof(o.device), "%.15s", o.name);
+            if (!o.devices_n) snprintf(o.devices[o.devices_n++], 32, "%s", o.device);
+        }
         else if (!strcmp(kind, "interface")) {
             o.kind = OUT_INTERFACE;
             /* device и devices описывают одно и то же с разных сторон: device — что
@@ -189,7 +208,7 @@ static void parse_outputs(struct js *j) {
             if (!o.devices_n && o.device[0]) snprintf(o.devices[o.devices_n++], 32, "%s", o.device);
             if (!o.device[0] && o.devices_n) snprintf(o.device, sizeof(o.device), "%s", o.devices[0]);
             if (!o.device[0]) die("outputs.%s: kind interface needs a device", o.name);
-        } else die("outputs.%s: unknown kind (want direct or interface)", o.name);
+        } else die("outputs.%s: неизвестный kind (нужен direct, interface или vless)", o.name);
         if (g_out_n >= MAX_OUTPUTS) die("too many outputs", NULL);
         g_out[g_out_n++] = o;
         js_ws(j);

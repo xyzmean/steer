@@ -12,6 +12,19 @@ IMAGE="${STEER_BUILDER_IMAGE:-splify-dnsd-builder:zig-0.13.0}"
 
 # id:target:mcpu — the ISAs OpenWrt actually ships. Package arch names below map
 # several OpenWrt targets onto one ISA build, which is why the two lists differ.
+# Два варианта одного движка, как dnsmasq и dnsmasq-full: базовый и с клиентом
+# VLESS/Reality. Базовому VLESS не нужен, а весит он вместе с TLS-стеком больше самого
+# движка — и на 4C с 6.9 МБ overlay это решает, влезет ли пакет.
+#
+# Собираются из ОДНИХ исходников: extended это те же файлы плюс src/ext и mbedtls.
+# Разные бинарники из разного набора файлов означали бы два места, где чинить одну ошибку.
+BASE_SRC="src/steer.c src/spec.c src/dnsd.c src/failover.c src/aggregate.c"
+# Абсолютные пути внутри контейнера: расширенная сборка компилирует mbedtls из отдельного
+# каталога и делает cd туда, так что относительные пути к исходникам не находятся —
+# ошибка выглядела как «FileNotFound: src/ext/tls13.c», то есть будто файла нет вовсе.
+BASE_SRC_ABS="/src/src/steer.c /src/src/spec.c /src/src/dnsd.c /src/src/failover.c /src/src/aggregate.c"
+EXT_SRC_ABS="/src/src/ext/sub.c /src/src/ext/reality.c /src/src/ext/tls13.c /src/src/ext/vless_proto.c /src/src/ext/vision.c /src/src/ext/client.c /src/src/ext/tun.c /src/src/ext/tunnel.c"
+
 ISAS="
 mipsel_24kc:mipsel-linux-musl:mips32r2+soft_float
 mips_24kc:mips-linux-musl:mips32r2+soft_float
@@ -30,8 +43,7 @@ for spec in $ISAS; do
     printf '  %-26s ' "$arch"
     if docker run --rm -v "$PWD:/src" -w /src "$IMAGE" \
             cc -target "$target" -mcpu="$mcpu" -static -Os -Wall -Wextra \
-               -o "build/steer-$arch" src/steer.c src/spec.c src/dnsd.c src/failover.c \
-               src/aggregate.c \
+               -o "build/steer-$arch" $BASE_SRC \
                2>"build/$arch.err"; then
         echo "$(stat -c %s "build/steer-$arch") bytes"
     else
@@ -41,6 +53,18 @@ for spec in $ISAS; do
         rm -f "build/steer-$arch"
         echo "FAILED — $(grep -m1 error "build/$arch.err" || head -1 "build/$arch.err")"
         continue
+    fi
+
+    # Расширенный вариант: те же исходники плюс VLESS и mbedtls. Логика в отдельном
+    # скрипте — см. build/build-ext.sh, там объяснено почему.
+    printf '  %-26s ' "$arch (extended)"
+    if docker run --rm -v "$PWD:/src" -w /src --entrypoint sh "$IMAGE" \
+            /src/build/build-ext.sh "$target" "$mcpu" "/src/build/steer-ext-$arch" \
+            2>"build/$arch-ext.err"; then
+        echo "$(stat -c %s "build/steer-ext-$arch") bytes"
+    else
+        rm -f "build/steer-ext-$arch"
+        echo "FAILED — $(grep -m1 error "build/$arch-ext.err" || head -1 "build/$arch-ext.err")"
     fi
 
     root="build/pkg/$arch"
@@ -71,6 +95,28 @@ EOF
 exit 0
 EOF
     chmod +x build/scripts/post-install build/scripts/pre-deinstall
+
+    # Расширенный пакет: то же имя команды, поэтому provides/conflicts с базовым —
+    # установленные вместе они спорили бы за /usr/sbin/steer, и какой победит зависело бы
+    # от порядка установки.
+    if [ -f "build/steer-ext-$arch" ]; then
+        eroot="build/pkg/$arch-ext"
+        rm -rf "$eroot"
+        mkdir -p "$eroot/usr/sbin" "$eroot/etc/init.d" "$eroot/etc/steer/lists"
+        cp "build/steer-ext-$arch" "$eroot/usr/sbin/steer"
+        cp files/etc/init.d/steer "$eroot/etc/init.d/steer"
+        chmod 0755 "$eroot/usr/sbin/steer" "$eroot/etc/init.d/steer"
+        docker run --rm -v "$PWD":/w -w /w alpine:latest sh -c \
+            "apk add --no-cache apk-tools >/dev/null 2>&1; apk mkpkg \
+               --info name:steer-extended --info version:$VERSION-r1 \
+               --info description:'steer + клиент VLESS/Reality (как dnsmasq-full)' \
+               --info arch:$arch --info depends:'nftables ip-full kmod-tun' \
+               --info provides:steer --info replaces:steer \
+               --script post-install:build/scripts/post-install \
+               --script pre-deinstall:build/scripts/pre-deinstall \
+               -F $eroot -o $OUT/steer-extended-$VERSION-1_$arch.apk" >/dev/null 2>&1 \
+            || echo "    (упаковка extended для $arch не удалась)"
+    fi
 
     docker run --rm -v "$PWD":/w -w /w alpine:latest sh -c \
         "apk add --no-cache apk-tools >/dev/null 2>&1; apk mkpkg \

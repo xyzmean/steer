@@ -33,6 +33,7 @@
 #include "tls13.h"
 #include "tun.h"
 #include "tunnel.h"
+#include "../spec.h"
 
 /* Сколько соединений держим одновременно. Каждое — это сокет к серверу плюс TLS-состояние,
  * то есть около 3 КБ; 64 соединения это ~200 КБ, что для роутера с 15 МБ приемлемо, а для
@@ -349,4 +350,67 @@ int tunnel_run(const char *dev, const struct vless_node *node) {
     }
     close(tun_fd);
     return 0;
+}
+
+/* ---- подкоманда steer vless -------------------------------------------------
+ *
+ * Поднимает TUN для выхода kind=vless из спеки. Отдельный процесс, а не поток внутри
+ * apply: apply должен завершаться, а туннель — жить. Init-скрипт держит по экземпляру
+ * procd на каждый такой выход, поэтому падение одного не уносит остальные.
+ */
+int cmd_vless(const char *spec_path, const char *out_name) {
+    load_spec(spec_path);
+    struct output *o = out_by_name(out_name);
+    if (!o) { fprintf(stderr, "steer: выхода %s нет в спеке\n", out_name); return 2; }
+    if (o->kind != OUT_VLESS) {
+        fprintf(stderr, "steer: выход %s не vless (kind другой)\n", out_name);
+        return 2;
+    }
+
+    /* Подписка читается с диска: скачивание — дело управляющего слоя. */
+    FILE *f = fopen(o->sub_file, "r");
+    if (!f) { fprintf(stderr, "steer: %s не читается\n", o->sub_file); return 2; }
+    static char raw[262144], dec[262144];
+    size_t n = fread(raw, 1, sizeof(raw) - 1, f);
+    raw[n] = '\0';
+    fclose(f);
+    const char *text = raw;
+    if (!strstr(raw, "://")) { b64_decode(raw, n, dec, sizeof(dec)); text = dec; }
+
+    static struct vless_node nodes[128];
+    size_t skipped = 0, foreign = 0;
+    size_t cnt = vless_parse_sub(text, nodes, 128, &skipped, &foreign);
+    if (!cnt) {
+        fprintf(stderr, "steer: в подписке нет пригодных узлов "
+                        "(пропущено %zu, чужих протоколов %zu)\n", skipped, foreign);
+        return 1;
+    }
+    fprintf(stderr, "steer: узлов %zu (пропущено %zu, чужих %zu)\n", cnt, skipped, foreign);
+
+    /* Выбор узла. node=-1 означает «первый рабочий», и это умолчание не из лени: номер
+     * узла в подписке меняется при её обновлении, а проверка находит живой сама. */
+    int chosen = -1;
+    if (o->node_index >= 0) {
+        if ((size_t)o->node_index >= cnt) {
+            fprintf(stderr, "steer: узла %d нет (всего %zu)\n", o->node_index, cnt);
+            return 1;
+        }
+        chosen = o->node_index;
+    } else {
+        for (size_t i = 0; i < cnt; i++) {
+            char why[256];
+            if (vless_probe(&nodes[i], 8, why, sizeof(why)) == 0) {
+                fprintf(stderr, "steer: выбран %s (%s)\n", nodes[i].name, why);
+                chosen = (int)i;
+                break;
+            }
+            fprintf(stderr, "steer: %s — %s\n", nodes[i].name, why);
+        }
+    }
+    if (chosen < 0) {
+        fprintf(stderr, "steer: ни один узел подписки не отвечает\n");
+        return 1;
+    }
+
+    return tunnel_run(o->device, &nodes[chosen]);
 }

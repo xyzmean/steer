@@ -1,3 +1,7 @@
 build/
 out/
 build/libmbed-*.a
+build/steer-*
+build/*.err
+build/pkg/
+build/scripts/

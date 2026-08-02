@@ -21,7 +21,13 @@
  * is a cost with nothing to show for it. */
 #define MAX_FILES    16
 
-enum out_kind { OUT_DIRECT, OUT_INTERFACE };
+/* Вид выхода.
+ *
+ * vless — это тоже устройство: клиент поднимает TUN, и дальше всё остальное (метки,
+ * таблицы, failover, каналы) работает с ним ровно как с wireguard. Отдельный вид нужен
+ * только потому, что устройство надо СОЗДАТЬ и обслуживать процессом, тогда как
+ * wireguard уже есть в системе к моменту apply. */
+enum out_kind { OUT_DIRECT, OUT_INTERFACE, OUT_VLESS };
 
 /* Что делать с трафиком выхода, когда ни одно его устройство не работает.
  *
@@ -45,6 +51,14 @@ struct output {
     char devices[MAX_DEVICES][32];
     size_t devices_n;
     enum on_fail on_fail;
+    /* Только для kind=vless: откуда брать узлы. Подписка, а не один узел, потому что
+     * failover между узлами — то же самое, что между устройствами, и списком он и
+     * выражается. Файл, а не URL: скачивание это дело управляющего слоя, движок читает
+     * то, что ему положили — см. правило про списки в README. */
+    char sub_file[256];
+    /* Какой узел подписки использовать. -1 (по умолчанию) означает «первый рабочий»:
+     * тогда выбор делает проверка при подъёме, а не человек, угадывающий номер. */
+    int node_index;
     uint32_t mark;      /* 0 for direct: claiming a packet needs no mark */
     int table;
 };
@@ -84,6 +98,15 @@ extern const char *g_state_dir;
 /* The port `steer dnsd` listens on and the redirect points at. One constant, so
  * the two halves cannot disagree about where DNS is being steered. */
 #define DNS_PORT 5300
+
+/* Выход, у которого есть устройство и своя таблица маршрутизации. vless сюда входит:
+ * его TUN — такое же устройство, и вся логика меток, маршрутов и проверок к нему
+ * применима без изменений. Одна функция вместо повторения условия в пяти местах —
+ * иначе добавление нового вида требовало бы найти их все, а забытое место означало бы
+ * выход, который настроен, но не маршрутизируется. */
+static inline int out_has_device(const struct output *o) {
+    return o->kind == OUT_INTERFACE || o->kind == OUT_VLESS;
+}
 
 void die(const char *fmt, const char *a);
 void load_spec(const char *path);
