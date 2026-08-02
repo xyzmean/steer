@@ -76,6 +76,32 @@ int ip_parse(const unsigned char *p, size_t n, struct flow_key *k, size_t *paylo
         if (doff < 20 || n < ihl + doff) return -1;
         k->tcp_flags = t[13];
         k->window = (uint16_t)((t[14] << 8) | t[15]);
+        /* Масштаб окна из опций SYN (kind 3, RFC 7323).
+         *
+         * Без него объявленное окно читается как 16 бит, то есть максимум 64 КБ, — а
+         * современный клиент присылает 65535 со множителем и имеет в виду мегабайты.
+         * Считать его буквально значит держать в пути не больше 64 КБ и упереться в это
+         * задолго до полосы: при подтверждениях раз в 5 мс это 13 МБ/с потолка.
+         *
+         * Опции разбираются только в SYN: дальше их не бывает, а множитель постоянен на
+         * всё соединение. */
+        k->wscale = 0;
+        if ((k->tcp_flags & TCP_SYN) && doff > 20) {
+            size_t o = ihl + 20, end = ihl + doff;
+            while (o < end && o < n) {
+                unsigned char kind = p[o];
+                if (kind == 0) break;                 /* конец списка опций */
+                if (kind == 1) { o++; continue; }     /* заполнитель */
+                if (o + 1 >= end) break;
+                unsigned char olen = p[o + 1];
+                if (olen < 2 || o + olen > end) break;
+                if (kind == 3 && olen == 3) {
+                    k->wscale = p[o + 2] > 14 ? 14 : p[o + 2];
+                    break;
+                }
+                o += olen;
+            }
+        }
         k->seq = ((uint32_t)t[4] << 24) | ((uint32_t)t[5] << 16) |
                  ((uint32_t)t[6] << 8) | t[7];
         k->ack = ((uint32_t)t[8] << 24) | ((uint32_t)t[9] << 16) |
