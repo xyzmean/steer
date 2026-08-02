@@ -32,12 +32,26 @@ int cmd_failover(const char *spec, int verbose);
  * заставила бы искать опечатку вместо того, чтобы поставить нужный пакет. */
 #ifdef STEER_EXTENDED
 int cmd_vless(const char *spec_path, const char *out_name);
+int cmd_vless_nodes(const char *spec_path, const char *out_name);
+int cmd_vless_probe(const char *spec_path, const char *out_name, int node, int timeout_s);
 #else
-static int cmd_vless(const char *spec_path, const char *out_name) {
-    (void)spec_path; (void)out_name;
+static int no_vless(void) {
     fprintf(stderr, "steer: клиент VLESS в этой сборке отсутствует — "
                     "нужен пакет steer-extended\n");
     return 2;
+}
+static int cmd_vless(const char *spec_path, const char *out_name) {
+    (void)spec_path; (void)out_name;
+    return no_vless();
+}
+static int cmd_vless_nodes(const char *spec_path, const char *out_name) {
+    (void)spec_path; (void)out_name;
+    return no_vless();
+}
+static int cmd_vless_probe(const char *spec_path, const char *out_name,
+                           int node, int timeout_s) {
+    (void)spec_path; (void)out_name; (void)node; (void)timeout_s;
+    return no_vless();
 }
 #endif
 int aggregate_main(int argc, char **argv);
@@ -602,6 +616,9 @@ int main(int argc, char **argv) {
               "       steer failover [--spec FILE] [-v]   (pick a live device per output)\n"
               "       steer fit --budget N [IN]   (подогнать список под память)\n"
               "       steer vless OUTPUT          (поднять TUN для выхода kind=vless)\n"
+              "       steer vless-nodes OUTPUT    (узлы подписки, JSON)\n"
+              "       steer vless-probe OUTPUT [--node N] [--timeout S]\n"
+              "                                   (проверить узел и замерить задержку)\n"
               "       steer outputs [--kind K]    (перечислить выходы)\n"
               "       steer needs-dnsd            (exit 0 if the spec has domain channels)\n"
               "       steer status [--spec FILE]\n"
@@ -610,13 +627,22 @@ int main(int argc, char **argv) {
     }
     const char *cmd = argv[1], *arg = NULL;
     int dry = 0, verbose = 0;
+    /* Умолчание по узлу — «до первого рабочего»: то же решение, что принимает подъём
+     * выхода, поэтому проверка отвечает на вопрос «что будет, если применить». */
+    int node = -1, timeout = 5;
     for (int i = 2; i < argc; i++) {
         if (!strcmp(argv[i], "--spec") && i + 1 < argc) spec = argv[++i];
         else if (!strcmp(argv[i], "--dry-run")) dry = 1;
         else if (!strcmp(argv[i], "-v") || !strcmp(argv[i], "--verbose")) verbose = 1;
         else if (!strcmp(argv[i], "--state-dir") && i + 1 < argc) g_state_dir = argv[++i];
+        else if (!strcmp(argv[i], "--node") && i + 1 < argc) node = atoi(argv[++i]);
+        else if (!strcmp(argv[i], "--timeout") && i + 1 < argc) timeout = atoi(argv[++i]);
+        /* Значения флагов разбираются ЗДЕСЬ, а не в ветке команды: общий цикл иначе
+         * принял бы «--node» и «3» за имя выхода, и последнее слово в строке молча
+         * становилось бы именем. Так уже случалось с fit, у которого свои аргументы. */
         else arg = argv[i];
     }
+    if (timeout < 1) timeout = 1;
     /* Does this spec need the resolver? Asked by the init script instead of guessing
      * from the file's text — it used to grep for the literal `"domains_file"`, and when
      * the spec gained the plural `domains_files` the match silently stopped working:
@@ -651,6 +677,14 @@ int main(int argc, char **argv) {
     if (!strcmp(cmd, "vless")) {
         if (!arg) die("нужно имя выхода: steer vless <output>", NULL);
         return cmd_vless(spec, arg);
+    }
+    if (!strcmp(cmd, "vless-nodes")) {
+        if (!arg) die("нужно имя выхода: steer vless-nodes <output>", NULL);
+        return cmd_vless_nodes(spec, arg);
+    }
+    if (!strcmp(cmd, "vless-probe")) {
+        if (!arg) die("нужно имя выхода: steer vless-probe <output>", NULL);
+        return cmd_vless_probe(spec, arg, node, timeout);
     }
     if (!strcmp(cmd, "failover")) return cmd_failover(spec, verbose);
     if (!strcmp(cmd, "dnsd")) return dnsd_main(argc - 2, argv + 2);

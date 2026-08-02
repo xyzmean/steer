@@ -26,10 +26,22 @@ struct flow_key {
 #define TCP_PSH 0x08
 #define TCP_ACK 0x10
 
+/* MSS, который мы объявляем клиенту в SYN-ACK: MTU устройства минус заголовки IP и TCP.
+ *
+ * Объявлять обязательно. Без опции MSS клиент обязан считать её равной 536 байтам (RFC
+ * 1122), и тогда мегабайт едет 1860 пакетами вместо 690 — а каждый пакет у нас проходит
+ * полный цикл разбора, отправки и подтверждения в одном потоке. Замер до и после виден
+ * прямо в скорости выгрузки. */
+#define TUN_MSS 1460
+
 int tun_open(const char *name);
 int ip_parse(const unsigned char *p, size_t n, struct flow_key *k, size_t *payload_off);
+
+/* mss != 0 добавляет опцию MSS — она осмысленна только в SYN и SYN-ACK, в остальных
+ * пакетах её просто не бывает. */
 size_t tcp_build(unsigned char *out, size_t cap,
                  uint32_t src, uint32_t dst, uint16_t sport, uint16_t dport,
                  uint32_t seq, uint32_t ack, unsigned char flags,
-                 const unsigned char *data, size_t data_n, uint16_t window);
+                 const unsigned char *data, size_t data_n, uint16_t window,
+                 unsigned mss);
 #endif

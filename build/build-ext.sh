@@ -41,5 +41,5 @@ zig cc -target "$TARGET" ${MCPU:+-mcpu=$MCPU} -static -Os \
     /src/src/aggregate.c \
     /src/src/ext/sub.c /src/src/ext/reality.c /src/src/ext/tls13.c \
     /src/src/ext/vless_proto.c /src/src/ext/vision.c /src/src/ext/client.c \
-    /src/src/ext/tun.c /src/src/ext/tunnel.c \
+    /src/src/ext/tun.c /src/src/ext/tunnel.c /src/src/ext/h2.c \
     "$WORK"/*.o

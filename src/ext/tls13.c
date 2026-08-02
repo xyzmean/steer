@@ -323,6 +323,32 @@ int tls13_handshake(struct tls13 *t, int fd,
             unsigned char msg = rec[p];
             size_t mlen = ((size_t)rec[p + 1] << 16) | ((size_t)rec[p + 2] << 8) | rec[p + 3];
             if (p + 4 + mlen > pt) break;
+            if (msg == 0x08) {                  /* EncryptedExtensions */
+                /* Достаём только ALPN. Разбирать остальные расширения нечем и незачем:
+                 * ни одно из них на нас не влияет, а лишний разбор недоверенных байт —
+                 * лишнее место для ошибки. Тело: длина списка(2), затем расширения
+                 * тип(2)+длина(2)+тело, а внутри ALPN — длина списка(2), длина(1), имя. */
+                const unsigned char *e = rec + p + 4;
+                if (mlen >= 2) {
+                    size_t total = ((size_t)e[0] << 8) | e[1];
+                    if (total + 2 <= mlen) {
+                        size_t q = 2;
+                        while (q + 4 <= total + 2) {
+                            unsigned etype = ((unsigned)e[q] << 8) | e[q + 1];
+                            size_t ebody = ((size_t)e[q + 2] << 8) | e[q + 3];
+                            if (q + 4 + ebody > total + 2) break;
+                            if (etype == 0x0010 && ebody >= 4) {
+                                size_t pl = e[q + 6];
+                                if (pl && pl < sizeof(t->alpn) && 3 + pl <= ebody) {
+                                    memcpy(t->alpn, e + q + 7, pl);
+                                    t->alpn[pl] = '\0';
+                                }
+                            }
+                            q += 4 + ebody;
+                        }
+                    }
+                }
+            }
             if (msg == 0x14) {                  /* Finished */
                 /* Проверяем ДО добавления в транскрипт: сервер считал его от хеша
                  * предыдущих сообщений. */
@@ -417,41 +443,53 @@ int tls13_write(struct tls13 *t, const unsigned char *data, size_t n) {
     return 0;
 }
 
+/* Прочитать РОВНО ОДНУ запись. Данных в ней может не оказаться — тогда ноль байт с
+ * кодом 0, и это успех, а не отказ.
+ *
+ * «Ровно одну» здесь дороже, чем выглядит. Прежняя версия крутила цикл, пока не получит
+ * данные, и на записи без данных немедленно бралась читать следующую. А записей без
+ * данных в этом потоке хватает: ChangeCipherSpec, NewSessionTicket и пустые записи,
+ * которыми пользуется Vision. Второе чтение упиралось в SO_RCVTIMEO, через восемь секунд
+ * возвращало EAGAIN — и вызывающий получал ошибку ввода-вывода на полностью исправном
+ * соединении.
+ *
+ * Наблюдалось как «выгрузка встаёт на 130–260 КБ и обрывается»: пустая запись приезжала
+ * посреди передачи, соединение умирало, и место обрыва каждый раз было другим. На коротких
+ * ответах не проявлялось никогда, потому что пустая запись просто не успевала прийти.
+ *
+ * Ждать, пока сокет станет читаемым, — дело вызывающего: у него есть poll, у нас его нет
+ * и быть не должно. */
 int tls13_read(struct tls13 *t, unsigned char *out, size_t cap, size_t *got) {
     if (!t->ready) return TLS13_ESTATE;
-    for (;;) {
-        unsigned char rec[TLS13_MAX_REC];
-        unsigned char type;
-        size_t n;
-        int rc = read_record(t->fd, &type, rec, sizeof(rec), &n);
-        if (rc) return rc;
-        if (type == 0x14) continue;
-        if (type != 0x17) return TLS13_EBADREC;
+    *got = 0;
 
-        unsigned char aad[5] = { 0x17, 0x03, 0x03,
-                                 (unsigned char)(n >> 8), (unsigned char)n };
-        rc = aead_open(&t->rd, t->rd_seq++, aad, 5, rec, n);
-        if (rc) return rc;
-        size_t pt = n - 16;
-        while (pt > 0 && rec[pt - 1] == 0) pt--;
-        if (pt == 0) return TLS13_EBADREC;
-        unsigned char inner = rec[--pt];
+    unsigned char rec[TLS13_MAX_REC];
+    unsigned char type;
+    size_t n;
+    int rc = read_record(t->fd, &type, rec, sizeof(rec), &n);
+    if (rc) return rc;
+    if (type == 0x14) return 0;                /* ChangeCipherSpec: в 1.3 смысла не несёт */
+    if (type != 0x17) return TLS13_EBADREC;
 
-        /* NewSessionTicket и прочие post-handshake сообщения приходят как handshake и
-         * нас не интересуют: возобновление не поддержано. Пропускаем, а не считаем
-         * ошибкой — иначе соединение падало бы через минуту после установки. */
-        if (inner == 0x16) continue;
-        if (inner == 0x15) return TLS13_ECLOSED;   /* alert */
-        if (inner != 0x17) continue;
+    unsigned char aad[5] = { 0x17, 0x03, 0x03,
+                             (unsigned char)(n >> 8), (unsigned char)n };
+    rc = aead_open(&t->rd, t->rd_seq++, aad, 5, rec, n);
+    if (rc) return rc;
+    size_t pt = n - 16;
+    while (pt > 0 && rec[pt - 1] == 0) pt--;
+    if (pt == 0) return TLS13_EBADREC;
+    unsigned char inner = rec[--pt];
 
-        /* Пустая запись — законное явление: TLS 1.3 разрешает записи без данных, и Vision
-         * ими пользуется. Возврат нуля как успеха выглядел бы для вызывающего как «сервер
-         * ответил пустотой», то есть как отказ; продолжаем читать до настоящих данных. */
-        if (pt == 0) continue;
+    /* NewSessionTicket и прочие post-handshake сообщения приходят как handshake и нас не
+     * интересуют: возобновление не поддержано. Пропускаем, а не считаем ошибкой — иначе
+     * соединение падало бы через минуту после установки. */
+    if (inner == 0x16) return 0;
+    if (inner == 0x15) return TLS13_ECLOSED;   /* alert */
+    if (inner != 0x17) return 0;
+    if (pt == 0) return 0;                     /* пустая запись — законная набивка Vision */
 
-        if (pt > cap) return TLS13_ETOOBIG;
-        memcpy(out, rec, pt);
-        *got = pt;
-        return 0;
-    }
+    if (pt > cap) return TLS13_ETOOBIG;
+    memcpy(out, rec, pt);
+    *got = pt;
+    return 0;
 }

@@ -85,10 +85,18 @@ static void conn_drop(struct conn *c) {
 }
 
 /* Отправить серверу данные в правильной форме: с заголовком VLESS на первом кадре и в
- * обёртке Vision, если узел её требует. */
+ * обёртке Vision, если узел её требует.
+ *
+ * Три исхода, а не два: «ушло», «сейчас нельзя, повторите» и «всё сломалось». Средний
+ * появился вместе с HTTP/2, где закрытое окно — нормальное состояние, а не сбой, и
+ * путать его с отказом значит разрывать рабочее соединение. */
+#define SEND_OK    0
+#define SEND_AGAIN 1
+#define SEND_FATAL (-1)
+
 static int upstream_send(struct conn *c, const struct vless_node *node,
                          const unsigned char *data, size_t n) {
-    unsigned char out[TUNNEL_BUF];
+    static unsigned char out[TUNNEL_BUF];
     size_t len = 0;
 
     if (!c->header_sent) {
@@ -99,31 +107,56 @@ static int upstream_send(struct conn *c, const struct vless_node *node,
         /* dport уже в хостовом порядке — см. комментарий в tun.h. */
         len = vless_build_request(c->uuid, VLESS_CMD_TCP, NULL, ip4,
                                   c->key.dport, node->flow, out, sizeof(out));
-        if (!len) return -1;
-        c->header_sent = 1;
+        if (!len) return SEND_FATAL;
     }
 
     if (node->flow[0]) {
-        unsigned char framed[TUNNEL_BUF];
+        static unsigned char framed[TUNNEL_BUF];
         size_t fn = vision_wrap(&c->vis, data, n, framed, sizeof(framed));
-        if (!fn) return -1;
-        if (len + fn > sizeof(out)) return -1;
+        if (!fn) return SEND_FATAL;
+        if (len + fn > sizeof(out)) return SEND_FATAL;
         memcpy(out + len, framed, fn);
         len += fn;
     } else {
-        if (len + n > sizeof(out)) return -1;
+        if (len + n > sizeof(out)) return SEND_FATAL;
         memcpy(out + len, data, n);
         len += n;
     }
-    return tls13_write(&c->v.tls, out, len);
+
+    /* Через vless_send: упаковку транспорта знает клиент, а не туннель. */
+    int rc = vless_send(&c->v, out, len);
+    if (rc == H2_EWINDOW) {
+        /* Окно HTTP/2 закрыто: сервер не успевает принимать. Это НЕ отказ — это то, для
+         * чего управление потоком и существует. Ничего не ушло (h2_write либо отправляет
+         * всё, либо ничего), поэтому достаточно не подтверждать пакет: клиент повторит
+         * его сам, как при потере, и повторит уже тогда, когда окно откроется.
+         *
+         * Первая версия считала это ошибкой и разрывала соединение. Выглядело как
+         * «выгрузка обрывается на случайном месте» — месте, где сервер впервые не успел. */
+        return SEND_AGAIN;
+    }
+    if (rc) return SEND_FATAL;
+    /* Заголовок отмечаем отправленным только теперь: пометить раньше значило бы, что
+     * повторная попытка уйдёт без него, и сервер не поймёт, куда соединять. */
+    c->header_sent = 1;
+    return SEND_OK;
 }
 
 /* Прочитать у сервера и отдать клиенту как TCP-пакет. */
 static int downstream_pump(struct conn *c, const struct vless_node *node, int tun_fd) {
-    unsigned char buf[TUNNEL_BUF];
+    /* Статический, а не на стеке: буфер размером с запись TLS — это шестнадцать килобайт
+     * стека на каждый вызов, а поток обработки здесь один. */
+    static unsigned char buf[TUNNEL_BUF];
     size_t got = 0;
-    int rc = tls13_read(&c->v.tls, buf, sizeof(buf), &got);
+    /* Через vless_recv, а не tls13_read напрямую: у grpc и xhttp между TLS и VLESS лежит
+     * HTTP/2, и чтение мимо него отдавало бы кадры вместо данных. Прямой вызов работал,
+     * пока транспорт был единственный, и это ровно тот случай, когда «работает» и
+     * «правильно» разошлись молча. */
+    int rc = vless_recv(&c->v, buf, sizeof(buf), &got);
     if (rc) { TR("чтение от сервера: rc=%d\n", rc); return rc; }
+    /* Ноль байт — законно: приехал служебный кадр HTTP/2, данных пока нет. Принять это за
+     * конец потока значило бы разрывать соединение на первом же SETTINGS. */
+    if (!got) { TR("служебный кадр, данных нет\n"); return 0; }
     TR("от сервера %zu байт\n", got);
 
     /* Порядок разбора: сначала заголовок ОТВЕТА VLESS, потом кадры Vision.
@@ -193,7 +226,7 @@ static int downstream_pump(struct conn *c, const struct vless_node *node, int tu
     size_t len = tcp_build(pkt, sizeof(pkt), c->key.dst, c->key.src,
                            c->key.dport, c->key.sport,
                            c->our_seq, c->client_seq, TCP_ACK | TCP_PSH,
-                           payload, total, 65535);
+                           payload, total, 65535, 0);
     if (!len) return -1;
     c->our_seq += (uint32_t)total;
     TR("клиенту %zu байт (seq=%u)\n", total, c->our_seq - (uint32_t)total);
@@ -238,7 +271,7 @@ static void handle_packet(int tun_fd, const struct vless_node *node,
              * до таймаута, и «сайт не открывается» вместо «отказано в соединении». */
             unsigned char rst[64];
             size_t rl = tcp_build(rst, sizeof(rst), k.dst, k.src, k.dport, k.sport,
-                                  0, c->client_seq, TCP_RST | TCP_ACK, NULL, 0, 0);
+                                  0, c->client_seq, TCP_RST | TCP_ACK, NULL, 0, 0, 0);
             if (rl) write(tun_fd, rst, rl);
             conn_drop(c);
             return;
@@ -246,7 +279,8 @@ static void handle_packet(int tun_fd, const struct vless_node *node,
         /* SYN-ACK: подтверждаем соединение клиенту. */
         unsigned char sa[64];
         size_t sl = tcp_build(sa, sizeof(sa), k.dst, k.src, k.dport, k.sport,
-                              c->our_seq++, c->client_seq, TCP_SYN | TCP_ACK, NULL, 0, 65535);
+                              c->our_seq++, c->client_seq, TCP_SYN | TCP_ACK,
+                              NULL, 0, 65535, TUN_MSS);
         if (sl) write(tun_fd, sa, sl);
         TR("SYN-ACK отправлен (seq=%u ack=%u)\n", c->our_seq - 1, c->client_seq);
         return;
@@ -261,7 +295,7 @@ static void handle_packet(int tun_fd, const struct vless_node *node,
              * что требует хранить, какая сторона ещё пишет. */
             unsigned char fa[64];
             size_t fl = tcp_build(fa, sizeof(fa), k.dst, k.src, k.dport, k.sport,
-                                  c->our_seq, k.seq + 1, TCP_ACK | TCP_FIN, NULL, 0, 0);
+                                  c->our_seq, k.seq + 1, TCP_ACK | TCP_FIN, NULL, 0, 0, 0);
             if (fl) write(tun_fd, fa, fl);
         }
         conn_drop(c);
@@ -276,7 +310,38 @@ static void handle_packet(int tun_fd, const struct vless_node *node,
     if (k.seq != c->client_seq) return;
 
     TR("данные клиента %zu байт -> серверу\n", data_n);
-    if (upstream_send(c, node, pkt + off, data_n) != 0) {
+    int sr = upstream_send(c, node, pkt + off, data_n);
+    if (sr == SEND_AGAIN) {
+        /* Окно закрыто. Прежде чем перекладывать задержку на клиента, разберём то, что уже
+         * лежит в сокете: WINDOW_UPDATE приходит именно оттуда и обычно УЖЕ там — сервер
+         * присылает его, как только освободил буфер.
+         *
+         * Без этой попытки каждое закрытие окна стоило бы таймаута повторной передачи у
+         * клиента, то есть двухсот миллисекунд на каждые 64 КБ. Замер: выгрузка через
+         * grpc шла 200 КБ/с вместо мегабайта.
+         *
+         * Читаем через downstream_pump, а не сами: только он умеет отдать пришедшие данные
+         * клиенту. Читать «на выброс» здесь означало бы потерять ответ сервера. */
+        /* Пять миллисекунд ожидания, а не ноль. Кадр WINDOW_UPDATE обычно уже в сокете, но
+         * иногда отстаёт на доли круга — и тогда нулевое ожидание отдаёт задержку клиенту,
+         * у которого таймаут повторной передачи двести миллисекунд. Пять против двухсот.
+         *
+         * Больше нельзя: цикл здесь один на все соединения, и каждая миллисекунда ожидания
+         * — это миллисекунда, на которую стоят остальные. */
+        struct pollfd sp = { .fd = c->v.fd, .events = POLLIN };
+        if (poll(&sp, 1, 5) > 0 && (sp.revents & POLLIN)) {
+            if (downstream_pump(c, node, tun_fd) != 0) { conn_drop(c); return; }
+            sr = upstream_send(c, node, pkt + off, data_n);
+        }
+    }
+    if (sr == SEND_AGAIN) {
+        /* Всё ещё нельзя: не подтверждаем и не двигаем счётчик — пакет для нас как бы не
+         * приходил. Клиент повторит его сам, и это единственный способ придержать поток,
+         * не храня недоотправленное у себя. */
+        TR("окно закрыто, пакет не подтверждён — клиент повторит\n");
+        return;
+    }
+    if (sr != SEND_OK) {
         TR("отправка серверу не удалась\n");
         conn_drop(c);
         return;
@@ -286,7 +351,7 @@ static void handle_packet(int tun_fd, const struct vless_node *node,
     /* Подтверждаем приём: без ACK клиент будет повторять пакет, считая его потерянным. */
     unsigned char ackp[64];
     size_t al = tcp_build(ackp, sizeof(ackp), k.dst, k.src, k.dport, k.sport,
-                          c->our_seq, c->client_seq, TCP_ACK, NULL, 0, 65535);
+                          c->our_seq, c->client_seq, TCP_ACK, NULL, 0, 65535, 0);
     if (al) write(tun_fd, ackp, al);
 }
 
@@ -336,7 +401,7 @@ int tunnel_run(const char *dev, const struct vless_node *node) {
                 size_t fl = tcp_build(fin, sizeof(fin), c->key.dst, c->key.src,
                                       c->key.dport, c->key.sport,
                                       c->our_seq, c->client_seq, TCP_FIN | TCP_ACK,
-                                      NULL, 0, 0);
+                                      NULL, 0, 0, 0);
                 if (fl) write(tun_fd, fin, fl);
                 conn_drop(c);
             }
@@ -358,7 +423,14 @@ int tunnel_run(const char *dev, const struct vless_node *node) {
  * apply: apply должен завершаться, а туннель — жить. Init-скрипт держит по экземпляру
  * procd на каждый такой выход, поэтому падение одного не уносит остальные.
  */
-int cmd_vless(const char *spec_path, const char *out_name) {
+#define MAX_NODES 128
+static struct vless_node g_nodes[MAX_NODES];
+
+/* Найти выход и разобрать его подписку. Одно место на все три команды: иначе «как
+ * читается подписка» разошлось бы между подъёмом, списком и проверкой — а расхождение
+ * здесь означало бы, что человек выбирает в интерфейсе не тот узел, который поднимется. */
+static int load_nodes(const char *spec_path, const char *out_name, struct output **out,
+                      size_t *cnt, size_t *skipped, size_t *foreign) {
     load_spec(spec_path);
     struct output *o = out_by_name(out_name);
     if (!o) { fprintf(stderr, "steer: выхода %s нет в спеке\n", out_name); return 2; }
@@ -366,6 +438,7 @@ int cmd_vless(const char *spec_path, const char *out_name) {
         fprintf(stderr, "steer: выход %s не vless (kind другой)\n", out_name);
         return 2;
     }
+    *out = o;
 
     /* Подписка читается с диска: скачивание — дело управляющего слоя. */
     FILE *f = fopen(o->sub_file, "r");
@@ -377,9 +450,115 @@ int cmd_vless(const char *spec_path, const char *out_name) {
     const char *text = raw;
     if (!strstr(raw, "://")) { b64_decode(raw, n, dec, sizeof(dec)); text = dec; }
 
-    static struct vless_node nodes[128];
-    size_t skipped = 0, foreign = 0;
-    size_t cnt = vless_parse_sub(text, nodes, 128, &skipped, &foreign);
+    *cnt = vless_parse_sub(text, g_nodes, MAX_NODES, skipped, foreign);
+    return 0;
+}
+
+/* Строка JSON с экранированием. Имена узлов приходят из подписки и содержат что угодно —
+ * кавычки в них ломали бы весь ответ, а не только своё поле. */
+static void json_str(const char *s) {
+    putchar('"');
+    for (const unsigned char *p = (const unsigned char *)s; *p; p++) {
+        if (*p == '"' || *p == '\\') { putchar('\\'); putchar(*p); }
+        else if (*p < 0x20) printf("\\u%04x", *p);
+        else putchar(*p);
+    }
+    putchar('"');
+}
+
+static void node_json(const struct vless_node *n, int index) {
+    printf("{\"index\":%d,", index);
+    printf("\"name\":"); json_str(n->name);
+    printf(",\"host\":"); json_str(n->host);
+    printf(",\"port\":%u,\"type\":", n->port);
+    json_str(n->type);
+    printf(",\"security\":"); json_str(n->security);
+    printf(",\"vision\":%s", n->flow[0] ? "true" : "false");
+    if (n->mode[0]) { printf(",\"mode\":"); json_str(n->mode); }
+    printf("}");
+}
+
+/* Перечислить узлы подписки.
+ *
+ * Индекс здесь — это индекс среди ПРИГОДНЫХ узлов, и он же понимается движком в поле
+ * `node` спеки. Одно значение слова «номер узла» на весь проект: если бы список включал
+ * непригодные, человек выбрал бы номер 5, а поднялся бы другой узел — и понять это было
+ * бы невозможно, потому что оба списка выглядят правдоподобно. Непригодные считаются
+ * отдельно и объясняются причиной, но номеров не занимают. */
+int cmd_vless_nodes(const char *spec_path, const char *out_name) {
+    struct output *o = NULL;
+    size_t cnt = 0, skipped = 0, foreign = 0;
+    int rc = load_nodes(spec_path, out_name, &o, &cnt, &skipped, &foreign);
+    if (rc) return rc;
+
+    printf("{\"output\":");
+    json_str(out_name);
+    printf(",\"sub_file\":");
+    json_str(o->sub_file);
+    printf(",\"node\":%d,\"usable\":%zu,\"skipped\":%zu,\"foreign\":%zu,\"nodes\":[",
+           o->node_index, cnt, skipped, foreign);
+    for (size_t i = 0; i < cnt; i++) {
+        if (i) putchar(',');
+        node_json(&g_nodes[i], (int)i);
+    }
+    printf("]}\n");
+    return 0;
+}
+
+/* Проверить узел и измерить задержку.
+ *
+ * node >= 0 — только этот узел. node < 0 — по порядку до первого рабочего, то есть ровно
+ * то, что сделает движок при подъёме выхода.
+ *
+ * По одному узлу за вызов не случайно: проверка узла упирается в таймаут, и «проверить
+ * все» на подписке из двадцати шести узлов заняло бы минуты — дольше, чем живёт вызов
+ * ubus. Интерфейс спрашивает по одному и заполняет таблицу постепенно. */
+int cmd_vless_probe(const char *spec_path, const char *out_name, int node, int timeout_s) {
+    struct output *o = NULL;
+    size_t cnt = 0, skipped = 0, foreign = 0;
+    int rc = load_nodes(spec_path, out_name, &o, &cnt, &skipped, &foreign);
+    if (rc) return rc;
+    if (!cnt) {
+        printf("{\"ok\":false,\"error\":\"в подписке нет пригодных узлов\","
+               "\"skipped\":%zu,\"foreign\":%zu}\n", skipped, foreign);
+        return 1;
+    }
+    if (node >= (int)cnt) {
+        printf("{\"ok\":false,\"error\":\"узла %d нет, всего %zu\"}\n", node, cnt);
+        return 1;
+    }
+
+    size_t from = node >= 0 ? (size_t)node : 0;
+    size_t to = node >= 0 ? (size_t)node + 1 : cnt;
+    int found = -1;
+    printf("{\"output\":");
+    json_str(out_name);
+    printf(",\"results\":[");
+    for (size_t i = from; i < to; i++) {
+        char why[256] = "";
+        int hs = -1, ttfb = -1;
+        int pr = vless_probe_timed(&g_nodes[i], timeout_s, why, sizeof(why), &hs, &ttfb);
+        if (i > from) putchar(',');
+        printf("{\"index\":%zu,\"name\":", i);
+        json_str(g_nodes[i].name);
+        printf(",\"type\":");
+        json_str(g_nodes[i].type);
+        printf(",\"ok\":%s,\"handshake_ms\":%d,\"ttfb_ms\":%d,\"why\":",
+               pr == 0 ? "true" : "false", hs, ttfb);
+        json_str(why);
+        printf("}");
+        if (pr == 0) { found = (int)i; if (node < 0) break; }
+    }
+    printf("],\"working\":%d}\n", found);
+    return found >= 0 ? 0 : 1;
+}
+
+int cmd_vless(const char *spec_path, const char *out_name) {
+    struct output *o = NULL;
+    size_t cnt = 0, skipped = 0, foreign = 0;
+    int rc = load_nodes(spec_path, out_name, &o, &cnt, &skipped, &foreign);
+    if (rc) return rc;
+    struct vless_node *nodes = g_nodes;
     if (!cnt) {
         fprintf(stderr, "steer: в подписке нет пригодных узлов "
                         "(пропущено %zu, чужих протоколов %zu)\n", skipped, foreign);

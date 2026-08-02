@@ -313,6 +313,24 @@ int reality_build_hello(const struct reality_cfg *cfg, struct reality_state *st,
       ext(&b, 0x000A, g2, sb.len); }
 
     ext(&b, 0x0023, NULL, 0);              /* session_ticket */
+
+    /* ALPN — только когда транспорт этого требует (grpc, xhttp). Место то же, где его
+     * ставит openssl с ключом -alpn: сразу за session_ticket. Формат: длина списка(2),
+     * затем на каждый протокол длина(1) и байты.
+     *
+     * Без этого расширения сервер обслуживает соединение как HTTP/1.1, а gRPC по 1.1 не
+     * бывает вовсе: запрос уходит, ответа нет, и выглядит это как мёртвый узел. */
+    if (cfg->alpn && cfg->alpn[0]) {
+        size_t al = strlen(cfg->alpn);
+        unsigned char a[40];
+        struct buf ab = { a, 0, sizeof(a) };
+        if (al > 32) return REALITY_ETOOBIG;
+        put16(&ab, (unsigned)(al + 1));
+        put8(&ab, (unsigned)al);
+        put(&ab, cfg->alpn, al);
+        ext(&b, 0x0010, a, ab.len);
+    }
+
     ext(&b, 0x0016, NULL, 0);              /* encrypt_then_mac */
     ext(&b, 0x0017, NULL, 0);              /* extended_master_secret */
 

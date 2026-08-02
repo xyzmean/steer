@@ -154,6 +154,20 @@ int vless_parse_url(const char *url, struct vless_node *n) {
         snprintf(n->skip_reason, sizeof(n->skip_reason), "транспорт %s не поддержан", n->type);
         return 1;
     }
+
+    /* Режим xhttp, которого мы не умеем, называется ЗДЕСЬ, а не выясняется при
+     * подключении: непригодный узел не должен попадать в кандидаты и тратить попытки.
+     *
+     * Поддержан stream-one: один запрос POST, тело запроса — поток наверх, тело ответа —
+     * вниз. Его же выбирает и сам Xray при reality с mode=auto, поэтому «auto» пригоден.
+     * packet-up и stream-up требуют второго запроса и нумерации кусков — заметно больше
+     * кода ради того же результата с худшей задержкой. */
+    if (!strcmp(n->type, "xhttp") && n->mode[0] &&
+        strcmp(n->mode, "auto") != 0 && strcmp(n->mode, "stream-one") != 0) {
+        snprintf(n->skip_reason, sizeof(n->skip_reason),
+                 "xhttp mode=%s: нужен auto или stream-one", n->mode);
+        return 1;
+    }
     return 0;
 }
 

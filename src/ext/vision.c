@@ -60,9 +60,20 @@ void vision_init(struct vision *v, const unsigned char uuid[16]) {
     v->need_uuid = 1;
 }
 
-/* Обернуть данные в кадр. Возвращает длину кадра или 0, если не влез в буфер. */
+/* Обернуть данные в кадр. Возвращает длину кадра или 0, если не влез в буфер.
+ *
+ * После кадра с командой end обёртки больше НЕ БЫВАЕТ: сервер, получив end, перестаёт
+ * ждать заголовки и читает поток как есть. Продолжать оборачивать — значит вписывать пять
+ * байт заголовка внутрь данных, и сервер отдаст их дальше как часть запроса. На одном
+ * коротком запросе это незаметно, потому что кадр всего один; ломается всё, что длиннее
+ * одной посылки, и выглядит как «выгрузка портится». */
 size_t vision_wrap(struct vision *v, const unsigned char *data, size_t n,
                    unsigned char *out, size_t cap) {
+    if (v->sent_end) {
+        if (n > cap) return 0;
+        memcpy(out, data, n);
+        return n;
+    }
     /* Длинная набивка — пока прячем заголовок VLESS, то есть на первых кадрах и на
      * коротких данных. Дальше короткая: длинная на каждом кадре съедала бы полосу. */
     unsigned pad;
@@ -99,6 +110,7 @@ size_t vision_wrap(struct vision *v, const unsigned char *data, size_t n,
         i += pad;
     }
     v->sent_frames++;
+    v->sent_end = 1;
     return i;
 }
 
@@ -112,6 +124,7 @@ int vision_unwrap(struct vision *v, const unsigned char *in, size_t n,
     *consumed = 0;
     *payload = NULL;
     *payload_n = 0;
+    if (!n) return 0;
 
     /* После end сервер шлёт данные без обёртки — отдаём как есть. */
     if (v->recv_done) {
@@ -145,34 +158,58 @@ int vision_unwrap(struct vision *v, const unsigned char *in, size_t n,
         *consumed = 16;
     }
 
-    if (n < 5) return VISION_EAGAIN;
-    unsigned char cmd = in[0];
-    size_t len = ((size_t)in[1] << 8) | in[2];
-    size_t pad = ((size_t)in[3] << 8) | in[4];
-    if (cmd > VISION_CMD_DIRECT) return VISION_EPROTO;
-    if (n < 5 + len + pad) return VISION_EAGAIN;
+    /* Дальше — потоком. Кадр не обязан приехать целиком: его длина описывает данные,
+     * которых может быть больше, чем несёт одна запись TLS, и это обычное дело на любой
+     * передаче крупнее ответа в пару килобайт.
+     *
+     * Прежняя версия требовала кадр целиком и при нехватке ВЫБРАСЫВАЛА остаток. Хуже
+     * того, выбрасывала не только его: потеряв начало, разбор терял и синхронизацию, и
+     * дальше каждый кусок выглядел испорченным. Симптом — «скачивание отдаёт ноль байт»,
+     * причём короткие ответы при этом работали, потому что укладывались в одну запись. */
+    size_t i = 0;
 
-    *consumed += 5 + len + pad;
-    *payload = in + 5;
-    *payload_n = len;
-    if (cmd == VISION_CMD_END || cmd == VISION_CMD_DIRECT) v->recv_done = 1;
+    /* Остаток данных текущего кадра. */
+    if (v->rx_data_left) {
+        size_t take = v->rx_data_left < n - i ? v->rx_data_left : n - i;
+        *payload = in + i;
+        *payload_n = take;
+        v->rx_data_left -= (uint32_t)take;
+        i += take;
+        *consumed += i;
+        if (!v->rx_data_left && !v->rx_pad_left && v->rx_end_after) v->recv_done = 1;
+        return 0;
+    }
+
+    /* Остаток набивки: молча проглатывается, полезного в ней нет. */
+    if (v->rx_pad_left) {
+        size_t take = v->rx_pad_left < n - i ? v->rx_pad_left : n - i;
+        v->rx_pad_left -= (uint32_t)take;
+        i += take;
+        *consumed += i;
+        if (!v->rx_pad_left && v->rx_end_after) v->recv_done = 1;
+        return 0;
+    }
+
+    /* Заголовок следующего кадра — тоже по байтам: он может разорваться границей записи. */
+    while (v->rx_hdr_n < 5 && i < n) v->rx_hdr[v->rx_hdr_n++] = in[i++];
+    *consumed += i;
+    if (v->rx_hdr_n < 5) return 0;              /* дочитаем в следующий раз */
+
+    unsigned char cmd = v->rx_hdr[0];
+    if (cmd > VISION_CMD_DIRECT) return VISION_EPROTO;
+    v->rx_data_left = ((uint32_t)v->rx_hdr[1] << 8) | v->rx_hdr[2];
+    v->rx_pad_left = ((uint32_t)v->rx_hdr[3] << 8) | v->rx_hdr[4];
+    v->rx_end_after = (cmd == VISION_CMD_END || cmd == VISION_CMD_DIRECT);
+    v->rx_hdr_n = 0;
+    /* Кадр без данных и без набивки: сервер так закрывает набивку. */
+    if (!v->rx_data_left && !v->rx_pad_left && v->rx_end_after) v->recv_done = 1;
     return 0;
 }
 
-/* Сколько байт полезных данных в буфере, если развернуть все кадры. Нужно вызывающему,
- * чтобы собрать их в один TCP-пакет: отдавать клиенту по пакету на кадр значит дробить
- * поток на куски по 200 байт там, где сервер прислал 1400. */
-size_t vision_payload_total(struct vision *v, const unsigned char *in, size_t n) {
-    struct vision probe = *v;      /* копия: подсчёт не должен менять состояние */
-    size_t total = 0;
-    while (n) {
-        size_t used = 0;
-        const unsigned char *pl = NULL;
-        size_t pl_n = 0;
-        if (vision_unwrap(&probe, in, n, &used, &pl, &pl_n) != 0 || !used) break;
-        total += pl_n;
-        in += used;
-        n -= used;
-    }
-    return total;
-}
+/* Функция vision_payload_total удалена: её никто не вызывал.
+ *
+ * Она считала, сколько полезных байт даст разбор буфера, чтобы вызывающий заранее знал
+ * размер. Вызывающий вместо этого просто складывает куски в один буфер по мере разбора —
+ * то же самое без второго прохода по данным. Мёртвый код в файле, отвечающем за разбор
+ * недоверенного потока, хуже отсутствующего: он выглядит частью механизма и его начинают
+ * поддерживать при изменениях. */

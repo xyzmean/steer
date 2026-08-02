@@ -35,7 +35,7 @@ BASE_SRC="src/steer.c src/spec.c src/dnsd.c src/failover.c src/aggregate.c"
 # каталога и делает cd туда, так что относительные пути к исходникам не находятся —
 # ошибка выглядела как «FileNotFound: src/ext/tls13.c», то есть будто файла нет вовсе.
 BASE_SRC_ABS="/src/src/steer.c /src/src/spec.c /src/src/dnsd.c /src/src/failover.c /src/src/aggregate.c"
-EXT_SRC_ABS="/src/src/ext/sub.c /src/src/ext/reality.c /src/src/ext/tls13.c /src/src/ext/vless_proto.c /src/src/ext/vision.c /src/src/ext/client.c /src/src/ext/tun.c /src/src/ext/tunnel.c"
+EXT_SRC_ABS="/src/src/ext/sub.c /src/src/ext/reality.c /src/src/ext/tls13.c /src/src/ext/vless_proto.c /src/src/ext/vision.c /src/src/ext/client.c /src/src/ext/tun.c /src/src/ext/tunnel.c /src/src/ext/h2.c"
 
 ISAS="
 mipsel_24kc:mipsel-linux-musl:mips32r2+soft_float

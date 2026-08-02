@@ -113,10 +113,12 @@ static uint16_t csum_fin(uint32_t acc) {
 size_t tcp_build(unsigned char *out, size_t cap,
                  uint32_t src, uint32_t dst, uint16_t sport, uint16_t dport,
                  uint32_t seq, uint32_t ack, unsigned char flags,
-                 const unsigned char *data, size_t data_n, uint16_t window) {
-    size_t total = 20 + 20 + data_n;
+                 const unsigned char *data, size_t data_n, uint16_t window,
+                 unsigned mss) {
+    size_t opt_n = mss ? 4 : 0;
+    size_t total = 20 + 20 + opt_n + data_n;
     if (total > cap) return 0;
-    memset(out, 0, 40);
+    memset(out, 0, 40 + opt_n);
 
     out[0] = 0x45;                                   /* IPv4, ihl=5 */
     out[2] = (unsigned char)(total >> 8);
@@ -137,20 +139,26 @@ size_t tcp_build(unsigned char *out, size_t cap,
     t[6] = (unsigned char)(seq >> 8);  t[7] = (unsigned char)seq;
     t[8] = (unsigned char)(ack >> 24); t[9] = (unsigned char)(ack >> 16);
     t[10] = (unsigned char)(ack >> 8); t[11] = (unsigned char)ack;
-    t[12] = 5 << 4;                                  /* data offset */
+    t[12] = (unsigned char)(((20 + opt_n) / 4) << 4); /* data offset в 32-битных словах */
     t[13] = flags;
     t[14] = (unsigned char)(window >> 8); t[15] = (unsigned char)window;
-    if (data_n) memcpy(t + 20, data, data_n);
+    if (opt_n) {
+        t[20] = 2;                                   /* kind: MSS */
+        t[21] = 4;                                   /* длина опции */
+        t[22] = (unsigned char)(mss >> 8);
+        t[23] = (unsigned char)mss;
+    }
+    if (data_n) memcpy(t + 20 + opt_n, data, data_n);
 
     /* Псевдозаголовок TCP: адреса, протокол, длина — иначе сумма не сойдётся у клиента. */
     unsigned char pseudo[12];
     memcpy(pseudo, &src, 4);
     memcpy(pseudo + 4, &dst, 4);
     pseudo[8] = 0; pseudo[9] = 6;
-    uint16_t tlen = (uint16_t)(20 + data_n);
+    uint16_t tlen = (uint16_t)(20 + opt_n + data_n);
     pseudo[10] = (unsigned char)(tlen >> 8); pseudo[11] = (unsigned char)tlen;
     uint32_t acc = csum_add(pseudo, 12, 0);
-    acc = csum_add(t, 20 + data_n, acc);
+    acc = csum_add(t, 20 + opt_n + data_n, acc);
     uint16_t tsum = csum_fin(acc);
     t[16] = (unsigned char)(tsum >> 8);
     t[17] = (unsigned char)tsum;
