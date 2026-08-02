@@ -26,6 +26,10 @@ size_t g_from_default_n;
  * delegated global one that changes), so there is no stable `ip6 saddr` to write
  * and the rule has to match the device instead. */
 char g_lan_device[32] = "br-lan";
+/* Opt-in, because it cannot work without a firewall rule the engine does not own —
+ * see the comment on the generated chain in steer.c. Defaulting it on would turn
+ * legible-but-wrong hops into no hops at all. */
+int g_traceroute_hops;
 const char *g_state_dir = "/var/lib/steer";
 
 void die(const char *fmt, const char *a) {
@@ -221,6 +225,7 @@ void load_spec(const char *path) {
         else if (!strcmp(key, "channels")) parse_channels(&j);
         else if (!strcmp(key, "from_default")) str_array(&j, g_from_default, MAX_FROM, &g_from_default_n);
         else if (!strcmp(key, "lan_device")) js_str(&j, g_lan_device, sizeof(g_lan_device));
+        else if (!strcmp(key, "traceroute_hops")) { js_ws(&j); g_traceroute_hops = (*j.p == 't'); js_skip(&j); }
         else js_skip(&j);
         js_ws(&j);
         if (*j.p == ',') { j.p++; js_ws(&j); }

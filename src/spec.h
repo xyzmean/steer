@@ -48,6 +48,7 @@ extern size_t g_ch_n;
 extern char g_from_default[MAX_FROM][64];
 extern size_t g_from_default_n;
 extern char g_lan_device[32];
+extern int g_traceroute_hops;
 extern const char *g_state_dir;
 
 /* The port `steer dnsd` listens on and the redirect points at. One constant, so

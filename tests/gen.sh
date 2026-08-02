@@ -119,6 +119,17 @@ sed 's/"mode": "realip"/"mode": "nonsense"/' "$tmp/rspec.json" > "$tmp/rbad.json
 "$BIN" apply --dry-run --spec "$tmp/rbad.json" --state-dir "$tmp/state-r" >/dev/null 2>&1
 check "refuses an unknown mode" "2" "$?"
 
+# Intermediate traceroute hops: untracking ICMP time-exceeded stops the kernel from
+# rewriting its source to the fake address. Only type 11 — dest-unreachable must stay
+# tracked or path-MTU discovery breaks.
+sed 's/"schema": 1,/"schema": 1, "traceroute_hops": true,/' "$tmp/dspec.json" > "$tmp/tspec.json"
+tout="$("$BIN" apply --dry-run --spec "$tmp/tspec.json" --state-dir "$tmp/state-t")"
+check "untracks time-exceeded when asked" "1" \
+    "$(printf '%s\n' "$tout" | grep -c 'icmp type time-exceeded counter notrack')"
+check "leaves dest-unreachable tracked" "0" \
+    "$(printf '%s\n' "$tout" | grep -c 'destination-unreachable')"
+check "off by default" "0" "$(printf '%s\n' "$dout" | grep -c notrack)"
+
 # ---- refusals ---------------------------------------------------------------
 # Guessing at an unknown schema would mean compiling a config we do not understand
 # into firewall rules.

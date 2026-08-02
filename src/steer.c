@@ -128,6 +128,44 @@ static void generate(FILE *f) {
                        "        ip daddr 198.18.0.0/15 dnat ip to ip daddr map @fakeip\n"
                        "    }\n");
         }
+        /* Make traceroute show the REAL intermediate routers while the destination
+         * stays the fake address.
+         *
+         * By default every hop shows the fake IP, including the first: an ICMP error
+         * belonging to a DNATed flow gets its OUTER source rewritten to the address
+         * the client addressed, because otherwise the client would not recognise the
+         * error as its own. Taking those errors out of conntrack stops that rewrite,
+         * so they arrive from the router that actually sent them.
+         *
+         * Scope is deliberately just time-exceeded (type 11). dest-unreachable must
+         * stay tracked — path-MTU discovery rides on it, and untracking that would
+         * trade a cosmetic win for silently broken large transfers.
+         *
+         * The final hop is unaffected: it is an Echo Reply on the tracked flow, so
+         * conntrack still translates it back to the fake address.
+         *
+         * ONLY WORKS WHEN THE OUTPUT DOES NOT MASQUERADE, and that is not a detail —
+         * it is what makes this useless for most tunnels. Measured on a real client
+         * with masquerade on: 13 errors hit this rule, 0 reached the accept for
+         * untracked traffic, and every hop after the first turned into an asterisk.
+         *
+         * With NAT in the path the error is addressed to the ROUTER, not the client,
+         * so only conntrack knows which client it belongs to. Untracking removes
+         * exactly that knowledge: the packet is delivered locally instead of being
+         * forwarded, and never reaches the LAN at all. Tracking is the delivery
+         * mechanism, and being tracked is what rewrites the source. There is no third
+         * option short of rewriting the embedded header inside the ICMP payload.
+         *
+         * So this is opt-in, apply refuses to pretend it will help when the output
+         * masquerades, and it also needs the firewall to accept untracked ICMP toward
+         * the LAN — which steer does not add, because it does not own the firewall. */
+        if (g_traceroute_hops) {
+            fprintf(f, "    chain prerouting_raw {\n"
+                       "        type filter hook prerouting priority raw; policy accept;\n"
+                       "        meta l4proto icmp icmp type time-exceeded counter notrack "
+                       "comment \"steer:traceroute-hops\"\n"
+                       "    }\n");
+        }
         /* The resolver only sees what is steered to it. IPv6 as well as IPv4: the
          * router advertises itself as an IPv6 resolver by default and clients
          * prefer that server, so an IPv4-only redirect catches almost nothing —
@@ -207,6 +245,37 @@ static struct fwcheck fw_check(const char *device) {
     }
     pclose(f);
     return r;
+}
+
+static void report_traceroute_dep(void) {
+    if (!g_traceroute_hops) return;
+    /* Say the useless case out loud rather than leaving the operator to discover it
+     * as a column of asterisks. */
+    for (size_t i = 0; i < g_out_n; i++) {
+        if (g_out[i].kind != OUT_INTERFACE) continue;
+        if (fw_check(g_out[i].device).masqueraded) {
+            fprintf(stderr, "steer: traceroute_hops cannot work for output %s: %s "
+                            "masquerades, so ICMP errors come addressed to the router "
+                            "and only conntrack can route them to the client — "
+                            "untracking them drops the hops entirely\n",
+                    g_out[i].name, g_out[i].device);
+            return;
+        }
+    }
+    FILE *f = popen("nft list ruleset 2>/dev/null", "r");
+    int ok = 0;
+    if (f) {
+        char line[2048];
+        while (fgets(line, sizeof(line), f))
+            if (strstr(line, "untracked") && strstr(line, "accept")) ok = 1;
+        pclose(f);
+    }
+    if (!ok)
+        fprintf(stderr, "steer: traceroute_hops is on but no rule accepting untracked "
+                        "packets was found — ICMP time-exceeded will be dropped by the "
+                        "firewall and hops will show as asterisks. Needed once, in the "
+                        "firewall (not here): accept ct state untracked icmp type "
+                        "time-exceeded towards %s\n", g_lan_device);
 }
 
 static void report_output_deps(void) {
@@ -293,6 +362,7 @@ static int cmd_apply(const char *spec, int dry) {
     unlink(tmp);
     apply_routing();
     report_output_deps();
+    report_traceroute_dep();
     printf("steer: applied %zu channel(s), %zu output(s)\n", g_ch_n, g_out_n);
     return 0;
 }
