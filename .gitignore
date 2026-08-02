@@ -1,2 +1,3 @@
 build/
 out/
+build/libmbed-*.a
