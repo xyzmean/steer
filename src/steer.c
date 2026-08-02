@@ -27,22 +27,110 @@
 
 int dnsd_main(int argc, char **argv);
 
-/* ---- ruleset generation --------------------------------------------------- */
-static void emit_from(FILE *f, const struct channel *c) {
-    const char (*list)[64] = c->from_n ? c->from : g_from_default;
-    size_t n = c->from_n ? c->from_n : g_from_default_n;
-    if (!n) return;
+/* ---- coalescing: one interface, at most two sets ---------------------------
+ *
+ * Channels are how a configuration is WRITTEN — a list, who it applies to, where it
+ * goes. They are not how it has to be EXECUTED. Emitting one set and one rule per
+ * channel means a box with a dozen enabled lists walks a dozen rules for every
+ * packet and holds a dozen sets, when all of them lead to the same tunnel.
+ *
+ * So channels that agree on everything that matters to the kernel — the output, the
+ * kind of list, the clients, and (for domains) the resolver mode — are merged into
+ * one set and one rule. With one tunnel and every list enabled that is 2 sets and 2
+ * rules instead of a dozen each: addresses and domains, because those two reach a
+ * set by different routes and cannot share one.
+ *
+ * Expressiveness is not lost, only deduplicated: a channel that differs in `from` or
+ * mode still gets its own group, so "only the TV, only this list" remains sayable.
+ */
+struct group {
+    char name[64];              /* <output>_ip | <output>_dom, and the set name */
+    const char *out;
+    int domains;                /* addresses otherwise */
+    int realip;
+    const char (*from)[64];
+    size_t from_n;
+    const char *files[MAX_CHANNELS * MAX_FILES];
+    size_t files_n;
+    /* Which channels fed it — reported so a counter still has names behind it. */
+    const char *members[MAX_CHANNELS];
+    size_t members_n;
+};
+
+static struct group g_grp[MAX_CHANNELS];
+static size_t g_grp_n;
+
+static int same_from(const struct channel *c, const struct group *g) {
+    const char (*cf)[64] = c->from_n ? c->from : g_from_default;
+    size_t cn = c->from_n ? c->from_n : g_from_default_n;
+    if (cn != g->from_n) return 0;
+    for (size_t i = 0; i < cn; i++)
+        if (strcmp(cf[i], g->from[i]) != 0) return 0;
+    return 1;
+}
+
+/* Built once per run, in spec order: the first channel of a group fixes its place, so
+ * "first match wins" still reads off the spec. */
+static void build_groups(void) {
+    g_grp_n = 0;
+    for (size_t i = 0; i < g_ch_n; i++) {
+        const struct channel *c = &g_ch[i];
+        int domains = c->domains_n > 0;
+        size_t k = 0;
+        for (; k < g_grp_n; k++) {
+            struct group *g = &g_grp[k];
+            if (strcmp(g->out, c->out) != 0) continue;
+            if (g->domains != domains) continue;
+            if (domains && g->realip != c->realip) continue;
+            if (!same_from(c, g)) continue;
+            break;
+        }
+        if (k == g_grp_n) {
+            struct group *g = &g_grp[g_grp_n++];
+            memset(g, 0, sizeof(*g));
+            g->out = c->out;
+            g->domains = domains;
+            g->realip = c->realip;
+            g->from = c->from_n ? c->from : g_from_default;
+            g->from_n = c->from_n ? c->from_n : g_from_default_n;
+            snprintf(g->name, sizeof(g->name), "%.24s_%s", c->out, domains ? "dom" : "ip");
+            /* An `any` channel has no set: it claims everything from those clients. */
+            if (c->any && !c->prefixes_n && !c->domains_n)
+                snprintf(g->name, sizeof(g->name), "%.24s_all", c->out);
+        }
+        struct group *g = &g_grp[k];
+        const char (*src)[256] = domains ? c->domains_files : c->prefixes_files;
+        size_t n = domains ? c->domains_n : c->prefixes_n;
+        for (size_t f = 0; f < n && g->files_n < (sizeof(g->files) / sizeof(g->files[0])); f++)
+            g->files[g->files_n++] = src[f];
+        if (g->members_n < MAX_CHANNELS) g->members[g->members_n++] = c->name;
+    }
+}
+
+static int has_domains(void) {
+    for (size_t i = 0; i < g_grp_n; i++) if (g_grp[i].domains) return 1;
+    return 0;
+}
+
+static int has_fakeip(void) {
+    for (size_t i = 0; i < g_grp_n; i++)
+        if (g_grp[i].domains && !g_grp[i].realip) return 1;
+    return 0;
+}
+
+static void emit_from(FILE *f, const struct group *g) {
+    if (!g->from_n) return;
     fprintf(f, "ip saddr { ");
-    for (size_t i = 0; i < n; i++) fprintf(f, "%s%s", i ? ", " : "", list[i]);
+    for (size_t i = 0; i < g->from_n; i++) fprintf(f, "%s%s", i ? ", " : "", g->from[i]);
     fprintf(f, " } ");
 }
 
-/* Elements come straight from the list file: the fitter (steer-aggregate) has
- * already decided what fits, and re-parsing 10 000 prefixes here would only add a
- * second place for the two to disagree. */
+/* Elements come straight from the list files: the fitter (steer-aggregate) has
+ * already decided what fits, and re-parsing them here would only add a second place
+ * for the two to disagree. */
 static size_t emit_elements(FILE *f, const char *path, size_t already) {
     FILE *in = fopen(path, "r");
-    if (!in) die("%s: cannot read the channel's list", path);
+    if (!in) die("%s: cannot read a channel's list", path);
     char line[128];
     size_t n = already;
     while (fgets(line, sizeof(line), in)) {
@@ -58,73 +146,50 @@ static size_t emit_elements(FILE *f, const char *path, size_t already) {
     return n - already;
 }
 
-static int has_domains(void) {
-    for (size_t i = 0; i < g_ch_n; i++) if (g_ch[i].domains_n) return 1;
-    return 0;
-}
-
-/* The fake-IP map and its DNAT chain are only worth generating when some channel
- * actually hands out fake addresses. A spec whose domain channels are all realip
- * needs the DNS redirect but no translation at all. */
-static int has_fakeip(void) {
-    for (size_t i = 0; i < g_ch_n; i++)
-        if (g_ch[i].domains_n && !g_ch[i].realip) return 1;
-    return 0;
-}
-
 static void generate(FILE *f) {
     fprintf(f, "table inet steer {\n");
-    for (size_t i = 0; i < g_ch_n; i++) {
-        if (g_ch[i].prefixes_n) {
-            /* auto-merge: several lists feeding one channel WILL overlap (an address
-             * list and a service list cover the same hosting), and the kernel folding
-             * duplicates into one element is cheaper than us deduplicating text. */
-            fprintf(f, "    set ch_%s {\n        type ipv4_addr\n"
-                       "        flags interval\n        auto-merge\n", g_ch[i].name);
+    for (size_t i = 0; i < g_grp_n; i++) {
+        struct group *g = &g_grp[i];
+        if (!g->files_n && !g->domains) continue;      /* an `any` group has no set */
+        if (g->domains) {
+            /* Declared EMPTY: the resolver fills it as answers arrive, and a set with
+             * no inline `elements =` keeps its contents across a reload. Timeouts come
+             * from each answer's TTL, so an address a CDN stops using expires instead
+             * of accumulating forever. */
+            fprintf(f, "    set %s {\n        type ipv4_addr\n"
+                       "        flags interval,timeout\n        auto-merge\n    }\n", g->name);
+        } else {
+            /* auto-merge because several lists in one group WILL overlap — an address
+             * list and a service list cover the same hosting — and folding duplicates
+             * in the kernel is cheaper than rewriting the text. */
+            fprintf(f, "    set %s {\n        type ipv4_addr\n"
+                       "        flags interval\n        auto-merge\n", g->name);
             fprintf(f, "        elements = { ");
             size_t written = 0;
-            for (size_t k = 0; k < g_ch[i].prefixes_n; k++)
-                written += emit_elements(f, g_ch[i].prefixes_files[k], written);
+            for (size_t k = 0; k < g->files_n; k++)
+                written += emit_elements(f, g->files[k], written);
             fprintf(f, " }\n    }\n");
-        } else if (g_ch[i].domains_n) {
-            /* Declared EMPTY on purpose: the resolver fills it as answers arrive,
-             * and a set with no inline `elements =` keeps its contents across a
-             * reload. Timeouts come from each answer's TTL, so an address a CDN
-             * stops using expires on its own instead of accumulating forever. */
-            fprintf(f, "    set ch_%s {\n        type ipv4_addr\n"
-                       "        flags interval,timeout\n        auto-merge\n    }\n",
-                    g_ch[i].name);
         }
     }
-    /* mangle + 1, like splify: the mark must exist before the routing decision,
-     * and staying one step after mangle leaves room for anything that legitimately
-     * wants to run first. */
+
+    /* mangle + 1: the mark must exist before the routing decision, and staying one
+     * step after mangle leaves room for anything that legitimately wants to run first. */
     fprintf(f, "    chain prerouting_mark {\n"
                "        type filter hook prerouting priority mangle + 1; policy accept;\n");
-    for (size_t i = 0; i < g_ch_n; i++) {
-        struct output *o = out_by_name(g_ch[i].out);
-        if (!o) die("channel %s points at a missing output", g_ch[i].name);
+    for (size_t i = 0; i < g_grp_n; i++) {
+        struct group *g = &g_grp[i];
+        struct output *o = out_by_name(g->out);
+        if (!o) die("channel group %s points at a missing output", g->name);
         fprintf(f, "        ");
-        emit_from(f, &g_ch[i]);
-        /* Both kinds of channel own a set — a domain channel's is just filled by
-         * the resolver instead of from a file. Emitting the daddr match only for
-         * the prefix kind left a domain channel matching EVERYTHING from the LAN
-         * and marking it into that channel's tunnel. Only `any` matches all. */
-        if (g_ch[i].prefixes_n || g_ch[i].domains_n)
-            fprintf(f, "ip daddr @ch_%s ", g_ch[i].name);
+        emit_from(f, g);
+        if (g->files_n || g->domains) fprintf(f, "ip daddr @%s ", g->name);
         if (o->kind == OUT_INTERFACE) fprintf(f, "meta mark set 0x%08x ", o->mark);
         /* `return` and not `accept`: it ends OUR chain, letting the rest of the
-         * firewall proceed, while making the first matching channel the winner. */
-        fprintf(f, "counter return comment \"steer:%s\"\n", g_ch[i].name);
+         * firewall proceed, while making the first matching group the winner. */
+        fprintf(f, "counter return comment \"steer:%s\"\n", g->name);
     }
     fprintf(f, "    }\n");
 
-    /* Fake-IP plumbing, only when some channel actually matches domains.
-     *
-     * A domain channel hands the client an address out of 198.18.0.0/15 instead of
-     * the real one, so two sites behind one CDN address stop being the same thing
-     * to the router. That address has to be translated back on the way out, which
-     * is what the map and this chain do — filled live by `steer dnsd`. */
     if (has_domains()) {
         if (has_fakeip()) {
             fprintf(f, "\n    map fakeip { type ipv4_addr : ipv4_addr; }\n");
@@ -136,34 +201,15 @@ static void generate(FILE *f) {
         /* Make traceroute show the REAL intermediate routers while the destination
          * stays the fake address.
          *
-         * By default every hop shows the fake IP, including the first: an ICMP error
-         * belonging to a DNATed flow gets its OUTER source rewritten to the address
-         * the client addressed, because otherwise the client would not recognise the
-         * error as its own. Taking those errors out of conntrack stops that rewrite,
-         * so they arrive from the router that actually sent them.
+         * ONLY WORKS WHEN THE OUTPUT DOES NOT MASQUERADE — measured: with NAT on, 13
+         * errors hit this rule, 0 reached the accept for untracked traffic, and every
+         * hop after the first became an asterisk. With NAT the error is addressed to
+         * the ROUTER, so only conntrack knows which client it belongs to; untracking
+         * removes exactly that knowledge. Tracking is the delivery mechanism and being
+         * tracked is what rewrites the source — one does not come without the other.
          *
-         * Scope is deliberately just time-exceeded (type 11). dest-unreachable must
-         * stay tracked — path-MTU discovery rides on it, and untracking that would
-         * trade a cosmetic win for silently broken large transfers.
-         *
-         * The final hop is unaffected: it is an Echo Reply on the tracked flow, so
-         * conntrack still translates it back to the fake address.
-         *
-         * ONLY WORKS WHEN THE OUTPUT DOES NOT MASQUERADE, and that is not a detail —
-         * it is what makes this useless for most tunnels. Measured on a real client
-         * with masquerade on: 13 errors hit this rule, 0 reached the accept for
-         * untracked traffic, and every hop after the first turned into an asterisk.
-         *
-         * With NAT in the path the error is addressed to the ROUTER, not the client,
-         * so only conntrack knows which client it belongs to. Untracking removes
-         * exactly that knowledge: the packet is delivered locally instead of being
-         * forwarded, and never reaches the LAN at all. Tracking is the delivery
-         * mechanism, and being tracked is what rewrites the source. There is no third
-         * option short of rewriting the embedded header inside the ICMP payload.
-         *
-         * So this is opt-in, apply refuses to pretend it will help when the output
-         * masquerades, and it also needs the firewall to accept untracked ICMP toward
-         * the LAN — which steer does not add, because it does not own the firewall. */
+         * Scope is just time-exceeded (type 11): dest-unreachable must stay tracked or
+         * path-MTU discovery breaks, which trades a cosmetic win for broken transfers. */
         if (g_traceroute_hops) {
             fprintf(f, "    chain prerouting_raw {\n"
                        "        type filter hook prerouting priority raw; policy accept;\n"
@@ -172,11 +218,11 @@ static void generate(FILE *f) {
                        "    }\n");
         }
         /* The resolver only sees what is steered to it. IPv6 as well as IPv4: the
-         * router advertises itself as an IPv6 resolver by default and clients
-         * prefer that server, so an IPv4-only redirect catches almost nothing —
-         * measured on a real client, 15 of its DNS packets went over IPv6 against
-         * 20 over IPv4. TCP/53 stays with the system resolver: this daemon is
-         * UDP-only, so redirecting TCP would break the truncated-answer retry. */
+         * router advertises itself as an IPv6 resolver by default and clients prefer
+         * that server, so an IPv4-only redirect catches almost nothing — measured on a
+         * real client, 15 of its DNS packets went over IPv6 against 20 over IPv4.
+         * TCP/53 stays with the system resolver: this daemon is UDP-only, so
+         * redirecting TCP would break the truncated-answer retry. */
         fprintf(f, "    chain prerouting_dns {\n"
                    "        type nat hook prerouting priority dstnat; policy accept;\n");
         for (size_t i = 0; i < g_from_default_n; i++)
@@ -342,6 +388,7 @@ static void apply_routing(void) {
 static int cmd_apply(const char *spec, int dry) {
     load_spec(spec);
     registry_assign();
+    build_groups();
     if (dry) { generate(stdout); return 0; }
 
     char tmp[] = "/tmp/steer-ruleset.XXXXXX";
@@ -379,6 +426,7 @@ static int cmd_apply(const char *spec, int dry) {
 static int cmd_status(const char *spec) {
     load_spec(spec);
     registry_assign();
+    build_groups();
     printf("{\"schema\":1,\"outputs\":{");
     for (size_t i = 0; i < g_out_n; i++) {
         char devpath[128];
@@ -430,14 +478,18 @@ static int cmd_status(const char *spec) {
         }
         pclose(nft);
     }
-    for (size_t i = 0; i < g_ch_n; i++) {
+    for (size_t i = 0; i < g_grp_n; i++) {
         long p = -1, b = -1;
         for (size_t k = 0; k < found; k++)
-            if (!strcmp(names[k], g_ch[i].name)) { p = (long)pkts[k]; b = (long)bytes[k]; }
-        printf("%s{\"name\":\"%s\",\"out\":\"%s\",\"live\":%s",
-               i ? "," : "", g_ch[i].name, g_ch[i].out, p >= 0 ? "true" : "false");
+            if (!strcmp(names[k], g_grp[i].name)) { p = (long)pkts[k]; b = (long)bytes[k]; }
+        printf("%s{\"name\":\"%s\",\"out\":\"%s\",\"kind\":\"%s\",\"live\":%s",
+               i ? "," : "", g_grp[i].name, g_grp[i].out,
+               g_grp[i].domains ? "domains" : "prefixes", p >= 0 ? "true" : "false");
         if (p >= 0) printf(",\"packets\":%ld,\"bytes\":%ld", p, b);
-        printf("}");
+        printf(",\"lists\":%zu,\"channels\":[", g_grp[i].files_n);
+        for (size_t m = 0; m < g_grp[i].members_n; m++)
+            printf("%s\"%s\"", m ? "," : "", g_grp[i].members[m]);
+        printf("]}");
     }
     printf("]}\n");
     return 0;
@@ -463,28 +515,30 @@ static int addr_ok(const char *a) {
 static int cmd_explain(const char *spec, const char *addr) {
     load_spec(spec);
     registry_assign();
-    for (size_t i = 0; i < g_ch_n; i++) {
-        int hit = g_ch[i].any;
+    build_groups();
+    for (size_t i = 0; i < g_grp_n; i++) {
+        int hit = !g_grp[i].files_n && !g_grp[i].domains;   /* an `any` group */
         /* Domain channels own a set too — it is just filled by the resolver. Asking
          * only the prefix channels made explain answer "no channel matches" for
          * every fake IP, i.e. exactly the addresses a user is most likely to ask
          * about. Same oversight the generator had one commit earlier. */
-        if (!hit && (g_ch[i].prefixes_n || g_ch[i].domains_n)) {
-            char setname[40], elem[32];
+        if (!hit) {
+            char setname[72], elem[32];
             /* Which sets were consulted, in order — the difference between "no
              * channel matches" meaning "not listed" and meaning "explain never
              * looked". */
             if (getenv("STEER_EXPLAIN_TRACE"))
-                fprintf(stderr, "checking ch_%.31s\n", g_ch[i].name);
-            snprintf(setname, sizeof(setname), "ch_%.31s", g_ch[i].name);
+                fprintf(stderr, "checking %.63s\n", g_grp[i].name);
+            snprintf(setname, sizeof(setname), "%.63s", g_grp[i].name);
             snprintf(elem, sizeof(elem), "{ %s }", addr);
             const char *q[] = { "nft", "get", "element", "inet", "steer", setname, elem, NULL };
             hit = run(q) == 0;
         }
         if (!hit) continue;
-        struct output *o = out_by_name(g_ch[i].out);
-        if (!o) die("channel %s points at a missing output", g_ch[i].name);
-        printf("%s -> channel \"%s\" -> output \"%s\"", addr, g_ch[i].name, o->name);
+        struct output *o = out_by_name(g_grp[i].out);
+        if (!o) die("group %s points at a missing output", g_grp[i].name);
+        printf("%s -> %s \"%s\" -> output \"%s\"", addr,
+               g_grp[i].domains ? "domain set" : "address set", g_grp[i].name, o->name);
         if (o->kind == OUT_INTERFACE)
             printf(" -> dev %s (mark 0x%08x, table %d)\n", o->device, o->mark, o->table);
         else

@@ -1491,14 +1491,26 @@ int dnsd_main(int argc, char **argv) {
      * parser the compiler used, so the sets named here are exactly the sets it
      * generated. */
     load_spec(spec);
-    for (size_t i = 0; i < g_ch_n && g_dch_n < MAX_CHANNELS; i++) {
+    /* Same coalescing the compiler does, and it must agree with it exactly: the set
+     * names here ARE the sets it generated. Domain channels that share an output, the
+     * same clients and the same mode are one set — which is why this groups by
+     * (out, realip) rather than walking channels one by one. */
+    for (size_t i = 0; i < g_ch_n; i++) {
         if (!g_ch[i].domains_n) continue;
-        snprintf(g_dch[g_dch_n].set, sizeof(g_dch[g_dch_n].set), "ch_%.31s", g_ch[i].name);
-        for (size_t k = 0; k < g_ch[i].domains_n; k++)
-            g_dch[g_dch_n].rules_path[k] = g_ch[i].domains_files[k];
-        g_dch[g_dch_n].rules_n = g_ch[i].domains_n;
-        g_dch[g_dch_n].realip = g_ch[i].realip;
-        g_dch_n++;
+        char set[64];
+        snprintf(set, sizeof(set), "%.24s_dom", g_ch[i].out);
+        size_t k = 0;
+        for (; k < g_dch_n; k++)
+            if (!strcmp(g_dch[k].set, set) && g_dch[k].realip == g_ch[i].realip) break;
+        if (k == g_dch_n) {
+            if (g_dch_n >= MAX_CHANNELS) break;
+            memset(&g_dch[g_dch_n], 0, sizeof(g_dch[g_dch_n]));
+            snprintf(g_dch[g_dch_n].set, sizeof(g_dch[g_dch_n].set), "%s", set);
+            g_dch[g_dch_n].realip = g_ch[i].realip;
+            k = g_dch_n++;
+        }
+        for (size_t f = 0; f < g_ch[i].domains_n && g_dch[k].rules_n < MAX_FILES; f++)
+            g_dch[k].rules_path[g_dch[k].rules_n++] = g_ch[i].domains_files[f];
     }
     if (!g_dch_n) {
         fprintf(stderr, "steer dnsd: no channel in %s matches domains — nothing to do\n", spec);

@@ -41,13 +41,13 @@ out="$("$BIN" apply --dry-run --spec "$tmp/spec.json" $S)"
 # a golden test is for.
 want="$(cat <<'EOF'
 table inet steer {
-    set ch_keep {
+    set direct_ip {
         type ipv4_addr
         flags interval
         auto-merge
         elements = { 198.51.100.5 }
     }
-    set ch_blocked {
+    set vpn_ip {
         type ipv4_addr
         flags interval
         auto-merge
@@ -55,8 +55,8 @@ table inet steer {
     }
     chain prerouting_mark {
         type filter hook prerouting priority mangle + 1; policy accept;
-        ip saddr { 192.168.1.0/24 } ip daddr @ch_keep counter return comment "steer:keep"
-        ip saddr { 192.168.1.0/24 } ip daddr @ch_blocked meta mark set 0x00100000 counter return comment "steer:blocked"
+        ip saddr { 192.168.1.0/24 } ip daddr @direct_ip counter return comment "steer:direct_ip"
+        ip saddr { 192.168.1.0/24 } ip daddr @vpn_ip meta mark set 0x00100000 counter return comment "steer:vpn_ip"
     }
 }
 EOF
@@ -66,11 +66,13 @@ check "generates the expected ruleset" "$want" "$out"
 # Precedence is the spec's central promise: 198.51.100.5 is in BOTH lists, and the
 # rule that claims it must be the one written first.
 first="$(printf '%s\n' "$out" | grep -n 'comment "steer:' | head -1 | sed 's/.*steer://; s/".*//')"
-check "first channel in the spec is first in the chain" "keep" "$first"
+# The order of GROUPS follows the first channel that created each, so "first match
+# wins" still reads off the spec even though several channels may share one rule.
+check "first channel in the spec is first in the chain" "direct_ip" "$first"
 
 # A direct output claims the packet and marks nothing — the point of `return`.
 check "direct output sets no mark" "0" \
-    "$(printf '%s\n' "$out" | grep 'steer:keep' | grep -c 'meta mark set')"
+    "$(printf '%s\n' "$out" | grep 'steer:direct_ip' | grep -c 'meta mark set')"
 
 # ---- domain channels ---------------------------------------------------------
 # A domain channel's set is filled by the resolver, but the RULE still has to test
@@ -84,9 +86,9 @@ cat > "$tmp/dspec.json" <<EOF
 EOF
 dout="$("$BIN" apply --dry-run --spec "$tmp/dspec.json" --state-dir "$tmp/state-dom")"
 check "domain channel still tests its set" "1" \
-    "$(printf '%s\n' "$dout" | grep 'steer:dom' | grep -c 'ip daddr @ch_dom')"
+    "$(printf '%s\n' "$dout" | grep 'steer:geo_dom' | grep -c 'ip daddr @geo_dom')"
 check "domain set is declared empty, with timeouts" "1" \
-    "$(printf '%s\n' "$dout" | grep -A3 'set ch_dom' | grep -c 'flags interval,timeout')"
+    "$(printf '%s\n' "$dout" | grep -A3 'set geo_dom' | grep -c 'flags interval,timeout')"
 check "fake-IP DNAT appears with a domain channel" "1" \
     "$(printf '%s\n' "$dout" | grep -c 'dnat ip to ip daddr map @fakeip')"
 check "DNS redirect covers IPv6 too" "1" \
@@ -99,7 +101,7 @@ check "no fake-IP plumbing without domain channels" "0" \
 # which are precisely the addresses someone asks explain about.
 check "explain queries domain channels too" "1" \
     "$(STEER_EXPLAIN_TRACE=1 "$BIN" explain 198.18.0.1 --spec "$tmp/dspec.json" \
-        --state-dir "$tmp/state-dom" 2>&1 | grep -c 'ch_dom')"
+        --state-dir "$tmp/state-dom" 2>&1 | grep -c 'geo_dom')"
 
 # realip mode exists so traceroute stays legible: no DNAT means the kernel does not
 # rewrite ICMP errors, so hops show real routers instead of the fake address.
@@ -115,7 +117,7 @@ check "realip needs no fake-IP translation" "0" "$(printf '%s\n' "$rout" | grep 
 check "realip still redirects DNS on both families" "2" \
     "$(printf '%s\n' "$rout" | grep -c 'udp dport 53 counter redirect')"
 check "realip channel still has its set" "1" \
-    "$(printf '%s\n' "$rout" | grep -c 'ip daddr @ch_dom')"
+    "$(printf '%s\n' "$rout" | grep -c 'ip daddr @geo_dom')"
 
 sed 's/"mode": "realip"/"mode": "nonsense"/' "$tmp/rspec.json" > "$tmp/rbad.json"
 "$BIN" apply --dry-run --spec "$tmp/rbad.json" --state-dir "$tmp/state-r" >/dev/null 2>&1
@@ -147,13 +149,16 @@ cat > "$tmp/mspec.json" <<EOF
                   "out": "vpn" } ] }
 EOF
 mout="$("$BIN" apply --dry-run --spec "$tmp/mspec.json" --state-dir "$tmp/state-m")"
-check "one set from several lists" "1" "$(printf '%s\n' "$mout" | grep -c 'set ch_many')"
+# Two lists, one output: one set and one rule, not two of each. On the weak box that
+# is the difference between walking two rules per packet and walking a dozen.
+check "one set from several lists" "1" "$(printf '%s\n' "$mout" | grep -c 'set vpn_ip')"
+check "and one rule" "1" "$(printf '%s\n' "$mout" | grep -c 'comment "steer:vpn_ip"')"
 check "all three entries present" "1" \
     "$(printf '%s\n' "$mout" | grep -c 'elements = { 10.1.0.0/24, 10.2.0.0/24, 10.1.0.0/24 }')"
 # The duplicate is not deduplicated in text on purpose: the kernel folds it via
 # auto-merge, which is cheaper than us rewriting the list.
 check "auto-merge lets the kernel fold the duplicate" "1" \
-    "$(printf '%s\n' "$mout" | grep -A3 'set ch_many' | grep -c 'auto-merge')"
+    "$(printf '%s\n' "$mout" | grep -A3 'set vpn_ip' | grep -c 'auto-merge')"
 
 # A channel cannot hold both kinds: they reach the set by different routes.
 cat > "$tmp/xspec.json" <<EOF
