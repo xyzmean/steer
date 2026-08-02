@@ -23,294 +23,9 @@
 #include <sys/wait.h>
 #include <fcntl.h>
 
-#define MAX_CHANNELS 64
-#define MAX_OUTPUTS  16
-#define MAX_FROM     16
+#include "spec.h"
 
-/* Marks and tables live well away from what splify (0x40000/0x80000, tables
- * 200/202) and mwan3 use, so both can run on one box while the migration is in
- * progress. One bit per output keeps `nft` output readable. */
-#define MARK_BASE   0x00100000u
-#define TABLE_BASE  300
-
-enum out_kind { OUT_DIRECT, OUT_INTERFACE };
-
-struct output {
-    char name[32];
-    enum out_kind kind;
-    char device[32];
-    uint32_t mark;      /* 0 for direct: claiming a packet needs no mark */
-    int table;
-};
-
-struct channel {
-    char name[32];
-    char out[32];
-    char prefixes_file[256];
-    char from[MAX_FROM][64];
-    size_t from_n;
-    int any;
-};
-
-static struct output g_out[MAX_OUTPUTS];
-static size_t g_out_n;
-static struct channel g_ch[MAX_CHANNELS];
-static size_t g_ch_n;
-static char g_from_default[MAX_FROM][64];
-static size_t g_from_default_n;
-
-static const char *g_state_dir = "/var/lib/steer";
-
-static void die(const char *fmt, const char *a) {
-    fprintf(stderr, "steer: ");
-    fprintf(stderr, fmt, a);
-    fputc('\n', stderr);
-    exit(2);
-}
-
-/* ---- a JSON reader small enough to audit ---------------------------------- */
-/* Deliberately not a general parser: it walks the document the shape of the spec
- * demands and refuses anything else. A router config that compiles into firewall
- * rules should fail loudly on an unexpected shape rather than guess — which is the
- * same reason the spec is JSON and not YAML. */
-struct js { const char *p; };
-
-static void js_ws(struct js *j) {
-    while (*j->p == ' ' || *j->p == '\t' || *j->p == '\n' || *j->p == '\r') j->p++;
-}
-static int js_lit(struct js *j, char c) {
-    js_ws(j);
-    if (*j->p != c) return -1;
-    j->p++;
-    return 0;
-}
-static int js_str(struct js *j, char *buf, size_t n) {
-    js_ws(j);
-    if (*j->p != '"') return -1;
-    j->p++;
-    size_t i = 0;
-    while (*j->p && *j->p != '"') {
-        if (*j->p == '\\' && j->p[1]) j->p++;
-        if (i + 1 < n) buf[i++] = *j->p;
-        j->p++;
-    }
-    if (*j->p != '"') return -1;
-    j->p++;
-    buf[i] = '\0';
-    return 0;
-}
-static long js_num(struct js *j) {
-    js_ws(j);
-    char *e = NULL;
-    long v = strtol(j->p, &e, 10);
-    j->p = e;
-    return v;
-}
-/* Skips one value of any type, so unknown keys are tolerated (forward compat
- * within a schema major) without being silently interpreted. */
-static void js_skip(struct js *j) {
-    js_ws(j);
-    if (*j->p == '"') { char t[512]; js_str(j, t, sizeof(t)); return; }
-    if (*j->p == '{' || *j->p == '[') {
-        char open = *j->p, close = open == '{' ? '}' : ']';
-        int depth = 0;
-        do {
-            if (*j->p == '"') { char t[512]; js_str(j, t, sizeof(t)); continue; }
-            if (*j->p == open) depth++;
-            else if (*j->p == close) depth--;
-            j->p++;
-        } while (*j->p && depth > 0);
-        return;
-    }
-    while (*j->p && *j->p != ',' && *j->p != '}' && *j->p != ']') j->p++;
-}
-
-static int str_array(struct js *j, char dst[][64], size_t max, size_t *n) {
-    if (js_lit(j, '[') != 0) return -1;
-    *n = 0;
-    js_ws(j);
-    if (*j->p == ']') { j->p++; return 0; }
-    for (;;) {
-        char t[64];
-        if (js_str(j, t, sizeof(t)) != 0) return -1;
-        if (*n < max) snprintf(dst[(*n)++], 64, "%s", t);
-        js_ws(j);
-        if (*j->p == ',') { j->p++; continue; }
-        break;
-    }
-    return js_lit(j, ']');
-}
-
-static void parse_outputs(struct js *j) {
-    if (js_lit(j, '{') != 0) die("outputs: expected an object", NULL);
-    js_ws(j);
-    if (*j->p == '}') { j->p++; return; }
-    for (;;) {
-        struct output o = {0};
-        if (js_str(j, o.name, sizeof(o.name)) != 0) die("outputs: expected a name", NULL);
-        if (js_lit(j, ':') != 0) die("outputs.%s: expected ':'", o.name);
-        if (js_lit(j, '{') != 0) die("outputs.%s: expected an object", o.name);
-        char kind[32] = "";
-        js_ws(j);
-        while (*j->p != '}') {
-            char key[32];
-            if (js_str(j, key, sizeof(key)) != 0) die("outputs.%s: bad key", o.name);
-            js_lit(j, ':');
-            if (!strcmp(key, "kind")) js_str(j, kind, sizeof(kind));
-            else if (!strcmp(key, "device")) js_str(j, o.device, sizeof(o.device));
-            else js_skip(j);
-            js_ws(j);
-            if (*j->p == ',') { j->p++; js_ws(j); }
-        }
-        j->p++;
-        if (!strcmp(kind, "direct")) o.kind = OUT_DIRECT;
-        else if (!strcmp(kind, "interface")) {
-            o.kind = OUT_INTERFACE;
-            if (!o.device[0]) die("outputs.%s: kind interface needs a device", o.name);
-        } else die("outputs.%s: unknown kind (want direct or interface)", o.name);
-        if (g_out_n >= MAX_OUTPUTS) die("too many outputs", NULL);
-        g_out[g_out_n++] = o;
-        js_ws(j);
-        if (*j->p == ',') { j->p++; continue; }
-        break;
-    }
-    js_lit(j, '}');
-}
-
-static void parse_channels(struct js *j) {
-    if (js_lit(j, '[') != 0) die("channels: expected an array", NULL);
-    js_ws(j);
-    if (*j->p == ']') { j->p++; return; }
-    for (;;) {
-        struct channel c = {0};
-        if (js_lit(j, '{') != 0) die("channels: expected an object", NULL);
-        js_ws(j);
-        while (*j->p != '}') {
-            char key[32];
-            if (js_str(j, key, sizeof(key)) != 0) die("channels: bad key", NULL);
-            js_lit(j, ':');
-            if (!strcmp(key, "name")) js_str(j, c.name, sizeof(c.name));
-            else if (!strcmp(key, "out")) js_str(j, c.out, sizeof(c.out));
-            else if (!strcmp(key, "from")) str_array(j, c.from, MAX_FROM, &c.from_n);
-            else if (!strcmp(key, "match")) {
-                if (js_lit(j, '{') != 0) die("channels.%s: match must be an object", c.name);
-                js_ws(j);
-                while (*j->p != '}') {
-                    char mk[32];
-                    js_str(j, mk, sizeof(mk));
-                    js_lit(j, ':');
-                    if (!strcmp(mk, "prefixes_file")) js_str(j, c.prefixes_file, sizeof(c.prefixes_file));
-                    else if (!strcmp(mk, "any")) { js_ws(j); c.any = (*j->p == 't'); js_skip(j); }
-                    else js_skip(j);
-                    js_ws(j);
-                    if (*j->p == ',') { j->p++; js_ws(j); }
-                }
-                j->p++;
-            }
-            else js_skip(j);
-            js_ws(j);
-            if (*j->p == ',') { j->p++; js_ws(j); }
-        }
-        j->p++;
-        if (!c.name[0]) die("a channel has no name", NULL);
-        if (!c.out[0]) die("channel %s has no out", c.name);
-        if (!c.prefixes_file[0] && !c.any)
-            die("channel %s matches nothing (want prefixes_file or any)", c.name);
-        if (g_ch_n >= MAX_CHANNELS) die("too many channels", NULL);
-        g_ch[g_ch_n++] = c;
-        js_ws(j);
-        if (*j->p == ',') { j->p++; continue; }
-        break;
-    }
-    js_lit(j, ']');
-}
-
-static void load_spec(const char *path) {
-    FILE *f = strcmp(path, "-") ? fopen(path, "r") : stdin;
-    if (!f) die("%s: cannot open", path);
-    static char buf[262144];
-    size_t n = fread(buf, 1, sizeof(buf) - 1, f);
-    buf[n] = '\0';
-    if (f != stdin) fclose(f);
-
-    struct js j = { buf };
-    long schema = -1;
-    if (js_lit(&j, '{') != 0) die("spec: expected an object", NULL);
-    js_ws(&j);
-    while (*j.p && *j.p != '}') {
-        char key[64];
-        if (js_str(&j, key, sizeof(key)) != 0) die("spec: bad key", NULL);
-        js_lit(&j, ':');
-        if (!strcmp(key, "schema")) schema = js_num(&j);
-        else if (!strcmp(key, "outputs")) parse_outputs(&j);
-        else if (!strcmp(key, "channels")) parse_channels(&j);
-        else if (!strcmp(key, "from_default")) str_array(&j, g_from_default, MAX_FROM, &g_from_default_n);
-        else js_skip(&j);
-        js_ws(&j);
-        if (*j.p == ',') { j.p++; js_ws(&j); }
-    }
-    /* Refusing an unknown major is the whole point of having the field: guessing
-     * would mean compiling a config we do not understand into firewall rules. */
-    if (schema != 1) {
-        fprintf(stderr, "steer: spec schema %ld is not supported (this build speaks 1)\n", schema);
-        exit(2);
-    }
-    if (!g_out_n) die("spec has no outputs", NULL);
-    if (!g_ch_n) die("spec has no channels", NULL);
-    for (size_t i = 0; i < g_ch_n; i++) {
-        size_t k = 0;
-        for (; k < g_out_n; k++) if (!strcmp(g_ch[i].out, g_out[k].name)) break;
-        if (k == g_out_n) die("channel %s points at an output that does not exist", g_ch[i].name);
-    }
-}
-
-/* ---- mark/table registry -------------------------------------------------- */
-/* Persisted, because an output must keep its mark across restarts: a reboot that
- * reshuffles marks leaves stale `ip rule` entries pointing at the wrong table,
- * and the symptom is traffic silently taking someone else's path. */
-static void registry_assign(void) {
-    char path[512];
-    snprintf(path, sizeof(path), "%s/registry", g_state_dir);
-    FILE *f = fopen(path, "r");
-    if (f) {
-        char name[32];
-        unsigned mark;
-        int table;
-        while (fscanf(f, "%31s %x %d\n", name, &mark, &table) == 3)
-            for (size_t i = 0; i < g_out_n; i++)
-                if (!strcmp(g_out[i].name, name) && g_out[i].kind != OUT_DIRECT) {
-                    g_out[i].mark = mark;
-                    g_out[i].table = table;
-                }
-        fclose(f);
-    }
-    unsigned next_bit = 0;
-    for (size_t i = 0; i < g_out_n; i++)
-        if (g_out[i].mark) {
-            unsigned b = 0;
-            while ((MARK_BASE << b) < g_out[i].mark && b < 8) b++;
-            if (b + 1 > next_bit) next_bit = b + 1;
-        }
-    for (size_t i = 0; i < g_out_n; i++) {
-        if (g_out[i].kind == OUT_DIRECT || g_out[i].mark) continue;
-        if (next_bit >= 8) die("out of mark bits for output %s", g_out[i].name);
-        g_out[i].mark = MARK_BASE << next_bit;
-        g_out[i].table = TABLE_BASE + (int)next_bit;
-        next_bit++;
-    }
-    mkdir(g_state_dir, 0755);
-    f = fopen(path, "w");
-    if (!f) return;             /* best effort: apply still works, next boot re-assigns */
-    for (size_t i = 0; i < g_out_n; i++)
-        if (g_out[i].kind != OUT_DIRECT)
-            fprintf(f, "%s %x %d\n", g_out[i].name, g_out[i].mark, g_out[i].table);
-    fclose(f);
-}
-
-static struct output *out_by_name(const char *n) {
-    for (size_t i = 0; i < g_out_n; i++) if (!strcmp(g_out[i].name, n)) return &g_out[i];
-    return NULL;
-}
+int dnsd_main(int argc, char **argv);
 
 /* ---- ruleset generation --------------------------------------------------- */
 static void emit_from(FILE *f, const struct channel *c) {
@@ -343,15 +58,29 @@ static size_t emit_elements(FILE *f, const char *path) {
     return n;
 }
 
+static int has_domains(void) {
+    for (size_t i = 0; i < g_ch_n; i++) if (g_ch[i].domains_file[0]) return 1;
+    return 0;
+}
+
 static void generate(FILE *f) {
     fprintf(f, "table inet steer {\n");
     for (size_t i = 0; i < g_ch_n; i++) {
-        if (!g_ch[i].prefixes_file[0]) continue;
-        fprintf(f, "    set ch_%s {\n        type ipv4_addr\n        flags interval\n",
-                g_ch[i].name);
-        fprintf(f, "        elements = { ");
-        emit_elements(f, g_ch[i].prefixes_file);
-        fprintf(f, " }\n    }\n");
+        if (g_ch[i].prefixes_file[0]) {
+            fprintf(f, "    set ch_%s {\n        type ipv4_addr\n        flags interval\n",
+                    g_ch[i].name);
+            fprintf(f, "        elements = { ");
+            emit_elements(f, g_ch[i].prefixes_file);
+            fprintf(f, " }\n    }\n");
+        } else if (g_ch[i].domains_file[0]) {
+            /* Declared EMPTY on purpose: the resolver fills it as answers arrive,
+             * and a set with no inline `elements =` keeps its contents across a
+             * reload. Timeouts come from each answer's TTL, so an address a CDN
+             * stops using expires on its own instead of accumulating forever. */
+            fprintf(f, "    set ch_%s {\n        type ipv4_addr\n"
+                       "        flags interval,timeout\n        auto-merge\n    }\n",
+                    g_ch[i].name);
+        }
     }
     /* mangle + 1, like splify: the mark must exist before the routing decision,
      * and staying one step after mangle leaves room for anything that legitimately
@@ -363,13 +92,126 @@ static void generate(FILE *f) {
         if (!o) die("channel %s points at a missing output", g_ch[i].name);
         fprintf(f, "        ");
         emit_from(f, &g_ch[i]);
-        if (g_ch[i].prefixes_file[0]) fprintf(f, "ip daddr @ch_%s ", g_ch[i].name);
+        /* Both kinds of channel own a set — a domain channel's is just filled by
+         * the resolver instead of from a file. Emitting the daddr match only for
+         * the prefix kind left a domain channel matching EVERYTHING from the LAN
+         * and marking it into that channel's tunnel. Only `any` matches all. */
+        if (g_ch[i].prefixes_file[0] || g_ch[i].domains_file[0])
+            fprintf(f, "ip daddr @ch_%s ", g_ch[i].name);
         if (o->kind == OUT_INTERFACE) fprintf(f, "meta mark set 0x%08x ", o->mark);
         /* `return` and not `accept`: it ends OUR chain, letting the rest of the
          * firewall proceed, while making the first matching channel the winner. */
         fprintf(f, "counter return comment \"steer:%s\"\n", g_ch[i].name);
     }
-    fprintf(f, "    }\n}\n");
+    fprintf(f, "    }\n");
+
+    /* Fake-IP plumbing, only when some channel actually matches domains.
+     *
+     * A domain channel hands the client an address out of 198.18.0.0/15 instead of
+     * the real one, so two sites behind one CDN address stop being the same thing
+     * to the router. That address has to be translated back on the way out, which
+     * is what the map and this chain do — filled live by `steer dnsd`. */
+    if (has_domains()) {
+        fprintf(f, "\n    map fakeip { type ipv4_addr : ipv4_addr; }\n");
+        fprintf(f, "    chain prerouting_dnat {\n"
+                   "        type nat hook prerouting priority dstnat; policy accept;\n"
+                   "        ip daddr 198.18.0.0/15 dnat ip to ip daddr map @fakeip\n"
+                   "    }\n");
+        /* The resolver only sees what is steered to it. IPv6 as well as IPv4: the
+         * router advertises itself as an IPv6 resolver by default and clients
+         * prefer that server, so an IPv4-only redirect catches almost nothing —
+         * measured on a real client, 15 of its DNS packets went over IPv6 against
+         * 20 over IPv4. TCP/53 stays with the system resolver: this daemon is
+         * UDP-only, so redirecting TCP would break the truncated-answer retry. */
+        fprintf(f, "    chain prerouting_dns {\n"
+                   "        type nat hook prerouting priority dstnat; policy accept;\n");
+        for (size_t i = 0; i < g_from_default_n; i++)
+            fprintf(f, "        ip saddr %s udp dport 53 counter redirect to :%d\n",
+                    g_from_default[i], DNS_PORT);
+        if (g_lan_device[0])
+            fprintf(f, "        meta nfproto ipv6 iifname \"%s\" udp dport 53 counter redirect to :%d\n",
+                    g_lan_device, DNS_PORT);
+        fprintf(f, "    }\n");
+    }
+    fprintf(f, "}\n");
+}
+
+/* ---- what an interface output depends on, and does not own ----------------- */
+/* steer does not touch the firewall. It has no business rewriting someone's zones
+ * or adding masquerade rules — that is the operator's configuration, and a routing
+ * engine silently editing it is how two tools start fighting over one ruleset.
+ *
+ * But an interface output cannot work without it: packets leaving a tunnel with LAN
+ * source addresses never come back, so the route looks applied, the channel counter
+ * even rises, and every site behind it simply hangs. That failure is invisible from
+ * inside steer's own state — which is exactly why it must be REPORTED.
+ *
+ * Both checks are textual and deliberately conservative: a false "looks fine" is
+ * worse than a false warning, so anything unrecognised reads as missing. */
+struct fwcheck { int in_firewall, masqueraded; };
+
+/* Is DEVICE named here as a whole token? Substring matching is not good enough in
+ * either direction: looking for it quoted missed fw4 entirely (see below), while a
+ * bare substring would let "warp" answer for "warp0". */
+static int names_device(const char *hay, const char *device) {
+    size_t n = strlen(device);
+    for (const char *p = strstr(hay, device); p; p = strstr(p + 1, device)) {
+        char before = p == hay ? ' ' : p[-1];
+        char after = p[n];
+        int lb = (before >= 'a' && before <= 'z') || (before >= 'A' && before <= 'Z')
+                 || (before >= '0' && before <= '9');
+        int la = (after >= 'a' && after <= 'z') || (after >= 'A' && after <= 'Z')
+                 || (after >= '0' && after <= '9');
+        if (!lb && !la) return 1;
+    }
+    return 0;
+}
+
+static struct fwcheck fw_check(const char *device) {
+    struct fwcheck r = { 0, 0 };
+    FILE *f = popen("nft list ruleset 2>/dev/null", "r");
+    if (!f) return r;
+    char line[2048];
+    char chain[128] = "";
+    int in_steer = 0;
+    while (fgets(line, sizeof(line), f)) {
+        /* Our own table mentions the device too; it proves nothing about NAT. */
+        if (strstr(line, "table inet steer")) in_steer = 1;
+        else if (!strncmp(line, "table ", 6)) in_steer = 0;
+        if (in_steer) continue;
+
+        const char *c = strstr(line, "chain ");
+        if (c) snprintf(chain, sizeof(chain), "%s", c + 6);
+
+        if (names_device(line, device)) r.in_firewall = 1;
+        /* fw4 does NOT name the device on the masquerade rule: it emits
+         * `chain srcnat_warp0 { meta nfproto ipv4 masquerade comment "...warp0..." }`
+         * and matches the device on the jump into that chain. Checking only the rule
+         * line reported "no NAT" on a router whose NAT was working fine — a false
+         * alarm that sent me diagnosing the wrong thing. So the enclosing chain name
+         * counts as evidence too. */
+        if (strstr(line, "masquerade") || strstr(line, "snat")) {
+            if (names_device(line, device) || names_device(chain, device)) r.masqueraded = 1;
+        }
+    }
+    pclose(f);
+    return r;
+}
+
+static void report_output_deps(void) {
+    for (size_t i = 0; i < g_out_n; i++) {
+        if (g_out[i].kind != OUT_INTERFACE) continue;
+        struct fwcheck c = fw_check(g_out[i].device);
+        if (!c.in_firewall)
+            fprintf(stderr, "steer: output %s: %s is not mentioned by the firewall at all — "
+                            "traffic steered there will not come back until it is in a zone\n",
+                    g_out[i].name, g_out[i].device);
+        else if (!c.masqueraded)
+            fprintf(stderr, "steer: output %s: no masquerade/snat rule found for %s — "
+                            "if that path needs NAT, packets leave with LAN addresses and "
+                            "the channel goes quiet while its counter still rises\n",
+                    g_out[i].name, g_out[i].device);
+    }
 }
 
 /* ---- apply ---------------------------------------------------------------- */
@@ -439,6 +281,7 @@ static int cmd_apply(const char *spec, int dry) {
     }
     unlink(tmp);
     apply_routing();
+    report_output_deps();
     printf("steer: applied %zu channel(s), %zu output(s)\n", g_ch_n, g_out_n);
     return 0;
 }
@@ -465,9 +308,13 @@ static int cmd_status(const char *spec) {
         }
         printf("%s\"%s\":{\"kind\":\"%s\"", i ? "," : "", g_out[i].name,
                g_out[i].kind == OUT_DIRECT ? "direct" : "interface");
-        if (g_out[i].kind == OUT_INTERFACE)
-            printf(",\"device\":\"%s\",\"up\":%s,\"mark\":\"0x%08x\",\"table\":%d",
-                   g_out[i].device, up ? "true" : "false", g_out[i].mark, g_out[i].table);
+        if (g_out[i].kind == OUT_INTERFACE) {
+            struct fwcheck c = fw_check(g_out[i].device);
+            printf(",\"device\":\"%s\",\"up\":%s,\"mark\":\"0x%08x\",\"table\":%d"
+                   ",\"in_firewall\":%s,\"nat\":%s",
+                   g_out[i].device, up ? "true" : "false", g_out[i].mark, g_out[i].table,
+                   c.in_firewall ? "true" : "false", c.masqueraded ? "true" : "false");
+        }
         printf("}");
     }
     printf("},\"channels\":[");
@@ -532,8 +379,17 @@ static int cmd_explain(const char *spec, const char *addr) {
     registry_assign();
     for (size_t i = 0; i < g_ch_n; i++) {
         int hit = g_ch[i].any;
-        if (!hit && g_ch[i].prefixes_file[0]) {
+        /* Domain channels own a set too — it is just filled by the resolver. Asking
+         * only the prefix channels made explain answer "no channel matches" for
+         * every fake IP, i.e. exactly the addresses a user is most likely to ask
+         * about. Same oversight the generator had one commit earlier. */
+        if (!hit && (g_ch[i].prefixes_file[0] || g_ch[i].domains_file[0])) {
             char setname[40], elem[32];
+            /* Which sets were consulted, in order — the difference between "no
+             * channel matches" meaning "not listed" and meaning "explain never
+             * looked". */
+            if (getenv("STEER_EXPLAIN_TRACE"))
+                fprintf(stderr, "checking ch_%.31s\n", g_ch[i].name);
             snprintf(setname, sizeof(setname), "ch_%.31s", g_ch[i].name);
             snprintf(elem, sizeof(elem), "{ %s }", addr);
             const char *q[] = { "nft", "get", "element", "inet", "steer", setname, elem, NULL };
@@ -557,6 +413,7 @@ int main(int argc, char **argv) {
     const char *spec = "/etc/steer/spec.json";
     if (argc < 2) {
         fputs("usage: steer apply [--dry-run] [--spec FILE]\n"
+              "       steer dnsd  [--spec FILE]   (resolver for domain channels)\n"
               "       steer status [--spec FILE]\n"
               "       steer explain ADDRESS [--spec FILE]\n", stderr);
         return 2;
@@ -569,6 +426,7 @@ int main(int argc, char **argv) {
         else if (!strcmp(argv[i], "--state-dir") && i + 1 < argc) g_state_dir = argv[++i];
         else arg = argv[i];
     }
+    if (!strcmp(cmd, "dnsd")) return dnsd_main(argc - 2, argv + 2);
     if (!strcmp(cmd, "apply")) return cmd_apply(spec, dry);
     if (!strcmp(cmd, "status")) return cmd_status(spec);
     if (!strcmp(cmd, "explain")) {
@@ -579,3 +437,4 @@ int main(int argc, char **argv) {
     die("unknown command: %s", cmd);
     return 2;
 }
+

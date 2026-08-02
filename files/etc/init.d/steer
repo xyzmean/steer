@@ -1,0 +1,58 @@
+#!/bin/sh /etc/rc.common
+# Applies the ruleset at boot and runs the resolver for domain channels.
+#
+# START is after the network is up (the routing tables an interface output needs
+# want their device to exist) but before anything that carries user traffic, so a
+# client never gets a moment of unsteered routing after a reboot.
+START=94
+STOP=11
+USE_PROCD=1
+
+SPEC=/etc/steer/spec.json
+
+boot() {
+    # `nft -f` needs the firewall's own tables to exist first; on a cold boot
+    # fw4 may still be starting. The apply below is idempotent, and the procd
+    # instance retries it anyway, so a lost race costs nothing.
+    start "$@"
+}
+
+start_service() {
+    [ -f "$SPEC" ] || { echo "steer: no $SPEC — nothing to apply"; return 0; }
+
+    steer apply --spec "$SPEC" || echo "steer: apply failed — see the message above"
+
+    # Only run the resolver when a channel actually matches domains: with none, it
+    # would sit on port 5300 doing nothing, and the generated ruleset has no
+    # redirect pointing at it.
+    grep -q '"domains_file"' "$SPEC" || return 0
+
+    procd_open_instance
+    procd_set_param command steer dnsd --spec "$SPEC"
+    procd_set_param respawn 3600 5 0
+    procd_set_param stdout 1
+    procd_set_param stderr 1
+    procd_set_param reload_signal HUP
+    procd_close_instance
+}
+
+# The ruleset lives in its own table, so cleanup cannot damage anyone else's
+# firewall — which is the whole reason for not being an fw4 include.
+stop_service() {
+    nft delete table inet steer 2>/dev/null
+    for t in $(awk '{print $3}' /var/lib/steer/registry 2>/dev/null); do
+        ip route flush table "$t" 2>/dev/null
+    done
+    for m in $(awk '{print $2}' /var/lib/steer/registry 2>/dev/null); do
+        while ip rule del fwmark "0x$m" 2>/dev/null; do :; done
+    done
+}
+
+reload_service() {
+    steer apply --spec "$SPEC"
+    procd_send_signal steer
+}
+
+service_triggers() {
+    procd_add_reload_trigger "steer"
+}

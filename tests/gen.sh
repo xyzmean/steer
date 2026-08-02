@@ -70,6 +70,35 @@ check "first channel in the spec is first in the chain" "keep" "$first"
 check "direct output sets no mark" "0" \
     "$(printf '%s\n' "$out" | grep 'steer:keep' | grep -c 'meta mark set')"
 
+# ---- domain channels ---------------------------------------------------------
+# A domain channel's set is filled by the resolver, but the RULE still has to test
+# it. Emitting the daddr match only for prefix channels once left a domain channel
+# matching everything from the LAN and marking it all into that tunnel.
+printf 'example.com\n' > "$tmp/d.lst"
+cat > "$tmp/dspec.json" <<EOF
+{ "schema": 1, "from_default": ["192.168.1.0/24"], "lan_device": "br-lan",
+  "outputs": { "geo": { "kind": "interface", "device": "tun0" } },
+  "channels": [ { "name": "dom", "match": { "domains_file": "$tmp/d.lst" }, "out": "geo" } ] }
+EOF
+dout="$("$BIN" apply --dry-run --spec "$tmp/dspec.json" --state-dir "$tmp/state-dom")"
+check "domain channel still tests its set" "1" \
+    "$(printf '%s\n' "$dout" | grep 'steer:dom' | grep -c 'ip daddr @ch_dom')"
+check "domain set is declared empty, with timeouts" "1" \
+    "$(printf '%s\n' "$dout" | grep -A3 'set ch_dom' | grep -c 'flags interval,timeout')"
+check "fake-IP DNAT appears with a domain channel" "1" \
+    "$(printf '%s\n' "$dout" | grep -c 'dnat ip to ip daddr map @fakeip')"
+check "DNS redirect covers IPv6 too" "1" \
+    "$(printf '%s\n' "$dout" | grep -c 'nfproto ipv6 iifname "br-lan" udp dport 53')"
+# No domain channel means none of that plumbing should exist at all.
+check "no fake-IP plumbing without domain channels" "0" \
+    "$(printf '%s\n' "$out" | grep -c 'fakeip')"
+
+# explain must consult a domain channel's set as well — those hold the fake IPs,
+# which are precisely the addresses someone asks explain about.
+check "explain queries domain channels too" "1" \
+    "$(STEER_EXPLAIN_TRACE=1 "$BIN" explain 198.18.0.1 --spec "$tmp/dspec.json" \
+        --state-dir "$tmp/state-dom" 2>&1 | grep -c 'ch_dom')"
+
 # ---- refusals ---------------------------------------------------------------
 # Guessing at an unknown schema would mean compiling a config we do not understand
 # into firewall rules.
