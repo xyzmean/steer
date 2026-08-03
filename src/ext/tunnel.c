@@ -59,6 +59,10 @@ struct conn {
     uint32_t client_ack;
     uint16_t client_win;
     uint8_t client_wscale;    /* множитель из опций SYN: окно = client_win << wscale */
+    /* Клиенту причитается подтверждение, но мы его отложили до конца разбора порции из
+     * TUN. Подтверждать каждый пакет отдельно — это лишняя запись в устройство на каждый
+     * пакет выгрузки, притом что все они подтверждаются одним ACK с последним номером. */
+    int ack_due;
     time_t last;
 };
 
@@ -77,7 +81,26 @@ struct conn {
  * роутере вставала на втором мегабайте; с ним, но без вычерпывания сокета — 3 Мбит/с;
  * с вычерпыванием и 32 КБ — 42 Мбит/с. Порядок важен: увеличивать окно, не научившись
  * вычерпывать, бессмысленно, и первая попытка это подтвердила — стало хуже. */
-#define CLIENT_INFLIGHT_CAP (256 * 1024)
+#define CLIENT_INFLIGHT_CAP (1024 * 1024)
+
+/* Масштаб окна, который объявляем клиенту МЫ.
+ *
+ * Ноль — и это не «забыли поставить». Опция обязана присутствовать в SYN-ACK, потому что
+ * масштабирование по RFC 7323 включается только при обоюдном согласии: клиент применит
+ * множитель к СВОЕМУ объявленному окну лишь тогда, когда получит эту опцию от нас. Без неё
+ * его окно остаётся честными 16 битами, то есть не больше 65535 байт, — а мы всё это время
+ * читали множитель из его SYN и умножали на него.
+ *
+ * Ошибка была ровно в этом: окно клиента считалось до 128 раз больше настоящего, и мы
+ * держали в пути мегабайт там, где приёмник объявил 64 килобайта. Всё за окном приёмник
+ * отбрасывает молча, повторной передачи у нас нет, и закрыть дыру нечем. Отсюда и «три
+ * секунды по 85 Мбит/с, дальше ровные нули», и потеря 40% при восьми потоках — то есть
+ * симптом выглядел как нехватка скорости, а был нарушением протокола.
+ *
+ * Своё окно при этом оставляем немасштабированным: значение множителя в опции относится
+ * только к окнам, которые объявляем мы, а нам 65535 достаточно — данные клиента уходят
+ * серверу сразу, копить их у себя мы не умеем и не собираемся. */
+#define OUR_WSCALE 0
 
 /* Сколько клиент готов принять СЕЙЧАС, с учётом множителя окна и нашего предела. Одна
  * функция вместо трёх копий одного вычисления: разойдясь, они дали бы либо остановку на
@@ -87,12 +110,43 @@ static uint32_t client_room(const struct conn *c) {
     return win < CLIENT_INFLIGHT_CAP ? win : CLIENT_INFLIGHT_CAP;
 }
 
-/* Сколько записей подряд читаем у одного соединения за проход цикла.
+/* Запас, который обязан оставаться свободным в окне клиента, прежде чем мы возьмём у
+ * сервера ещё одну запись.
  *
- * Не «сколько влезет»: цикл один на все соединения, и одно активное скачивание не должно
- * замораживать остальные. Восемь записей — это до 128 КБ за проход, чего хватает, чтобы
- * окно сервера не закрывалось, и мало, чтобы соседи ждали дольше миллисекунд. */
-#define DRAIN_MAX_RECORDS 8
+ * Прочитав запись, отдать её клиенту НАДО ЦЕЛИКОМ: деть её больше некуда, буфера на
+ * соединение у нас нет. Значит решать «читать или нет» надо заранее, с местом под целую
+ * запись, а не «пока в окне есть хоть байт».
+ *
+ * Без этого запаса мы перебирали окно на длину записи: замерено «окно 262144, в пути
+ * 268876». Всё, что за окном, приёмник отбрасывает молча — и поток встаёт НАВСЕГДА,
+ * потому что повторной передачи у нас нет и дыру закрыть нечем. В iperf3 это выглядело
+ * так: три секунды по 85 Мбит/с, дальше ровные нули; при восьми потоках терялось 40%
+ * отправленного.
+ *
+ * Считается от TUNNEL_BUF, а не от размера записи TLS: в режиме прямого копирования одно
+ * чтение отдаёт всё, что влезло в буфер, — это 18448 байт, а не 16384. Прежний запас был
+ * посчитан от записи и на 1040 байт не покрывал именно этот случай. */
+#define CLIENT_ROOM_RESERVE (TUNNEL_BUF + 1024)
+
+/* Готов ли клиент принять ещё одну запись целиком. */
+static int client_can_take_record(const struct conn *c) {
+    uint32_t room = client_room(c);
+    uint32_t inflight = c->our_seq - c->client_ack;
+    return room > inflight && room - inflight >= CLIENT_ROOM_RESERVE;
+}
+
+/* Сколько берём у одного соединения за проход цикла — в БАЙТАХ, а не в чтениях.
+ *
+ * Предел по числу чтений выглядел разумно, пока записи были по 8 КБ. Но после перехода
+ * сервера на прямое копирование (команда direct в Vision) чтения становятся мелкими — по
+ * 300 байт, — и «восемь чтений» превращались в 2,4 КБ за проход: замерено 3600 чтений/с
+ * при 1,1 МБ/с, то есть предел упирался не в данные, а в собственную арифметику.
+ *
+ * Байтовый предел ведёт себя одинаково при любом размере чтения. Второй предел, по числу
+ * чтений, оставлен большим — он страхует от бесконечного цикла на потоке из однобайтовых
+ * порций, а не ограничивает скорость. */
+#define DRAIN_MAX_BYTES  (192 * 1024)
+#define DRAIN_MAX_READS  256
 
 /* Сколько пакетов забираем из TUN за один проход. Подтверждения клиента идут густо, и по
  * одному за проход они ограничивали скорость числом проходов цикла. Предел оставлен, чтобы
@@ -112,9 +166,16 @@ static struct conn g_conns[MAX_CONNS];
  * poll, сколько прочитали у сервера и какими порциями, сколько записали клиенту и по чём,
  * и сколько раз не стали читать из-за окна клиента. */
 static int g_stats;
+/* Считается ВСЕГДА, а не только с диагностикой: по нему цикл решает, был ли проход
+ * пустым. Привязать это к счётчикам статистики значило бы, что без неё поведение другое. */
+static uint64_t g_rx_total;
 static struct {
     uint64_t iters, poll_ns, tun_reads, tun_writes, tun_write_ns;
     uint64_t recs, rec_bytes, win_skips, drain_full;
+    uint64_t recv_ns, pkt_ns, tun_read_ns;
+    /* Сколько соединений было живо на последнем проходе: «поток встал» и «поток закрылся»
+     * в остальных числах выглядят одинаково — оба дают нули. */
+    uint32_t conns;
     /* Окно клиента, каким мы его посчитали, и сколько было в пути в момент отказа: без
      * этих двух чисел «ждали окна» не отличить от «неверно прочитали окно». */
     uint32_t win_min, win_max, inflight_max;
@@ -133,7 +194,9 @@ static void stats_dump(uint64_t window_ns) {
     fprintf(stderr,
             "tun-stats: %.1f МБ/с | циклов %.0f/с | poll %.0f%% | чтений у сервера %.0f/с "
             "(по %.1f КБ) | записей клиенту %.0f/с (%.0f мкс) | ждали окна %.0f/с | "
-            "предел чтения %.0f/с | окно клиента %u..%u (масштаб %u), в пути до %u\n",
+            "предел чтения %.0f/с | соединений %u | окно клиента %u..%u (масштаб %u), "
+            "в пути до %u | "
+            "чтение у сервера %.0f%% | разбор из TUN %.0f%% | чтение из TUN %.0f%%\n",
             (double)g_st.rec_bytes / s / 1048576.0,
             (double)g_st.iters / s,
             100.0 * (double)g_st.poll_ns / (double)window_ns,
@@ -143,8 +206,12 @@ static void stats_dump(uint64_t window_ns) {
             g_st.tun_writes ? (double)g_st.tun_write_ns / (double)g_st.tun_writes / 1000.0 : 0.0,
             (double)g_st.win_skips / s,
             (double)g_st.drain_full / s,
+            g_st.conns,
             g_st.win_min == 0xFFFFFFFFu ? 0 : g_st.win_min, g_st.win_max,
-            g_st.wscale_seen, g_st.inflight_max);
+            g_st.wscale_seen, g_st.inflight_max,
+            100.0 * (double)g_st.recv_ns / (double)window_ns,
+            100.0 * (double)g_st.pkt_ns / (double)window_ns,
+            100.0 * (double)g_st.tun_read_ns / (double)window_ns);
     memset(&g_st, 0, sizeof(g_st));
     g_st.win_min = 0xFFFFFFFFu;
 }
@@ -235,8 +302,43 @@ static int upstream_send(struct conn *c, const struct vless_node *node,
     return SEND_OK;
 }
 
+/* Отдать клиенту кусок потока как TCP.
+ *
+ * Один вызов на кусок, без промежуточного буфера: данные уходят в устройство прямо оттуда,
+ * где лежат после расшифровки. Прежняя версия собирала их в отдельный массив, потом
+ * копировала оттуда в пакет — то есть каждый байт трафика проходил по памяти трижды.
+ *
+ * Размер куска определяет разгрузка. С ней одним вызовом уходит вся запись целиком, а
+ * нарезку по MSS делает ядро; без неё режем сами по 1460 и платим за каждый сегмент
+ * отдельным вызовом и отдельным проходом по данным ради контрольной суммы. */
+static int emit_to_client(struct conn *c, const struct tun_dev *tun,
+                          const unsigned char *p, size_t n) {
+    size_t seg = tun->gso ? (size_t)TUN_GSO_MAX : (size_t)TUN_MSS;
+    size_t sent = 0;
+    while (sent < n) {
+        size_t chunk = n - sent > seg ? seg : n - sent;
+        unsigned char hdr[TUN_HDR_LEN];
+        /* Отвечаем от имени сервера: адреса и порты наоборот. */
+        tcp_hdr_build(hdr, c->key.dst, c->key.src, c->key.dport, c->key.sport,
+                      c->our_seq, c->client_seq, TCP_ACK | TCP_PSH, chunk, 65535);
+        uint64_t w0 = g_stats ? now_ns() : 0;
+        if (tun_write_data(tun, hdr, p + sent, chunk) != 0) {
+            TR("запись в TUN не удалась (%zu байт): %s\n", chunk, strerror(errno));
+            return -1;
+        }
+        if (g_stats) { g_st.tun_writes++; g_st.tun_write_ns += now_ns() - w0; }
+        c->our_seq += (uint32_t)chunk;
+        sent += chunk;
+        /* Данные несут подтверждение в своём заголовке, поэтому отдельный ACK клиенту
+         * больше не нужен. */
+        c->ack_due = 0;
+    }
+    return 0;
+}
+
 /* Прочитать у сервера и отдать клиенту как TCP-пакет. */
-static int downstream_pump(struct conn *c, const struct vless_node *node, int tun_fd) {
+static int downstream_pump(struct conn *c, const struct vless_node *node,
+                           const struct tun_dev *tun) {
     /* Статический, а не на стеке: буфер размером с запись TLS — это шестнадцать килобайт
      * стека на каждый вызов, а поток обработки здесь один. */
     static unsigned char buf[TUNNEL_BUF];
@@ -246,7 +348,10 @@ static int downstream_pump(struct conn *c, const struct vless_node *node, int tu
      * пока транспорт был единственный, и это ровно тот случай, когда «работает» и
      * «правильно» разошлись молча. */
     TR("чтение conn#%ld fd=%d\n", (long)(c - g_conns), c->v.fd);
+    uint64_t r0 = g_stats ? now_ns() : 0;
     int rc = vless_recv(&c->v, buf, sizeof(buf), &got);
+    if (g_stats) g_st.recv_ns += now_ns() - r0;
+    g_rx_total += got;
     if (g_stats) { g_st.recs++; g_st.rec_bytes += got; }
     if (rc) { TR("чтение от сервера: rc=%d\n", rc); return rc; }
     /* Ноль байт — законно: приехал служебный кадр HTTP/2, данных пока нет. Принять это за
@@ -278,7 +383,6 @@ static int downstream_pump(struct conn *c, const struct vless_node *node, int tu
         TR("заголовок ответа снят (%zu байт), осталось %zu\n", skip, left);
     }
 
-    unsigned char payload[TUNNEL_BUF];
     size_t total = 0;
 
     while (left) {
@@ -307,9 +411,10 @@ static int downstream_pump(struct conn *c, const struct vless_node *node, int tu
             left = 0;
         }
 
+        /* Отдаём кадр сразу, а не складываем в общий буфер: складывать было незачем — всё
+         * равно потом нарезали, — а стоило это копии всего трафика и предела «не влезло». */
         if (pn) {
-            if (total + pn > sizeof(payload)) break;
-            memcpy(payload + total, p, pn);
+            if (emit_to_client(c, tun, p, pn) != 0) return -1;
             total += pn;
         }
     }
@@ -323,42 +428,12 @@ static int downstream_pump(struct conn *c, const struct vless_node *node, int tu
     }
 
     if (!total) { TR("после разбора данных нет\n"); return 0; }
-
-    /* Нарезаем на сегменты по MSS. Обязательно: за один раз от сервера приезжает до целой
-     * записи TLS — шестнадцать килобайт, — а MTU устройства 1500. Пакет больше MTU ядро в
-     * TUN не принимает, write возвращает ошибку, и данные пропадают.
-     *
-     * Именно так и ломалось: короткие ответы проходили, а длинная передача встаёт, как
-     * только сервер переходит на записи полного размера. Локально спотыкалось на 34 МБ, на
-     * роутере на 16 — то есть «работает, но не до конца», причём место обрыва каждый раз
-     * другое. Отдавать клиенту гигантский сегмент нельзя ещё и по существу: мы синтезируем
-     * TCP, и MSS для него не рекомендация. */
-    static unsigned char pkt[TUNNEL_BUF];
-    size_t sent = 0;
-    while (sent < total) {
-        size_t chunk = total - sent > TUN_MSS ? (size_t)TUN_MSS : total - sent;
-        /* Отвечаем от имени сервера: адреса и порты наоборот. */
-        size_t len = tcp_build(pkt, sizeof(pkt), c->key.dst, c->key.src,
-                               c->key.dport, c->key.sport,
-                               c->our_seq, c->client_seq, TCP_ACK | TCP_PSH,
-                               payload + sent, chunk, 65535, 0);
-        if (!len) return -1;
-        uint64_t w0 = g_stats ? now_ns() : 0;
-        if (write(tun_fd, pkt, len) < 0) {
-            TR("запись в TUN не удалась (%zu байт): %s\n", len, strerror(errno));
-            return -1;
-        }
-        if (g_stats) { g_st.tun_writes++; g_st.tun_write_ns += now_ns() - w0; }
-        c->our_seq += (uint32_t)chunk;
-        sent += chunk;
-    }
-    TR("клиенту %zu байт (%zu сегментов, seq до %u)\n",
-       total, (total + TUN_MSS - 1) / TUN_MSS, c->our_seq);
+    TR("клиенту %zu байт (seq до %u)\n", total, c->our_seq);
     return 0;
 }
 
 /* Один пакет из TUN. */
-static void handle_packet(int tun_fd, const struct vless_node *node,
+static void handle_packet(const struct tun_dev *tun, const struct vless_node *node,
                           const unsigned char *pkt, size_t n) {
     struct flow_key k;
     size_t off = 0;
@@ -402,8 +477,8 @@ static void handle_packet(int tun_fd, const struct vless_node *node,
              * до таймаута, и «сайт не открывается» вместо «отказано в соединении». */
             unsigned char rst[64];
             size_t rl = tcp_build(rst, sizeof(rst), k.dst, k.src, k.dport, k.sport,
-                                  0, c->client_seq, TCP_RST | TCP_ACK, NULL, 0, 0, 0);
-            if (rl) write(tun_fd, rst, rl);
+                                  0, c->client_seq, TCP_RST | TCP_ACK, NULL, 0, 0, 0, -1);
+            if (rl) tun_write_ctl(tun, rst, rl);
             conn_drop(c);
             return;
         }
@@ -411,8 +486,8 @@ static void handle_packet(int tun_fd, const struct vless_node *node,
         unsigned char sa[64];
         size_t sl = tcp_build(sa, sizeof(sa), k.dst, k.src, k.dport, k.sport,
                               c->our_seq++, c->client_seq, TCP_SYN | TCP_ACK,
-                              NULL, 0, 65535, TUN_MSS);
-        if (sl) write(tun_fd, sa, sl);
+                              NULL, 0, 65535, TUN_MSS, OUR_WSCALE);
+        if (sl) tun_write_ctl(tun, sa, sl);
         TR("SYN-ACK отправлен (seq=%u ack=%u)\n", c->our_seq - 1, c->client_seq);
         return;
     }
@@ -435,8 +510,8 @@ static void handle_packet(int tun_fd, const struct vless_node *node,
              * что требует хранить, какая сторона ещё пишет. */
             unsigned char fa[64];
             size_t fl = tcp_build(fa, sizeof(fa), k.dst, k.src, k.dport, k.sport,
-                                  c->our_seq, k.seq + 1, TCP_ACK | TCP_FIN, NULL, 0, 0, 0);
-            if (fl) write(tun_fd, fa, fl);
+                                  c->our_seq, k.seq + 1, TCP_ACK | TCP_FIN, NULL, 0, 0, 0, -1);
+            if (fl) tun_write_ctl(tun, fa, fl);
         }
         conn_drop(c);
         return;
@@ -470,7 +545,7 @@ static void handle_packet(int tun_fd, const struct vless_node *node,
          * — это миллисекунда, на которую стоят остальные. */
         struct pollfd sp = { .fd = c->v.fd, .events = POLLIN };
         if (poll(&sp, 1, 5) > 0 && (sp.revents & POLLIN)) {
-            if (downstream_pump(c, node, tun_fd) != 0) { conn_drop(c); return; }
+            if (downstream_pump(c, node, tun) != 0) { conn_drop(c); return; }
             sr = upstream_send(c, node, pkt + off, data_n);
         }
     }
@@ -488,11 +563,25 @@ static void handle_packet(int tun_fd, const struct vless_node *node,
     }
     c->client_seq += (uint32_t)data_n;
 
-    /* Подтверждаем приём: без ACK клиент будет повторять пакет, считая его потерянным. */
-    unsigned char ackp[64];
-    size_t al = tcp_build(ackp, sizeof(ackp), k.dst, k.src, k.dport, k.sport,
-                          c->our_seq, c->client_seq, TCP_ACK, NULL, 0, 65535, 0);
-    if (al) write(tun_fd, ackp, al);
+    /* Подтверждение ОТКЛАДЫВАЕМ до конца разбора порции из TUN. Без ACK клиент повторит
+     * пакет, считая его потерянным, — но подтверждать каждый пакет отдельной записью в
+     * устройство незачем: за проход их приезжает до шестидесяти четырёх, и все они
+     * подтверждаются одним ACK с последним номером. */
+    c->ack_due = 1;
+}
+
+/* Разослать отложенные подтверждения. Вызывается после разбора порции пакетов из TUN. */
+static void flush_acks(const struct tun_dev *tun) {
+    for (int i = 0; i < MAX_CONNS; i++) {
+        struct conn *c = &g_conns[i];
+        if (!c->used || !c->ack_due) continue;
+        c->ack_due = 0;
+        unsigned char ackp[64];
+        size_t al = tcp_build(ackp, sizeof(ackp), c->key.dst, c->key.src,
+                              c->key.dport, c->key.sport,
+                              c->our_seq, c->client_seq, TCP_ACK, NULL, 0, 65535, 0, -1);
+        if (al) tun_write_ctl(tun, ackp, al);
+    }
 }
 
 int run_quiet(const char *const argv[]);   /* из steer.c */
@@ -524,12 +613,21 @@ static void tun_bring_up(const char *dev, int table) {
     run_quiet(a);
     const char *u[] = { "ip", "link", "set", "dev", dev, "up", NULL };
     run_quiet(u);
+    /* Очередь устройства — 500 пакетов по умолчанию, а мы пишем в него по семь тысяч
+     * пакетов в секунду. Полная очередь означает EAGAIN и ожидание на каждой записи, то
+     * есть скорость, определяемую не каналом, а нашими паузами. Четыре тысячи пакетов —
+     * это 5,8 МБ, меньше секунды буферизации на быстром канале и никакой памяти зря:
+     * очередь занимает столько, сколько в ней реально лежит. */
+    const char *q[] = { "ip", "link", "set", "dev", dev, "txqueuelen", "4096", NULL };
+    run_quiet(q);
 }
 
 int tunnel_run(struct output *o, const struct vless_node *node) {
     const char *dev = o->device;
-    int tun_fd = tun_open(dev);
-    if (tun_fd < 0) return tun_fd;
+    struct tun_dev tun;
+    int orc = tun_open(&tun, dev);
+    if (orc < 0) return orc;
+    int tun_fd = tun.fd;
     /* Неблокирующее чтение: цикл вычерпывает устройство до EAGAIN, и без этого флага
      * последнее чтение засыпало бы, останавливая все соединения. */
     int fl = fcntl(tun_fd, F_GETFL, 0);
@@ -547,6 +645,11 @@ int tunnel_run(struct output *o, const struct vless_node *node) {
     fprintf(stderr, "steer tunnel: %s привязан к таблице %d\n", dev, o->table);
     fprintf(stderr, "steer tunnel: %s -> %s (%s:%u %s%s)\n", dev, node->name,
             node->host, node->port, node->type, node->flow[0] ? " +vision" : "");
+    /* Печатается всегда: без разгрузки скорость отдачи клиенту падает в разы, и знать,
+     * досталась она нам или нет, надо до замеров, а не после. */
+    fprintf(stderr, "steer tunnel: разгрузка записи в %s %s\n", dev,
+            tun.gso ? "включена (сегменты до 16 КБ, суммы считает ядро)"
+                    : "НЕДОСТУПНА — нарезаем по 1460 и считаем суммы сами");
 
     g_trace = getenv("STEER_TUN_TRACE") != NULL;
     g_stats = getenv("STEER_TUN_STATS") != NULL;
@@ -572,16 +675,23 @@ int tunnel_run(struct output *o, const struct vless_node *node) {
              * навсегда: клиент подтверждает старое, мы отдаём новое, и никто не сходится.
              *
              * Замер: на роутере без этой проверки передача вставала на втором мегабайте. */
-            if (g_conns[i].our_seq - g_conns[i].client_ack >= client_room(&g_conns[i])) {
-                if (g_stats) {
-                    uint32_t room = client_room(&g_conns[i]);
-                    uint32_t infl = g_conns[i].our_seq - g_conns[i].client_ack;
-                    g_st.win_skips++;
-                    if (room < g_st.win_min) g_st.win_min = room;
-                    if (room > g_st.win_max) g_st.win_max = room;
-                    if (infl > g_st.inflight_max) g_st.inflight_max = infl;
-                    g_st.wscale_seen = g_conns[i].client_wscale;
-                }
+            /* Окно и «в пути» пишем ВСЕГДА, а не только когда отказались читать.
+             *
+             * Прежде они считались внутри ветки отказа, и при «ждали окна 0/с» в отчёте
+             * стояли нули — то есть ровно там, где надо понять, почему поток встал, чисел
+             * не было вовсе. А встать он может и не упираясь в окно: сегмент, отброшенный
+             * приёмником, мы не повторим никогда, и выглядит это как тишина при свободном
+             * окне. Различить два случая можно только видя оба числа. */
+            if (g_stats) {
+                uint32_t room = client_room(&g_conns[i]);
+                uint32_t infl = g_conns[i].our_seq - g_conns[i].client_ack;
+                if (room < g_st.win_min) g_st.win_min = room;
+                if (room > g_st.win_max) g_st.win_max = room;
+                if (infl > g_st.inflight_max) g_st.inflight_max = infl;
+                g_st.wscale_seen = g_conns[i].client_wscale;
+            }
+            if (!client_can_take_record(&g_conns[i])) {
+                if (g_stats) g_st.win_skips++;
                 continue;
             }
             pf[nf].fd = g_conns[i].v.fd;
@@ -589,7 +699,17 @@ int tunnel_run(struct output *o, const struct vless_node *node) {
             map[nf - 1] = &g_conns[i];
             nf++;
         }
+        if (g_stats) {
+            uint32_t live = 0;
+            for (int i = 0; i < MAX_CONNS; i++) if (g_conns[i].used) live++;
+            g_st.conns = live;
+        }
 
+        /* Паузы на «пустой проход» здесь БЫЛА и убрана. Она душила одиночное соединение:
+         * недособранная запись стоила миллисекунды, то есть ~8 МБ/с потолка — замерено
+         * 9 Мбит/с на одном потоке против 192 на восьми. Остаток записи теперь добирается
+         * коротким ожиданием на самом сокете (см. read_record), поэтому холостых проходов
+         * не остаётся и тормозить цикл незачем. */
         uint64_t p0 = g_stats ? now_ns() : 0;
         int r = poll(pf, (unsigned)nf, 1000);
         if (g_stats) {
@@ -615,11 +735,15 @@ int tunnel_run(struct output *o, const struct vless_node *node) {
              * как EAGAIN, а не как сон. Предел на проход всё равно нужен: иначе поток
              * пакетов от одного клиента не даст дойти до чтения у серверов. */
             for (int k = 0; k < TUN_DRAIN_MAX; k++) {
-                ssize_t rn = read(tun_fd, pkt, sizeof(pkt));
+                uint64_t t0 = g_stats ? now_ns() : 0;
+                ssize_t rn = tun_read_packet(&tun, pkt, sizeof(pkt));
+                uint64_t t1 = g_stats ? now_ns() : 0;
                 if (rn <= 0) break;
-                if (g_stats) g_st.tun_reads++;
-                handle_packet(tun_fd, node, pkt, (size_t)rn);
+                if (g_stats) { g_st.tun_reads++; g_st.tun_read_ns += t1 - t0; }
+                handle_packet(&tun, node, pkt, (size_t)rn);
+                if (g_stats) g_st.pkt_ns += now_ns() - t1;
             }
+            flush_acks(&tun);
         }
         for (int i = 1; i < nf; i++) {
             if (!(pf[i].revents & (POLLIN | POLLHUP | POLLERR))) continue;
@@ -636,22 +760,27 @@ int tunnel_run(struct output *o, const struct vless_node *node) {
              * Предел здесь двойной: окно клиента (иначе потеряем сегмент, а повторной
              * передачи нет) и число записей за проход — чтобы одно активное соединение не
              * заморозило остальные. */
-            int drained = 0;
+            int reads = 0;
+            uint64_t drained_from = g_rx_total;
             for (;;) {
-                if (downstream_pump(c, node, tun_fd) != 0) {
+                if (downstream_pump(c, node, &tun) != 0) {
                     /* Сервер закрыл — сообщаем клиенту FIN, иначе он будет ждать данных,
                      * которых больше не будет. */
                     unsigned char fin[64];
                     size_t fl = tcp_build(fin, sizeof(fin), c->key.dst, c->key.src,
                                           c->key.dport, c->key.sport,
                                           c->our_seq, c->client_seq, TCP_FIN | TCP_ACK,
-                                          NULL, 0, 0, 0);
-                    if (fl) write(tun_fd, fin, fl);
+                                          NULL, 0, 0, 0, -1);
+                    if (fl) tun_write_ctl(&tun, fin, fl);
                     conn_drop(c);
                     break;
                 }
-                if (++drained >= DRAIN_MAX_RECORDS) { if (g_stats) g_st.drain_full++; break; }
-                if (c->our_seq - c->client_ack >= client_room(c)) break;
+                if (++reads >= DRAIN_MAX_READS ||
+                    g_rx_total - drained_from >= DRAIN_MAX_BYTES) {
+                    if (g_stats) g_st.drain_full++;
+                    break;
+                }
+                if (!client_can_take_record(c)) break;
                 /* Есть ли ещё что читать. Без этой проверки следующее чтение заблокируется
                  * на таймауте сокета и остановит весь цикл на секунды. */
                 struct pollfd sp = { .fd = c->v.fd, .events = POLLIN };

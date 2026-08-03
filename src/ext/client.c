@@ -77,7 +77,16 @@ static int io_write(void *ctx, const unsigned char *d, size_t n) {
 static int io_read(void *ctx, unsigned char *d, size_t cap, size_t *got) {
     struct vless_conn *c = ctx;
     /* Прямое копирование: сервер перестал шифровать в нашу сторону, и расшифровывать
-     * теперь нечего — в сокете лежит поток целевого соединения. Читаем как есть. */
+     * теперь нечего — в сокете лежит поток целевого соединения. Читаем как есть.
+     *
+     * Но СНАЧАЛА отдаём то, что уже прочитано у сокета в буфер записей: переход в прямой
+     * режим случается посреди потока, и начало сырых данных к этому моменту обычно уже у
+     * нас. Прочитать сокет, не отдав их, значит выбросить кусок и разъехаться с сервером —
+     * узлы с Vision отдавали ровно ноль байт. */
+    if (c->rx_direct && !c->plain) {
+        size_t pending = tls13_take_pending(&c->tls, d, cap);
+        if (pending) { *got = pending; return 0; }
+    }
     if (c->plain || c->rx_direct) {
         ssize_t r = read(c->fd, d, cap);
         if (r <= 0) return r == 0 ? VLESS_CONN_ECLOSED : VLESS_CONN_EIO;
@@ -522,6 +531,9 @@ int vless_probe_timed(const struct vless_node *node, int timeout_s, char *why, s
 void vless_close(struct vless_conn *c) {
     if (c->fd >= 0) close(c->fd);
     c->fd = -1;
+    /* Контексты шифров живут в куче: без освобождения туннель за час работы утекает на
+     * тысячах соединений. */
+    if (!c->plain) tls13_free(&c->tls);
     c->tls.ready = 0;
 }
 

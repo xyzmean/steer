@@ -3,6 +3,7 @@
 #define STEER_TUN_H
 #include <stdint.h>
 #include <stddef.h>
+#include <sys/types.h>
 
 #define TUN_ENODEV (-40)   /* нет /dev/net/tun — не установлен kmod-tun */
 #define TUN_ESETUP (-41)
@@ -41,14 +42,62 @@ struct flow_key {
  * прямо в скорости выгрузки. */
 #define TUN_MSS 1460
 
-int tun_open(const char *name);
+/* Сколько байт данных отдаём клиенту ОДНИМ write при включённой разгрузке.
+ *
+ * Больше записи TLS смысла не имеет: за раз от сервера всё равно приезжает не больше её,
+ * то есть 16384 байта. Меньше — значит платить за лишние вызовы там, где ядро готово
+ * принять всё сразу. */
+#define TUN_GSO_MAX 16384
+
+/* Заголовок IP+TCP без опций. Данные к нему не приклеиваются: они уходят отдельным
+ * элементом writev, и лишнего копирования потока не остаётся вовсе. */
+#define TUN_HDR_LEN 40
+
+/* Открытое устройство и то, что удалось у него выпросить.
+ *
+ * gso — самое важное поле в этом файле. С ним один write отдаёт ядру до 16 КБ как ОДИН
+ * сегмент с пометкой «нарежь сам по 1460», и ядро нарезает его уже внутри стека, а
+ * контрольные суммы досчитывает по ходу (а на многих LAN-картах их считает железо).
+ * Без него те же 16 КБ — это двенадцать write и двенадцать проходов по всем данным ради
+ * контрольной суммы TCP, вручную, по два байта за итерацию.
+ *
+ * Именно так работают sing-box и wireguard-go, и именно этим объясняется большая часть
+ * разницы в скорости: не крипто, а стоимость отдачи пакетов клиенту. */
+struct tun_dev {
+    int fd;
+    int gso;
+};
+
+int tun_open(struct tun_dev *d, const char *name);
 int ip_parse(const unsigned char *p, size_t n, struct flow_key *k, size_t *payload_off);
 
-/* mss != 0 добавляет опцию MSS — она осмысленна только в SYN и SYN-ACK, в остальных
- * пакетах её просто не бывает. */
+/* Прочитать один пакет, сняв заголовок разгрузки, если устройство его добавляет. */
+ssize_t tun_read_packet(const struct tun_dev *d, unsigned char *buf, size_t cap);
+
+/* Заголовок для сегмента данных: суммы в нём НЕ считаются — их поставит tun_write_data,
+ * потому что только там известно, считать их нам или это сделает ядро. */
+void tcp_hdr_build(unsigned char out[TUN_HDR_LEN],
+                   uint32_t src, uint32_t dst, uint16_t sport, uint16_t dport,
+                   uint32_t seq, uint32_t ack, unsigned char flags,
+                   size_t data_n, uint16_t window);
+
+/* Отдать клиенту заголовок вместе с данными. Данные НЕ копируются.
+ *
+ * Ждёт готовности устройства при заполненной очереди и повторяет: бросить сегмент нельзя,
+ * повторной передачи у нас нет, и потерянный сегмент подвесил бы соединение навсегда.
+ * Возвращает 0 или -1. */
+int tun_write_data(const struct tun_dev *d, unsigned char hdr[TUN_HDR_LEN],
+                   const unsigned char *data, size_t data_n);
+
+/* Служебный пакет, собранный tcp_build: суммы в нём уже посчитаны. Без повторов —
+ * потерянный SYN-ACK или ACK клиент пришлёт заново сам. */
+void tun_write_ctl(const struct tun_dev *d, const unsigned char *pkt, size_t n);
+
+/* mss != 0 добавляет опцию MSS, wscale >= 0 — опцию масштаба окна. Обе осмысленны только
+ * в SYN и SYN-ACK, в остальных пакетах их просто не бывает. */
 size_t tcp_build(unsigned char *out, size_t cap,
                  uint32_t src, uint32_t dst, uint16_t sport, uint16_t dport,
                  uint32_t seq, uint32_t ack, unsigned char flags,
                  const unsigned char *data, size_t data_n, uint16_t window,
-                 unsigned mss);
+                 unsigned mss, int wscale);
 #endif

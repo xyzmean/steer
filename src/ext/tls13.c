@@ -25,6 +25,7 @@
 #include <unistd.h>
 #include <sys/ioctl.h>
 #include <sys/socket.h>
+#include <poll.h>
 
 #include "mbedtls/sha256.h"
 #include "mbedtls/sha512.h"
@@ -91,6 +92,8 @@ static void tr_hash(const struct tls13 *t, unsigned char out[32]) {
 }
 
 /* ---- чтение записей -------------------------------------------------------- */
+/* Чтение по дескриптору — только для рукопожатия: у него ещё нет struct tls13 с буфером,
+ * и оно по своей природе синхронное. */
 static int read_full(int fd, unsigned char *buf, size_t n) {
     size_t got = 0;
     while (got < n) {
@@ -105,35 +108,45 @@ static int read_full(int fd, unsigned char *buf, size_t n) {
     return 0;
 }
 
-/* Одна TLS-запись: 5 байт заголовка, затем тело.
+/* Одна TLS-запись, собранная из буфера соединения.
  *
- * Сначала СПРАШИВАЕМ, пришла ли запись целиком, и только потом читаем. Это главное здесь.
+ * Читаем у сокета КРУПНО и редко: один read() берёт всё, что накопилось (до 16 КБ), а
+ * записи выдаются из буфера без новых вызовов. Прежняя версия спрашивала FIONREAD,
+ * подглядывала заголовок и ждала дособирания записи на каждой итерации — это давало
+ * 16 000 чтений в секунду по 600 байт и 80% времени цикла внутри чтения.
  *
- * Запись в 8 КБ приезжает шестью-семью сегментами TCP. Начав читать по первому из них, мы
- * засыпали в read() до прихода последнего — а сокет блокирующий, и цикл у нас один на все
- * соединения. То есть один недособранный кадр останавливал ВСЁ. Измерено на роутере:
- * poll простаивал 1%, процессор 14%, скорость стояла на 39 Мбит/с — остальные 85% времени
- * процесс спал вот здесь.
- *
- * FIONREAD плюс подглядывание заголовка через MSG_PEEK отвечают на вопрос без буферов:
- * недостающую запись оставляем в сокете и уходим к другим соединениям. Буфер на каждое
- * соединение стоил бы 16 КБ × 64, то есть мегабайт на коробке с пятнадцатью. */
-static int read_record(int fd, unsigned char *type, unsigned char *body, size_t cap,
-                       size_t *body_n, int may_wait) {
-    /* may_wait — для РУКОПОЖАТИЯ. Оно синхронное по своей природе: ServerHello приходит
-     * когда придёт, и вернуть «пока нечего» там некому — вызывающий не умеет продолжить с
-     * середины. Первая версия этого различия не делала, и рукопожатие падало на первой же
-     * недособранной записи: соединение не открывалось, клиенту уходил RST, а выглядело это
-     * как «узел перестал работать». */
-    int avail = 0;
-    if (!may_wait && ioctl(fd, FIONREAD, &avail) == 0) {
-        if (avail < 5) return TLS13_EAGAIN;
-        unsigned char peek[5];
-        ssize_t pk = recv(fd, peek, 5, MSG_PEEK);
-        if (pk < 5) return TLS13_EAGAIN;
-        size_t want = ((size_t)peek[3] << 8) | peek[4];
-        if ((size_t)avail < 5 + want) return TLS13_EAGAIN;
+ * may_wait разделяет два режима: рукопожатие ЖДЁТ (оно синхронное, продолжить с середины
+ * некому), поток данных не ждёт — недособранную запись оставляем в буфере и уходим к
+ * другим соединениям. */
+static int rbuf_fill(struct tls13 *t, int may_wait) {
+    /* Сдвигаем остаток к началу, чтобы место под чтение было непрерывным. */
+    if (t->rbuf_off) {
+        if (t->rbuf_n > t->rbuf_off)
+            memmove(t->rbuf, t->rbuf + t->rbuf_off, t->rbuf_n - t->rbuf_off);
+        t->rbuf_n -= t->rbuf_off;
+        t->rbuf_off = 0;
     }
+    if (t->rbuf_n >= sizeof(t->rbuf)) return TLS13_ETOOBIG;
+
+    if (!may_wait) {
+        struct pollfd p = { .fd = t->fd, .events = POLLIN };
+        int pr = poll(&p, 1, 0);
+        if (pr <= 0 || !(p.revents & POLLIN)) return TLS13_EAGAIN;
+    }
+    ssize_t r = read(t->fd, t->rbuf + t->rbuf_n, sizeof(t->rbuf) - t->rbuf_n);
+    if (r == 0) return TLS13_ECLOSED;
+    if (r < 0) {
+        if (errno == EINTR) return 0;
+        if (errno == EAGAIN || errno == EWOULDBLOCK) return TLS13_EAGAIN;
+        return TLS13_EIO;
+    }
+    t->rbuf_n += (size_t)r;
+    return 0;
+}
+
+/* Для рукопожатия: своего буфера у него ещё нет, а ждать он обязан. */
+static int read_record_fd(int fd, unsigned char *type, unsigned char *body, size_t cap,
+                          size_t *body_n) {
     unsigned char h[5];
     int rc = read_full(fd, h, 5);
     if (rc) return rc;
@@ -146,6 +159,28 @@ static int read_record(int fd, unsigned char *type, unsigned char *body, size_t 
     return 0;
 }
 
+static int read_record(struct tls13 *t, unsigned char *type, unsigned char **body,
+                       size_t *body_n, int may_wait) {
+    for (int guard = 0; guard < 64; guard++) {
+        size_t have = t->rbuf_n - t->rbuf_off;
+        if (have >= 5) {
+            const unsigned char *h = t->rbuf + t->rbuf_off;
+            size_t len = ((size_t)h[3] << 8) | h[4];
+            if (len > TLS13_MAX_REC) return TLS13_EBADREC;
+            if (have >= 5 + len) {
+                *type = h[0];
+                *body = t->rbuf + t->rbuf_off + 5;
+                *body_n = len;
+                t->rbuf_off += 5 + len;
+                return 0;
+            }
+        }
+        int rc = rbuf_fill(t, may_wait);
+        if (rc) return rc;
+    }
+    return TLS13_EAGAIN;
+}
+
 /* ---- AEAD ------------------------------------------------------------------ */
 /* Nonce в TLS 1.3: iv XOR порядковый номер, выровненный вправо. Счётчик свой на каждое
  * направление и НЕ сбрасывается — сброс означал бы повтор nonce, то есть полную потерю
@@ -156,10 +191,42 @@ static void aead_nonce(const unsigned char iv[12], uint64_t seq, unsigned char o
         out[11 - i] ^= (unsigned char)(seq >> (8 * i));
 }
 
+/* Развернуть ключ в контекст шифра. Вызывается один раз на направление, когда ключи
+ * трафика готовы; дальше каждая запись пользуется готовым контекстом. */
+static int keys_setup(struct tls13_keys *k) {
+    if (k->ctx_ready) return 0;
+    if (k->aead == TLS13_AEAD_CHACHA) {
+        mbedtls_chachapoly_init(&k->chacha);
+        if (mbedtls_chachapoly_setkey(&k->chacha, k->key) != 0) return TLS13_ECRYPTO;
+    } else {
+        mbedtls_gcm_init(&k->gcm);
+        if (mbedtls_gcm_setkey(&k->gcm, MBEDTLS_CIPHER_ID_AES, k->key,
+                               (unsigned)k->key_n * 8) != 0)
+            return TLS13_ECRYPTO;
+    }
+    k->ctx_ready = 1;
+    return 0;
+}
+
+static void keys_free(struct tls13_keys *k) {
+    if (!k->ctx_ready) return;
+    if (k->aead == TLS13_AEAD_CHACHA) mbedtls_chachapoly_free(&k->chacha);
+    else mbedtls_gcm_free(&k->gcm);
+    k->ctx_ready = 0;
+}
+
+void tls13_free(struct tls13 *t) {
+    keys_free(&t->rd);
+    keys_free(&t->wr);
+    mbedtls_sha256_free(&t->tr);
+    t->ready = 0;
+}
+
 static int aead_open(struct tls13_keys *k, uint64_t seq,
                      const unsigned char *aad, size_t aad_n,
                      unsigned char *buf, size_t n) {
     if (n < 16) return TLS13_EBADREC;
+    if (!k->ctx_ready) return TLS13_ESTATE;
     unsigned char nonce[12];
     aead_nonce(k->iv, seq, nonce);
     size_t ct = n - 16;
@@ -170,46 +237,54 @@ static int aead_open(struct tls13_keys *k, uint64_t seq,
      * внутреннего устройства незачем, а копия в шестнадцать байт стоит ничего. */
     unsigned char tag[16];
     memcpy(tag, buf + ct, 16);
-    if (k->aead == TLS13_AEAD_CHACHA) {
-        mbedtls_chachapoly_context c;
-        mbedtls_chachapoly_init(&c);
-        int rc = mbedtls_chachapoly_setkey(&c, k->key);
-        if (rc == 0)
-            rc = mbedtls_chachapoly_auth_decrypt(&c, ct, nonce, aad, aad_n, tag, buf, buf);
-        mbedtls_chachapoly_free(&c);
-        return rc == 0 ? 0 : TLS13_EAUTH;
-    }
-    mbedtls_gcm_context g;
-    mbedtls_gcm_init(&g);
-    int rc = mbedtls_gcm_setkey(&g, MBEDTLS_CIPHER_ID_AES, k->key, k->key_n * 8);
-    if (rc == 0)
-        rc = mbedtls_gcm_auth_decrypt(&g, ct, nonce, 12, aad, aad_n, tag, 16, buf, buf);
-    mbedtls_gcm_free(&g);
+    int rc;
+    if (k->aead == TLS13_AEAD_CHACHA)
+        rc = mbedtls_chachapoly_auth_decrypt(&k->chacha, ct, nonce, aad, aad_n, tag, buf, buf);
+    else
+        rc = mbedtls_gcm_auth_decrypt(&k->gcm, ct, nonce, 12, aad, aad_n, tag, 16, buf, buf);
     return rc == 0 ? 0 : TLS13_EAUTH;
 }
 
 static int aead_seal(struct tls13_keys *k, uint64_t seq,
                      const unsigned char *aad, size_t aad_n,
                      unsigned char *buf, size_t n, unsigned char *tag) {
+    if (!k->ctx_ready) return TLS13_ESTATE;
     unsigned char nonce[12];
     aead_nonce(k->iv, seq, nonce);
-    if (k->aead == TLS13_AEAD_CHACHA) {
-        mbedtls_chachapoly_context c;
-        mbedtls_chachapoly_init(&c);
-        int rc = mbedtls_chachapoly_setkey(&c, k->key);
-        if (rc == 0)
-            rc = mbedtls_chachapoly_encrypt_and_tag(&c, n, nonce, aad, aad_n, buf, buf, tag);
-        mbedtls_chachapoly_free(&c);
-        return rc == 0 ? 0 : TLS13_ECRYPTO;
-    }
-    mbedtls_gcm_context g;
-    mbedtls_gcm_init(&g);
-    int rc = mbedtls_gcm_setkey(&g, MBEDTLS_CIPHER_ID_AES, k->key, k->key_n * 8);
-    if (rc == 0)
-        rc = mbedtls_gcm_crypt_and_tag(&g, MBEDTLS_GCM_ENCRYPT, n, nonce, 12,
+    int rc;
+    if (k->aead == TLS13_AEAD_CHACHA)
+        rc = mbedtls_chachapoly_encrypt_and_tag(&k->chacha, n, nonce, aad, aad_n, buf, buf, tag);
+    else
+        rc = mbedtls_gcm_crypt_and_tag(&k->gcm, MBEDTLS_GCM_ENCRYPT, n, nonce, 12,
                                        aad, aad_n, buf, buf, 16, tag);
-    mbedtls_gcm_free(&g);
     return rc == 0 ? 0 : TLS13_ECRYPTO;
+}
+
+/* Те же две операции, но с одноразовым контекстом — для РУКОПОЖАТИЯ.
+ *
+ * Оно проходит по три-четыре записи на соединение, поэтому цена разворота ключа здесь не
+ * значит ничего, а взамен не приходится освобождать контексты на десятке путей выхода по
+ * ошибке. Постоянные контексты стоят там, где идёт поток, — и только там. */
+static int aead_open_once(const struct tls13_keys *src, uint64_t seq,
+                          const unsigned char *aad, size_t aad_n,
+                          unsigned char *buf, size_t n) {
+    struct tls13_keys k = *src;
+    k.ctx_ready = 0;
+    int rc = keys_setup(&k);
+    if (rc == 0) rc = aead_open(&k, seq, aad, aad_n, buf, n);
+    keys_free(&k);
+    return rc;
+}
+
+static int aead_seal_once(const struct tls13_keys *src, uint64_t seq,
+                          const unsigned char *aad, size_t aad_n,
+                          unsigned char *buf, size_t n, unsigned char *tag) {
+    struct tls13_keys k = *src;
+    k.ctx_ready = 0;
+    int rc = keys_setup(&k);
+    if (rc == 0) rc = aead_seal(&k, seq, aad, aad_n, buf, n, tag);
+    keys_free(&k);
+    return rc;
 }
 
 /* ---- рукопожатие ----------------------------------------------------------- */
@@ -233,7 +308,7 @@ int tls13_handshake(struct tls13 *t, int fd,
     size_t n;
 
     /* ServerHello. */
-    int rc = read_record(fd, &type, rec, sizeof(rec), &n, 1);
+    int rc = read_record_fd(fd, &type, rec, sizeof(rec), &n);
     if (rc) return rc;
     if (type != 0x16 || n < 44 || rec[0] != 0x02) return TLS13_EBADREC;
     tr_add(t, rec, n);
@@ -335,14 +410,14 @@ int tls13_handshake(struct tls13 *t, int fd,
     int got_finished = 0;
     unsigned char server_finished[32];
     for (int guard = 0; guard < 16 && !got_finished; guard++) {
-        rc = read_record(fd, &type, rec, sizeof(rec), &n, 1);
+        rc = read_record_fd(fd, &type, rec, sizeof(rec), &n);
         if (rc) return rc;
         if (type == 0x14) continue;             /* ChangeCipherSpec: игнор в 1.3 */
         if (type != 0x17) return TLS13_EBADREC;
 
         unsigned char aad[5] = { 0x17, 0x03, 0x03,
                                  (unsigned char)(n >> 8), (unsigned char)n };
-        rc = aead_open(&s_hk, s_seq++, aad, 5, rec, n);
+        rc = aead_open_once(&s_hk, s_seq++, aad, 5, rec, n);
         if (rc) return rc;
         size_t pt = n - 16;
         /* Последний непустой байт — настоящий тип записи (RFC 8446 §5.4). */
@@ -426,7 +501,7 @@ int tls13_handshake(struct tls13 *t, int fd,
         out[0] = 0x17; out[1] = 0x03; out[2] = 0x03;
         out[3] = (unsigned char)(total >> 8); out[4] = (unsigned char)total;
         memcpy(out + 5, pt, pl);
-        if (aead_seal(&c_hk, 0, out, 5, out + 5, pl, out + 5 + pl) != 0) return TLS13_ECRYPTO;
+        if (aead_seal_once(&c_hk, 0, out, 5, out + 5, pl, out + 5 + pl) != 0) return TLS13_ECRYPTO;
         if (write(fd, out, 5 + total) != (ssize_t)(5 + total)) return TLS13_EIO;
     }
 
@@ -443,9 +518,21 @@ int tls13_handshake(struct tls13 *t, int fd,
     if (expand_label(md, c_ap, H, "iv", NULL, 0, t->wr.iv, 12) != 0) return TLS13_ECRYPTO;
     if (expand_label(md, s_ap, H, "key", NULL, 0, t->rd.key, t->rd.key_n) != 0) return TLS13_ECRYPTO;
     if (expand_label(md, s_ap, H, "iv", NULL, 0, t->rd.iv, 12) != 0) return TLS13_ECRYPTO;
+    /* Ключи трафика больше не меняются — разворачиваем их в контексты шифров здесь, и
+     * дальше поток идёт без единого setkey. */
+    if (keys_setup(&t->wr) != 0 || keys_setup(&t->rd) != 0) return TLS13_ECRYPTO;
     t->wr_seq = t->rd_seq = 0;
     t->ready = 1;
     return 0;
+}
+
+size_t tls13_take_pending(struct tls13 *t, unsigned char *out, size_t cap) {
+    size_t have = t->rbuf_n - t->rbuf_off;
+    if (!have) return 0;
+    if (have > cap) have = cap;
+    memcpy(out, t->rbuf + t->rbuf_off, have);
+    t->rbuf_off += have;
+    return have;
 }
 
 /* ---- обмен данными --------------------------------------------------------- */
@@ -497,10 +584,12 @@ int tls13_read(struct tls13 *t, unsigned char *out, size_t cap, size_t *got) {
     if (!t->ready) return TLS13_ESTATE;
     *got = 0;
 
-    unsigned char rec[TLS13_MAX_REC];
+    /* Запись расшифровывается НА МЕСТЕ в буфере соединения: копировать её ещё раз значило
+     * бы гонять по памяти лишние 16 КБ на каждую запись. */
+    unsigned char *rec = NULL;
     unsigned char type;
-    size_t n;
-    int rc = read_record(t->fd, &type, rec, sizeof(rec), &n, 0);
+    size_t n = 0;
+    int rc = read_record(t, &type, &rec, &n, 0);
     /* Записи целиком нет — это «пока нечего», а не сбой: вызывающий просто придёт снова. */
     if (rc == TLS13_EAGAIN) return 0;
     if (rc) return rc;

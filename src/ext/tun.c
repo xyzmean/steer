@@ -21,6 +21,7 @@
 #define _GNU_SOURCE
 #include <stdio.h>
 #include <stdlib.h>
+#include <stdint.h>
 #include <string.h>
 #include <unistd.h>
 #include <errno.h>
@@ -32,10 +33,40 @@
 #include <netinet/in.h>
 #include <arpa/inet.h>
 #include <poll.h>
+#include <sys/uio.h>
 
 #include "tun.h"
 
-int tun_open(const char *name) {
+/* Заголовок разгрузки virtio, тот самый, который принимает IFF_VNET_HDR.
+ *
+ * Объявлен здесь, а не взят из <linux/virtio_net.h>: тот тянет virtio_types и с musl
+ * собирается не на всех версиях ядерных headers, а нам нужны ровно эти десять байт.
+ *
+ * Числа в ПОРЯДКЕ ХОСТА, а не в сетевом. Это не небрежность: tun согласовывает порядок
+ * только через VIRTIO_F_VERSION_1, которого он не объявляет, поэтому ядро читает поля
+ * как __virtio16 в legacy-режиме — то есть родным порядком. Среди целей сборки есть
+ * mips_24kc, он big-endian; фиксированный little-endian сломал бы разгрузку именно на нём,
+ * и выглядело бы это как «на одной архитектуре пакеты не доходят». */
+struct vnet_hdr {
+    uint8_t flags;
+    uint8_t gso_type;
+    uint16_t hdr_len;
+    uint16_t gso_size;
+    uint16_t csum_start;
+    uint16_t csum_offset;
+};
+#define VNET_HDR_LEN 10
+#define VNET_F_NEEDS_CSUM 1
+#define VNET_GSO_NONE     0
+#define VNET_GSO_TCPV4    1
+/* Раскладка обязана совпасть с ядерной побайтово: лишний байт выравнивания сдвинул бы
+ * всё, и ядро прочитало бы gso_size там, где лежит csum_start. */
+typedef char vnet_hdr_size_check[sizeof(struct vnet_hdr) == VNET_HDR_LEN ? 1 : -1];
+
+int tun_open(struct tun_dev *d, const char *name) {
+    d->fd = -1;
+    d->gso = 0;
+
     int fd = open("/dev/net/tun", O_RDWR);
     if (fd < 0) return TUN_ENODEV;
 
@@ -43,14 +74,46 @@ int tun_open(const char *name) {
     memset(&ifr, 0, sizeof(ifr));
     /* IFF_NO_PI: без 4-байтного префикса протокола. Он нужен только тому, кто хочет
      * различать семейства на одном устройстве, а у нас IPv4 и разбор всё равно по
-     * заголовку пакета. */
-    ifr.ifr_flags = IFF_TUN | IFF_NO_PI;
+     * заголовку пакета.
+     *
+     * IFF_VNET_HDR: разрешает писать в устройство сегмент больше MTU с пометкой «нарежь
+     * по столько», а контрольную сумму TCP оставить недосчитанной. Просим сначала с ним,
+     * и только если ядро откажет — без него: на старом ядре без поддержки это единственный
+     * способ узнать, есть она или нет, а ронять туннель из-за отсутствия УСКОРЕНИЯ нельзя.
+     *
+     * TUNSETOFFLOAD мы НЕ вызываем, и это осознанно. Он описывает, что мы готовы принимать
+     * ОТ ядра, то есть включил бы приход суперпакетов и в обратную сторону — а для них
+     * пришлось бы всюду держать буферы по 64 КБ вместо 16. Отдача клиенту, где выигрыш и
+     * лежит, от него не зависит: разгрузку на запись включает сам vnet_hdr. */
     snprintf(ifr.ifr_name, IFNAMSIZ, "%s", name);
-    if (ioctl(fd, TUNSETIFF, &ifr) < 0) {
-        close(fd);
-        return TUN_ESETUP;
+    ifr.ifr_flags = IFF_TUN | IFF_NO_PI | IFF_VNET_HDR;
+    /* STEER_TUN_NOGSO отключает разгрузку принудительно. Нужно для замеров: «стало быстрее»
+     * без возможности вернуться на прежний путь одной переменной — это утверждение, которое
+     * нельзя перепроверить на том же железе и той же подписке. */
+    if (!getenv("STEER_TUN_NOGSO") && ioctl(fd, TUNSETIFF, &ifr) == 0) {
+        d->gso = 1;
+    } else {
+        memset(&ifr, 0, sizeof(ifr));
+        snprintf(ifr.ifr_name, IFNAMSIZ, "%s", name);
+        ifr.ifr_flags = IFF_TUN | IFF_NO_PI;
+        if (ioctl(fd, TUNSETIFF, &ifr) < 0) {
+            close(fd);
+            return TUN_ESETUP;
+        }
     }
-    return fd;
+    d->fd = fd;
+    return 0;
+}
+
+ssize_t tun_read_packet(const struct tun_dev *d, unsigned char *buf, size_t cap) {
+    if (!d->gso) return read(d->fd, buf, cap);
+    /* Заголовок разгрузки приезжает и на чтении — он нам не нужен (без TUNSETOFFLOAD ядро
+     * отдаёт обычные пакеты), но снять его обязаны, иначе разбор поедет на десять байт. */
+    struct vnet_hdr vh;
+    struct iovec iov[2] = { { &vh, sizeof(vh) }, { buf, cap } };
+    ssize_t r = readv(d->fd, iov, 2);
+    if (r <= (ssize_t)sizeof(vh)) return r <= 0 ? r : 0;
+    return r - (ssize_t)sizeof(vh);
 }
 
 /* ---- разбор IP-заголовка --------------------------------------------------- */
@@ -137,12 +200,163 @@ static uint16_t csum_fin(uint32_t acc) {
 
 /* Собрать TCP-пакет для отправки клиенту. Адреса и порты меняются местами: мы отвечаем
  * от имени того, к кому клиент обращался. */
+/* Заголовок IP и TCP без опций, поля сумм оставлены нулями.
+ *
+ * Отдельно от tcp_build потому, что для потока данных сумму TCP считать может НЕ НАДО:
+ * при разгрузке её досчитывает ядро, и это ровно та экономия, ради которой разгрузка и
+ * включается. Смешивать «собрать заголовок» и «посчитать сумму по всем данным» в одной
+ * функции значило бы платить за вторую там, где она не нужна. */
+void tcp_hdr_build(unsigned char out[TUN_HDR_LEN],
+                   uint32_t src, uint32_t dst, uint16_t sport, uint16_t dport,
+                   uint32_t seq, uint32_t ack, unsigned char flags,
+                   size_t data_n, uint16_t window) {
+    size_t total = TUN_HDR_LEN + data_n;
+    memset(out, 0, TUN_HDR_LEN);
+    out[0] = 0x45;
+    out[2] = (unsigned char)(total >> 8);
+    out[3] = (unsigned char)total;
+    out[8] = 64;
+    out[9] = 6;
+    memcpy(out + 12, &src, 4);
+    memcpy(out + 16, &dst, 4);
+    uint16_t ipsum = csum_fin(csum_add(out, 20, 0));
+    out[10] = (unsigned char)(ipsum >> 8);
+    out[11] = (unsigned char)ipsum;
+
+    unsigned char *t = out + 20;
+    t[0] = (unsigned char)(sport >> 8); t[1] = (unsigned char)sport;
+    t[2] = (unsigned char)(dport >> 8); t[3] = (unsigned char)dport;
+    t[4] = (unsigned char)(seq >> 24); t[5] = (unsigned char)(seq >> 16);
+    t[6] = (unsigned char)(seq >> 8);  t[7] = (unsigned char)seq;
+    t[8] = (unsigned char)(ack >> 24); t[9] = (unsigned char)(ack >> 16);
+    t[10] = (unsigned char)(ack >> 8); t[11] = (unsigned char)ack;
+    t[12] = 0x50;                                    /* data offset 5 слов, опций нет */
+    t[13] = flags;
+    t[14] = (unsigned char)(window >> 8); t[15] = (unsigned char)window;
+}
+
+/* Сумма псевдозаголовка TCP: адреса, протокол, длина. */
+static uint32_t tcp_pseudo_sum(uint32_t src, uint32_t dst, size_t tcp_len) {
+    unsigned char pseudo[12];
+    memcpy(pseudo, &src, 4);
+    memcpy(pseudo + 4, &dst, 4);
+    pseudo[8] = 0; pseudo[9] = 6;
+    pseudo[10] = (unsigned char)(tcp_len >> 8); pseudo[11] = (unsigned char)tcp_len;
+    return csum_add(pseudo, 12, 0);
+}
+
+/* Дождаться, пока в очереди устройства освободится место, и повторить запись.
+ *
+ * Очередь заполняется на любом пике скорости, и write отвечает EAGAIN — устройство у нас
+ * неблокирующее (иначе последнее чтение в цикле засыпало бы). Считать это отказом
+ * соединения нельзя: очередь разгружается за микросекунды, а первая версия так и делала —
+ * скачивание пропадало совсем.
+ *
+ * Ожидание миллисекунда, а не десять: замерено, что десять превращались в потолок скорости
+ * (110 проходов цикла в секунду при простое poll в 0%). */
+static int tun_writev(const struct tun_dev *d, struct iovec *iov, int n) {
+    for (int attempts = 0;;) {
+        if (writev(d->fd, iov, n) >= 0) return 0;
+        if (errno == EINTR) continue;
+        if ((errno != EAGAIN && errno != EWOULDBLOCK) || ++attempts > 200) return -1;
+        struct pollfd wp = { .fd = d->fd, .events = POLLOUT };
+        poll(&wp, 1, 1);
+    }
+}
+
+int tun_write_data(const struct tun_dev *d, unsigned char hdr[TUN_HDR_LEN],
+                   const unsigned char *data, size_t data_n) {
+    struct iovec iov[3];
+    int n = 0;
+    struct vnet_hdr vh;
+    size_t tcp_len = 20 + data_n;
+    /* Адреса берём из уже собранного заголовка через memcpy, а не сдвигами: в flow_key они
+     * лежат в СЕТЕВОМ порядке внутри uint32_t, и сборка сдвигами дала бы верный результат
+     * только на little-endian — то есть mips_24kc считал бы сумму от перевёрнутых адресов. */
+    uint32_t src, dst;
+    memcpy(&src, hdr + 12, 4);
+    memcpy(&dst, hdr + 16, 4);
+
+    if (d->gso) {
+        /* Сумму ставим НЕДОСЧИТАННОЙ: только псевдозаголовок, без прохода по данным.
+         * Досчитает ядро — так же, как для любого сокета с CHECKSUM_PARTIAL.
+         *
+         * В поле check кладётся свёрнутая, но НЕ инвертированная сумма псевдозаголовка с
+         * НАСТОЯЩЕЙ длиной всего сегмента. Это тот же вид, который ядро само себе готовит
+         * в __tcp_v4_send_check: `th->check = ~tcp_v4_check(skb->len, saddr, daddr, 0)`.
+         * Поправку на длину каждого куска при нарезке вносит tcp_gso_segment. Инвертировать
+         * здесь ещё раз означало бы отдать сумму, которая не сойдётся ни у одного куска, —
+         * а выглядело бы это как «пакеты уходят, клиент их не видит». */
+        uint16_t partial = (uint16_t)~csum_fin(tcp_pseudo_sum(
+                src, dst, tcp_len));
+        hdr[20 + 16] = (unsigned char)(partial >> 8);
+        hdr[20 + 17] = (unsigned char)partial;
+
+        memset(&vh, 0, sizeof(vh));
+        vh.flags = VNET_F_NEEDS_CSUM;
+        vh.csum_start = 20;                          /* начало заголовка TCP */
+        vh.csum_offset = 16;                         /* поле check внутри него */
+        vh.hdr_len = TUN_HDR_LEN;
+        /* Нарезку просим только когда резать есть что: пометка GSO на сегменте в один MSS
+         * лишней работы ядру не добавляет, но и смысла не несёт. */
+        if (data_n > TUN_MSS) {
+            vh.gso_type = VNET_GSO_TCPV4;
+            vh.gso_size = TUN_MSS;
+        }
+        iov[n].iov_base = &vh;
+        iov[n].iov_len = sizeof(vh);
+        n++;
+    } else {
+        /* Без разгрузки сумму приходится считать самим, и это проход по ВСЕМ данным. */
+        uint32_t acc = tcp_pseudo_sum(src, dst, tcp_len);
+        acc = csum_add(hdr + 20, 20, acc);
+        acc = csum_add(data, data_n, acc);
+        uint16_t tsum = csum_fin(acc);
+        hdr[20 + 16] = (unsigned char)(tsum >> 8);
+        hdr[20 + 17] = (unsigned char)tsum;
+    }
+
+    iov[n].iov_base = hdr;
+    iov[n].iov_len = TUN_HDR_LEN;
+    n++;
+    if (data_n) {
+        iov[n].iov_base = (void *)(uintptr_t)data;
+        iov[n].iov_len = data_n;
+        n++;
+    }
+    return tun_writev(d, iov, n);
+}
+
+void tun_write_ctl(const struct tun_dev *d, const unsigned char *pkt, size_t n) {
+    struct iovec iov[2];
+    int i = 0;
+    struct vnet_hdr vh;
+    if (d->gso) {
+        /* Суммы в служебном пакете уже посчитаны, поэтому ядру сообщаем «ничего не надо». */
+        memset(&vh, 0, sizeof(vh));
+        vh.gso_type = VNET_GSO_NONE;
+        iov[i].iov_base = &vh;
+        iov[i].iov_len = sizeof(vh);
+        i++;
+    }
+    iov[i].iov_base = (void *)(uintptr_t)pkt;
+    iov[i].iov_len = n;
+    i++;
+    /* Без повторов и без проверки: потерянный SYN-ACK или ACK клиент пришлёт заново сам,
+     * а вешать на это ожидание значило бы задержать весь цикл ради пакета без данных. */
+    (void)!writev(d->fd, iov, i);
+}
+
 size_t tcp_build(unsigned char *out, size_t cap,
                  uint32_t src, uint32_t dst, uint16_t sport, uint16_t dport,
                  uint32_t seq, uint32_t ack, unsigned char flags,
                  const unsigned char *data, size_t data_n, uint16_t window,
-                 unsigned mss) {
-    size_t opt_n = mss ? 4 : 0;
+                 unsigned mss, int wscale) {
+    /* Опции: MSS занимает 4 байта, масштаб окна 3, и вместе они дают 7 — а длина
+     * заголовка TCP измеряется в 32-битных словах. Дополняем NOP до восьми. */
+    size_t opt_n = 0;
+    if (mss) opt_n += 4;
+    if (wscale >= 0) opt_n += 4;                     /* NOP + kind + len + shift */
     size_t total = 20 + 20 + opt_n + data_n;
     if (total > cap) return 0;
     memset(out, 0, 40 + opt_n);
@@ -169,22 +383,22 @@ size_t tcp_build(unsigned char *out, size_t cap,
     t[12] = (unsigned char)(((20 + opt_n) / 4) << 4); /* data offset в 32-битных словах */
     t[13] = flags;
     t[14] = (unsigned char)(window >> 8); t[15] = (unsigned char)window;
-    if (opt_n) {
-        t[20] = 2;                                   /* kind: MSS */
-        t[21] = 4;                                   /* длина опции */
-        t[22] = (unsigned char)(mss >> 8);
-        t[23] = (unsigned char)mss;
+    size_t o = 20;
+    if (mss) {
+        t[o++] = 2;                                  /* kind: MSS */
+        t[o++] = 4;                                  /* длина опции */
+        t[o++] = (unsigned char)(mss >> 8);
+        t[o++] = (unsigned char)mss;
+    }
+    if (wscale >= 0) {
+        t[o++] = 1;                                  /* NOP: выравнивание до слова */
+        t[o++] = 3;                                  /* kind: масштаб окна */
+        t[o++] = 3;                                  /* длина опции */
+        t[o++] = (unsigned char)wscale;
     }
     if (data_n) memcpy(t + 20 + opt_n, data, data_n);
 
-    /* Псевдозаголовок TCP: адреса, протокол, длина — иначе сумма не сойдётся у клиента. */
-    unsigned char pseudo[12];
-    memcpy(pseudo, &src, 4);
-    memcpy(pseudo + 4, &dst, 4);
-    pseudo[8] = 0; pseudo[9] = 6;
-    uint16_t tlen = (uint16_t)(20 + opt_n + data_n);
-    pseudo[10] = (unsigned char)(tlen >> 8); pseudo[11] = (unsigned char)tlen;
-    uint32_t acc = csum_add(pseudo, 12, 0);
+    uint32_t acc = tcp_pseudo_sum(src, dst, 20 + opt_n + data_n);
     acc = csum_add(t, 20 + opt_n + data_n, acc);
     uint16_t tsum = csum_fin(acc);
     t[16] = (unsigned char)(tsum >> 8);
