@@ -5,15 +5,21 @@
  * открываем свой поток VLESS и дальше переносим байты, подтверждая клиенту приём так, как
  * это сделал бы настоящий стек.
  *
- * Почему это НЕ полный стек TCP и почему так можно. Мы не реализуем повторную передачу,
- * управление окном и алгоритмы перегрузки — их делает клиент на своей стороне и сервер на
- * своей. Наша задача уже: подтвердить SYN, принимать данные по порядку, отдавать полученное
- * и закрыть соединение. Всё, что требует памяти о неподтверждённых байтах, живёт в ядре
- * клиента, а не здесь — поэтому на роутере с 15 МБ это остаётся дешёвым.
+ * Почему это НЕ полный стек TCP и почему так можно. Алгоритмов перегрузки здесь нет — их
+ * делает клиент на своей стороне и сервер на своей. Наша задача уже: подтвердить SYN,
+ * принимать данные по порядку, отдавать полученное, повторять неподтверждённое и закрыть
+ * соединение.
  *
- * Плата за это названа прямо: пакет, пришедший не по порядку, отбрасывается вместо
- * буферизации. В локальной сети до роутера потери редки, а буфер переупорядочивания на
- * каждое соединение — это как раз та память, которой на слабой коробке нет.
+ * Повторная передача В СТОРОНУ КЛИЕНТА теперь есть, и это не украшение. Без неё один
+ * потерянный сегмент подвешивал соединение навсегда: клиент подтверждает старое, мы отдаём
+ * новое, и сойтись им нечем. Отсюда же брался предел «в пути» — он существовал только чтобы
+ * реже терять то, что нельзя повторить. Цена названа прямо: 128 КБ на соединение, см.
+ * RTX_CAP.
+ *
+ * Чего по-прежнему нет: буфера ПЕРЕУПОРЯДОЧИВАНИЯ. Пакет от клиента, пришедший не по
+ * порядку, отбрасывается — его повторит клиент, у которого стек полный. Это разные вещи:
+ * повторять умеет тот, кто отправлял, а собирать дыры — тот, кто принимает, и вторая
+ * половина нам не нужна ровно потому, что данные мы тут же отдаём дальше.
  */
 #define _GNU_SOURCE
 #include <stdio.h>
@@ -25,6 +31,7 @@
 #include <poll.h>
 #include <time.h>
 #include <arpa/inet.h>
+#include <pthread.h>
 
 #include "vless.h"
 #include "client.h"
@@ -32,6 +39,7 @@
 #include "vision.h"
 #include "tls13.h"
 #include "tun.h"
+#include "rtx.h"
 #include "tunnel.h"
 #include "../spec.h"
 
@@ -52,10 +60,7 @@ struct conn {
     uint32_t our_seq;         /* следующий, который отправим клиенту */
     int header_sent;          /* заголовок VLESS уже ушёл серверу */
     int established;
-    /* Сколько из отправленного клиент подтвердил и сколько он готов принять. Нужно потому,
-     * что повторной передачи у нас нет: сегмент, потерянный из-за переполнения очереди
-     * устройства, не будет отправлен заново никогда, и соединение повиснет навсегда —
-     * клиент будет подтверждать старое, а мы отдавать новое. */
+    /* Сколько из отправленного клиент подтвердил и сколько он готов принять. */
     uint32_t client_ack;
     uint16_t client_win;
     uint8_t client_wscale;    /* множитель из опций SYN: окно = client_win << wscale */
@@ -63,25 +68,78 @@ struct conn {
      * TUN. Подтверждать каждый пакет отдельно — это лишняя запись в устройство на каждый
      * пакет выгрузки, притом что все они подтверждаются одним ACK с последним номером. */
     int ack_due;
+    /* ---- повторная передача клиенту ----
+     *
+     * Начало кольца — это ровно client_ack, а его длина — ровно our_seq - client_ack:
+     * другого места, где неподтверждённые байты живут, у нас нет, поэтому разойтись эти
+     * величины не могут по определению.
+     *
+     * Выделяется на SYN и освобождается на закрытии. malloc, а не массив внутри struct
+     * conn: 128 КБ × 64 — это 8 МБ, и в BSS они значили бы, что тронутые страницы больше
+     * никогда не вернутся системе. У malloc такого размера страницы приходят из mmap и
+     * занимают память только там, где по ним реально писали, — соединение, передавшее
+     * 10 КБ, стоит 10 КБ. */
+    struct rtx rtx;
+    /* Когда отправили самый старый неподтверждённый байт (или когда повторили его в
+     * последний раз). Ноль означает «неподтверждённого нет». */
+    uint64_t rtx_at;
+    uint32_t rto_ms;          /* текущий таймаут, растёт вдвое на каждый повтор */
+    int dup_acks;             /* подряд идущие подтверждения того же номера */
+    /* Быстрый повтор уже сделан и нового подтверждения ещё не было.
+     *
+     * Без этого флага повтор сам себя разгоняет: на повторную порцию клиент отвечает
+     * подтверждением с тем же номером (данные-то он уже принял), три таких — и мы повторяем
+     * снова. Один быстрый повтор на одно продвижение подтверждения — то же правило, по
+     * которому это работает в TCP. */
+    int fast_done;
+    /* Сервер закрыл поток, но у нас ещё есть неподтверждённое клиенту.
+     *
+     * Закрывать соединение в этот момент НЕЛЬЗЯ, и это ровно та ошибка, из-за которой
+     * повторная передача не помогала под потерями: вместе с соединением уничтожалось кольцо,
+     * то есть последний потерянный кусок становилось нечем повторить. Клиент оставался с
+     * дырой и ждал до своего таймаута — на стенде это давало 121 секунду там, где один поток
+     * при вдвое больших потерях доезжал за две.
+     *
+     * Поэтому: сервера больше не читаем, но живём и повторяем, пока клиент не подтвердит
+     * всё. FIN уходит после этого. */
+    int srv_closed;
+    uint64_t closed_at;       /* когда сервер закрылся: предел ожидания подтверждений */
     time_t last;
 };
 
-/* Сколько неподтверждённых байт разрешаем себе держать в пути.
+/* Сколько ждём подтверждений после закрытия сервером. Секунды, а не «сколько понадобится»:
+ * клиент мог уйти совсем, и тогда кольцо не опустеет никогда. */
+#define CLOSE_DRAIN_MS 5000
+
+/* Сколько неподтверждённых байт храним на соединение — и, тем самым, каков наш предел
+ * «в пути».
  *
- * Не «сколько объявил клиент», а МИНИМУМ из его окна и этого числа. Предел нужен потому,
- * что повторной передачи у нас нет: очередь устройства TUN — около пятисот пакетов, и
- * обогнав её, мы теряем сегмент навсегда.
+ * Это одно число, а не два: держать в пути больше, чем можем повторить, значит вернуться
+ * к тому, что было, — потерянный сегмент подвесит соединение навсегда. Поэтому окно
+ * отправки равно размеру этого буфера, и увеличить одно без другого нельзя.
  *
- * Почему именно столько. Скорость здесь равна «окно, поделённое на задержку
- * подтверждения»: при подтверждениях раз в пять миллисекунд 32 КБ дают 6 МБ/с и ни байтом
- * больше — сколько бы ни держала полоса. 256 КБ при той же задержке дают ~50 МБ/с, а в
- * очередь устройства укладываются с запасом (180 пакетов из 500).
- *
- * Замерено, почему предел вообще нужен и почему одного его мало: без него передача на
- * роутере вставала на втором мегабайте; с ним, но без вычерпывания сокета — 3 Мбит/с;
+ * Почему 128 КБ хватает. Скорость равна «в пути, поделённое на задержку подтверждения».
+ * Клиент здесь за роутером, круг до него меньше миллисекунды, а наш цикл на замерах
+ * крутится 1300-2000 раз в секунду, то есть подтверждение разбирается за 0,5-0,8 мс.
+ * 128 КБ при 0,7 мс — это 180 МБ/с на соединение, то есть предел не здесь. */
+#define RTX_CAP (128 * 1024)
+
+/* Таймаут повтора. Начинается с 50 мс, а не с двухсот, как минимум в TCP: клиент за
+ * роутером, и ждать двести миллисекунд там, где круг меньше одной, значит отдать скорость
+ * впустую. Растёт вдвое до секунды — на случай, если клиент действительно ушёл. */
+#define RTO_MIN_MS 50
+#define RTO_MAX_MS 1000
+
+/* Сколько подтверждений одного номера подряд считаем признаком потери. Три — как в TCP:
+ * клиент присылает их, получая данные не по порядку, то есть дыру он уже видит. Ждать
+ * таймаута в этом случае незачем — потеря известна на круг раньше. */
+#define DUP_ACK_TRIGGER 3
+
+/* Замерено, почему предел «в пути» вообще нужен и почему одного его мало: без него передача
+ * на роутере вставала на втором мегабайте; с ним, но без вычерпывания сокета — 3 Мбит/с;
  * с вычерпыванием и 32 КБ — 42 Мбит/с. Порядок важен: увеличивать окно, не научившись
- * вычерпывать, бессмысленно, и первая попытка это подтвердила — стало хуже. */
-#define CLIENT_INFLIGHT_CAP (1024 * 1024)
+ * вычерпывать, бессмысленно, и первая попытка это подтвердила — стало хуже. Сам предел
+ * теперь равен RTX_CAP. */
 
 /* Масштаб окна, который объявляем клиенту МЫ.
  *
@@ -107,7 +165,7 @@ struct conn {
  * пустом месте, либо обгон клиента с потерей сегмента. */
 static uint32_t client_room(const struct conn *c) {
     uint32_t win = (uint32_t)c->client_win << c->client_wscale;
-    return win < CLIENT_INFLIGHT_CAP ? win : CLIENT_INFLIGHT_CAP;
+    return win < RTX_CAP ? win : RTX_CAP;
 }
 
 /* Запас, который обязан оставаться свободным в окне клиента, прежде чем мы возьмём у
@@ -153,7 +211,20 @@ static int client_can_take_record(const struct conn *c) {
  * поток от одного клиента не заморозил чтение у серверов. */
 #define TUN_DRAIN_MAX 64
 
-static struct conn g_conns[MAX_CONNS];
+/* ВСЁ изменяемое состояние — у каждого потока своё (__thread).
+ *
+ * Это и есть вся многопоточность здесь: ядро раскладывает пакеты по очередям устройства,
+ * хэшируя поток симметрично, поэтому обе половины одного TCP-соединения всегда попадают
+ * одному и тому же потоку (см. tun_open). Значит делить между потоками нечего — ни таблицу
+ * соединений, ни счётчики, ни буферы, — и ни одной блокировки в цикле нет.
+ *
+ * Общая таблица под мьютексом означала бы замок на каждый пакет, а пакетов семьсот на
+ * мегабайт: второе ядро ушло бы на борьбу за первое. */
+static __thread struct conn g_conns[MAX_CONNS];
+/* Номер потока — только для диагностики: по нему видно, раскладывает ли ядро нагрузку или
+ * всё село в одну очередь. Без этого «стало быстрее вдвое» и «работает один поток из двух»
+ * в отчёте выглядят одинаково. */
+static __thread int g_worker;
 
 /* ---- счётчики цикла ---------------------------------------------------------
  *
@@ -168,11 +239,14 @@ static struct conn g_conns[MAX_CONNS];
 static int g_stats;
 /* Считается ВСЕГДА, а не только с диагностикой: по нему цикл решает, был ли проход
  * пустым. Привязать это к счётчикам статистики значило бы, что без неё поведение другое. */
-static uint64_t g_rx_total;
-static struct {
+static __thread uint64_t g_rx_total;
+static __thread struct {
     uint64_t iters, poll_ns, tun_reads, tun_writes, tun_write_ns;
     uint64_t recs, rec_bytes, win_skips, drain_full;
     uint64_t recv_ns, pkt_ns, tun_read_ns;
+    /* Повторы. Ноль здесь означает «клиент получает всё с первого раза», а не «повтор не
+     * работает», и различить это можно только имея число рядом с потерями. */
+    uint64_t rtx_sends, rtx_bytes;
     /* Сколько соединений было живо на последнем проходе: «поток встал» и «поток закрылся»
      * в остальных числах выглядят одинаково — оба дают нули. */
     uint32_t conns;
@@ -181,6 +255,7 @@ static struct {
     uint32_t win_min, win_max, inflight_max;
     uint8_t wscale_seen;
 } g_st;
+
 
 static uint64_t now_ns(void) {
     struct timespec ts;
@@ -192,11 +267,12 @@ static void stats_dump(uint64_t window_ns) {
     double s = (double)window_ns / 1e9;
     if (s <= 0) return;
     fprintf(stderr,
-            "tun-stats: %.1f МБ/с | циклов %.0f/с | poll %.0f%% | чтений у сервера %.0f/с "
+            "tun-stats[%d]: %.1f МБ/с | циклов %.0f/с | poll %.0f%% | чтений у сервера %.0f/с "
             "(по %.1f КБ) | записей клиенту %.0f/с (%.0f мкс) | ждали окна %.0f/с | "
-            "предел чтения %.0f/с | соединений %u | окно клиента %u..%u (масштаб %u), "
-            "в пути до %u | "
+            "предел чтения %.0f/с | соединений %u | повторов %.0f/с (%.0f КБ/с) | "
+            "окно клиента %u..%u (масштаб %u), в пути до %u | "
             "чтение у сервера %.0f%% | разбор из TUN %.0f%% | чтение из TUN %.0f%%\n",
+            g_worker,
             (double)g_st.rec_bytes / s / 1048576.0,
             (double)g_st.iters / s,
             100.0 * (double)g_st.poll_ns / (double)window_ns,
@@ -207,6 +283,7 @@ static void stats_dump(uint64_t window_ns) {
             (double)g_st.win_skips / s,
             (double)g_st.drain_full / s,
             g_st.conns,
+            (double)g_st.rtx_sends / s, (double)g_st.rtx_bytes / s / 1024.0,
             g_st.win_min == 0xFFFFFFFFu ? 0 : g_st.win_min, g_st.win_max,
             g_st.wscale_seen, g_st.inflight_max,
             100.0 * (double)g_st.recv_ns / (double)window_ns,
@@ -241,6 +318,7 @@ static struct conn *conn_new(void) {
 static void conn_drop(struct conn *c) {
     TR("закрываю conn#%ld fd=%d\n", (long)(c - g_conns), c->v.fd);
     if (c->used) vless_close(&c->v);
+    rtx_done(&c->rtx);
     memset(c, 0, sizeof(*c));
 }
 
@@ -256,7 +334,7 @@ static void conn_drop(struct conn *c) {
 
 static int upstream_send(struct conn *c, const struct vless_node *node,
                          const unsigned char *data, size_t n) {
-    static unsigned char out[TUNNEL_BUF];
+    static __thread unsigned char out[TUNNEL_BUF];
     size_t len = 0;
 
     if (!c->header_sent) {
@@ -271,7 +349,7 @@ static int upstream_send(struct conn *c, const struct vless_node *node,
     }
 
     if (node->flow[0]) {
-        static unsigned char framed[TUNNEL_BUF];
+        static __thread unsigned char framed[TUNNEL_BUF];
         size_t fn = vision_wrap(&c->vis, data, n, framed, sizeof(framed));
         if (!fn) return SEND_FATAL;
         if (len + fn > sizeof(out)) return SEND_FATAL;
@@ -313,6 +391,17 @@ static int upstream_send(struct conn *c, const struct vless_node *node,
  * отдельным вызовом и отдельным проходом по данным ради контрольной суммы. */
 static int emit_to_client(struct conn *c, const struct tun_dev *tun,
                           const unsigned char *p, size_t n) {
+    /* Копия для повтора — ДО отправки. Место проверено заранее (client_can_take_record), и
+     * если его вдруг нет, отправлять нельзя: отправленное без копии повторить нечем, а
+     * именно это и подвешивало соединения. */
+    if (rtx_room(&c->rtx) < n) {
+        TR("буфер повтора полон (%u из %u) — не отправляю %zu байт\n",
+           c->rtx.len, (unsigned)RTX_CAP, n);
+        return -1;
+    }
+    if (!c->rtx.len) { c->rtx_at = now_ns(); c->rto_ms = RTO_MIN_MS; }
+    rtx_push(&c->rtx, p, (uint32_t)n);
+
     size_t seg = tun->gso ? (size_t)TUN_GSO_MAX : (size_t)TUN_MSS;
     size_t sent = 0;
     while (sent < n) {
@@ -336,12 +425,38 @@ static int emit_to_client(struct conn *c, const struct tun_dev *tun,
     return 0;
 }
 
+/* Отправить заново с начала неподтверждённого.
+ *
+ * Один сегмент, а не весь буфер: посылать 128 КБ на каждый таймаут — это лавина, которая
+ * сама себе создаёт потери. TCP так и делает, и по той же причине. Если потеряно больше,
+ * следующий круг подтверждений покажет это, и повтор пойдёт дальше.
+ *
+ * Размер сегмента — тот же, каким отправляли: при разгрузке потеряться могла вся
+ * шестнадцатикилобайтная порция, и повторять её по 1460 байт значило бы растянуть
+ * восстановление на десять таймаутов. */
+static void rtx_resend(struct conn *c, const struct tun_dev *tun, const char *why) {
+    uint32_t seg = tun->gso ? (uint32_t)TUN_GSO_MAX : (uint32_t)TUN_MSS;
+    const unsigned char *body = NULL;
+    uint32_t n = rtx_peek(&c->rtx, seg, &body);
+    if (!n) return;
+
+    unsigned char hdr[TUN_HDR_LEN];
+    tcp_hdr_build(hdr, c->key.dst, c->key.src, c->key.dport, c->key.sport,
+                  c->client_ack, c->client_seq, TCP_ACK | TCP_PSH, n, 65535);
+    TR("повтор conn#%ld: %u байт с seq=%u (%s)\n",
+       (long)(c - g_conns), n, c->client_ack, why);
+    if (tun_write_data(tun, hdr, body, n) != 0) return;
+    if (g_stats) { g_st.rtx_sends++; g_st.rtx_bytes += n; }
+    c->rtx_at = now_ns();
+    c->rto_ms = c->rto_ms * 2 > RTO_MAX_MS ? RTO_MAX_MS : c->rto_ms * 2;
+}
+
 /* Прочитать у сервера и отдать клиенту как TCP-пакет. */
 static int downstream_pump(struct conn *c, const struct vless_node *node,
                            const struct tun_dev *tun) {
     /* Статический, а не на стеке: буфер размером с запись TLS — это шестнадцать килобайт
      * стека на каждый вызов, а поток обработки здесь один. */
-    static unsigned char buf[TUNNEL_BUF];
+    static __thread unsigned char buf[TUNNEL_BUF];
     size_t got = 0;
     /* Через vless_recv, а не tls13_read напрямую: у grpc и xhttp между TLS и VLESS лежит
      * HTTP/2, и чтение мимо него отдавало бы кадры вместо данных. Прямой вызов работал,
@@ -461,7 +576,21 @@ static void handle_packet(const struct tun_dev *tun, const struct vless_node *no
         c->client_ack = 1;                          /* столько он уже подтвердил (SYN-ACK) */
         c->client_win = k.window ? k.window : 8192;
         c->client_wscale = k.wscale;
+        c->rto_ms = RTO_MIN_MS;
         c->last = time(NULL);
+        /* Кольцо повтора — на SYN, а не лениво при первых данных: лениво означало бы, что
+         * отказ выделения приходит посреди передачи, когда отвечать клиенту уже нечем.
+         * Здесь на отказ есть честный ответ — RST, и он у нас уже написан ниже. */
+        if (rtx_init(&c->rtx, RTX_CAP) != 0) {
+            fprintf(stderr, "steer tunnel: нет памяти на буфер повтора (%d КБ)\n",
+                    RTX_CAP / 1024);
+            conn_drop(c);
+            unsigned char rst[64];
+            size_t rl = tcp_build(rst, sizeof(rst), k.dst, k.src, k.dport, k.sport,
+                                  0, k.seq + 1, TCP_RST | TCP_ACK, NULL, 0, 0, 0, -1);
+            if (rl) tun_write_ctl(tun, rst, rl);
+            return;
+        }
         if (vless_uuid_parse(node->uuid, c->uuid) != 0) { conn_drop(c); return; }
         vision_init(&c->vis, c->uuid);
 
@@ -498,9 +627,34 @@ static void handle_packet(const struct tun_dev *tun, const struct vless_node *no
     /* Учитываем подтверждения и окно клиента с ЛЮБОГО его пакета, включая чистые ACK: без
      * этого мы не знаем, сколько он принял, и продолжаем лить в устройство. Именно чистые
      * ACK и приходят во время скачивания — данных от клиента там нет вовсе. */
+    size_t data_n = n - off;
+
     if (k.tcp_flags & TCP_ACK) {
         /* Сравнение с учётом переполнения счётчика: разность как знаковая. */
-        if ((int32_t)(k.ack - c->client_ack) > 0) c->client_ack = k.ack;
+        if ((int32_t)(k.ack - c->client_ack) > 0) {
+            rtx_drop(&c->rtx, k.ack - c->client_ack);   /* ДО сдвига: отсчёт от старого */
+            c->client_ack = k.ack;
+            c->dup_acks = 0;
+            c->fast_done = 0;
+            /* Есть продвижение — таймаут снова короткий, и он отсчитывается от нового
+             * самого старого байта, а не от прежнего. */
+            c->rtx_at = c->rtx.len ? now_ns() : 0;
+            c->rto_ms = RTO_MIN_MS;
+        } else if (k.ack == c->client_ack && c->rtx.len && !data_n && !c->fast_done &&
+                   k.window == c->client_win && !(k.tcp_flags & (TCP_SYN | TCP_FIN))) {
+            /* Дубликат подтверждения по определению из RFC 5681: тот же номер, без данных,
+             * БЕЗ ИЗМЕНЕНИЯ ОКНА и при неподтверждённых данных в пути.
+             *
+             * Условие про окно — не формальность. Пока клиент читает принятое, его ядро
+             * шлёт обновления окна: тот же номер подтверждения, окно больше. Считать их
+             * дубликатами значит повторять данные на каждой третьей такой пачке посреди
+             * исправной передачи — то есть тратить полосу ровно там, где всё в порядке. */
+            if (++c->dup_acks >= DUP_ACK_TRIGGER) {
+                c->dup_acks = 0;
+                c->fast_done = 1;
+                rtx_resend(c, tun, "три подтверждения одного номера");
+            }
+        }
         c->client_win = k.window;
     }
 
@@ -517,7 +671,6 @@ static void handle_packet(const struct tun_dev *tun, const struct vless_node *no
         return;
     }
 
-    size_t data_n = n - off;
     if (!data_n) return;                            /* чистый ACK */
 
     /* Не по порядку — отбрасываем. Буфер переупорядочивания на каждое соединение это как
@@ -622,37 +775,21 @@ static void tun_bring_up(const char *dev, int table) {
     run_quiet(q);
 }
 
-int tunnel_run(struct output *o, const struct vless_node *node) {
-    const char *dev = o->device;
+/* Что нужно потоку, чтобы работать: своя очередь устройства, узел и свой номер. Больше
+ * ничего — остальное состояние у него собственное (__thread). */
+struct worker {
     struct tun_dev tun;
-    int orc = tun_open(&tun, dev);
-    if (orc < 0) return orc;
+    const struct vless_node *node;
+    int id;
+};
+
+static void *worker_loop(void *arg) {
+    struct worker *w = arg;
+    struct tun_dev tun = w->tun;
+    const struct vless_node *node = w->node;
     int tun_fd = tun.fd;
-    /* Неблокирующее чтение: цикл вычерпывает устройство до EAGAIN, и без этого флага
-     * последнее чтение засыпало бы, останавливая все соединения. */
-    int fl = fcntl(tun_fd, F_GETFL, 0);
-    if (fl >= 0) fcntl(tun_fd, F_SETFL, fl | O_NONBLOCK);
-    tun_bring_up(dev, o->table);
+    g_worker = w->id;
 
-    /* Привязываем таблицу выхода к устройству ЗДЕСЬ, а не в apply.
-     *
-     * Apply уже прошёл к этому моменту и, не найдя устройства, поставил запрет — иначе и
-     * нельзя: пока туннеля нет, пускать в него трафик некуда. Дождаться устройства снаружи
-     * невозможно: procd запускает этот процесс только после того, как init-скрипт вернул
-     * управление, то есть уже после apply. Значит привязать может только тот, кто знает
-     * момент готовности, — а это мы. */
-    bind_device(o, dev);
-    fprintf(stderr, "steer tunnel: %s привязан к таблице %d\n", dev, o->table);
-    fprintf(stderr, "steer tunnel: %s -> %s (%s:%u %s%s)\n", dev, node->name,
-            node->host, node->port, node->type, node->flow[0] ? " +vision" : "");
-    /* Печатается всегда: без разгрузки скорость отдачи клиенту падает в разы, и знать,
-     * досталась она нам или нет, надо до замеров, а не после. */
-    fprintf(stderr, "steer tunnel: разгрузка записи в %s %s\n", dev,
-            tun.gso ? "включена (сегменты до 16 КБ, суммы считает ядро)"
-                    : "НЕДОСТУПНА — нарезаем по 1460 и считаем суммы сами");
-
-    g_trace = getenv("STEER_TUN_TRACE") != NULL;
-    g_stats = getenv("STEER_TUN_STATS") != NULL;
     g_st.win_min = 0xFFFFFFFFu;
     uint64_t stats_at = g_stats ? now_ns() : 0;
     memset(g_conns, 0, sizeof(g_conns));
@@ -667,6 +804,8 @@ int tunnel_run(struct output *o, const struct vless_node *node) {
         nf++;
         for (int i = 0; i < MAX_CONNS; i++) {
             if (!g_conns[i].used) continue;
+            /* У закрытых сервером читать нечего — они живут только чтобы додать клиенту. */
+            if (g_conns[i].srv_closed) continue;
             /* Не спрашиваем сервер о новых данных, пока клиент не разгрёб прежние.
              *
              * Это и есть управление потоком, которого у нас иначе нет: прочитав, мы обязаны
@@ -710,8 +849,23 @@ int tunnel_run(struct output *o, const struct vless_node *node) {
          * 9 Мбит/с на одном потоке против 192 на восьми. Остаток записи теперь добирается
          * коротким ожиданием на самом сокете (см. read_record), поэтому холостых проходов
          * не остаётся и тормозить цикл незачем. */
-        uint64_t p0 = g_stats ? now_ns() : 0;
-        int r = poll(pf, (unsigned)nf, 1000);
+        /* Таймаут poll — до ближайшего срока повтора, а не всегда секунда.
+         *
+         * Иначе повтор через 50 мс ждал бы, пока цикл проснётся сам: при живом трафике это
+         * происходит сразу, а при потере последнего сегмента просыпаться уже нечему —
+         * ровно тот случай, для которого таймер и нужен. */
+        uint64_t now = now_ns();
+        int wait_ms = 1000;
+        for (int i = 0; i < MAX_CONNS; i++) {
+            const struct conn *c = &g_conns[i];
+            if (!c->used || !c->rtx.len || !c->rtx_at) continue;
+            int64_t left = (int64_t)c->rto_ms - (int64_t)((now - c->rtx_at) / 1000000);
+            if (left < 0) left = 0;
+            if (left < wait_ms) wait_ms = (int)left;
+        }
+
+        uint64_t p0 = g_stats ? now : 0;
+        int r = poll(pf, (unsigned)nf, wait_ms);
         if (g_stats) {
             uint64_t t = now_ns();
             g_st.poll_ns += t - p0;
@@ -764,15 +918,13 @@ int tunnel_run(struct output *o, const struct vless_node *node) {
             uint64_t drained_from = g_rx_total;
             for (;;) {
                 if (downstream_pump(c, node, &tun) != 0) {
-                    /* Сервер закрыл — сообщаем клиенту FIN, иначе он будет ждать данных,
-                     * которых больше не будет. */
-                    unsigned char fin[64];
-                    size_t fl = tcp_build(fin, sizeof(fin), c->key.dst, c->key.src,
-                                          c->key.dport, c->key.sport,
-                                          c->our_seq, c->client_seq, TCP_FIN | TCP_ACK,
-                                          NULL, 0, 0, 0, -1);
-                    if (fl) tun_write_ctl(&tun, fin, fl);
-                    conn_drop(c);
+                    /* Сервер закрыл. Соединение НЕ закрываем, пока клиент не подтвердит всё
+                     * отправленное: пока в кольце есть неподтверждённое, его надо повторять,
+                     * а закрыв соединение, мы уничтожим и кольцо. FIN уйдёт в fin_if_drained. */
+                    c->srv_closed = 1;
+                    c->closed_at = now_ns();
+                    TR("сервер закрыл conn#%ld, ждём подтверждения %u байт\n",
+                       (long)(c - g_conns), c->rtx.len);
                     break;
                 }
                 if (++reads >= DRAIN_MAX_READS ||
@@ -788,13 +940,127 @@ int tunnel_run(struct output *o, const struct vless_node *node) {
             }
         }
 
+        /* Истёкшие сроки — повторяем. После обработки пакетов, а не до: подтверждение,
+         * приехавшее в этом же проходе, могло снять надобность. */
+        now = now_ns();
+        for (int i = 0; i < MAX_CONNS; i++) {
+            struct conn *c = &g_conns[i];
+            if (!c->used || !c->rtx.len || !c->rtx_at) continue;
+            if ((now - c->rtx_at) / 1000000 >= c->rto_ms)
+                rtx_resend(c, &tun, "истёк таймаут");
+        }
+
+        /* Закрытые сервером: как только клиент подтвердил всё — FIN и закрываем. Если не
+         * подтвердил за отведённое время, закрываем всё равно: клиент мог уйти совсем. */
+        for (int i = 0; i < MAX_CONNS; i++) {
+            struct conn *c = &g_conns[i];
+            if (!c->used || !c->srv_closed) continue;
+            int drained = c->rtx.len == 0;
+            if (!drained && (now - c->closed_at) / 1000000 < CLOSE_DRAIN_MS) continue;
+            if (!drained)
+                TR("conn#%ld: клиент не подтвердил %u байт за %d мс, закрываю\n",
+                   (long)(c - g_conns), c->rtx.len, CLOSE_DRAIN_MS);
+            /* FIN, иначе клиент будет ждать данных, которых больше не будет. */
+            unsigned char fin[64];
+            size_t fl = tcp_build(fin, sizeof(fin), c->key.dst, c->key.src,
+                                  c->key.dport, c->key.sport,
+                                  c->our_seq, c->client_seq, TCP_FIN | TCP_ACK,
+                                  NULL, 0, 0, 0, -1);
+            if (fl) tun_write_ctl(&tun, fin, fl);
+            conn_drop(c);
+        }
+
         /* Уборка задержавшихся: без неё таблица заполняется соединениями, которые клиент
          * бросил без FIN, и новые перестают открываться. */
-        time_t now = time(NULL);
+        time_t stale = time(NULL);
         for (int i = 0; i < MAX_CONNS; i++)
-            if (g_conns[i].used && now - g_conns[i].last > 120) conn_drop(&g_conns[i]);
+            if (g_conns[i].used && stale - g_conns[i].last > 120) conn_drop(&g_conns[i]);
     }
+    for (int i = 0; i < MAX_CONNS; i++)
+        if (g_conns[i].used) conn_drop(&g_conns[i]);
     close(tun_fd);
+    return NULL;
+}
+
+/* Сколько потоков поднимать.
+ *
+ * По числу ядер, но не больше MAX_WORKERS: на двухъядерной коробке третий поток только
+ * добавил бы переключений. Один поток на ядро, а не больше, потому что цикл почти всё время
+ * либо ждёт в poll, либо считает — очередь на процессоре ему не помогает.
+ *
+ * STEER_TUN_THREADS задаёт число вручную. Нужно ровно для того же, для чего STEER_TUN_NOGSO:
+ * «стало быстрее от второго ядра» — утверждение, которое надо уметь перепроверить, вернувшись
+ * к одному потоку на том же железе. */
+#define MAX_WORKERS 4
+
+static int worker_count(void) {
+    const char *env = getenv("STEER_TUN_THREADS");
+    if (env) {
+        int n = atoi(env);
+        if (n >= 1) return n < MAX_WORKERS ? n : MAX_WORKERS;
+    }
+    long cpus = sysconf(_SC_NPROCESSORS_ONLN);
+    if (cpus < 1) cpus = 1;
+    return cpus < MAX_WORKERS ? (int)cpus : MAX_WORKERS;
+}
+
+int tunnel_run(struct output *o, const struct vless_node *node) {
+    const char *dev = o->device;
+    g_trace = getenv("STEER_TUN_TRACE") != NULL;
+    g_stats = getenv("STEER_TUN_STATS") != NULL;
+
+    static struct worker workers[MAX_WORKERS];
+    struct tun_dev queues[MAX_WORKERS];
+    int want = worker_count();
+    int n = tun_open(queues, want, dev);
+    if (n < 0) return n;
+
+    for (int i = 0; i < n; i++) {
+        /* Неблокирующее чтение: цикл вычерпывает устройство до EAGAIN, и без этого флага
+         * последнее чтение засыпало бы, останавливая все соединения. */
+        int fl = fcntl(queues[i].fd, F_GETFL, 0);
+        if (fl >= 0) fcntl(queues[i].fd, F_SETFL, fl | O_NONBLOCK);
+        workers[i].tun = queues[i];
+        workers[i].node = node;
+        workers[i].id = i;
+    }
+    tun_bring_up(dev, o->table);
+
+    /* Привязываем таблицу выхода к устройству ЗДЕСЬ, а не в apply.
+     *
+     * Apply уже прошёл к этому моменту и, не найдя устройства, поставил запрет — иначе и
+     * нельзя: пока туннеля нет, пускать в него трафик некуда. Дождаться устройства снаружи
+     * невозможно: procd запускает этот процесс только после того, как init-скрипт вернул
+     * управление, то есть уже после apply. Значит привязать может только тот, кто знает
+     * момент готовности, — а это мы. */
+    bind_device(o, dev);
+    fprintf(stderr, "steer tunnel: %s привязан к таблице %d\n", dev, o->table);
+    fprintf(stderr, "steer tunnel: %s -> %s (%s:%u %s%s)\n", dev, node->name,
+            node->host, node->port, node->type, node->flow[0] ? " +vision" : "");
+    /* Печатается всегда: без разгрузки и без второй очереди скорость падает в разы, и знать,
+     * что именно досталось, надо до замеров, а не после. */
+    fprintf(stderr, "steer tunnel: разгрузка записи в %s %s; потоков %d из %d запрошенных\n",
+            dev, queues[0].gso ? "включена (сегменты до 16 КБ, суммы считает ядро)"
+                               : "НЕДОСТУПНА — нарезаем по 1460 и считаем суммы сами",
+            n, want);
+    if (n < want)
+        fprintf(stderr, "steer tunnel: очередей меньше запрошенного — ядро без "
+                        "IFF_MULTI_QUEUE, работаем в один поток\n");
+
+    /* Потоки со второго по последний — отдельными, первый работает в этом же. Так процесс
+     * остаётся тем, чем был для procd: если цикл завершится, завершится и процесс. */
+    pthread_t tids[MAX_WORKERS];
+    int started = 0;
+    for (int i = 1; i < n; i++) {
+        if (pthread_create(&tids[started], NULL, worker_loop, &workers[i]) != 0) {
+            fprintf(stderr, "steer tunnel: поток %d не создался, работаем без него\n", i);
+            close(workers[i].tun.fd);
+            continue;
+        }
+        started++;
+    }
+    worker_loop(&workers[0]);
+    for (int i = 0; i < started; i++) pthread_join(tids[i], NULL);
     return 0;
 }
 

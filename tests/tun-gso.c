@@ -30,6 +30,7 @@
 #include "../src/ext/tun.h"
 
 #define PAYLOAD_N 16000
+#define QUEUES 4
 
 static int sh(const char *cmd) {
     int rc = system(cmd);
@@ -46,10 +47,15 @@ static uint16_t csum(const unsigned char *d, size_t n, uint32_t acc) {
 }
 
 int main(void) {
-    struct tun_dev in, out;
-    if (tun_open(&in, "tgin") != 0) { fprintf(stderr, "tgin не открылся\n"); return 2; }
-    if (tun_open(&out, "tgout") != 0) { fprintf(stderr, "tgout не открылся\n"); return 2; }
-    printf("разгрузка: tgin=%d tgout=%d\n", in.gso, out.gso);
+    struct tun_dev in, outq[QUEUES];
+    if (tun_open(&in, 1, "tgin") < 0) { fprintf(stderr, "tgin не открылся\n"); return 2; }
+    /* Приёмную сторону открываем НЕСКОЛЬКИМИ очередями: на них проверяется свойство, на
+     * котором стоит вся многопоточность, — что ядро кладёт весь поток в одну очередь. */
+    int nq = tun_open(outq, QUEUES, "tgout");
+    if (nq < 0) { fprintf(stderr, "tgout не открылся\n"); return 2; }
+    struct tun_dev out = outq[0];
+    printf("разгрузка: tgin=%d tgout=%d; очередей tgout: %d из %d\n",
+           in.gso, out.gso, nq, QUEUES);
 
     if (sh("ip addr add 10.77.0.1/24 dev tgin && ip link set tgin up") ||
         sh("ip addr add 10.88.0.1/24 dev tgout && ip link set tgout up") ||
@@ -63,10 +69,12 @@ int main(void) {
 
     /* Читаем всё, что ядро уже успело положить в tgout до нашей записи (объявления и
      * прочий шум): иначе оно попадёт в проверку и будет выглядеть как испорченный сегмент. */
-    int fl = fcntl(out.fd, F_GETFL, 0);
-    fcntl(out.fd, F_SETFL, fl | O_NONBLOCK);
     unsigned char junk[65536];
-    while (tun_read_packet(&out, junk, sizeof(junk)) > 0) { }
+    for (int q = 0; q < nq; q++) {
+        int fl = fcntl(outq[q].fd, F_GETFL, 0);
+        fcntl(outq[q].fd, F_SETFL, fl | O_NONBLOCK);
+        while (tun_read_packet(&outq[q], junk, sizeof(junk)) > 0) { }
+    }
 
     static unsigned char payload[PAYLOAD_N];
     for (size_t i = 0; i < sizeof(payload); i++) payload[i] = (unsigned char)(i * 31 + 7);
@@ -94,16 +102,24 @@ int main(void) {
 
     /* Собираем то, что вышло с другой стороны. */
     size_t got = 0, segs = 0, bad_ip = 0, bad_tcp = 0, bad_data = 0;
+    size_t per_queue[QUEUES] = {0};
     for (int idle = 0; idle < 200 && got < sizeof(payload); ) {
         unsigned char pkt[65536];
-        ssize_t n = tun_read_packet(&out, pkt, sizeof(pkt));
+        ssize_t n = -1;
+        int from = -1;
+        for (int q = 0; q < nq; q++) {
+            n = tun_read_packet(&outq[q], pkt, sizeof(pkt));
+            if (n > 0) { from = q; break; }
+        }
         if (n <= 0) {
-            struct pollfd p = { .fd = out.fd, .events = POLLIN };
-            poll(&p, 1, 10);
+            struct pollfd p[QUEUES];
+            for (int q = 0; q < nq; q++) { p[q].fd = outq[q].fd; p[q].events = POLLIN; }
+            poll(p, (unsigned)nq, 10);
             idle++;
             continue;
         }
         idle = 0;
+        per_queue[from]++;
         if (n < 40 || (pkt[0] >> 4) != 4 || pkt[9] != 6) continue;
         size_t ihl = (size_t)(pkt[0] & 0x0F) * 4;
         size_t doff = (size_t)(pkt[ihl + 12] >> 4) * 4;
@@ -133,7 +149,20 @@ int main(void) {
 
     printf("сегментов %zu, байт %zu из %zu; суммы IP плохих %zu, TCP плохих %zu, данные "
            "разошлись %zu раз\n", segs, got, sizeof(payload), bad_ip, bad_tcp, bad_data);
-    int ok = got == sizeof(payload) && !bad_ip && !bad_tcp && !bad_data;
+
+    /* Весь поток обязан лежать в ОДНОЙ очереди. Разложись он по нескольким — и соединение
+     * обслуживали бы разные потоки, у каждого своя таблица; получилось бы два независимых
+     * состояния одного TCP, то есть тихая порча вместо ошибки. */
+    int used = 0, spread = 0;
+    for (int q = 0; q < nq; q++) {
+        if (!per_queue[q]) continue;
+        used++;
+        printf("  очередь %d: %zu пакетов\n", q, per_queue[q]);
+    }
+    if (nq > 1 && used != 1) { printf("FAIL: поток разложился по %d очередям\n", used); spread = 1; }
+    if (nq == 1) printf("  (ядро без IFF_MULTI_QUEUE — привязку проверить нечем)\n");
+
+    int ok = got == sizeof(payload) && !bad_ip && !bad_tcp && !bad_data && !spread;
     printf("%s\n", ok ? "PASS" : "FAIL");
     return ok ? 0 : 1;
 }

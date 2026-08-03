@@ -150,7 +150,9 @@ static int h2_open(struct vless_conn *c, const struct vless_node *n) {
     /* Набивка: сервер требует от 100 до 1000 символов x_padding. Длина случайная — иначе
      * постоянная длина запроса сама становится признаком, ради устранения которого эта
      * набивка и придумана. */
-    static char ref[1400];
+    /* __thread: буфер живёт между вызовами, но потоков теперь несколько, и один общий
+     * массив они переписывали бы друг под другом. Своя копия на поток — 1,4 КБ. */
+    static __thread char ref[1400];
     unsigned char r = 0;
     if (getrandom(&r, 1, 0) != 1) r = 128;
     size_t pad = 150 + (size_t)r * 2;               /* 150…660 */
@@ -357,7 +359,7 @@ int vless_send(struct vless_conn *c, const unsigned char *d, size_t n) {
         case VT_XHTTP:
             return h2_write(&c->h2, d, n);
         case VT_GRPC: {
-            static unsigned char msg[H2_MIN_READ_CAP + 16];
+            static __thread unsigned char msg[H2_MIN_READ_CAP + 16];
             size_t mn = grpc_wrap(d, n, msg, sizeof(msg));
             if (!mn) return H2_ETOOBIG;
             return h2_write(&c->h2, msg, mn);
@@ -373,9 +375,11 @@ int vless_recv(struct vless_conn *c, unsigned char *d, size_t cap, size_t *got) 
         case VT_XHTTP:
             return h2_read(&c->h2, d, cap, got);
         case VT_GRPC: {
-            /* Общий буфер: разбор идёт в один поток, а по 16 КБ на соединение — это
-             * мегабайт на коробке с пятнадцатью. */
-            static unsigned char raw[H2_MIN_READ_CAP];
+            /* Один буфер на ПОТОК, а не на соединение: по 16 КБ на каждое соединение
+             * это мегабайт на коробке с пятнадцатью, а потоков всего несколько. Общим он
+             * был, пока поток был один; теперь общий массив потоки переписывали бы друг под
+             * другом — и это не «иногда мусор», а перепутанные куски чужого соединения. */
+            static __thread unsigned char raw[H2_MIN_READ_CAP];
             size_t rn = 0;
             int rc = h2_read(&c->h2, raw, sizeof(raw), &rn);
             if (rc) return rc;
@@ -457,7 +461,7 @@ int vless_probe_timed(const struct vless_node *node, int timeout_s, char *why, s
         struct vision vis;
         vless_uuid_parse(node->uuid, uuid);
         vision_init(&vis, uuid);
-        static unsigned char framed[8192];
+        static __thread unsigned char framed[8192];
         /* Заголовок VLESS занимает первые header_n байт req — остальное это HTTP-данные. */
         size_t header_n = req_n - (sizeof(http) - 1);
         size_t fn = vision_wrap(&vis, req + header_n, req_n - header_n,
@@ -465,7 +469,7 @@ int vless_probe_timed(const struct vless_node *node, int timeout_s, char *why, s
         if (!fn) { vless_close(&c); snprintf(why, why_n, "кадр Vision не собрался"); return VLESS_CONN_EIO; }
         /* Одной записью: заголовок и кадр должны уехать вместе, иначе их разделение по
          * записям само становится признаком. */
-        static unsigned char together[8704];
+        static __thread unsigned char together[8704];
         if (header_n + fn > sizeof(together)) { vless_close(&c); snprintf(why, why_n, "не влезло"); return VLESS_CONN_EIO; }
         memcpy(together, req, header_n);
         memcpy(together + header_n, framed, fn);
@@ -478,7 +482,7 @@ int vless_probe_timed(const struct vless_node *node, int timeout_s, char *why, s
 
     /* Буфер по мерке транспорта, а не «с запасом»: поверх HTTP/2 за один раз приезжает до
      * целой записи TLS, и меньший буфер дал бы ошибку на совершенно законном кадре. */
-    static unsigned char buf[VLESS_MIN_RECV_CAP];
+    static __thread unsigned char buf[VLESS_MIN_RECV_CAP];
     size_t got = 0;
     /* Служебные кадры HTTP/2 (SETTINGS, WINDOW_UPDATE) приезжают раньше данных, и на них
      * vless_recv законно отдаёт ноль байт. Ждём именно данных — иначе проверка объявляла

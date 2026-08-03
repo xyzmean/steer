@@ -139,7 +139,7 @@ static int frame_out(struct h2 *h, unsigned char type, unsigned char flags, uint
     put32(hdr + 5, sid);
     /* Заголовок и тело одной записью: разделение их по записям TLS создаёт узнаваемый
      * рисунок длин (9 + N, 9 + N, …), ради избавления от которого и существует Vision. */
-    static unsigned char one[9 + DEFAULT_MAX_FRAME];
+    static __thread unsigned char one[9 + DEFAULT_MAX_FRAME];
     if (n > DEFAULT_MAX_FRAME) return H2_ETOOBIG;
     memcpy(one, hdr, 9);
     if (n) memcpy(one + 9, body, n);
@@ -153,7 +153,7 @@ int h2_start(struct h2 *h, const struct h2_io *io, const char *authority,
     h->send_win = 65535;                 /* до SETTINGS сервера — значение по умолчанию */
     h->send_win_conn = 65535;
 
-    static unsigned char buf[4096];
+    static __thread unsigned char buf[4096];
     struct wbuf b = { buf, 0, sizeof(buf) };
 
     /* Преамбула. Байт в байт из RFC 7540 §3.5 — сервер сверяет её дословно. */
@@ -183,7 +183,7 @@ int h2_start(struct h2 *h, const struct h2_io *io, const char *authority,
 
     /* HEADERS. Псевдозаголовки обязаны идти первыми и в этом порядке. */
     {
-        static unsigned char hb[2048];
+        static __thread unsigned char hb[2048];
         struct wbuf hp = { hb, 0, sizeof(hb) };
         hp_indexed(&hp, HP_METHOD_POST);
         hp_indexed(&hp, HP_SCHEME_HTTPS);
@@ -325,7 +325,7 @@ int h2_read(struct h2 *h, unsigned char *out, size_t cap, size_t *got) {
 
     /* Общий буфер на всех: разбор идёт в один поток, и держать по 16 КБ на соединение
      * значило бы мегабайт там, где хватает одного буфера. */
-    static unsigned char rec[TLS13_MAX_PLAIN + sizeof(h->pend)];
+    static __thread unsigned char rec[TLS13_MAX_PLAIN + sizeof(h->pend)];
     size_t avail = 0;
     if (h->pend_n) {
         memcpy(rec, h->pend, h->pend_n);

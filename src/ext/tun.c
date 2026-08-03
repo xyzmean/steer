@@ -63,46 +63,76 @@ struct vnet_hdr {
  * всё, и ядро прочитало бы gso_size там, где лежит csum_start. */
 typedef char vnet_hdr_size_check[sizeof(struct vnet_hdr) == VNET_HDR_LEN ? 1 : -1];
 
-int tun_open(struct tun_dev *d, const char *name) {
-    d->fd = -1;
-    d->gso = 0;
-
+/* Одна попытка открыть очередь с заданным набором флагов. */
+static int queue_open(const char *name, short flags) {
     int fd = open("/dev/net/tun", O_RDWR);
-    if (fd < 0) return TUN_ENODEV;
-
+    if (fd < 0) return -1;
     struct ifreq ifr;
     memset(&ifr, 0, sizeof(ifr));
+    snprintf(ifr.ifr_name, IFNAMSIZ, "%s", name);
+    ifr.ifr_flags = flags;
+    if (ioctl(fd, TUNSETIFF, &ifr) < 0) {
+        close(fd);
+        return -1;
+    }
+    return fd;
+}
+
+int tun_open(struct tun_dev *d, int max_queues, const char *name) {
     /* IFF_NO_PI: без 4-байтного префикса протокола. Он нужен только тому, кто хочет
      * различать семейства на одном устройстве, а у нас IPv4 и разбор всё равно по
      * заголовку пакета.
      *
      * IFF_VNET_HDR: разрешает писать в устройство сегмент больше MTU с пометкой «нарежь
-     * по столько», а контрольную сумму TCP оставить недосчитанной. Просим сначала с ним,
-     * и только если ядро откажет — без него: на старом ядре без поддержки это единственный
-     * способ узнать, есть она или нет, а ронять туннель из-за отсутствия УСКОРЕНИЯ нельзя.
+     * по столько», а контрольную сумму TCP оставить недосчитанной.
+     *
+     * IFF_MULTI_QUEUE: несколько дескрипторов на одно устройство, по одному на поток.
+     *
+     * Порядок попыток — от лучшего к худшему, и каждая следующая отказывается ровно от
+     * одного. Ядро без той или иной поддержки не должно ронять туннель: остаться без
+     * УСКОРЕНИЯ можно, остаться без туннеля нельзя.
      *
      * TUNSETOFFLOAD мы НЕ вызываем, и это осознанно. Он описывает, что мы готовы принимать
      * ОТ ядра, то есть включил бы приход суперпакетов и в обратную сторону — а для них
      * пришлось бы всюду держать буферы по 64 КБ вместо 16. Отдача клиенту, где выигрыш и
      * лежит, от него не зависит: разгрузку на запись включает сам vnet_hdr. */
-    snprintf(ifr.ifr_name, IFNAMSIZ, "%s", name);
-    ifr.ifr_flags = IFF_TUN | IFF_NO_PI | IFF_VNET_HDR;
+    short base = IFF_TUN | IFF_NO_PI;
     /* STEER_TUN_NOGSO отключает разгрузку принудительно. Нужно для замеров: «стало быстрее»
      * без возможности вернуться на прежний путь одной переменной — это утверждение, которое
      * нельзя перепроверить на том же железе и той же подписке. */
-    if (!getenv("STEER_TUN_NOGSO") && ioctl(fd, TUNSETIFF, &ifr) == 0) {
-        d->gso = 1;
-    } else {
-        memset(&ifr, 0, sizeof(ifr));
-        snprintf(ifr.ifr_name, IFNAMSIZ, "%s", name);
-        ifr.ifr_flags = IFF_TUN | IFF_NO_PI;
-        if (ioctl(fd, TUNSETIFF, &ifr) < 0) {
-            close(fd);
-            return TUN_ESETUP;
+    int want_gso = getenv("STEER_TUN_NOGSO") == NULL;
+    if (max_queues < 1) max_queues = 1;
+
+    static const struct { int gso, multi; } order[] = {
+        { 1, 1 }, { 1, 0 }, { 0, 1 }, { 0, 0 },
+    };
+    for (size_t i = 0; i < sizeof(order) / sizeof(*order); i++) {
+        if (order[i].gso && !want_gso) continue;
+        if (order[i].multi && max_queues < 2) continue;
+        short flags = base;
+        if (order[i].gso) flags |= IFF_VNET_HDR;
+        if (order[i].multi) flags |= IFF_MULTI_QUEUE;
+
+        int fd = queue_open(name, flags);
+        if (fd < 0) continue;
+        d[0].fd = fd;
+        d[0].gso = order[i].gso;
+
+        int n = 1;
+        if (order[i].multi) {
+            /* Остальные очереди — теми же флагами. Сколько дали, столько и берём: отказ на
+             * пятой очереди не повод отказываться от четырёх уже открытых. */
+            while (n < max_queues) {
+                int extra = queue_open(name, flags);
+                if (extra < 0) break;
+                d[n].fd = extra;
+                d[n].gso = order[i].gso;
+                n++;
+            }
         }
+        return n;
     }
-    d->fd = fd;
-    return 0;
+    return TUN_ESETUP;
 }
 
 ssize_t tun_read_packet(const struct tun_dev *d, unsigned char *buf, size_t cap) {
