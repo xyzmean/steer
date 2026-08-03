@@ -35,6 +35,9 @@
 #include <errno.h>
 #include <sys/random.h>
 #include <stdlib.h>
+#if defined(__aarch64__)
+#include <sys/auxv.h>
+#endif
 
 #include "mbedtls/ecdh.h"
 #include "mbedtls/ecp.h"
@@ -96,6 +99,38 @@ static int fill_random(unsigned char *buf, size_t n) {
         got += (size_t)r;
     }
     return 0;
+}
+
+/* Есть ли у процессора инструкции AES.
+ *
+ * От этого зависит порядок шифров в ClientHello, и оба варианта — браузерные: Chrome
+ * задаёт тот же вопрос (EVP_has_aes_hardware) и так же меняет порядок. Так что здесь мы не
+ * выбираем «что нам удобнее», а повторяем поведение браузера на этом железе.
+ *
+ * Спрашиваем ядро через AT_HWCAP, а не пробуем инструкцию: инструкция, которой нет, даёт
+ * SIGILL, а ловить его в статическом бинарнике на роутере — худшая из идей. На MIPS
+ * вопроса нет вовсе: там таких инструкций не бывает.
+ *
+ * STEER_CIPHER=aes|chacha переопределяет ответ. Нужно, чтобы «стало быстрее от смены
+ * шифра» можно было перепроверить на месте, а не поверить на слово. */
+static int cpu_has_aes(void) {
+    const char *env = getenv("STEER_CIPHER");
+    if (env && !strcmp(env, "aes")) return 1;
+    if (env && !strcmp(env, "chacha")) return 0;
+#if defined(__x86_64__) || defined(__i386__)
+    unsigned a = 1, b = 0, c = 0, d = 0;
+    __asm__ volatile("cpuid" : "=a"(a), "=b"(b), "=c"(c), "=d"(d) : "a"(1), "c"(0));
+    return (c & (1u << 25)) != 0;                 /* AESNI */
+#elif defined(__aarch64__)
+    return (getauxval(AT_HWCAP) & (1ul << 3)) != 0;      /* HWCAP_AES */
+#else
+    /* Всё остальное — включая 32-битный ARM с расширениями криптографии. Вопрос здесь не
+     * «есть ли инструкции у процессора», а «воспользуется ли ими НАША сборка»: путь
+     * MBEDTLS_AESCE_C существует только для aarch64 (см. mbedtls_config.h). На armv7 с
+     * crypto extensions AES у нас всё равно табличный, то есть медленный, и объявлять его
+     * предпочтительным означало бы выбрать заведомо худший шифр. */
+    return 0;
+#endif
 }
 
 /* Обёртка в форме, которую ждёт mbedtls. Нужна не для красоты: ecp_mul ТРЕБУЕТ источник
@@ -285,13 +320,32 @@ int reality_build_hello(const struct reality_cfg *cfg, struct reality_state *st,
      * даст нерасшифровываемый поток: раньше именно так и было, и выглядело это как рабочее
      * соединение без данных. Поддержка SHA-384 — отдельная работа: параметризовать длину
      * хеша во всём расписании ключей, а не подменить одну функцию. */
-    static const unsigned suites[] = {
+    static const unsigned suites_aes[] = {
         0x1301, 0x1302, 0x1303, 0xC02B, 0xC02F, 0xC02C, 0xC030,
         0xCCA9, 0xCCA8, 0xC013, 0xC014, 0x009C, 0x009D, 0x002F, 0x0035,
     };
-    put16(&b, (unsigned)(sizeof(suites) / sizeof(suites[0]) + 1) * 2);
+    /* Тот же список в порядке BoringSSL для процессора БЕЗ инструкций AES: ChaCha20
+     * поднята выше AES-GCM и в 1.3, и в 1.2. Ровно это делает Chrome (EVP_has_aes_hardware
+     * в ssl_cipher.cc), поэтому отпечаток остаётся браузерным — меняется не состав, а
+     * порядок, и меняется он так же, как у настоящего Chrome на таком же процессоре.
+     *
+     * Зачем: сервер Reality — это Go, а crypto/tls смотрит на НАШ порядок. Функция
+     * aesgcmPreferred() спрашивает, стоит ли AES-GCM первым в списке клиента, и если нет,
+     * берёт список предпочтений defaultCipherSuitesTLS13NoAES, то есть ChaCha20.
+     *
+     * Зачем это нужно, числами, на роутере с MIPS 24Kc: AES-128-GCM 1,7 МБ/с против
+     * 11,6 МБ/с у ChaCha20-Poly1305 — в шесть раз. Туннель отдавал 1,2 МБ/с, проводя 91%
+     * времени в расшифровке, то есть упирался ровно в этот потолок. Полоса канала при этом
+     * была 48 Мбит/с. Ни один другой предел близко не стоял. */
+    static const unsigned suites_chacha[] = {
+        0x1303, 0x1301, 0x1302, 0xCCA9, 0xCCA8, 0xC02B, 0xC02F, 0xC02C, 0xC030,
+        0xC013, 0xC014, 0x009C, 0x009D, 0x002F, 0x0035,
+    };
+    const unsigned *suites = cpu_has_aes() ? suites_aes : suites_chacha;
+    size_t nsuites = sizeof(suites_aes) / sizeof(suites_aes[0]);
+    put16(&b, (unsigned)(nsuites + 1) * 2);
     put16(&b, g_cipher);
-    for (size_t i = 0; i < sizeof(suites) / sizeof(suites[0]); i++) put16(&b, suites[i]);
+    for (size_t i = 0; i < nsuites; i++) put16(&b, suites[i]);
 
     put8(&b, 1); put8(&b, 0);  /* compression: null */
 

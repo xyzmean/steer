@@ -10,3 +10,11 @@ build/pkg/
 build/scripts/
 out/
 build/sing-box
+build/bench-*
+build/cstorm-*
+build/hget-*
+build/res-*
+build/tmo-*
+build/tun-gso-*
+build/gcm-size
+build/bench

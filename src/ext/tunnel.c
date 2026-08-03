@@ -124,11 +124,30 @@ struct conn {
  * 128 КБ при 0,7 мс — это 180 МБ/с на соединение, то есть предел не здесь. */
 #define RTX_CAP (128 * 1024)
 
-/* Таймаут повтора. Начинается с 50 мс, а не с двухсот, как минимум в TCP: клиент за
- * роутером, и ждать двести миллисекунд там, где круг меньше одной, значит отдать скорость
- * впустую. Растёт вдвое до секунды — на случай, если клиент действительно ушёл. */
-#define RTO_MIN_MS 50
+/* Таймаут повтора. Растёт вдвое до секунды — на случай, если клиент действительно ушёл.
+ *
+ * Нижний порог — 200 мс, как минимум RTO в самом Linux, и это исправление, а не осторожность.
+ * Раньше здесь стояло 50 мс с рассуждением «клиент за роутером, круг меньше миллисекунды,
+ * ждать двести значит отдать скорость впустую». Рассуждение верное про сеть и неверное про
+ * НАС: подтверждение клиента приходит быстро, но разбираем его мы — на своём проходе цикла.
+ *
+ * На слабом роутере проход длинный: измерено 22 прохода в секунду, то есть 45 мс, потому что
+ * почти всё время уходит на расшифровку записей. Отправленный сегмент к моменту следующего
+ * взгляда на устройство оказывается старше 50 мс — и таймаут срабатывал не на потере, а на
+ * нашей же занятости. В отчёте это выглядело как «повторов 11/с (169 КБ/с)»: четырнадцать
+ * процентов полосы уходило на пересылку того, что клиент давно получил, плюс расшифровка
+ * этих же байт заново.
+ *
+ * Терять от большого порога нечего: настоящую потерю ловит не таймер, а три одинаковых
+ * подтверждения (DUP_ACK_TRIGGER) — за один круг. Таймер нужен только для последнего
+ * сегмента, за которым подтверждений больше не будет, и там 200 мс против 50 незаметны. */
+#define RTO_MIN_MS 200
 #define RTO_MAX_MS 1000
+
+/* Но и 200 мс мало, если проход цикла сам длиннее. Порог = четыре прохода, потому что за
+ * один проход мы можем только УВИДЕТЬ подтверждение; запас нужен на то, что проход перед
+ * этим был занят другим соединением. Период прохода считаем сглаженно, по факту. */
+#define RTO_LOOP_FACTOR 4
 
 /* Сколько подтверждений одного номера подряд считаем признаком потери. Три — как в TCP:
  * клиент присылает их, получая данные не по порядку, то есть дыру он уже видит. Ждать
@@ -240,6 +259,18 @@ static int g_stats;
 /* Считается ВСЕГДА, а не только с диагностикой: по нему цикл решает, был ли проход
  * пустым. Привязать это к счётчикам статистики значило бы, что без неё поведение другое. */
 static __thread uint64_t g_rx_total;
+
+/* Сглаженный период прохода цикла в миллисекундах — из него берётся нижний порог RTO.
+ * Начинаем с RTO_MIN_MS/RTO_LOOP_FACTOR, то есть «как будто проход уже длинный»: первые
+ * проходы после старта самые долгие (рукопожатия), и занижать порог именно там опаснее. */
+static __thread uint32_t g_loop_ms = RTO_MIN_MS / RTO_LOOP_FACTOR;
+
+/* Нижняя граница таймаута повтора для этого потока. */
+static uint32_t rto_floor(void) {
+    uint32_t byloop = g_loop_ms * RTO_LOOP_FACTOR;
+    uint32_t f = byloop > RTO_MIN_MS ? byloop : RTO_MIN_MS;
+    return f > RTO_MAX_MS ? RTO_MAX_MS : f;
+}
 static __thread struct {
     uint64_t iters, poll_ns, tun_reads, tun_writes, tun_write_ns;
     uint64_t recs, rec_bytes, win_skips, drain_full;
@@ -270,7 +301,7 @@ static void stats_dump(uint64_t window_ns) {
             "tun-stats[%d]: %.1f МБ/с | циклов %.0f/с | poll %.0f%% | чтений у сервера %.0f/с "
             "(по %.1f КБ) | записей клиенту %.0f/с (%.0f мкс) | ждали окна %.0f/с | "
             "предел чтения %.0f/с | соединений %u | повторов %.0f/с (%.0f КБ/с) | "
-            "окно клиента %u..%u (масштаб %u), в пути до %u | "
+            "окно клиента %u..%u (масштаб %u), в пути до %u | порог повтора %u мс | "
             "чтение у сервера %.0f%% | разбор из TUN %.0f%% | чтение из TUN %.0f%%\n",
             g_worker,
             (double)g_st.rec_bytes / s / 1048576.0,
@@ -285,7 +316,7 @@ static void stats_dump(uint64_t window_ns) {
             g_st.conns,
             (double)g_st.rtx_sends / s, (double)g_st.rtx_bytes / s / 1024.0,
             g_st.win_min == 0xFFFFFFFFu ? 0 : g_st.win_min, g_st.win_max,
-            g_st.wscale_seen, g_st.inflight_max,
+            g_st.wscale_seen, g_st.inflight_max, rto_floor(),
             100.0 * (double)g_st.recv_ns / (double)window_ns,
             100.0 * (double)g_st.pkt_ns / (double)window_ns,
             100.0 * (double)g_st.tun_read_ns / (double)window_ns);
@@ -399,7 +430,7 @@ static int emit_to_client(struct conn *c, const struct tun_dev *tun,
            c->rtx.len, (unsigned)RTX_CAP, n);
         return -1;
     }
-    if (!c->rtx.len) { c->rtx_at = now_ns(); c->rto_ms = RTO_MIN_MS; }
+    if (!c->rtx.len) { c->rtx_at = now_ns(); c->rto_ms = rto_floor(); }
     rtx_push(&c->rtx, p, (uint32_t)n);
 
     size_t seg = tun->gso ? (size_t)TUN_GSO_MAX : (size_t)TUN_MSS;
@@ -576,7 +607,7 @@ static void handle_packet(const struct tun_dev *tun, const struct vless_node *no
         c->client_ack = 1;                          /* столько он уже подтвердил (SYN-ACK) */
         c->client_win = k.window ? k.window : 8192;
         c->client_wscale = k.wscale;
-        c->rto_ms = RTO_MIN_MS;
+        c->rto_ms = rto_floor();
         c->last = time(NULL);
         /* Кольцо повтора — на SYN, а не лениво при первых данных: лениво означало бы, что
          * отказ выделения приходит посреди передачи, когда отвечать клиенту уже нечем.
@@ -603,7 +634,15 @@ static void handle_packet(const struct tun_dev *tun, const struct vless_node *no
             fprintf(stderr, "steer tunnel: поток к %s не открылся: %s (rc=%d)\n",
                     node->host, vless_strerror(cr), cr);
             /* Сервер недоступен — отвечаем RST, а не молчим: клиент иначе будет ждать
-             * до таймаута, и «сайт не открывается» вместо «отказано в соединении». */
+             * до таймаута, и «сайт не открывается» вместо «отказано в соединении».
+             *
+             * Я пробовал молчать, рассчитывая, что клиент повторит SYN сам и попадёт в
+             * удачную попытку: узел отбивал 11 соединений из 19, а RST браузер понимает как
+             * окончательное «отказано». Стало ХУЖЕ — страница с видео перестала открываться
+             * вовсе. Молчание не даёт браузеру перейти к следующему адресу, а он на это
+             * рассчитывает: у него самого есть и повтор, и запасные адреса, и наш быстрый
+             * отказ он использует лучше, чем мы его ожидание. Проверено на живом роутере,
+             * возвращено обратно. */
             unsigned char rst[64];
             size_t rl = tcp_build(rst, sizeof(rst), k.dst, k.src, k.dport, k.sport,
                                   0, c->client_seq, TCP_RST | TCP_ACK, NULL, 0, 0, 0, -1);
@@ -639,7 +678,7 @@ static void handle_packet(const struct tun_dev *tun, const struct vless_node *no
             /* Есть продвижение — таймаут снова короткий, и он отсчитывается от нового
              * самого старого байта, а не от прежнего. */
             c->rtx_at = c->rtx.len ? now_ns() : 0;
-            c->rto_ms = RTO_MIN_MS;
+            c->rto_ms = rto_floor();
         } else if (k.ack == c->client_ack && c->rtx.len && !data_n && !c->fast_done &&
                    k.window == c->client_win && !(k.tcp_flags & (TCP_SYN | TCP_FIN))) {
             /* Дубликат подтверждения по определению из RFC 5681: тот же номер, без данных,
@@ -792,6 +831,7 @@ static void *worker_loop(void *arg) {
 
     g_st.win_min = 0xFFFFFFFFu;
     uint64_t stats_at = g_stats ? now_ns() : 0;
+    uint64_t loop_at = 0;   /* когда вернулся прошлый poll — для оценки периода прохода */
     memset(g_conns, 0, sizeof(g_conns));
     unsigned char pkt[TUNNEL_BUF];
 
@@ -855,6 +895,20 @@ static void *worker_loop(void *arg) {
          * происходит сразу, а при потере последнего сегмента просыпаться уже нечему —
          * ровно тот случай, для которого таймер и нужен. */
         uint64_t now = now_ns();
+
+        /* Период прохода: сколько прошло с прошлого места ожидания. Считаем РАБОЧУЮ часть,
+         * а не время в poll: порог RTO должен закрывать то, на что мы заняты, а сон в poll
+         * прерывается пришедшим подтверждением сразу. Сглаживание 1/8 — как в оценке RTT в
+         * TCP, чтобы одна долгая итерация не задирала порог надолго. */
+        if (loop_at) {
+            uint64_t busy64 = (now - loop_at) / 1000000;
+            uint32_t busy = busy64 > 5000 ? 5000 : (uint32_t)busy64;
+            /* Вверх с округлением вверх — то есть заметив занятость, порог поднимается сразу
+             * хотя бы на миллисекунду. Вниз с округлением вниз, чтобы не дёргаться. */
+            if (busy > g_loop_ms) g_loop_ms += (busy - g_loop_ms + 7) / 8;
+            else                  g_loop_ms -= (g_loop_ms - busy) / 8;
+        }
+
         int wait_ms = 1000;
         for (int i = 0; i < MAX_CONNS; i++) {
             const struct conn *c = &g_conns[i];
@@ -864,13 +918,16 @@ static void *worker_loop(void *arg) {
             if (left < wait_ms) wait_ms = (int)left;
         }
 
-        uint64_t p0 = g_stats ? now : 0;
         int r = poll(pf, (unsigned)nf, wait_ms);
+        uint64_t after_poll = now_ns();
+        loop_at = after_poll;
         if (g_stats) {
-            uint64_t t = now_ns();
-            g_st.poll_ns += t - p0;
+            g_st.poll_ns += after_poll - now;
             g_st.iters++;
-            if (t - stats_at >= 2000000000ull) { stats_dump(t - stats_at); stats_at = t; }
+            if (after_poll - stats_at >= 2000000000ull) {
+                stats_dump(after_poll - stats_at);
+                stats_at = after_poll;
+            }
         }
         if (r < 0) {
             if (errno == EINTR) continue;

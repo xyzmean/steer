@@ -21,6 +21,7 @@
 #include <netinet/in.h>
 #include <netinet/tcp.h>
 #include <poll.h>
+#include <fcntl.h>
 #include <arpa/inet.h>
 #include <sys/random.h>
 #include <time.h>
@@ -242,16 +243,66 @@ static int grpc_unwrap(struct grpc_de *de, const unsigned char *in, size_t n,
     return 0;
 }
 
-static int tcp_connect(const char *host, uint16_t port, int timeout_s) {
-    char portstr[8];
-    snprintf(portstr, sizeof(portstr), "%u", port);
-    struct addrinfo hints = { .ai_family = AF_INET, .ai_socktype = SOCK_STREAM };
-    struct addrinfo *res = NULL;
-    if (getaddrinfo(host, portstr, &hints, &res) != 0 || !res) return VLESS_CONN_EDNS;
+/* ---- установление TCP: ВСЕ адреса узла, а не первый ---------------------------
+ *
+ * Одно имя узла — это, как правило, не один адрес. Живой пример, на котором это нашлось:
+ * pl.riotvpn.eu отдаёт ПЯТНАДЦАТЬ записей A, и шесть из них — чёрные дыры: SYN уходит, в
+ * ответ тишина. DNS перемешивает список при каждом запросе, поэтому «первый адрес» каждый
+ * раз другой, и в сорока процентах случаев он мёртвый.
+ *
+ * Прежний код брал res->ai_next == первый и на этом останавливался. Последствия оказались
+ * куда хуже, чем «иногда не соединяется»:
+ *
+ *   - блокирующий connect к чёрной дыре ждёт SO_SNDTIMEO целиком — восемь секунд, — и
+ *     всё это время событийный цикл СТОИТ. Не тормозит, а стоит: ни один другой поток не
+ *     двигается. На роутере это выглядело как «сайты еле открываются» при простое
+ *     процессора 80% и нулевых счётчиках ошибок;
+ *   - Linux сообщает об этом таймауте кодом EINPROGRESS (см. __inet_stream_connect:
+ *     истёк timeo — err остаётся -EINPROGRESS), а не ETIMEDOUT. То есть в логе стояло
+ *     «Operation in progress» у блокирующего вызова — вид сообщения, за которым не видно
+ *     ни таймаута, ни мёртвого адреса;
+ *   - сторож считал узел живым или мёртвым по одной пробе, то есть по жребию.
+ *
+ * Поэтому здесь: неблокирующий connect, свой таймаут вместо SO_SNDTIMEO, несколько
+ * попыток одновременно с задержкой между запусками, и адрес-победитель запоминается,
+ * чтобы следующее соединение начиналось с него. */
 
-    int fd = socket(res->ai_family, SOCK_STREAM, 0);
-    if (fd < 0) { freeaddrinfo(res); return VLESS_CONN_ESOCK; }
+#define ADDR_MAX      16   /* сколько адресов имени вообще рассматриваем */
+#define ATTEMPT_MAX    4   /* сколько держим в воздухе одновременно */
+#define STAGGER_MS   150   /* пауза перед запуском следующей попытки */
 
+/* Победивший адрес на имя. Живёт по потоку: работники независимы, блокировка не нужна, а
+ * «каждый узнал сам» стоит одного лишнего перебора на работника при старте. */
+#define GOOD_MAX 8
+static __thread struct { char host[96]; struct in_addr ip; uint16_t port; } g_good[GOOD_MAX];
+static __thread unsigned g_good_n;
+
+static struct in_addr *good_get(const char *host, uint16_t port) {
+    for (unsigned i = 0; i < g_good_n; i++)
+        if (g_good[i].port == port && strcmp(g_good[i].host, host) == 0) return &g_good[i].ip;
+    return NULL;
+}
+
+static void good_put(const char *host, uint16_t port, struct in_addr ip) {
+    struct in_addr *p = good_get(host, port);
+    if (p) { *p = ip; return; }
+    unsigned i = g_good_n < GOOD_MAX ? g_good_n++ : GOOD_MAX - 1;
+    snprintf(g_good[i].host, sizeof(g_good[i].host), "%s", host);
+    g_good[i].port = port;
+    g_good[i].ip = ip;
+}
+
+static int64_t now_ms(void) {
+    struct timespec t;
+    clock_gettime(CLOCK_MONOTONIC, &t);
+    return (int64_t)t.tv_sec * 1000 + t.tv_nsec / 1000000;
+}
+
+/* Готовит установленный сокет к работе остального кода: снимает O_NONBLOCK (чтение и
+ * запись дальше блокирующие, с таймаутом через SO_*TIMEO) и ставит опции. */
+static void sock_ready(int fd, int timeout_s) {
+    int fl = fcntl(fd, F_GETFL, 0);
+    if (fl >= 0) fcntl(fd, F_SETFL, fl & ~O_NONBLOCK);
     /* Таймаут на чтение и запись. Без него мёртвый узел вешает проверку до таймаута
      * ядра — минуты, за которые сторож не успеет обойти остальных кандидатов. */
     struct timeval tv = { .tv_sec = timeout_s, .tv_usec = 0 };
@@ -268,14 +319,122 @@ static int tcp_connect(const char *host, uint16_t port, int timeout_s) {
      *
      * То есть «поставил буфер побольше» на деле означало «запретил ядру увеличивать его
      * дальше». Пределы живут в net.ipv4.tcp_rmem и настраиваются системой, а не нами. */
+}
 
-    if (connect(fd, res->ai_addr, res->ai_addrlen) != 0) {
-        close(fd);
-        freeaddrinfo(res);
+/* Запускает неблокирующий connect. Возвращает fd (соединение уже установлено или в
+ * процессе) либо -1. */
+static int attempt_start(struct in_addr ip, uint16_t port, int *done) {
+    int fd = socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK, 0);
+    if (fd < 0) return -1;
+    struct sockaddr_in sa = { .sin_family = AF_INET, .sin_port = htons(port), .sin_addr = ip };
+    *done = 0;
+    if (connect(fd, (struct sockaddr *)&sa, sizeof(sa)) == 0) { *done = 1; return fd; }
+    if (errno != EINPROGRESS) { close(fd); return -1; }
+    return fd;
+}
+
+static int tcp_connect(const char *host, uint16_t port, int timeout_s) {
+    char portstr[8];
+    snprintf(portstr, sizeof(portstr), "%u", port);
+    struct addrinfo hints = { .ai_family = AF_INET, .ai_socktype = SOCK_STREAM };
+    struct addrinfo *res = NULL;
+    if (getaddrinfo(host, portstr, &hints, &res) != 0 || !res) return VLESS_CONN_EDNS;
+
+    struct in_addr addr[ADDR_MAX];
+    unsigned an = 0;
+    for (struct addrinfo *p = res; p && an < ADDR_MAX; p = p->ai_next)
+        if (p->ai_family == AF_INET)
+            addr[an++] = ((struct sockaddr_in *)p->ai_addr)->sin_addr;
+    freeaddrinfo(res);
+    if (an == 0) return VLESS_CONN_EDNS;
+
+    /* Прошлый победитель — вперёд. В устойчивом состоянии это означает одно соединение за
+     * один круг до сервера вместо перебора мёртвых адресов заново каждый раз. */
+    struct in_addr *g = good_get(host, port);
+    if (g) for (unsigned i = 1; i < an; i++)
+        if (addr[i].s_addr == g->s_addr) { struct in_addr t = addr[0]; addr[0] = addr[i]; addr[i] = t; break; }
+
+    int fd[ATTEMPT_MAX];
+    struct in_addr fa[ATTEMPT_MAX];
+    unsigned nf = 0;     /* попыток в воздухе */
+    unsigned next = 0;   /* следующий адрес к запуску */
+    unsigned dead = 0;   /* сколько адресов отвалилось */
+    int64_t deadline = now_ms() + (long long)timeout_s * 1000;
+    int64_t stagger_at = 0;
+    int win = -1;
+
+    while (win < 0) {
+        int64_t t = now_ms();
+        if (t >= deadline) break;
+
+        /* Запуск новых попыток: первая сразу, дальше через STAGGER_MS. Пауза нужна, чтобы
+         * при живом первом адресе (обычный случай) второй сокет вообще не открывался. */
+        while (nf < ATTEMPT_MAX && next < an && t >= stagger_at) {
+            int d = 0;
+            struct in_addr ip = addr[next++];
+            int s = attempt_start(ip, port, &d);
+            if (s < 0) { dead++; continue; }
+            if (d) {   /* соединилось сразу: обычно это адрес в той же сети */
+                for (unsigned j = 0; j < nf; j++) close(fd[j]);
+                nf = 0;
+                good_put(host, port, ip);
+                win = s;
+                break;
+            }
+            fd[nf] = s; fa[nf] = ip;
+            nf++;
+            stagger_at = t + STAGGER_MS;
+        }
+        if (win >= 0) break;
+        if (nf == 0) break;   /* адреса кончились, и ни одна попытка не жива */
+
+        struct pollfd pv[ATTEMPT_MAX];
+        for (unsigned i = 0; i < nf; i++) { pv[i].fd = fd[i]; pv[i].events = POLLOUT; pv[i].revents = 0; }
+
+        /* Ждём до ближайшего из двух событий: пора запускать следующую попытку или вышел
+         * общий срок. Ограничение «только если есть куда запускать» — не мелочь: без него
+         * при четырёх попытках в воздухе и непустом остатке адресов poll получал таймаут 0
+         * и цикл крутился на месте, съедая ядро. */
+        int64_t wait = deadline - t;
+        if (next < an && nf < ATTEMPT_MAX) {
+            int64_t till = stagger_at > t ? stagger_at - t : 0;
+            if (till < wait) wait = till;
+        }
+        if (wait < 0) wait = 0;
+        int pr = poll(pv, nf, (int)wait);
+        if (pr < 0) { if (errno == EINTR) continue; break; }
+
+        for (unsigned i = 0; i < nf; ) {
+            if (!pv[i].revents) { i++; continue; }
+            int err = 0; socklen_t el = sizeof(err);
+            getsockopt(fd[i], SOL_SOCKET, SO_ERROR, &err, &el);
+            if (err == 0 && !(pv[i].revents & (POLLERR | POLLHUP))) {
+                win = fd[i];
+                good_put(host, port, fa[i]);
+                for (unsigned j = 0; j < nf; j++) if (j != i) close(fd[j]);
+                nf = 0;
+                break;
+            }
+            /* Этот адрес отпал — освобождаем место и сразу пробуем следующий. */
+            close(fd[i]); dead++;
+            nf--; fd[i] = fd[nf]; fa[i] = fa[nf]; pv[i] = pv[nf];
+            stagger_at = 0;
+        }
+    }
+
+    if (win < 0) {
+        for (unsigned i = 0; i < nf; i++) close(fd[i]);
+        /* Сообщение называет масштаб: «ни один из N адресов» — это про имя узла, а не
+         * про сеть, и лечится сменой узла, а не настройкой роутера. */
+        fprintf(stderr, "steer vless: %s:%u — ни один адрес не ответил (адресов %u, отпало %u)\n",
+                host, port, an, dead);
         return VLESS_CONN_ECONNECT;
     }
-    freeaddrinfo(res);
-    return fd;
+    if (dead)
+        fprintf(stderr, "steer vless: %s:%u — соединился, пропущено мёртвых адресов: %u из %u\n",
+                host, port, dead, an);
+    sock_ready(win, timeout_s);
+    return win;
 }
 
 /* Полное установление: TCP + Reality + TLS 1.3. Возвращает 0 и заполняет conn. */
@@ -402,12 +561,6 @@ int vless_recv(struct vless_conn *c, unsigned char *d, size_t cap, size_t *got) 
  * Обращаемся к 1.1.1.1:80 и ждём хоть какой-то ответ: цель не проверить интернет, а
  * получить от СЕРВЕРА подтверждение, что он понял запрос VLESS. Побочно это и есть
  * измерение задержки — тот же путь, по которому пойдёт настоящий трафик. */
-static int64_t now_ms(void) {
-    struct timespec ts;
-    clock_gettime(CLOCK_MONOTONIC, &ts);
-    return (int64_t)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
-}
-
 int vless_probe(const struct vless_node *node, int timeout_s, char *why, size_t why_n) {
     return vless_probe_timed(node, timeout_s, why, why_n, NULL, NULL);
 }
