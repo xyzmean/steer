@@ -237,6 +237,21 @@ int reality_build_hello(const struct reality_cfg *cfg, struct reality_state *st,
     unsigned char rnd[32];
     if (fill_random(rnd, sizeof(rnd)) != 0) return REALITY_ECRYPTO;
 
+    /* Значения GREASE (RFC 8701) — по одному на каждое место, где Chrome их ставит, и
+     * СВОИ на каждое соединение. Постоянные значения сами стали бы отпечатком: именно
+     * непредсказуемость здесь и есть смысл GREASE.
+     *
+     * Значения — это 0x0a0a + n*0x1010, то есть шестнадцать вариантов от 0x0a0a до 0xfafa.
+     * Два типа расширений обязаны отличаться друг от друга: одинаковые дали бы расширение,
+     * повторённое дважды, чего в TLS быть не может. */
+    unsigned char gr[5];
+    if (fill_random(gr, sizeof(gr)) != 0) return REALITY_ECRYPTO;
+    unsigned g_cipher  = 0x0A0Au + (unsigned)(gr[0] & 15) * 0x1010u;
+    unsigned g_group   = 0x0A0Au + (unsigned)(gr[1] & 15) * 0x1010u;
+    unsigned g_version = 0x0A0Au + (unsigned)(gr[2] & 15) * 0x1010u;
+    unsigned g_ext_a   = 0x0A0Au + (unsigned)(gr[3] & 15) * 0x1010u;
+    unsigned g_ext_b   = 0x0A0Au + (unsigned)((gr[4] & 15) ^ (((gr[4] & 15) == (gr[3] & 15)) ? 1 : 0)) * 0x1010u;
+
     /* record header заполним в конце: длина известна только тогда */
     size_t rec_at = b.len;
     put8(&b, 0x16);            /* handshake */
@@ -258,18 +273,24 @@ int reality_build_hello(const struct reality_cfg *cfg, struct reality_state *st,
     put8(&b, 32);
     put(&b, st->session_id, 32);
 
-    /* Шифры Chrome, в его порядке, с GREASE первым. */
-    /* Только наборы на SHA-256. AES_256_GCM_SHA384 (0x1302) НЕ предлагается сознательно:
-     * его расписание ключей идёт целиком на SHA-384, то есть все секреты по 48 байт
-     * вместо 32. Пока tls13.c написан под SHA-256, предлагать его означало бы получить
-     * рабочее рукопожатие и нерасшифровываемый поток — именно это и произошло: сервер
-     * выбрал 0x1302, ключи вывелись от другого хеша, AEAD не сошёлся.
+    /* Наборы шифров Chrome, в его порядке, с GREASE первым. Сверено с перехватом.
      *
-     * Предлагать только то, что умеешь обработать, честнее, чем поддерживать наполовину.
-     * Поддержка SHA-384 — отдельная работа: параметризовать длину хеша во всём
-     * расписании, а не подменить одну функцию. */
-    static const unsigned suites[] = { 0x1303, 0x1301, 0x00FF };
-    put16(&b, (unsigned)(sizeof(suites) / sizeof(suites[0])) * 2);
+     * 0x1302 (AES_256_GCM_SHA384) в списке есть, хотя tls13.c умеет только SHA-256. Это не
+     * оплошность: список обязан совпадать с браузерным, иначе весь смысл Reality теряется, —
+     * а выбирает набор сервер, и сервер здесь Go. crypto/tls перебирает СВОЙ порядок
+     * предпочтений (AES_128_GCM_SHA256, CHACHA20, AES_256_GCM_SHA384) и берёт первый, который
+     * предложил клиент, то есть 0x1301; без аппаратного AES — 0x1303. Оба мы умеем.
+     *
+     * Если сервер всё-таки выберет 0x1302, рукопожатие честно упадёт с TLS13_EBADSUITE, а не
+     * даст нерасшифровываемый поток: раньше именно так и было, и выглядело это как рабочее
+     * соединение без данных. Поддержка SHA-384 — отдельная работа: параметризовать длину
+     * хеша во всём расписании ключей, а не подменить одну функцию. */
+    static const unsigned suites[] = {
+        0x1301, 0x1302, 0x1303, 0xC02B, 0xC02F, 0xC02C, 0xC030,
+        0xCCA9, 0xCCA8, 0xC013, 0xC014, 0x009C, 0x009D, 0x002F, 0x0035,
+    };
+    put16(&b, (unsigned)(sizeof(suites) / sizeof(suites[0]) + 1) * 2);
+    put16(&b, g_cipher);
     for (size_t i = 0; i < sizeof(suites) / sizeof(suites[0]); i++) put16(&b, suites[i]);
 
     put8(&b, 1); put8(&b, 0);  /* compression: null */
@@ -278,80 +299,163 @@ int reality_build_hello(const struct reality_cfg *cfg, struct reality_state *st,
     put16(&b, 0);
     size_t exts_at = b.len;
 
-    /* Состав и ПОРЯДОК расширений повторяют openssl, чей Hello этот сервер принимает
-     * (перехвачен и проверен: ответ 1448 байт с ServerHello). Своя версия «как у Chrome
-     * по памяти» получала alert 50 decode_error, и найти причину перебором полей не
-     * удалось — потому что причина была не в одном поле, а в составе целиком.
+    /* Состав, содержимое и порядок расширений повторяют Chrome, сверенные с перехватом
+     * его Hello до этого же сервера (tests/hello-diff.py).
      *
-     * Это компромисс, и он назван честно: openssl отличим от браузера, то есть
-     * маскировка слабее, чем у настоящего Chrome. Но рабочее соединение с посредственной
-     * маскировкой полезнее неработающего с идеальной, а точный отпечаток Chrome — это
-     * отдельная задача с эталонными дампами, а не то, что угадывается. */
+     * Почему это важно настолько. Аутентификатор Reality подписывает ClientHello ЦЕЛИКОМ,
+     * а весь смысл Reality — быть неотличимым от браузера. Прежняя версия повторяла openssl:
+     * 3 набора шифров вместо 16, 10 расширений вместо 18, ни одного GREASE, без ECH и ALPN,
+     * зато с encrypt_then_mac, которого браузер не посылает. Работало это до тех пор, пока
+     * сервер не стал разборчивее — а потом перестало на всех 26 узлах подписки сразу, при
+     * рабочем sing-box на том же узле и тех же ключах (0 успехов из 10 против 7 из 10).
+     *
+     * Симптом при этом ничего не подсказывал: рукопожатие проходит целиком, серверный
+     * Finished сходится, не приходит только ответ VLESS. У Reality нет отрицательного
+     * ответа — непризнанного клиента он молча проксирует на маскировочный сайт.
+     *
+     * Отсюда правило для этого блока: любое изменение здесь проверяется перехватом рядом с
+     * браузерным эталоном, а не рассуждением о том, что «должно подойти». */
+
+    /* Расширения складываются в таблицу и лишь потом пишутся: Chrome начиная с 110-й версии
+     * ПЕРЕМЕШИВАЕТ их порядок на каждом соединении, оставляя на месте первое и последнее.
+     * Фиксированный порядок сам был бы отпечатком. */
+    struct pend { unsigned type; const unsigned char *body; size_t n; };
+    struct pend px[20];
+    size_t pn = 0;
+
+    unsigned char b_sni[300], b_alpn[16], b_cc[4], b_ech[220], b_alps[8], b_reneg[1];
+    unsigned char b_ocsp[5], b_vers[8], b_sigs[20], b_ks[64], b_grp[12], b_pskm[2];
+    unsigned char b_ecpf[2], b_last[1];
+
+    /* Первым — GREASE, пустой. */
+    px[pn].type = g_ext_a; px[pn].body = NULL; px[pn].n = 0; pn++;
 
     /* server_name: список(2) + тип(1) + длина(2) + имя. */
     {
         size_t sni_len = strlen(cfg->sni);
-        unsigned char sni[300];
-        struct buf sb = { sni, 0, sizeof(sni) };
+        struct buf sb = { b_sni, 0, sizeof(b_sni) };
         put16(&sb, (unsigned)(sni_len + 3));
         put8(&sb, 0);
         put16(&sb, (unsigned)sni_len);
         put(&sb, cfg->sni, sni_len);
-        ext(&b, 0x0000, sni, sb.len);
+        px[pn].type = 0x0000; px[pn].body = b_sni; px[pn].n = sb.len; pn++;
     }
 
-    /* ec_point_formats: три формата, как у openssl. */
-    ext(&b, 0x000B, "\x03\x00\x01\x02", 4);
-
-    /* supported_groups: X25519 первым, затем то, что предлагает openssl. */
-    { unsigned char g2[24]; struct buf sb = { g2, 0, sizeof(g2) };
-      put16(&sb, 20);
-      put16(&sb, 0x001D); put16(&sb, 0x0017); put16(&sb, 0x001E);
-      put16(&sb, 0x0019); put16(&sb, 0x0018);
-      put16(&sb, 0x0100); put16(&sb, 0x0101); put16(&sb, 0x0102);
-      put16(&sb, 0x0103); put16(&sb, 0x0104);
-      ext(&b, 0x000A, g2, sb.len); }
-
-    ext(&b, 0x0023, NULL, 0);              /* session_ticket */
-
-    /* ALPN — только когда транспорт этого требует (grpc, xhttp). Место то же, где его
-     * ставит openssl с ключом -alpn: сразу за session_ticket. Формат: длина списка(2),
-     * затем на каждый протокол длина(1) и байты.
+    /* ALPN: ВСЕГДА h2 и http/1.1, как браузер, независимо от транспорта узла.
      *
-     * Без этого расширения сервер обслуживает соединение как HTTP/1.1, а gRPC по 1.1 не
-     * бывает вовсе: запрос уходит, ответа нет, и выглядит это как мёртвый узел. */
-    if (cfg->alpn && cfg->alpn[0]) {
-        size_t al = strlen(cfg->alpn);
-        unsigned char a[40];
-        struct buf ab = { a, 0, sizeof(a) };
-        if (al > 32) return REALITY_ETOOBIG;
-        put16(&ab, (unsigned)(al + 1));
-        put8(&ab, (unsigned)al);
-        put(&ab, cfg->alpn, al);
-        ext(&b, 0x0010, a, ab.len);
+     * Раньше ALPN ставился только для grpc и xhttp — и это само было отличием от браузера,
+     * который присылает его всегда. Транспорту это не вредит: h2 стоит первым, поэтому
+     * сервер, желающий h2, его и выберет, а признавший нас Reality не выбирает ничего
+     * (NextProtos nil в Xray) и присылает пустые EncryptedExtensions. */
+    {
+        struct buf ab = { b_alpn, 0, sizeof(b_alpn) };
+        put16(&ab, 12);
+        put8(&ab, 2); put(&ab, "h2", 2);
+        put8(&ab, 8); put(&ab, "http/1.1", 8);
+        px[pn].type = 0x0010; px[pn].body = b_alpn; px[pn].n = ab.len; pn++;
     }
 
-    ext(&b, 0x0016, NULL, 0);              /* encrypt_then_mac */
-    ext(&b, 0x0017, NULL, 0);              /* extended_master_secret */
+    /* compress_certificate: brotli (2). */
+    { struct buf cb = { b_cc, 0, sizeof(b_cc) };
+      put8(&cb, 2); put16(&cb, 0x0002);
+      px[pn].type = 0x001B; px[pn].body = b_cc; px[pn].n = cb.len; pn++; }
 
-    /* signature_algorithms: набор openssl, он этому серверу подходит наверняка. */
-    { static const unsigned sigs[] = { 0x0403, 0x0503, 0x0603, 0x0807, 0x0808,
-                                      0x0809, 0x080a, 0x080b, 0x0804, 0x0805,
-                                      0x0806, 0x0401, 0x0501, 0x0601 };
-      unsigned char s[64]; struct buf sb = { s, 0, sizeof(s) };
-      put16(&sb, (unsigned)(sizeof(sigs)/sizeof(sigs[0])) * 2);
-      for (size_t i = 0; i < sizeof(sigs)/sizeof(sigs[0]); i++) put16(&sb, sigs[i]);
-      ext(&b, 0x000D, s, sb.len); }
+    /* encrypted_client_hello — НАБИВКА, а не настоящий ECH.
+     *
+     * Chrome без конфигурации ECH посылает именно это: расширение правильной формы, набитое
+     * случайными байтами (в utls — GREASE-ECH). Настоящий ECH нам не нужен и не с чем
+     * согласовывать; нужна ровно та же форма и тот же размер, иначе Hello отличим по одному
+     * отсутствующему расширению в 218 байт.
+     *
+     * Раскладка: тип(1)=0 внешний, kdf(2)=HKDF-SHA256, aead(2)=AES-128-GCM, номер
+     * конфигурации(1), длина enc(2)=32 и сам enc, длина payload(2)=176 и payload.
+     * Итого 1+2+2+1+2+32+2+176 = 218 байт — столько же, сколько у эталона. */
+    {
+        unsigned char noise[209];
+        if (fill_random(noise, sizeof(noise)) != 0) return REALITY_ECRYPTO;
+        struct buf eb = { b_ech, 0, sizeof(b_ech) };
+        put8(&eb, 0x00);
+        put16(&eb, 0x0001);
+        put16(&eb, 0x0001);
+        put8(&eb, noise[0]);
+        put16(&eb, 32);
+        put(&eb, noise + 1, 32);
+        put16(&eb, 176);
+        put(&eb, noise + 33, 176);
+        px[pn].type = 0xFE0D; px[pn].body = b_ech; px[pn].n = eb.len; pn++;
+    }
 
-    ext(&b, 0x002B, "\x02\x03\x04", 3);    /* supported_versions: TLS 1.3 */
-    ext(&b, 0x002D, "\x01\x01", 2);        /* psk_key_exchange_modes */
+    /* application_settings (ALPS), новый номер 0x44cd: список из одного "h2". */
+    { struct buf ab = { b_alps, 0, sizeof(b_alps) };
+      put16(&ab, 3); put8(&ab, 2); put(&ab, "h2", 2);
+      px[pn].type = 0x44CD; px[pn].body = b_alps; px[pn].n = ab.len; pn++; }
 
-    /* key_share: здесь едет наша публичная половина — то, из чего сервер выведет тот же
-     * общий секрет, что и мы. Последним, как у openssl. */
-    { unsigned char k[80]; struct buf sb = { k, 0, sizeof(k) };
-      put16(&sb, 36);
-      put16(&sb, 0x001D); put16(&sb, 32); put(&sb, st->pub, 32);
-      ext(&b, 0x0033, k, sb.len); }
+    b_reneg[0] = 0;
+    px[pn].type = 0xFF01; px[pn].body = b_reneg; px[pn].n = 1; pn++;
+
+    px[pn].type = 0x0017; px[pn].body = NULL; px[pn].n = 0; pn++;   /* extended_master_secret */
+    px[pn].type = 0x0023; px[pn].body = NULL; px[pn].n = 0; pn++;   /* session_ticket */
+
+    /* status_request: OCSP, пустые списки. */
+    { struct buf ob = { b_ocsp, 0, sizeof(b_ocsp) };
+      put8(&ob, 1); put16(&ob, 0); put16(&ob, 0);
+      px[pn].type = 0x0005; px[pn].body = b_ocsp; px[pn].n = ob.len; pn++; }
+
+    /* supported_versions: GREASE, 1.3, 1.2.
+     *
+     * TLS 1.2 в списке есть потому, что он есть у браузера. Обслужить его tls13.c не умеет,
+     * но Reality — это строго 1.3, и сервер выберет 1.3; если вдруг нет, разбор ServerHello
+     * не найдёт key_share и вернёт ENOKEYSHARE, то есть ошибку, а не молчание. */
+    { struct buf vb = { b_vers, 0, sizeof(b_vers) };
+      put8(&vb, 6); put16(&vb, g_version); put16(&vb, 0x0304); put16(&vb, 0x0303);
+      px[pn].type = 0x002B; px[pn].body = b_vers; px[pn].n = vb.len; pn++; }
+
+    px[pn].type = 0x0012; px[pn].body = NULL; px[pn].n = 0; pn++;   /* signed_cert_timestamp */
+
+    /* signature_algorithms: восемь, в порядке Chrome. */
+    { static const unsigned sigs[] = { 0x0403, 0x0804, 0x0401, 0x0503,
+                                       0x0805, 0x0501, 0x0806, 0x0601 };
+      struct buf sb = { b_sigs, 0, sizeof(b_sigs) };
+      put16(&sb, (unsigned)(sizeof(sigs) / sizeof(sigs[0])) * 2);
+      for (size_t i = 0; i < sizeof(sigs) / sizeof(sigs[0]); i++) put16(&sb, sigs[i]);
+      px[pn].type = 0x000D; px[pn].body = b_sigs; px[pn].n = sb.len; pn++; }
+
+    /* key_share: GREASE-группа с одним нулевым байтом, затем наша половина X25519.
+     * Номер GREASE-группы тот же, что в supported_groups — так делает браузер. */
+    { struct buf kb = { b_ks, 0, sizeof(b_ks) };
+      put16(&kb, 41);
+      put16(&kb, g_group); put16(&kb, 1); put8(&kb, 0);
+      put16(&kb, 0x001D); put16(&kb, 32); put(&kb, st->pub, 32);
+      px[pn].type = 0x0033; px[pn].body = b_ks; px[pn].n = kb.len; pn++; }
+
+    /* supported_groups: GREASE, X25519, secp256r1, secp384r1 — ровно набор Chrome.
+     * Прежние FFDHE 0x0100..0x0104 браузер не предлагает вовсе. */
+    { struct buf gb = { b_grp, 0, sizeof(b_grp) };
+      put16(&gb, 8); put16(&gb, g_group);
+      put16(&gb, 0x001D); put16(&gb, 0x0017); put16(&gb, 0x0018);
+      px[pn].type = 0x000A; px[pn].body = b_grp; px[pn].n = gb.len; pn++; }
+
+    b_pskm[0] = 1; b_pskm[1] = 1;
+    px[pn].type = 0x002D; px[pn].body = b_pskm; px[pn].n = 2; pn++;  /* psk_key_exchange_modes */
+
+    b_ecpf[0] = 1; b_ecpf[1] = 0;
+    px[pn].type = 0x000B; px[pn].body = b_ecpf; px[pn].n = 2; pn++;  /* ec_point_formats */
+
+    /* Последним — второй GREASE, с одним нулевым байтом. */
+    b_last[0] = 0;
+    px[pn].type = g_ext_b; px[pn].body = b_last; px[pn].n = 1; pn++;
+
+    /* Перемешиваем всё, кроме первого и последнего. Тасование Фишера — Йетса на случайных
+     * байтах: без него порядок был бы постоянным, то есть отличимым. */
+    if (pn > 3) {
+        unsigned char sh[20];
+        if (fill_random(sh, sizeof(sh)) != 0) return REALITY_ECRYPTO;
+        for (size_t i = pn - 2; i > 1; i--) {
+            size_t j = 1 + (size_t)sh[i] % i;
+            struct pend t = px[i]; px[i] = px[j]; px[j] = t;
+        }
+    }
+    for (size_t i = 0; i < pn; i++) ext(&b, px[i].type, px[i].body, px[i].n);
 
     if (b.len > b.cap) return REALITY_ETOOBIG;
 

@@ -9,3 +9,4 @@ build/*.err
 build/pkg/
 build/scripts/
 out/
+build/sing-box

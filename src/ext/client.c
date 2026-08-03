@@ -20,6 +20,7 @@
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <netinet/tcp.h>
+#include <poll.h>
 #include <arpa/inet.h>
 #include <sys/random.h>
 #include <time.h>
@@ -484,12 +485,30 @@ int vless_probe_timed(const struct vless_node *node, int timeout_s, char *why, s
      * целой записи TLS, и меньший буфер дал бы ошибку на совершенно законном кадре. */
     static __thread unsigned char buf[VLESS_MIN_RECV_CAP];
     size_t got = 0;
-    /* Служебные кадры HTTP/2 (SETTINGS, WINDOW_UPDATE) приезжают раньше данных, и на них
-     * vless_recv законно отдаёт ноль байт. Ждём именно данных — иначе проверка объявляла
-     * бы рабочий узел молчащим из-за первой же записи с настройками. */
-    for (int spin = 0; spin < 8 && got == 0; spin++) {
+    /* Ждём данных ПО ЧАСАМ, а не заданным числом попыток.
+     *
+     * Ноль байт от vless_recv означает «пока нечего», и причин тому две: служебный кадр
+     * HTTP/2 (SETTINGS, WINDOW_UPDATE) или запись, которая ещё не приехала целиком. Чтение
+     * записей неблокирующее — оно обязано таким быть, потому что в туннеле один цикл на все
+     * соединения, — поэтому восемь попыток подряд проходили за микросекунды, ещё до того
+     * как ответ вообще успевал прийти по сети.
+     *
+     * Стоило это дорого: проба объявляла «сервер не прислал данных» на полностью рабочем
+     * узле. Туннель при этом работал, потому что при заданном номере узла он пробу не
+     * вызывает вовсе, — и расхождение между «узел не проходит проверку» и «через узел идёт
+     * трафик» выглядело как что угодно, кроме ошибки в самой проверке. Проверено на своём
+     * Reality-сервере (tests/run-reality.sh): сервер отвечал, в его логе видно и разбор
+     * нашего кадра Vision, и отправленный нам ответ.
+     *
+     * Ждём на сокете, а не в холостом цикле: иначе это те же микросекунды, только дороже. */
+    int64_t rx_deadline = now_ms() + (int64_t)(timeout_s > 0 ? timeout_s : 8) * 1000;
+    for (;;) {
         rc = vless_recv(&c, buf, sizeof(buf), &got);
         if (rc) { vless_close(&c); snprintf(why, why_n, "ответа нет: %s", vless_strerror(rc)); return rc; }
+        if (got) break;
+        if (now_ms() >= rx_deadline) break;
+        struct pollfd pw = { .fd = c.fd, .events = POLLIN, .revents = 0 };
+        poll(&pw, 1, 200);
     }
     if (!got) { vless_close(&c); snprintf(why, why_n, "сервер не прислал данных"); return VLESS_CONN_EIO; }
     /* Первый байт пришёл. Замер сделан ДО разбора ответа: разбор ничего не ждёт, а
