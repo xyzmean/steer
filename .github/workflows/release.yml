@@ -1,0 +1,109 @@
+name: Релиз
+
+# Сборка и публикация по кнопке. От человека нужна одна вещь — номер версии.
+#
+# Почему не по тегу и не по push в main: движок собирается под шесть архитектур, и каждая
+# расширенная сборка компилирует mbedtls целиком. Это десятки минут, и запускать это на
+# каждый коммит значит либо ждать, либо привыкнуть к красным галочкам. Релиз — событие
+# редкое и намеренное, кнопка ему соответствует.
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Версия (например 0.7.0). Ставится в VERSION и в тег vX.Y.Z'
+        required: true
+        type: string
+      prerelease:
+        description: 'Черновик для проверки: пометить как pre-release'
+        required: false
+        default: false
+        type: boolean
+
+permissions:
+  contents: write
+
+concurrency:
+  # Два релиза одновременно перезаписали бы VERSION друг под другом и выложили бы пакеты
+  # от разных сборок под одним тегом.
+  group: release
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    # Шесть архитектур, и в каждой расширенной сборке mbedtls компилируется заново.
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Проверить формат версии
+        run: |
+          set -eu
+          V='${{ inputs.version }}'
+          # Строгая проверка здесь, а не «как-нибудь потом»: версия попадает и в имена
+          # файлов, и в тег, и в ?v= бандлов у splify2. Опечатка расходится по всем трём.
+          echo "$V" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+$' || {
+            echo "::error::версия '$V' не в виде X.Y.Z"; exit 1; }
+          echo "$V" > VERSION
+          echo "VERSION=$V" >> "$GITHUB_ENV"
+
+      - name: Собрать пакеты
+        run: |
+          set -eu
+          # build.sh сам поднимает образ сборщика из build/Dockerfile, если его нет.
+          ./build.sh 2>&1 | tee /tmp/build.log
+
+      - name: Убедиться, что ни одна архитектура не отвалилась
+        run: |
+          set -eu
+          # build.sh печатает FAILED и ИДЁТ ДАЛЬШЕ — это верно для локальной работы, но в
+          # релизе молча выложить пять пакетов из двенадцати нельзя: человек скачает свой
+          # и не найдёт, а в логе давно никто не смотрит.
+          if grep -q FAILED /tmp/build.log; then
+            echo "::error::часть архитектур не собралась:"
+            grep FAILED /tmp/build.log
+            exit 1
+          fi
+          n=$(ls out/*.apk 2>/dev/null | wc -l)
+          [ "$n" -gt 0 ] || { echo "::error::пакетов нет"; exit 1; }
+          echo "собрано пакетов: $n"
+          ls -la out/
+
+      - name: Зафиксировать версию в репозитории
+        run: |
+          set -eu
+          # Чтобы репозиторий и релиз не расходились: тег vX.Y.Z должен указывать на
+          # коммит, в котором VERSION действительно X.Y.Z.
+          git config user.name 'github-actions[bot]'
+          git config user.email 'github-actions[bot]@users.noreply.github.com'
+          if ! git diff --quiet VERSION; then
+            git add VERSION
+            git commit -m "Версия ${VERSION}"
+            git push
+          fi
+
+      - name: Опубликовать релиз
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v${{ env.VERSION }}
+          name: steer ${{ env.VERSION }}
+          prerelease: ${{ inputs.prerelease }}
+          files: out/*.apk
+          body: |
+            Движок маршрутизации по политикам для OpenWrt.
+
+            **Какой пакет брать.** Имя файла содержит архитектуру — ту же, что показывает
+            `apk --print-arch` на роутере.
+
+            * `steer-*` — движок. Каналы, наборы адресов, доменные списки с fake-IP,
+              failover между устройствами.
+            * `steer-extended-*` — то же плюс собственный клиент VLESS/Reality с Vision,
+              транспортами tcp/grpc/xhttp и своим TUN. Нужен, только если туннель поднимает
+              сам движок; для готового wireguard или amneziawg достаточно базового.
+
+            Пакеты взаимозаменяемы и конфликтуют между собой: `steer-extended` объявляет
+            `provides: steer`, поэтому ставится поверх без удаления настроек.
+
+            ```sh
+            apk add --allow-untrusted ./steer-extended-${{ env.VERSION }}-1_<arch>.apk
+            ```
