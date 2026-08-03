@@ -23,9 +23,14 @@ static long long ms(void) {
     return (long long)t.tv_sec * 1000 + t.tv_nsec / 1000000;
 }
 
+static const char *g_dev;
+
 static int start(struct sockaddr_in *a) {
     int fd = socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK, 0);
     if (fd < 0) return -1;
+    /* Привязка к устройству: без неё проверка идёт тем путём, который выберет маршрутизация,
+     * и «работает» относится не к туннелю. На этом я уже обжигался трижды. */
+    if (g_dev) setsockopt(fd, SOL_SOCKET, SO_BINDTODEVICE, g_dev, strlen(g_dev));
     int one = 1; setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof one);
     if (connect(fd, (struct sockaddr *)a, sizeof *a) == 0) return fd;
     if (errno != EINPROGRESS) { fprintf(stderr, "connect: %s\n", strerror(errno)); close(fd); return -1; }
@@ -43,7 +48,8 @@ static int finish(int fd, int tmo) {   /* 0 ок, иначе errno */
 }
 
 int main(int argc, char **argv) {
-    if (argc < 5) { fprintf(stderr, "cstorm IP PORT N seq|par\n"); return 2; }
+    if (argc < 5) { fprintf(stderr, "cstorm IP PORT N seq|par [УСТРОЙСТВО]\n"); return 2; }
+    if (argc > 5 && argv[5][0] != '-') g_dev = argv[5];
     struct sockaddr_in a = { .sin_family = AF_INET, .sin_port = htons(atoi(argv[2])) };
     inet_pton(AF_INET, argv[1], &a.sin_addr);
     int n = atoi(argv[3]); if (n > MAXN) n = MAXN;

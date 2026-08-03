@@ -377,6 +377,58 @@ void tun_write_ctl(const struct tun_dev *d, const unsigned char *pkt, size_t n) 
     (void)!writev(d->fd, iov, i);
 }
 
+/* ICMP «порт недостижим» на пакет, который мы нести не умеем.
+ *
+ * Зачем это вообще есть. В туннель попадает всё, что совпало с адресным списком, — правило
+ * метки протокол не различает и не должно: иначе UDP пошёл бы открытым путём, и сайт увидел
+ * бы настоящий адрес ровно там, где его прятали. Но нести UDP мы не умеем, и прежде такой
+ * пакет просто выбрасывался молча.
+ *
+ * Молча — это и была ошибка, ценой которой стало «speed.cloudflare.com не открывается
+ * вообще». Браузер идёт к Cloudflare по QUIC, то есть UDP на 443. Тишина для него означает
+ * не «нельзя», а «пока не ответили»: он ждёт, повторяет, и только потом пробует TCP. На
+ * сайтах, которые предпочитают QUIC особенно настойчиво, это выглядит как мёртвая страница
+ * при полностью живом туннеле — TCP до тех же адресов проходил за 250 мс, 7 попыток из 7.
+ *
+ * ICMP-ошибка превращает ожидание в мгновенный отказ: браузер бросает QUIC и берёт TCP,
+ * который у нас работает. Источником ставится тот адрес, к которому клиент обращался, —
+ * то же решение, что и в синтезированных RST выше: мы отвечаем от имени назначения, потому
+ * что для клиента мы и есть путь к нему.
+ *
+ * Формат (RFC 792): заголовок ICMP 8 байт, дальше заголовок исходного пакета IP и первые
+ * 8 байт его данных — по ним клиент и опознаёт, какое своё соединение отвергли. */
+size_t icmp_unreach_build(unsigned char *out, size_t cap,
+                          const unsigned char *orig, size_t orig_n) {
+    if (orig_n < 20) return 0;
+    size_t ihl = (size_t)(orig[0] & 0x0F) * 4;
+    if (ihl < 20 || ihl > orig_n) return 0;
+    size_t quote = ihl + 8 > orig_n ? orig_n : ihl + 8;   /* заголовок + 8 байт данных */
+    size_t total = 20 + 8 + quote;
+    if (cap < total) return 0;
+
+    memset(out, 0, 28);
+    out[0] = 0x45;                                  /* IPv4, заголовок 20 байт */
+    out[2] = (unsigned char)(total >> 8);
+    out[3] = (unsigned char)total;
+    out[6] = 0x40;                                  /* не фрагментировать */
+    out[8] = 64;                                    /* TTL */
+    out[9] = 1;                                     /* ICMP */
+    memcpy(out + 12, orig + 16, 4);                 /* от имени назначения */
+    memcpy(out + 16, orig + 12, 4);                 /* клиенту */
+    uint16_t ipc = csum_fin(csum_add(out, 20, 0));
+    out[10] = (unsigned char)(ipc >> 8);
+    out[11] = (unsigned char)ipc;
+
+    out[20] = 3;                                    /* destination unreachable */
+    out[21] = 3;                                    /* port unreachable */
+    /* Следующие 4 байта — нули: для кода 3 они не используются. */
+    memcpy(out + 28, orig, quote);
+    uint16_t ic = csum_fin(csum_add(out + 20, 8 + quote, 0));
+    out[22] = (unsigned char)(ic >> 8);
+    out[23] = (unsigned char)ic;
+    return total;
+}
+
 size_t tcp_build(unsigned char *out, size_t cap,
                  uint32_t src, uint32_t dst, uint16_t sport, uint16_t dport,
                  uint32_t seq, uint32_t ack, unsigned char flags,

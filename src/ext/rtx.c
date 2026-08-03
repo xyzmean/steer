@@ -12,6 +12,30 @@ int rtx_init(struct rtx *r, uint32_t cap) {
     return r->buf ? 0 : -1;
 }
 
+int rtx_grow(struct rtx *r, uint32_t cap) {
+    if (cap <= r->cap) return -1;
+    unsigned char *nb = malloc(cap);
+    if (!nb) return -1;
+    if (!r->buf) {                      /* кольца ещё не было — просто берём буфер */
+        r->buf = nb; r->cap = cap; r->len = 0; r->head = 0;
+        return 0;
+    }
+    /* Кольцо ВЫПРЯМЛЯЕТСЯ: старое содержимое переносится с начала нового буфера, head
+     * становится нулём. Скопировать буфер как есть нельзя — за краем данные продолжаются с
+     * нуля, и после увеличения размера этот край оказался бы в другом месте, то есть
+     * следующий повтор отдал бы клиенту чужие байты. Ровно тот класс ошибок, из-за которого
+     * кольцо и живёт отдельным файлом с отдельными тестами. */
+    uint32_t first = r->cap - r->head;
+    if (first > r->len) first = r->len;
+    memcpy(nb, r->buf + r->head, first);
+    if (r->len > first) memcpy(nb + first, r->buf, r->len - first);
+    free(r->buf);
+    r->buf = nb;
+    r->cap = cap;
+    r->head = 0;
+    return 0;
+}
+
 void rtx_done(struct rtx *r) {
     free(r->buf);
     r->buf = NULL;

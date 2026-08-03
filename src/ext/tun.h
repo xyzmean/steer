@@ -109,6 +109,12 @@ int tun_write_data(const struct tun_dev *d, unsigned char hdr[TUN_HDR_LEN],
  * потерянный SYN-ACK или ACK клиент пришлёт заново сам. */
 void tun_write_ctl(const struct tun_dev *d, const unsigned char *pkt, size_t n);
 
+/* ICMP «порт недостижим» в ответ на пакет, который туннель нести не умеет (UDP, в том числе
+ * QUIC). Нужен, чтобы клиент получил ОТКАЗ, а не тишину: тишину браузер трактует как «ещё не
+ * ответили» и ждёт, вместо того чтобы сразу перейти на TCP. Подробности — в tun.c. */
+size_t icmp_unreach_build(unsigned char *out, size_t cap,
+                          const unsigned char *orig, size_t orig_n);
+
 /* mss != 0 добавляет опцию MSS, wscale >= 0 — опцию масштаба окна. Обе осмысленны только
  * в SYN и SYN-ACK, в остальных пакетах их просто не бывает. */
 size_t tcp_build(unsigned char *out, size_t cap,
