@@ -58,10 +58,35 @@ table inet steer {
         ip saddr { 192.168.1.0/24 } ip daddr @direct_ip counter return comment "steer:direct_ip"
         ip saddr { 192.168.1.0/24 } ip daddr @vpn_ip meta mark set 0x00100000 counter return comment "steer:vpn_ip"
     }
+
+    chain postrouting_down {
+        type filter hook postrouting priority srcnat + 10; policy accept;
+        ip daddr { 192.168.1.0/24 } ip saddr @direct_ip counter comment "steer-down:direct_ip"
+        ip daddr { 192.168.1.0/24 } ip saddr @vpn_ip counter comment "steer-down:vpn_ip"
+    }
 }
 EOF
 )"
 check "generates the expected ruleset" "$want" "$out"
+
+# Встречная цепочка обязана считать в POSTROUTING, и это не косметика приоритетов.
+#
+# У доменного канала в наборе лежат fake-IP, а у ответного пакета адрес источника переводится
+# обратно в fake-IP манипуляцией ИСТОЧНИКА — то есть в postrouting. В prerouting там стоит
+# настоящий адрес сервера при любом приоритете, набор не совпадает, и доменные каналы вечно
+# показывали бы нуль скачанного при работающем правиле и идущем трафике. Проверено опытом:
+# build/natorder.sh, мегабайт через fake-IP дал в prerouting нуль, в postrouting 1 050 921
+# байт. Перенести цепочку обратно стоит одного слова, а замечается это только по нулям в
+# интерфейсе, которые легко списать на «ещё не качали».
+check "встречная цепочка считает в postrouting" "1" \
+    "$(printf '%s\n' "$out" | grep -c 'hook postrouting priority srcnat + 10')"
+check "и ни одной считающей цепочки в prerouting сверх метки" "1" \
+    "$(printf '%s\n' "$out" | grep -c 'hook prerouting')"
+check "и не ставит метку" "0" \
+    "$(printf '%s\n' "$out" | sed -n '/chain postrouting_down/,/^    }/p' | grep -c 'meta mark set')"
+# Вердикта тоже быть не должно: цепочка только считает, решения принимает prerouting_mark.
+check "и не выносит вердиктов" "0" \
+    "$(printf '%s\n' "$out" | sed -n '/chain postrouting_down/,/^    }/p' | grep -cE ' (return|accept|drop)$')"
 
 # Precedence is the spec's central promise: 198.51.100.5 is in BOTH lists, and the
 # rule that claims it must be the one written first.

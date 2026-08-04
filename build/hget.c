@@ -1,8 +1,16 @@
 /* Замер туннеля с самого роутера: N параллельных HTTP-запросов через заданное устройство.
  * Меряет то, что чувствует человек, — время до первого байта каждого соединения и общую
  * скорость, а не «пинг до узла».
- *   hget УСТРОЙСТВО IP ХОСТ ПУТЬ N СЕКУНД      (УСТРОЙСТВО = "-" значит не привязывать)
- */
+ *   hget УСТРОЙСТВО IP ХОСТ ПУТЬ N СЕКУНД [ИСТОЧНИК]
+ *
+ * УСТРОЙСТВО = "-" значит не привязывать.
+ *
+ * ИСТОЧНИК — адрес, которым представиться. Нужен, чтобы проверять правила, различающие
+ * локальную сеть: встречный счётчик каналов стоит на `ip daddr <локальная сеть>`, а
+ * запросы с самого роутера уходят с адреса туннеля и под него не подпадают — их скачанное
+ * в счётчике не появлялось вовсе, и по нему нельзя было понять, считает он или нет.
+ * Настоящего клиента сети на этой коробке не сделать: veth в ядре нет, netns не работает.
+ * Зато адрес br-lan сам лежит в локальной сети, и с ним роутер годится за клиента. */
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -30,6 +38,7 @@ static void say_ms(char *out, size_t cap, long long v) {
 int main(int argc, char **argv) {
     if (argc < 7) { fprintf(stderr, "hget DEV IP HOST PATH N SEC\n"); return 2; }
     const char *dev = argv[1], *ip = argv[2], *host = argv[3], *path = argv[4];
+    const char *src = argc > 7 ? argv[7] : NULL;
     int n = atoi(argv[5]); if (n > MAXC) n = MAXC; if (n < 1) n = 1;
     long long budget = atoll(argv[6]) * 1000;
 
@@ -44,6 +53,20 @@ int main(int argc, char **argv) {
     for (int i = 0; i < n; i++) {
         fd[i] = socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK, 0);
         if (dev[0] != '-') setsockopt(fd[i], SOL_SOCKET, SO_BINDTODEVICE, dev, strlen(dev));
+        if (src) {
+            /* Порт 0 — пусть ядро выберет: занимать конкретный при N соединениях нельзя. */
+            struct sockaddr_in s = { .sin_family = AF_INET, .sin_port = 0 };
+            if (inet_pton(AF_INET, src, &s.sin_addr) != 1) {
+                fprintf(stderr, "источник «%s» не адрес\n", src);
+                return 2;
+            }
+            /* Отказ обязан быть громким: молча уйдя с адреса туннеля, замер показал бы
+             * нули и выглядел бы как «счётчик не работает». */
+            if (bind(fd[i], (struct sockaddr *)&s, sizeof s) != 0) {
+                fprintf(stderr, "не удалось взять источник %s: %s\n", src, strerror(errno));
+                return 2;
+            }
+        }
         setsockopt(fd[i], IPPROTO_TCP, TCP_NODELAY, &one, sizeof one);
         t0[i] = ms(); tc[i] = tf[i] = -1; got[i] = 0; st[i] = 0;
         if (connect(fd[i], (struct sockaddr *)&a, sizeof a) != 0 && errno != EINPROGRESS) {

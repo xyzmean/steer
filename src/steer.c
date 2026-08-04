@@ -154,6 +154,14 @@ static void emit_from(FILE *f, const struct group *g) {
     fprintf(f, " } ");
 }
 
+/* То же «кто», но на встречном пути: там наш клиент — это ПОЛУЧАТЕЛЬ. */
+static void emit_to(FILE *f, const struct group *g) {
+    if (!g->from_n) return;
+    fprintf(f, "ip daddr { ");
+    for (size_t i = 0; i < g->from_n; i++) fprintf(f, "%s%s", i ? ", " : "", g->from[i]);
+    fprintf(f, " } ");
+}
+
 /* Elements come straight from the list files: the fitter (steer-aggregate) has
  * already decided what fits, and re-parsing them here would only add a second place
  * for the two to disagree. */
@@ -323,6 +331,41 @@ static void generate(FILE *f) {
         /* `return` and not `accept`: it ends OUR chain, letting the rest of the
          * firewall proceed, while making the first matching group the winner. */
         fprintf(f, "counter return comment \"steer:%s\"\n", g->name);
+    }
+    fprintf(f, "    }\n");
+
+    /* Встречный путь — только чтобы его было ЧЕМ ПОСЧИТАТЬ. Метку здесь не ставим и
+     * решений не принимаем: маршрут ответным пакетам не нужен, их ведёт conntrack.
+     *
+     * Зачем вообще. Счётчик в prerouting_mark стоит на правиле, ставящем метку, а метка
+     * ставится по пути «из локальной сети наружу»: скачанное под `ip saddr <сеть>` не
+     * подпадает и в него не попадает никогда. На живом роутере это выглядело как 4,3 МБ при
+     * скачанных 223 МБ — человек видел одни подтверждения и не мог понять, куда ушёл
+     * трафик. Объём по устройству выхода отвечал на «сколько всего», но не «сколько по
+     * этому каналу».
+     *
+     * ПОЧЕМУ POSTROUTING, а не prerouting. Тут я ошибся и был поправлен опытом
+     * (build/natorder.sh), поэтому вывод записан числами. Для доменного канала в наборе
+     * лежат fake-IP, и у ответного пакета адрес источника обязан быть переведён обратно в
+     * fake-IP, чтобы совпасть с набором. Этот обратный перевод — манипуляция ИСТОЧНИКОМ, а
+     * она делается в postrouting: в prerouting в saddr стоит настоящий адрес сервера, каким
+     * бы приоритет ни был. Опыт: мегабайт через fake-IP дал в prerouting (и на месте метки,
+     * и после dstnat) ровно нуль, а в postrouting — 42 пакета и 1 050 973 байта.
+     *
+     * Адресному каналу postrouting тоже годится: там адрес источника настоящий с обеих
+     * сторон и переводить его нечего — тот же мегабайт, те же 42 пакета. Поэтому одна
+     * цепочка покрывает оба вида, и разделять их не нужно.
+     *
+     * Правило `counter` без вердикта: цепочка ничего не решает, policy accept, и на пути
+     * скачивания это один поиск по набору на пакет. */
+    fprintf(f, "\n    chain postrouting_down {\n"
+               "        type filter hook postrouting priority srcnat + 10; policy accept;\n");
+    for (size_t i = 0; i < g_grp_n; i++) {
+        struct group *g = &g_grp[i];
+        fprintf(f, "        ");
+        emit_to(f, g);
+        if (g->files_n || g->domains) fprintf(f, "ip saddr @%s ", g->name);
+        fprintf(f, "counter comment \"steer-down:%s\"\n", g->name);
     }
     fprintf(f, "    }\n");
 
@@ -635,23 +678,44 @@ static int cmd_status(const char *spec) {
     }
     printf("},\"channels\":[");
 
-    FILE *nft = popen("nft -a list chain inet steer prerouting_mark 2>/dev/null", "r");
+    /* Обе цепочки за один вызов: раздельные popen дали бы счётчики, снятые в разные
+     * моменты, и «отдано больше, чем скачано» на глазах у человека объяснялось бы не
+     * маршрутизацией, а нашей ленью. */
+    FILE *nft = popen("nft -a list chain inet steer prerouting_mark 2>/dev/null; "
+                      "nft -a list chain inet steer postrouting_down 2>/dev/null", "r");
     char line[1024];
     char names[MAX_CHANNELS][32];
     unsigned long pkts[MAX_CHANNELS] = {0}, bytes[MAX_CHANNELS] = {0};
-    size_t found = 0;
+    char dnames[MAX_CHANNELS][32];
+    unsigned long dpkts[MAX_CHANNELS] = {0}, dbytes[MAX_CHANNELS] = {0};
+    size_t found = 0, dfound = 0;
     if (nft) {
         while (fgets(line, sizeof(line), nft)) {
-            char *c = strstr(line, "comment \"steer:");
-            if (!c) continue;
-            c += strlen("comment \"steer:");
+            /* Порядок проверки важен: «steer:» — префикс «steer-down:»… нет, не префикс,
+             * но strstr нашёл бы «steer:» и в чужом комментарии, поэтому ищем каждый вид
+             * своей строкой и встречный проверяем первым. */
+            int down = 0;
+            char *c = strstr(line, "comment \"steer-down:");
+            if (c) { c += strlen("comment \"steer-down:"); down = 1; }
+            else {
+                c = strstr(line, "comment \"steer:");
+                if (!c) continue;
+                c += strlen("comment \"steer:");
+            }
             char *e = strchr(c, '"');
             if (!e) continue;
             *e = '\0';
             unsigned long p = 0, b = 0;
             char *pc = strstr(line, "packets ");
             if (pc) sscanf(pc, "packets %lu bytes %lu", &p, &b);
-            if (found < MAX_CHANNELS) {
+            if (down) {
+                if (dfound < MAX_CHANNELS) {
+                    snprintf(dnames[dfound], sizeof(dnames[dfound]), "%s", c);
+                    dpkts[dfound] = p;
+                    dbytes[dfound] = b;
+                    dfound++;
+                }
+            } else if (found < MAX_CHANNELS) {
                 snprintf(names[found], sizeof(names[found]), "%s", c);
                 pkts[found] = p;
                 bytes[found] = b;
@@ -661,13 +725,19 @@ static int cmd_status(const char *spec) {
         pclose(nft);
     }
     for (size_t i = 0; i < g_grp_n; i++) {
-        long p = -1, b = -1;
+        long p = -1, b = -1, dp = -1, db = -1;
         for (size_t k = 0; k < found; k++)
             if (!strcmp(names[k], g_grp[i].name)) { p = (long)pkts[k]; b = (long)bytes[k]; }
+        for (size_t k = 0; k < dfound; k++)
+            if (!strcmp(dnames[k], g_grp[i].name)) { dp = (long)dpkts[k]; db = (long)dbytes[k]; }
         printf("%s{\"name\":\"%s\",\"out\":\"%s\",\"kind\":\"%s\",\"live\":%s",
                i ? "," : "", g_grp[i].name, g_grp[i].out,
                g_grp[i].domains ? "domains" : "prefixes", p >= 0 ? "true" : "false");
         if (p >= 0) printf(",\"packets\":%ld,\"bytes\":%ld", p, b);
+        /* Отдельными именами, а не вторым «bytes»: старое имя значило «наружу» и в таком
+         * значении уже разошлось по установленным версиям splify2. Переопределить его
+         * значило бы, что новый движок со старым интерфейсом молча показывает не то. */
+        if (dp >= 0) printf(",\"down_packets\":%ld,\"down_bytes\":%ld", dp, db);
         printf(",\"lists\":%zu,\"channels\":[", g_grp[i].files_n);
         for (size_t m = 0; m < g_grp[i].members_n; m++)
             printf("%s\"%s\"", m ? "," : "", g_grp[i].members[m]);
