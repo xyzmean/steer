@@ -73,6 +73,23 @@
 
 struct conn {
     int used;
+    /* Рукопожатие к узлу идёт в отдельном потоке, и пока идёт — соединение НЕДОТРОЖИМО.
+     *
+     * Зачем это вообще. Рукопожатие стоит 250-400 мс, и делалось оно прямо в цикле: цикл
+     * стоял, ничего не обслуживая. На многоядерной коробке это делили несколько потоков, на
+     * одноядерной поток один — и соединения выстраивались в очередь. Замерено на ютубе:
+     * ответ в 146 байт приходил через 1769 мс при шести одновременных соединениях против
+     * 58 мс мимо туннеля. Столько Chrome не ждёт: он бросал запрос, а с ним умирало всё
+     * HTTP/2-соединение, по которому запросы шли мультиплексом, — отсюда залп одинаковых
+     * ERR_CONNECTION_CLOSED при живом туннеле, отдающем видео.
+     *
+     * pending=1 означает: заявка отдана установщику, ответа ещё нет. В этом состоянии
+     * соединение нельзя ни закрыть, ни вытеснить, ни убрать по простою — установщик пишет
+     * в c->v, и освободить запись под ним значит писать в освобождённую память. Проверка
+     * стоит во всех трёх местах, где conn удаляется. */
+    int pending;
+    int done;                 /* установщик закончил: читать только с ACQUIRE */
+    int rc;                   /* его результат: 0 или код ошибки vless_* */
     struct flow_key key;
     struct vless_conn v;
     struct vision vis;
@@ -377,6 +394,78 @@ static void stats_dump(uint64_t window_ns) {
 static int g_trace;
 #define TR(...) do { if (g_trace) fprintf(stderr, "tun: " __VA_ARGS__); } while (0)
 
+/* ---- пул установщиков ------------------------------------------------------
+ *
+ * Рукопожатие вынесено из цикла в отдельные потоки. Пул, а не поток на соединение, по двум
+ * причинам: поток на каждое соединение это сотни потоков на пачке запросов страницы, и —
+ * важнее — адрес узла, сработавший в прошлый раз, кэшируется в client.c как __thread. Живя
+ * в потоке-однодневке, этот кэш терялся бы на каждом соединении, и перебор мёртвых адресов
+ * начинался бы заново.
+ *
+ * Очередь короткая СОЗНАТЕЛЬНО. Полная очередь означает «столько одновременных рукопожатий
+ * этот процессор не переварит», и честный ответ на это — отказать в SYN: клиент повторит
+ * через секунду, к тому времени место освободится. Принять больше, чем можем обслужить,
+ * значит вернуться к очереди, только уже невидимой. */
+/* Четыре, а не больше. Восемь проверены и не дали ничего: двенадцатое соединение приходило
+ * за 1798 мс против 1693 при четырёх — то есть в пределах разброса. Значит упор уже не в
+ * ожидание сети, которое потоки и перекрывают, а в само ядро: X25519 и AEAD рукопожатия.
+ * Держать вдвое больше потоков за тот же результат незачем. */
+#define CONNECTORS 4
+#define CONNQ 32
+
+struct connjob { struct conn *c; const struct vless_node *node; };
+static struct {
+    struct connjob q[CONNQ];
+    unsigned head, n;
+    pthread_mutex_t mu;
+    pthread_cond_t cv;
+    int started;
+} g_cq = { .mu = PTHREAD_MUTEX_INITIALIZER, .cv = PTHREAD_COND_INITIALIZER };
+
+static void *connector(void *arg) {
+    (void)arg;
+    for (;;) {
+        pthread_mutex_lock(&g_cq.mu);
+        while (g_cq.n == 0) pthread_cond_wait(&g_cq.cv, &g_cq.mu);
+        struct connjob j = g_cq.q[g_cq.head];
+        g_cq.head = (g_cq.head + 1) % CONNQ;
+        g_cq.n--;
+        pthread_mutex_unlock(&g_cq.mu);
+
+        int rc = vless_connect(j.node, &j.c->v, 8);
+        j.c->rc = rc;
+        /* RELEASE: цикл читает done с ACQUIRE, и всё, что записано в c->v выше, обязано
+         * быть видно ему к этому моменту. Без барьера это ровно та ошибка, которая
+         * проявляется раз в сутки на другой архитектуре. */
+        __atomic_store_n(&j.c->done, 1, __ATOMIC_RELEASE);
+    }
+    return NULL;
+}
+
+/* Поставить заявку. 0 — принята, -1 — очередь полна. */
+static int conn_submit(struct conn *c, const struct vless_node *node) {
+    pthread_mutex_lock(&g_cq.mu);
+    if (!g_cq.started) {
+        g_cq.started = 1;
+        pthread_attr_t a;
+        pthread_attr_init(&a);
+        /* Стек скромный: рукопожатие держит крупные буферы в __thread, а не на стеке. */
+        pthread_attr_setstacksize(&a, 128 * 1024);
+        pthread_attr_setdetachstate(&a, PTHREAD_CREATE_DETACHED);
+        for (int i = 0; i < CONNECTORS; i++) {
+            pthread_t t;
+            if (pthread_create(&t, &a, connector, NULL) != 0) break;
+        }
+        pthread_attr_destroy(&a);
+    }
+    if (g_cq.n == CONNQ) { pthread_mutex_unlock(&g_cq.mu); return -1; }
+    g_cq.q[(g_cq.head + g_cq.n) % CONNQ] = (struct connjob){ .c = c, .node = node };
+    g_cq.n++;
+    pthread_cond_signal(&g_cq.cv);
+    pthread_mutex_unlock(&g_cq.mu);
+    return 0;
+}
+
 static struct conn *conn_find(const struct flow_key *k) {
     for (int i = 0; i < MAX_CONNS; i++) {
         struct conn *c = &g_conns[i];
@@ -419,6 +508,7 @@ static struct conn *conn_new(const struct tun_dev *tun) {
         struct conn *c = &g_conns[i];
         /* Закрытые сервером — первые кандидаты в любом возрасте: они уже ничего не принесут,
          * а живут только чтобы додать клиенту остаток. */
+        if (c->pending) continue;        /* установщик пишет в эту запись — не трогать */
         int cheap = c->srv_closed != 0;
         /* Остальные — только если ДЕЙСТВИТЕЛЬНО простаивают. Порог не осторожность, а
          * исправление: без него вытеснялось самое давнее из ЖИВЫХ, и это оказалось хуже
@@ -774,40 +864,34 @@ static void handle_packet(const struct tun_dev *tun, const struct vless_node *no
         if (vless_uuid_parse(node->uuid, c->uuid) != 0) { conn_drop(c); return; }
         vision_init(&c->vis, c->uuid);
 
-        TR("SYN: открываю поток к серверу\n");
-        int cr = vless_connect(node, &c->v, 8);
-        if (cr != 0) {
-            /* С причиной, а не «не открылся». Без неё разбор упирается в стену: код
-             * различает «TCP не соединился», «сервер не признал ключ» и «сервер не
-             * согласился на HTTP/2», а в логе всё это выглядело одинаково. */
-            fprintf(stderr, "steer tunnel: поток к %s не открылся: %s (rc=%d)\n",
-                    node->host, vless_strerror(cr), cr);
-            /* Сервер недоступен — отвечаем RST, а не молчим: клиент иначе будет ждать
-             * до таймаута, и «сайт не открывается» вместо «отказано в соединении».
-             *
-             * Я пробовал молчать, рассчитывая, что клиент повторит SYN сам и попадёт в
-             * удачную попытку: узел отбивал 11 соединений из 19, а RST браузер понимает как
-             * окончательное «отказано». Стало ХУЖЕ — страница с видео перестала открываться
-             * вовсе. Молчание не даёт браузеру перейти к следующему адресу, а он на это
-             * рассчитывает: у него самого есть и повтор, и запасные адреса, и наш быстрый
-             * отказ он использует лучше, чем мы его ожидание. Проверено на живом роутере,
-             * возвращено обратно. */
-            unsigned char rst[64];
-            size_t rl = tcp_build(rst, sizeof(rst), k.dst, k.src, k.dport, k.sport,
-                                  0, c->client_seq, TCP_RST | TCP_ACK, NULL, 0, 0, 0, -1);
-            if (rl) tun_write_ctl(tun, rst, rl);
+        TR("SYN: заявка установщику\n");
+        /* Рукопожатие уходит в пул, SYN-ACK отправится, когда поток будет готов (см. ниже,
+         * в цикле). Клиент до SYN-ACK не пришлёт ни байта, поэтому буферизовать нечего —
+         * ровно поэтому подтверждение и отложено, а не отправлено сразу оптимистично. */
+        if (conn_submit(c, node) != 0) {
+            /* Очередь полна: столько рукопожатий разом процессор не переварит. Молча
+             * отбрасывать SYN нельзя — за это уже пришлось расплатиться однажды, — поэтому
+             * говорим в лог и отпускаем запись: клиент повторит SYN сам. */
+            static __thread time_t said_q;
+            time_t nw = time(NULL);
+            if (nw - said_q >= 5) {
+                said_q = nw;
+                fprintf(stderr, "steer tunnel: очередь установки соединений полна (%d), "
+                                "SYN отклонён — процессор не успевает\n", CONNQ);
+            }
             conn_drop(c);
             return;
         }
-        /* SYN-ACK: подтверждаем соединение клиенту. */
-        unsigned char sa[64];
-        size_t sl = tcp_build(sa, sizeof(sa), k.dst, k.src, k.dport, k.sport,
-                              c->our_seq++, c->client_seq, TCP_SYN | TCP_ACK,
-                              NULL, 0, 65535, TUN_MSS, OUR_WSCALE);
-        if (sl) tun_write_ctl(tun, sa, sl);
-        TR("SYN-ACK отправлен (seq=%u ack=%u)\n", c->our_seq - 1, c->client_seq);
+        c->pending = 1;
         return;
     }
+
+    if (c && c->pending) {
+        /* Клиент повторяет SYN, пока мы устанавливаем. Молчим: ответить нечем, а закрывать
+         * нельзя — установщик работает с этой записью. */
+        return;
+    }
+
 
     if (!c) return;                                 /* данные без соединения — игнор */
     c->last = time(NULL);
@@ -993,6 +1077,8 @@ static void *worker_loop(void *arg) {
         nf++;
         for (int i = 0; i < MAX_CONNS; i++) {
             if (!g_conns[i].used) continue;
+            /* Устанавливающиеся не опрашиваем: сокета ещё нет, и c->v под установщиком. */
+            if (g_conns[i].pending) continue;
             /* У закрытых сервером читать нечего — они живут только чтобы додать клиенту. */
             if (g_conns[i].srv_closed) continue;
             /* Не спрашиваем сервер о новых данных, пока клиент не разгрёб прежние.
@@ -1058,7 +1144,16 @@ static void *worker_loop(void *arg) {
             else                  g_loop_ms -= (g_loop_ms - busy) / 8;
         }
 
-        int wait_ms = 1000;
+        /* Пока есть заявки в работе, просыпаемся часто: готовность установщика приходит не
+         * событием на дескрипторе, а флагом в памяти. Двадцать миллисекунд — это худшая
+         * добавка к времени соединения, и она в десять раз меньше самого рукопожатия.
+         *
+         * Отдельная труба для побудки была бы точнее, но это лишний дескриптор в каждом
+         * проходе и лишняя ветка в разборе poll; для прототипа цена не оправдана. */
+        int pend = 0;
+        for (int i = 0; i < MAX_CONNS; i++) if (g_conns[i].used && g_conns[i].pending) pend++;
+
+        int wait_ms = pend ? 20 : 1000;
         for (int i = 0; i < MAX_CONNS; i++) {
             const struct conn *c = &g_conns[i];
             if (!c->used || !c->rtx.len || !c->rtx_at) continue;
@@ -1081,6 +1176,40 @@ static void *worker_loop(void *arg) {
         if (r < 0) {
             if (errno == EINTR) continue;
             break;
+        }
+
+        /* Готовые заявки: отсюда и уходит SYN-ACK. Разбираем ДО чтения из TUN — клиент,
+         * получив подтверждение, тут же пришлёт данные, и пусть они попадут в этот же
+         * проход, а не в следующий. */
+        for (int i = 0; i < MAX_CONNS; i++) {
+            struct conn *c = &g_conns[i];
+            if (!c->used || !c->pending) continue;
+            if (!__atomic_load_n(&c->done, __ATOMIC_ACQUIRE)) continue;
+            c->pending = 0;
+            if (c->rc != 0) {
+                /* С причиной, а не «не открылся»: код различает «TCP не соединился»,
+                 * «сервер не признал ключ» и «сервер не согласился на HTTP/2». */
+                fprintf(stderr, "steer tunnel: поток к %s не открылся: %s (rc=%d)\n",
+                        node->host, vless_strerror(c->rc), c->rc);
+                /* RST, а не молчание: клиент иначе ждёт до таймаута. Молчать я пробовал —
+                 * страница с видео перестала открываться вовсе, потому что браузер
+                 * использует быстрый отказ лучше, чем ожидание. */
+                unsigned char rst[64];
+                size_t rl = tcp_build(rst, sizeof(rst), c->key.dst, c->key.src,
+                                      c->key.dport, c->key.sport,
+                                      0, c->client_seq, TCP_RST | TCP_ACK, NULL, 0, 0, 0, -1);
+                if (rl) tun_write_ctl(&tun, rst, rl);
+                conn_drop(c);
+                continue;
+            }
+            unsigned char sa[64];
+            size_t sl = tcp_build(sa, sizeof(sa), c->key.dst, c->key.src,
+                                  c->key.dport, c->key.sport,
+                                  c->our_seq++, c->client_seq, TCP_SYN | TCP_ACK,
+                                  NULL, 0, 65535, TUN_MSS, OUR_WSCALE);
+            if (sl) tun_write_ctl(&tun, sa, sl);
+            c->last = time(NULL);
+            TR("SYN-ACK отправлен (seq=%u ack=%u)\n", c->our_seq - 1, c->client_seq);
         }
 
         if (pf[0].revents & POLLIN) {
@@ -1193,7 +1322,8 @@ static void *worker_loop(void *arg) {
             /* Пустое кольцо отдаём обратно системе. Соединение при этом полностью рабочее:
              * при следующих данных кольцо появится снова. Именно здесь, а не сразу по
              * опустошении, — иначе на каждом залпе подтверждений шли бы malloc и free. */
-            if (c->used && c->rtx.cap && !c->rtx.len && stale - c->last > 5) rtx_done(&c->rtx);
+            if (c->pending) continue;    /* установщик пишет в эту запись — не трогать */
+            if (c->used && c->rtx.cap && !c->rtx.len && !c->pending && stale - c->last > 5) rtx_done(&c->rtx);
             if (!c->used || stale - c->last <= IDLE_EVICT_S) continue;
             unsigned char rst[64];
             size_t rl = tcp_build(rst, sizeof(rst), c->key.dst, c->key.src,
