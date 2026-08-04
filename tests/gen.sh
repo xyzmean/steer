@@ -88,6 +88,49 @@ check "и не ставит метку" "0" \
 check "и не выносит вердиктов" "0" \
     "$(printf '%s\n' "$out" | sed -n '/chain postrouting_down/,/^    }/p' | grep -cE ' (return|accept|drop)$')"
 
+# ---- перенос счётчиков через apply -------------------------------------------
+#
+# apply сносит таблицу и загружает новую, а счётчики живут в правилах — значит без переноса
+# каждый apply обнуляет объёмы. Само по себе незаметно, но обновление списков вызывает apply
+# по расписанию, раз в сутки: объёмы в интерфейсе оказывались «с пяти утра», причём молча.
+#
+# Ядро в тестах недоступно, поэтому подставляем nft, который печатает готовое состояние. Так
+# проверяется то, что здесь и может сломаться: разбор его вывода и подстановка значений в
+# новые правила. Перенос ПО ИМЕНИ, а не по позиции: правила перетасовываются при правке
+# спеки, и перенос по номеру приписал бы каналу чужой трафик.
+mkdir -p "$tmp/bin"
+cat > "$tmp/bin/nft" <<'NFT'
+#!/bin/sh
+# Порядок нарочно обратный порядку каналов в спеке: перенос обязан идти по имени.
+case "$*" in
+*prerouting_mark*)
+    echo '  ip saddr { 192.168.1.0/24 } ip daddr @vpn_ip meta mark set 0x00100000 counter packets 7 bytes 700 return comment "steer:vpn_ip"'
+    echo '  ip saddr { 192.168.1.0/24 } ip daddr @direct_ip counter packets 3 bytes 300 return comment "steer:direct_ip"'
+    ;;
+esac
+case "$*" in
+*postrouting_down*)
+    echo '  ip daddr { 192.168.1.0/24 } ip saddr @vpn_ip counter packets 9 bytes 90000 comment "steer-down:vpn_ip"'
+    ;;
+esac
+exit 0
+NFT
+chmod +x "$tmp/bin/nft"
+carried="$(PATH="$tmp/bin:$PATH" $BIN apply --dry-run --spec "$tmp/spec.json" $S 2>/dev/null)"
+
+check "перенос: наружу по direct_ip" "1" \
+    "$(printf '%s\n' "$carried" | grep -c 'counter packets 3 bytes 300 return comment "steer:direct_ip"')"
+check "перенос: наружу по vpn_ip" "1" \
+    "$(printf '%s\n' "$carried" | grep -c 'counter packets 7 bytes 700 return comment "steer:vpn_ip"')"
+check "перенос: внутрь по vpn_ip" "1" \
+    "$(printf '%s\n' "$carried" | grep -c 'counter packets 9 bytes 90000 comment "steer-down:vpn_ip"')"
+# Канала, которого в ядре не было, переносить нечего — и выдумывать значение нельзя.
+check "чего не было, то остаётся нулём" "1" \
+    "$(printf '%s\n' "$carried" | grep -c 'ip saddr @direct_ip counter comment "steer-down:direct_ip"')"
+# Ноль печатается коротким `counter`: иначе вывод на чистой машине менялся бы без причины.
+check "нули не пишутся числами" "0" \
+    "$(printf '%s\n' "$out" | grep -c 'counter packets 0 bytes 0')"
+
 # Precedence is the spec's central promise: 198.51.100.5 is in BOTH lists, and the
 # rule that claims it must be the one written first.
 first="$(printf '%s\n' "$out" | grep -n 'comment "steer:' | head -1 | sed 's/.*steer://; s/".*//')"

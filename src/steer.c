@@ -290,6 +290,85 @@ static size_t emit_elements(FILE *f, const char *path, size_t already) {
     return n - already;
 }
 
+/* ---- перенос счётчиков через apply ------------------------------------------
+ *
+ * `apply` сносит таблицу и загружает новую одной транзакцией, а счётчики живут в правилах —
+ * значит каждый apply обнулял их. Само по себе это выглядело безобидно, но обновление списков
+ * из splify2 вызывает apply по расписанию, раз в сутки в пять утра. То есть объёмы в
+ * интерфейсе всегда были «с пяти утра», нигде об этом не сказано, и вопрос «сколько ушло за
+ * сутки» ответа не имел. Замер: 4 090 141 байт до apply, 0 после.
+ *
+ * Поэтому перед генерацией читаем то, что накопилось, и вписываем в новые правила: nft
+ * принимает `counter packets N bytes M` на входе — ровно в том виде, в каком сам печатает.
+ *
+ * Переносим ПО ИМЕНИ КАНАЛА, а не по номеру правила: правила перетасовываются при любой
+ * правке спеки, и перенос по позиции приписал бы чужой трафик. Канал, которого в новой спеке
+ * нет, свой счётчик теряет — это и правильно, его больше не существует.
+ */
+#define CTR_MAX MAX_CHANNELS
+struct ctr { char name[32]; unsigned long pkts, bytes; };
+static struct ctr g_ctr_up[CTR_MAX], g_ctr_down[CTR_MAX];
+static size_t g_ctr_up_n, g_ctr_down_n;
+
+/* Разбор вывода nft — ОДИН на apply и status. Раздельные разошлись бы в понимании одного и
+ * того же текста, а расхождение здесь означало бы, что перенесённое и показанное — разные
+ * числа. */
+static void counters_load(void) {
+    g_ctr_up_n = g_ctr_down_n = 0;
+    /* Обе цепочки за один вызов: раздельные popen дали бы счётчики, снятые в разные моменты,
+     * и «отдано больше, чем скачано» на глазах у человека объяснялось бы не маршрутизацией,
+     * а нашей ленью. */
+    FILE *nft = popen("nft -a list chain inet steer prerouting_mark 2>/dev/null; "
+                      "nft -a list chain inet steer postrouting_down 2>/dev/null", "r");
+    if (!nft) return;
+    char line[1024];
+    while (fgets(line, sizeof(line), nft)) {
+        /* Встречный вид проверяется первым: «steer:» нашлось бы и внутри «steer-down:». */
+        int down = 0;
+        char *c = strstr(line, "comment \"steer-down:");
+        if (c) { c += strlen("comment \"steer-down:"); down = 1; }
+        else {
+            c = strstr(line, "comment \"steer:");
+            if (!c) continue;
+            c += strlen("comment \"steer:");
+        }
+        char *e = strchr(c, '"');
+        if (!e) continue;
+        *e = '\0';
+        unsigned long p = 0, b = 0;
+        char *pc = strstr(line, "packets ");
+        if (pc) sscanf(pc, "packets %lu bytes %lu", &p, &b);
+        struct ctr *arr = down ? g_ctr_down : g_ctr_up;
+        size_t *n = down ? &g_ctr_down_n : &g_ctr_up_n;
+        if (*n < CTR_MAX) {
+            snprintf(arr[*n].name, sizeof(arr[*n].name), "%s", c);
+            arr[*n].pkts = p;
+            arr[*n].bytes = b;
+            (*n)++;
+        }
+    }
+    pclose(nft);
+}
+
+/* Найти прежнее значение. -1 — канала в ядре не было (первый apply или новый канал). */
+static int counter_find(const char *name, int down, unsigned long *p, unsigned long *b) {
+    const struct ctr *arr = down ? g_ctr_down : g_ctr_up;
+    size_t n = down ? g_ctr_down_n : g_ctr_up_n;
+    for (size_t i = 0; i < n; i++)
+        if (!strcmp(arr[i].name, name)) { *p = arr[i].pkts; *b = arr[i].bytes; return 0; }
+    return -1;
+}
+
+/* `counter` с прежним значением, если оно есть. Нули печатаем коротким `counter`: так вывод
+ * `--dry-run` на чистой машине остаётся тем же текстом, что и раньше. */
+static void emit_counter(FILE *f, const char *name, int down) {
+    unsigned long p = 0, b = 0;
+    if (counter_find(name, down, &p, &b) == 0 && (p || b))
+        fprintf(f, "counter packets %lu bytes %lu ", p, b);
+    else
+        fprintf(f, "counter ");
+}
+
 static void generate(FILE *f) {
     fprintf(f, "table inet steer {\n");
     for (size_t i = 0; i < g_grp_n; i++) {
@@ -330,7 +409,8 @@ static void generate(FILE *f) {
         if (out_has_device(o)) fprintf(f, "meta mark set 0x%08x ", o->mark);
         /* `return` and not `accept`: it ends OUR chain, letting the rest of the
          * firewall proceed, while making the first matching group the winner. */
-        fprintf(f, "counter return comment \"steer:%s\"\n", g->name);
+        emit_counter(f, g->name, 0);
+        fprintf(f, "return comment \"steer:%s\"\n", g->name);
     }
     fprintf(f, "    }\n");
 
@@ -365,7 +445,8 @@ static void generate(FILE *f) {
         fprintf(f, "        ");
         emit_to(f, g);
         if (g->files_n || g->domains) fprintf(f, "ip saddr @%s ", g->name);
-        fprintf(f, "counter comment \"steer-down:%s\"\n", g->name);
+        emit_counter(f, g->name, 1);
+        fprintf(f, "comment \"steer-down:%s\"\n", g->name);
     }
     fprintf(f, "    }\n");
 
@@ -602,6 +683,10 @@ static int cmd_apply(const char *spec, int dry) {
      * Значит человек узнает про не тот список сразу при сохранении, а не потом, когда
      * apply молча не подействует. */
     check_address_lists();
+    /* Снять накопленное ДО генерации: она вписывает эти значения в новые правила, иначе
+     * каждый apply обнулял бы объёмы. Читаем и при --dry-run — так печатаемый текст остаётся
+     * тем, что реально применится, а на машине без таблицы вывод не меняется вовсе. */
+    counters_load();
     /* Ни одной группы — таблица всё равно ставится, с пустой цепочкой: так status
      * продолжает отвечать, а следующий apply не зависит от того, была ли таблица
      * раньше. */
@@ -678,66 +763,19 @@ static int cmd_status(const char *spec) {
     }
     printf("},\"channels\":[");
 
-    /* Обе цепочки за один вызов: раздельные popen дали бы счётчики, снятые в разные
-     * моменты, и «отдано больше, чем скачано» на глазах у человека объяснялось бы не
-     * маршрутизацией, а нашей ленью. */
-    FILE *nft = popen("nft -a list chain inet steer prerouting_mark 2>/dev/null; "
-                      "nft -a list chain inet steer postrouting_down 2>/dev/null", "r");
-    char line[1024];
-    char names[MAX_CHANNELS][32];
-    unsigned long pkts[MAX_CHANNELS] = {0}, bytes[MAX_CHANNELS] = {0};
-    char dnames[MAX_CHANNELS][32];
-    unsigned long dpkts[MAX_CHANNELS] = {0}, dbytes[MAX_CHANNELS] = {0};
-    size_t found = 0, dfound = 0;
-    if (nft) {
-        while (fgets(line, sizeof(line), nft)) {
-            /* Порядок проверки важен: «steer:» — префикс «steer-down:»… нет, не префикс,
-             * но strstr нашёл бы «steer:» и в чужом комментарии, поэтому ищем каждый вид
-             * своей строкой и встречный проверяем первым. */
-            int down = 0;
-            char *c = strstr(line, "comment \"steer-down:");
-            if (c) { c += strlen("comment \"steer-down:"); down = 1; }
-            else {
-                c = strstr(line, "comment \"steer:");
-                if (!c) continue;
-                c += strlen("comment \"steer:");
-            }
-            char *e = strchr(c, '"');
-            if (!e) continue;
-            *e = '\0';
-            unsigned long p = 0, b = 0;
-            char *pc = strstr(line, "packets ");
-            if (pc) sscanf(pc, "packets %lu bytes %lu", &p, &b);
-            if (down) {
-                if (dfound < MAX_CHANNELS) {
-                    snprintf(dnames[dfound], sizeof(dnames[dfound]), "%s", c);
-                    dpkts[dfound] = p;
-                    dbytes[dfound] = b;
-                    dfound++;
-                }
-            } else if (found < MAX_CHANNELS) {
-                snprintf(names[found], sizeof(names[found]), "%s", c);
-                pkts[found] = p;
-                bytes[found] = b;
-                found++;
-            }
-        }
-        pclose(nft);
-    }
+    counters_load();
     for (size_t i = 0; i < g_grp_n; i++) {
-        long p = -1, b = -1, dp = -1, db = -1;
-        for (size_t k = 0; k < found; k++)
-            if (!strcmp(names[k], g_grp[i].name)) { p = (long)pkts[k]; b = (long)bytes[k]; }
-        for (size_t k = 0; k < dfound; k++)
-            if (!strcmp(dnames[k], g_grp[i].name)) { dp = (long)dpkts[k]; db = (long)dbytes[k]; }
+        unsigned long up_p = 0, up_b = 0, dn_p = 0, dn_b = 0;
+        int live = counter_find(g_grp[i].name, 0, &up_p, &up_b) == 0;
+        int dn = counter_find(g_grp[i].name, 1, &dn_p, &dn_b) == 0;
         printf("%s{\"name\":\"%s\",\"out\":\"%s\",\"kind\":\"%s\",\"live\":%s",
                i ? "," : "", g_grp[i].name, g_grp[i].out,
-               g_grp[i].domains ? "domains" : "prefixes", p >= 0 ? "true" : "false");
-        if (p >= 0) printf(",\"packets\":%ld,\"bytes\":%ld", p, b);
+               g_grp[i].domains ? "domains" : "prefixes", live ? "true" : "false");
+        if (live) printf(",\"packets\":%lu,\"bytes\":%lu", up_p, up_b);
         /* Отдельными именами, а не вторым «bytes»: старое имя значило «наружу» и в таком
          * значении уже разошлось по установленным версиям splify2. Переопределить его
          * значило бы, что новый движок со старым интерфейсом молча показывает не то. */
-        if (dp >= 0) printf(",\"down_packets\":%ld,\"down_bytes\":%ld", dp, db);
+        if (dn) printf(",\"down_packets\":%lu,\"down_bytes\":%lu", dn_p, dn_b);
         printf(",\"lists\":%zu,\"channels\":[", g_grp[i].files_n);
         for (size_t m = 0; m < g_grp[i].members_n; m++)
             printf("%s\"%s\"", m ? "," : "", g_grp[i].members[m]);
@@ -759,6 +797,228 @@ static int addr_ok(const char *a) {
         if (n > 18) return 0;
     }
     return n > 0;
+}
+
+/* ---- diag --------------------------------------------------------------------
+ *
+ * Один вопрос: работает ли всё. Спрашивается у ЯДРА и у живых процессов, а не у спеки —
+ * спека описывает намерение, и совпадение с ней ничего не доказывает. Каждая проверка
+ * отвечает своей строкой: что смотрели, каков итог и что делать, если плохо.
+ *
+ * Зачем отдельная команда, если есть status. status отвечает «что применено», и по нему
+ * человек, у которого сайт не открывается, вынужден сам догадываться, какие из полей
+ * важны. Здесь набор проверок назван прямо, вместе с причиной, и в нём есть то, чего в
+ * status нет вовсе: пустой набор при непустом списке, отсутствующий редирект DNS,
+ * незапущенный резолвер и две ловушки, которые движок не решает, но обязан назвать (DoH и
+ * IPv6). Ровно эти два случая выглядят как «список не работает» при исправной настройке.
+ *
+ * Итог у проверки один из трёх: ok — проверено и хорошо; warn — работает, но есть чем
+ * объяснить будущую жалобу; fail — сломано, трафик идёт не туда.
+ */
+static int g_diag_first = 1;
+static int g_diag_warn, g_diag_fail;
+
+static void diag(const char *id, const char *verdict, const char *what, const char *why) {
+    if (!strcmp(verdict, "warn")) g_diag_warn++;
+    if (!strcmp(verdict, "fail")) g_diag_fail++;
+    printf("%s{\"id\":\"%s\",\"verdict\":\"%s\",\"what\":\"%s\",\"why\":\"%s\"}",
+           g_diag_first ? "" : ",", id, verdict, what, why);
+    g_diag_first = 0;
+}
+
+/* Сколько элементов в наборе по мнению ядра. -1 — набора нет.
+ *
+ * Имя проверяется по составу, а не просто обрезается: оно уходит в командную строку через
+ * popen. Имя набора собирается из имени выхода, а то приходит из спеки — то есть снаружи.
+ * В этом файле такую дыру уже находили однажды, в explain, где адрес подставлялся в
+ * system(); повторять не будем. */
+static long set_count(const char *name) {
+    for (const char *q = name; *q; q++)
+        if (!((*q >= 'a' && *q <= 'z') || (*q >= 'A' && *q <= 'Z') ||
+              (*q >= '0' && *q <= '9') || *q == '_' || *q == '-' || *q == '.'))
+            return -1;
+    char cmd[256];
+    snprintf(cmd, sizeof(cmd), "nft list set inet steer %.64s 2>/dev/null", name);
+    FILE *p = popen(cmd, "r");
+    if (!p) return -1;
+    long n = -1;
+    char line[4096];
+    int seen = 0;
+    while (fgets(line, sizeof(line), p)) {
+        seen = 1;
+        char *e = strstr(line, "elements = {");
+        if (!e) continue;
+        n = 0;
+        /* Считаем запятые, а не разбираем элементы: их бывают десятки тысяч, и разбор
+         * ради одного числа значил бы держать в памяти весь список второй раз. */
+        for (char *q = e; *q; q++) if (*q == ',') n++;
+        /* Элементов на одну больше, чем запятых; продолжение приезжает следующими
+         * строками, поэтому дальше просто добавляем. */
+        n++;
+        while (fgets(line, sizeof(line), p)) {
+            for (char *q = line; *q; q++) if (*q == ',') n++;
+            if (strchr(line, '}')) break;
+        }
+        break;
+    }
+    pclose(p);
+    if (!seen) return -1;
+    return n < 0 ? 0 : n;
+}
+
+static int nft_has(const char *what) {
+    char cmd[256];
+    snprintf(cmd, sizeof(cmd), "nft list table inet steer 2>/dev/null | grep -qF '%s'", what);
+    return system(cmd) == 0;
+}
+
+static int cmd_diag(const char *spec) {
+    load_spec(spec);
+    registry_assign();
+    build_groups();
+    printf("{\"schema\":1,\"checks\":[");
+
+    /* 1. Таблица. Без неё всё остальное бессмысленно: apply не применялся или его снесли. */
+    int table = nft_has("chain prerouting_mark");
+    diag("table", table ? "ok" : "fail",
+         table ? "правила движка в ядре" : "правил движка в ядре нет",
+         table ? "" : "apply не применялся или таблицу снесли — нажмите «Применить»");
+
+    /* 2. Встречная цепочка. Её отсутствие не ломает маршрутизацию, но объёмы «внутрь»
+     *    будут пустыми, и это надо назвать, а не показывать нули. */
+    if (table) {
+        int down = nft_has("chain postrouting_down");
+        diag("down_chain", down ? "ok" : "warn",
+             down ? "скачанное считается" : "скачанное не считается",
+             down ? "" : "правила от старой версии движка — примените настройку заново");
+    }
+
+    /* 3. Наборы. Пустой набор при непустом списке — самая частая настоящая поломка:
+     *    правило на месте, трафик мимо, и по status этого не видно. */
+    for (size_t i = 0; i < g_grp_n; i++) {
+        struct group *g = &g_grp[i];
+        if (!g->files_n && !g->domains) continue;
+        long n = set_count(g->name);
+        char what[160], why[240];
+        if (n < 0) {
+            snprintf(what, sizeof(what), "канал %.48s: набора в ядре нет", g->name);
+            snprintf(why, sizeof(why), "apply не довёл набор до ядра — примените заново");
+            diag("set", "fail", what, why);
+        } else if (n == 0 && g->files_n) {
+            snprintf(what, sizeof(what), "канал %.48s: набор пуст", g->name);
+            snprintf(why, sizeof(why),
+                     "списков %zu, но в ядре ни одного адреса — списки не скачались "
+                     "или в них нет адресных строк", g->files_n);
+            diag("set", "fail", what, why);
+        } else if (n == 0) {
+            snprintf(what, sizeof(what), "канал %.48s: набор пока пуст", g->name);
+            snprintf(why, sizeof(why),
+                     "доменный канал наполняет резолвер по мере запросов — это нормально "
+                     "до первого обращения");
+            diag("set", "warn", what, why);
+        } else {
+            snprintf(what, sizeof(what), "канал %.48s: адресов в ядре %ld", g->name, n);
+            diag("set", "ok", what, "");
+        }
+    }
+
+    /* 4. Резолвер и редирект. Доменные каналы держатся на обоих: без редиректа клиент
+     *    спрашивает не нас, без процесса спрашивать некого. */
+    if (has_domains()) {
+        int redir = nft_has("chain prerouting_dns");
+        diag("dns_redirect", redir ? "ok" : "fail",
+             redir ? "запросы DNS заворачиваются на движок"
+                   : "запросы DNS на движок не заворачиваются",
+             redir ? "" : "доменные каналы без этого не работают вовсе — примените настройку");
+        int alive = system("pgrep -f 'steer dnsd' >/dev/null 2>&1") == 0;
+        diag("dnsd", alive ? "ok" : "fail",
+             alive ? "резолвер доменных каналов работает" : "резолвер доменных каналов не запущен",
+             alive ? "" : "запустите: /etc/init.d/steer restart");
+
+        /* DoH — ловушка, которую движок не решает, но обязан назвать. Клиент с DoH
+         * резолвит сам, fake-IP не появляется, и выглядит это как «список не работает»
+         * при исправном наборе и правиле. */
+        diag("doh", "warn", "клиент может обходить DNS роутера",
+             "браузер с DNS-over-HTTPS резолвит сам, и доменные каналы его трафик не видят: "
+             "выключите DoH в браузере или пользуйтесь адресными списками");
+    }
+
+    /* 5. IPv6. Адресных каналов для IPv6 нет вовсе, значит при живом IPv6 наружу трафик
+     *    к тем же целям уходит мимо канала. Для on_fail=drop это утечка, а не неудобство,
+     *    поэтому там fail. Проверяем НАЛИЧИЕ маршрута, а не убеждения: без него нет и
+     *    повода тревожить. */
+    int v6 = system("ip -6 route show default 2>/dev/null | grep -q .") == 0;
+    if (v6) {
+        int drops = 0;
+        for (size_t i = 0; i < g_out_n; i++)
+            if (g_out[i].on_fail == FAIL_DROP) drops++;
+        int dom_only = 1;
+        for (size_t i = 0; i < g_grp_n; i++)
+            if (g_grp[i].files_n) dom_only = 0;
+        if (drops)
+            diag("ipv6", "fail", "IPv6 наружу работает, а каналы его не разбирают",
+                 "выход с on_fail=drop останавливает только IPv4: то, что должно быть "
+                 "отброшено, уйдёт по IPv6 — отключите IPv6 у провайдера или на роутере");
+        else if (!dom_only)
+            diag("ipv6", "warn", "IPv6 наружу работает, а адресные каналы только про IPv4",
+                 "сайт, доступный по IPv6, пойдёт мимо канала: доменные каналы прикрыты "
+                 "подавлением AAAA, адресные — нет");
+        else
+            diag("ipv6", "ok", "IPv6 наружу работает, доменные каналы прикрыты",
+                 "");
+    }
+
+    /* 6. Выходы: устройство, зона фаервола, NAT. То же, что в status, но с приговором —
+     *    в status это поля, и какие из них важны, человек угадывал сам. */
+    for (size_t i = 0; i < g_out_n; i++) {
+        if (!out_has_device(&g_out[i])) continue;
+        char path[128];
+        snprintf(path, sizeof(path), "/sys/class/net/%s/operstate", g_out[i].device);
+        int present = access(path, R_OK) == 0;
+        char what[160], why[240];
+        if (!present) {
+            snprintf(what, sizeof(what), "выход %.40s: устройства %.24s нет",
+                     g_out[i].name, g_out[i].device);
+            snprintf(why, sizeof(why), "туннель не поднят — %s",
+                     g_out[i].kind == OUT_VLESS ? "смотрите журнал движка"
+                                                : "проверьте настройку интерфейса");
+            diag("output", "fail", what, why);
+            continue;
+        }
+        struct fwcheck c = fw_check(g_out[i].device);
+        if (!c.in_firewall) {
+            snprintf(what, sizeof(what), "выход %.40s: %.24s вне зоны фаервола",
+                     g_out[i].name, g_out[i].device);
+            diag("output", "fail", what,
+                 "фаервол отбросит ответы — добавьте устройство в зону");
+        } else if (!c.masqueraded && g_out[i].kind != OUT_VLESS) {
+            /* Только для kind=interface. Выходу vless masquerade не нужен: он завершает TCP
+             * сам и наружу идёт от своего имени, адреса клиентов границу не переходят. Жалоба
+             * на исправной системе — это постоянная жёлтая метка, которая учит не смотреть на
+             * проверки вовсе. */
+            snprintf(what, sizeof(what), "выход %.40s: у %.24s нет masquerade",
+                     g_out[i].name, g_out[i].device);
+            diag("output", "warn", what,
+                 "без подмены адреса ответы не найдут дорогу назад, если туннель этого "
+                 "не делает сам");
+        } else if (c.masqueraded) {
+            snprintf(what, sizeof(what), "выход %.40s: устройство %.24s в зоне, NAT есть",
+                     g_out[i].name, g_out[i].device);
+            diag("output", "ok", what, "");
+        } else {
+            /* Сюда попадает только vless без masquerade — для него это норма. Сказать
+             * «NAT есть» было бы прямой неправдой: его нет, он просто не нужен. */
+            snprintf(what, sizeof(what), "выход %.40s: устройство %.24s в зоне",
+                     g_out[i].name, g_out[i].device);
+            diag("output", "ok", what,
+                 "masquerade не нужен: туннель завершает TCP сам, адреса клиентов наружу "
+                 "не уходят");
+        }
+    }
+
+    printf("],\"warn\":%d,\"fail\":%d}\n", g_diag_warn, g_diag_fail);
+    /* Код возврата — чтобы это годилось в скрипт, а не только глазам. */
+    return g_diag_fail ? 1 : 0;
 }
 
 /* Asks the KERNEL, channel by channel in spec order, instead of re-reading the
@@ -815,6 +1075,7 @@ int main(int argc, char **argv) {
               "       steer outputs [--kind K]    (перечислить выходы)\n"
               "       steer needs-dnsd            (exit 0 if the spec has domain channels)\n"
               "       steer status [--spec FILE]\n"
+              "       steer diag [--spec FILE]    (проверки состояния, JSON; код 1 при поломке)\n"
               "       steer explain ADDRESS [--spec FILE]\n", stderr);
         return 2;
     }
@@ -883,6 +1144,7 @@ int main(int argc, char **argv) {
     if (!strcmp(cmd, "dnsd")) return dnsd_main(argc - 2, argv + 2);
     if (!strcmp(cmd, "apply")) return cmd_apply(spec, dry);
     if (!strcmp(cmd, "status")) return cmd_status(spec);
+    if (!strcmp(cmd, "diag")) return cmd_diag(spec);
     if (!strcmp(cmd, "explain")) {
         if (!arg) die("explain needs an address", NULL);
         if (!addr_ok(arg)) die("not an address: %s", arg);
