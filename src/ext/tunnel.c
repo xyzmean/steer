@@ -577,6 +577,53 @@ static void *connector(void *arg) {
     return NULL;
 }
 
+/* Снять из очереди заявки этого потока и дождаться тех, что уже в работе.
+ *
+ * Нужно на выходе из цикла — а он выходит, если epoll вернул ошибку. Без этого слив таблицы
+ * закрывал сессию, с которой в тот момент работает установщик, и дальше происходили сразу две
+ * разные беды:
+ *
+ *   - vless_close отдавал ядру дескриптор, которым установщик ещё пользуется. Номер тут же
+ *     достаётся другому потоку, и куски чужого соединения уезжают не туда — ровно тот класс
+ *     ошибок, ради которого заявка и несёт указатель на сессию, а не индекс;
+ *   - g_conns и g_sess живут в TLS потока-владельца. Он возвращается из worker_loop, TLS
+ *     освобождается, а установщик продолжает писать по прежнему адресу.
+ *
+ * Необслуженные заявки просто выбрасываем: установщик их ещё не брал, ждать нечего. Ждать
+ * приходится только взятых, их не больше CONNECTORS, и каждая ограничена таймаутом connect.
+ *
+ * Возвращает 0, если отпустили всех, и -1, если кто-то так и не доложил. По -1 таблицу
+ * сливать НЕЛЬЗЯ — освобождать её под работающим установщиком это и есть то, от чего мы тут
+ * защищаемся. Тогда честнее утечь: путь и так предсмертный, а процесс перезапустит procd. */
+static int connq_release(struct conn *base) {
+    pthread_mutex_lock(&g_cq.mu);
+    unsigned kept = 0;
+    for (unsigned i = 0; i < g_cq.n; i++) {
+        struct connjob j = g_cq.q[(g_cq.head + i) % CONNQ];
+        if (j.c >= base && j.c < base + MAX_CONNS) {
+            j.c->pending = 0;            /* нашу запись больше никто не тронет */
+            continue;
+        }
+        g_cq.q[(g_cq.head + kept++) % CONNQ] = j;
+    }
+    g_cq.n = kept;
+    pthread_mutex_unlock(&g_cq.mu);
+
+    /* Взятые в работу: ждём доклада. Предел щедрый — таймаут установления восемь секунд, и
+     * пережидать его дешевле, чем разбираться в порче памяти на живом роутере. */
+    for (int spin = 0; spin < 1500; spin++) {
+        int busy = 0;
+        for (int i = 0; i < MAX_CONNS; i++)
+            if (base[i].used && base[i].pending &&
+                !__atomic_load_n(&base[i].done, __ATOMIC_ACQUIRE)) busy++;
+        if (!busy) return 0;
+        struct timespec ts = { .tv_sec = 0, .tv_nsec = 10 * 1000 * 1000 };
+        nanosleep(&ts, NULL);
+    }
+    fprintf(stderr, "steer tunnel: установщик не доложил за 15 с, таблица не освобождается\n");
+    return -1;
+}
+
 /* Поставить заявку. 0 — принята, -1 — очередь полна. */
 static int conn_submit(struct conn *c, const struct vless_node *node) {
     pthread_mutex_lock(&g_cq.mu);
@@ -1649,7 +1696,10 @@ static void *worker_loop(void *arg) {
             li++;
         }
     }
-    while (g_live_n) conn_drop(&g_conns[g_live[0]]);
+    /* Сначала отпустить установщиков, только потом закрывать сессии: иначе закрываем то,
+     * с чем они работают. Почему это важно — у connq_release. */
+    if (connq_release(g_conns) == 0)
+        while (g_live_n) conn_drop(&g_conns[g_live[0]]);
     close(ep);
     close(tun_fd);
     return NULL;
