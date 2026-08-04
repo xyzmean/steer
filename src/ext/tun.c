@@ -63,15 +63,26 @@ struct vnet_hdr {
  * всё, и ядро прочитало бы gso_size там, где лежит csum_start. */
 typedef char vnet_hdr_size_check[sizeof(struct vnet_hdr) == VNET_HDR_LEN ? 1 : -1];
 
-/* Одна попытка открыть очередь с заданным набором флагов. */
+/* Одна попытка открыть очередь с заданным набором флагов.
+ *
+ * errno сохраняется в g_open_errno: перебор наборов флагов затирает его следующей попыткой,
+ * а причина нужна именно от ПЕРВОЙ — она отвечает на вопрос «почему устройства нет вовсе»,
+ * тогда как последняя расскажет лишь про отказ от последнего украшения. */
+static int g_open_errno;
+static int g_open_stage;      /* 1 — не открылся /dev/net/tun, 2 — отказал TUNSETIFF */
+
 static int queue_open(const char *name, short flags) {
     int fd = open("/dev/net/tun", O_RDWR);
-    if (fd < 0) return -1;
+    if (fd < 0) {
+        if (!g_open_errno) { g_open_errno = errno; g_open_stage = 1; }
+        return -1;
+    }
     struct ifreq ifr;
     memset(&ifr, 0, sizeof(ifr));
     snprintf(ifr.ifr_name, IFNAMSIZ, "%s", name);
     ifr.ifr_flags = flags;
     if (ioctl(fd, TUNSETIFF, &ifr) < 0) {
+        if (!g_open_errno) { g_open_errno = errno; g_open_stage = 2; }
         close(fd);
         return -1;
     }
@@ -132,6 +143,19 @@ int tun_open(struct tun_dev *d, int max_queues, const char *name) {
         }
         return n;
     }
+    /* Ни один набор флагов не подошёл. Молча вернуть код нельзя: он доходил до человека
+     * только как код выхода процесса — и не как 40 или 41, а как 216 или 215, потому что
+     * отрицательное возвращённое из main обрезается до байта. В журнале при этом не было
+     * ни строки, и «туннель не поднялся» выглядело как «туннель просто не работает». */
+    if (g_open_stage == 1 && (g_open_errno == ENOENT || g_open_errno == ENXIO ||
+                              g_open_errno == ENODEV)) {
+        fprintf(stderr, "steer tunnel: нет /dev/net/tun (%s) — не установлен kmod-tun\n",
+                strerror(g_open_errno));
+        return TUN_ENODEV;
+    }
+    fprintf(stderr, "steer tunnel: устройство %s не создалось: %s (%s)\n", name,
+            strerror(g_open_errno ? g_open_errno : EINVAL),
+            g_open_stage == 1 ? "не открылся /dev/net/tun" : "отказал TUNSETIFF");
     return TUN_ESETUP;
 }
 

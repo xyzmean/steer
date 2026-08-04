@@ -1377,6 +1377,10 @@ struct worker {
     struct tun_dev tun;
     const struct vless_node *node;
     int id;
+    /* Дошёл ли поток до цикла, то есть нёс ли эта очередь трафик хоть секунду. Нужно
+     * ровно для одного: различить в журнале «туннель не поднялся» и «туннель работал и
+     * умер». Для кода выхода разницы нет — он в обоих случаях ненулевой. */
+    int served;
 };
 
 static void *worker_loop(void *arg) {
@@ -1434,6 +1438,7 @@ static void *worker_loop(void *arg) {
         }
     }
     struct epoll_event evs[MAX_CONNS + 1];
+    w->served = 1;      /* очередь встала в epoll — дальше она несёт трафик */
 
     for (;;) {
         /* Время снимается ОДИН раз на виток и лежит в g_now_ns/g_now_s — почему, написано
@@ -1750,7 +1755,11 @@ int tunnel_run(struct output *o, const struct vless_node *node) {
     struct tun_dev queues[MAX_WORKERS];
     int want = worker_count();
     int n = tun_open(queues, want, dev);
-    if (n < 0) return n;
+    /* Код выхода — ОДИН, и он положительный. Возвращая сюда -40 или -41, движок отдавал
+     * их main, а тот отдавал ядру: отрицательное обрезается до байта, и procd получал 216
+     * или 215. Число, которое ничего не значит ни для человека, ни для splify2. Причину
+     * называет tun_open своим сообщением, здесь остаётся признак отказа. */
+    if (n < 0) return 1;
 
     for (int i = 0; i < n; i++) {
         /* Неблокирующее чтение: цикл вычерпывает устройство до EAGAIN, и без этого флага
@@ -1786,6 +1795,7 @@ int tunnel_run(struct output *o, const struct vless_node *node) {
 
     /* Потоки со второго по последний — отдельными, первый работает в этом же. Так процесс
      * остаётся тем, чем был для procd: если цикл завершится, завершится и процесс. */
+    for (int i = 0; i < n; i++) workers[i].served = 0;
     pthread_t tids[MAX_WORKERS];
     int started = 0;
     for (int i = 1; i < n; i++) {
@@ -1798,7 +1808,24 @@ int tunnel_run(struct output *o, const struct vless_node *node) {
     }
     worker_loop(&workers[0]);
     for (int i = 0; i < started; i++) pthread_join(tids[i], NULL);
-    return 0;
+
+    /* Досюда мы доходим ТОЛЬКО когда все очереди завершились, а завершиться они могут
+     * лишь по ошибке: успешного выхода у worker_loop нет ни одного. Штатное окончание
+     * работы выглядит иначе — procd присылает сигнал, и процесс умирает, не возвращаясь
+     * сюда вовсе.
+     *
+     * Поэтому ноль здесь неверен всегда. Возвращая его, движок сообщал procd и splify2
+     * «завершился успешно» в тот момент, когда туннель не нёс трафик: интерфейс показывал
+     * выход настроенным, журнал — ни одной жалобы, а сайты не открывались. Ровно тот
+     * тихий сбой, который в этом коде вычищен везде, кроме этой строки. */
+    int served = 0;
+    for (int i = 0; i < n; i++) served += workers[i].served;
+    if (!served)
+        fprintf(stderr, "steer tunnel: %s не поднялся ни одной очередью из %d\n", dev, n);
+    else
+        fprintf(stderr, "steer tunnel: %s больше не несёт трафик — все очереди (%d) "
+                        "завершились\n", dev, n);
+    return 1;
 }
 
 /* ---- подкоманда steer vless -------------------------------------------------
