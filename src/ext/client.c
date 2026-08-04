@@ -704,6 +704,34 @@ int vless_probe_timed(const struct vless_node *node, int timeout_s, char *why, s
     return 0;
 }
 
+int vless_recv_zc(struct vless_conn *c, unsigned char *buf, size_t cap,
+                  const unsigned char **data, size_t *got) {
+    *got = 0;
+    *data = buf;
+    /* Без копии — только на голом транспорте: у grpc и xhttp между TLS и данными лежит
+     * HTTP/2, и он всё равно перекладывает тело кадра в свой буфер. Тянуть указатель ещё и
+     * через него значило бы усложнить разбор ради случая, который на этих транспортах не
+     * встречается. Прямое копирование (rx_direct) и security=none читают сокет сами. */
+    if (c->tr == VT_RAW && !c->plain && !c->rx_direct)
+        return tls13_read_ref(&c->tls, data, got);
+    return vless_recv(c, buf, cap, got);
+}
+
+/* Есть ли у нас непрочитанное, о чём ядро не расскажет.
+ *
+ * Спрашивает туннель, прежде чем уйти ждать событий: данные, уже вынутые из сокета в буфер
+ * записей, для epoll не существуют. Зачем это важно — в tls13.h у tls13_has_record.
+ *
+ * Три режима, а не один. Без TLS буфера нет вовсе. В прямом копировании нет и границ
+ * записей — значимо просто «есть байты». В обычном режиме — только ЦЕЛАЯ запись: по части
+ * записи мы всё равно ничего не сможем отдать, и считать её готовностью значило бы крутить
+ * цикл впустую до прихода остатка. */
+int vless_has_data(const struct vless_conn *c) {
+    if (c->plain) return 0;
+    if (c->rx_direct) return tls13_buffered(&c->tls) > 0;
+    return tls13_has_record(&c->tls);
+}
+
 void vless_close(struct vless_conn *c) {
     if (c->fd >= 0) close(c->fd);
     c->fd = -1;

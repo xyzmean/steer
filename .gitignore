@@ -18,3 +18,6 @@ build/tmo-*
 build/tun-gso-*
 build/gcm-size
 build/bench
+build/dnsmatch
+build/crypto-vec
+build/bx-*

@@ -74,6 +74,118 @@
 #define MAX_HOSTNAME 256
 
 /* ---------------------------------------------------------------------- */
+/* индекс строк: имя -> номер записи                                      */
+/* ---------------------------------------------------------------------- */
+/* Зачем он здесь. Резолвер — второй по времени жизни процесс движка, и в нём было ДВА
+ * места, где на каждый запрос шёл перебор со сравнением строк:
+ *
+ *   1. подбор правила: доменный список категории — это тысячи строк, и каждая проверялась
+ *      strcmp'ом на каждый запрос. При 5000 доменов и трёх каналах это 15 000 сравнений
+ *      строк на один вопрос клиента;
+ *   2. таблица fake-IP: поиск домена, чтение и запись его реального адреса — три отдельных
+ *      перебора на каждый ОТВЕТ.
+ *
+ * И одно место, где перебор был квадратичным: загрузка состояния проверяла каждую строку
+ * файла против всех уже загруженных. Файл на 5000 записей — 12,5 миллиона сравнений при
+ * старте, то есть секунды на слабом ядре ровно в тот момент, когда клиенты уже спрашивают.
+ *
+ * Индекс — открытая адресация с линейной пробой. Ёмкость всегда степень двойки и не меньше
+ * двойного числа записей: при заполнении ниже половины средняя проба короче двух шагов.
+ * Значение — номер записи плюс единица (ноль означает «пусто») и две метки типа в старших
+ * битах, чтобы один и тот же шаблон, заданный и точным, и доменным правилом, не занимал
+ * двух слотов.
+ *
+ * Строки НЕ копируются: ключ достаётся у владельца по номеру. Иначе тот же список лежал бы
+ * в памяти дважды, а её на роутере нет. */
+
+#define SIDX_TAG_SHIFT 30
+#define SIDX_IDX_MASK  ((1u << SIDX_TAG_SHIFT) - 1)
+
+typedef const char *(*sidx_key_fn)(const void *owner, uint32_t idx);
+
+struct sindex {
+    uint32_t *slot;
+    uint32_t cap;    /* степень двойки, либо 0 пока не выделено */
+    uint32_t n;
+};
+
+static uint32_t sidx_hash(const char *s) {
+    /* FNV-1a: три операции на байт и никаких таблиц. Имена короткие, и разница с более
+     * хитрыми функциями здесь меньше, чем цена одного промаха кэша. */
+    uint32_t h = 2166136261u;
+    for (; *s; s++) {
+        h ^= (unsigned char)*s;
+        h *= 16777619u;
+    }
+    return h;
+}
+
+static void sindex_free(struct sindex *ix) {
+    free(ix->slot);
+    ix->slot = NULL;
+    ix->cap = 0;
+    ix->n = 0;
+}
+
+static void sidx_insert_raw(struct sindex *ix, const void *owner, sidx_key_fn key,
+                            const char *s, uint32_t val) {
+    uint32_t m = ix->cap - 1;
+    uint32_t i = sidx_hash(s) & m;
+    while (ix->slot[i]) {
+        uint32_t idx = (ix->slot[i] & SIDX_IDX_MASK) - 1;
+        if (strcmp(key(owner, idx), s) == 0) {
+            /* Тот же ключ: добавляем метку типа, а не второй слот. */
+            ix->slot[i] |= val & ~SIDX_IDX_MASK;
+            return;
+        }
+        i = (i + 1) & m;
+    }
+    ix->slot[i] = val;
+    ix->n++;
+}
+
+/* Место под ещё одну запись; при заполнении выше половины таблица удваивается. */
+static int sindex_reserve(struct sindex *ix, const void *owner, sidx_key_fn key) {
+    if (ix->cap && (ix->n + 1) * 2 <= ix->cap) return 0;
+    uint32_t ncap = ix->cap ? ix->cap * 2 : 256;
+    uint32_t *ns = calloc(ncap, sizeof(*ns));
+    if (!ns) return -1;
+    uint32_t *old = ix->slot;
+    uint32_t ocap = ix->cap;
+    ix->slot = ns;
+    ix->cap = ncap;
+    ix->n = 0;
+    for (uint32_t i = 0; i < ocap; i++) {
+        if (!old[i]) continue;
+        uint32_t idx = (old[i] & SIDX_IDX_MASK) - 1;
+        sidx_insert_raw(ix, owner, key, key(owner, idx), old[i]);
+    }
+    free(old);
+    return 0;
+}
+
+static int sindex_put(struct sindex *ix, const void *owner, sidx_key_fn key,
+                      const char *s, uint32_t idx, unsigned tag) {
+    if (sindex_reserve(ix, owner, key) != 0) return -1;
+    sidx_insert_raw(ix, owner, key, s, (idx + 1) | (tag << SIDX_TAG_SHIFT));
+    return 0;
+}
+
+/* Ноль, если ключа нет. Иначе номер записи в младших битах и метки в старших. */
+static uint32_t sindex_get(const struct sindex *ix, const void *owner, sidx_key_fn key,
+                           const char *s) {
+    if (!ix->cap) return 0;
+    uint32_t m = ix->cap - 1;
+    uint32_t i = sidx_hash(s) & m;
+    while (ix->slot[i]) {
+        uint32_t idx = (ix->slot[i] & SIDX_IDX_MASK) - 1;
+        if (strcmp(key(owner, idx), s) == 0) return ix->slot[i];
+        i = (i + 1) & m;
+    }
+    return 0;
+}
+
+/* ---------------------------------------------------------------------- */
 /* rule matching                                                          */
 /* ---------------------------------------------------------------------- */
 
@@ -86,11 +198,27 @@ struct rule {
     int re_valid;
 };
 
+/* Метки типа в индексе: одно и то же имя может быть задано и точным правилом, и доменным. */
+#define RTAG_EXACT     1u
+#define RTAG_NAMESPACE 2u
+
 struct ruleset {
     struct rule *rules;
     size_t n;
     size_t cap;
+    /* Точные и доменные правила — через индекс: их тысячи, и перебирать их на каждый запрос
+     * незачем, имя проверяется по своим суффиксам (см. ruleset_match). */
+    struct sindex idx;
+    /* Шаблоны и регулярные выражения перебираются как раньше: по суффиксу их не найти, а
+     * бывает их единицы на список. Отдельный массив номеров — чтобы перебор не шёл по всем
+     * правилам ради этих единиц. */
+    uint32_t *fancy;
+    size_t fancy_n, fancy_cap;
 };
+
+static const char *ruleset_key(const void *owner, uint32_t idx) {
+    return ((const struct ruleset *)owner)->rules[idx].pattern;
+}
 
 static void ruleset_free(struct ruleset *rs) {
     for (size_t i = 0; i < rs->n; i++) {
@@ -99,7 +227,11 @@ static void ruleset_free(struct ruleset *rs) {
             regfree(&rs->rules[i].re);
     }
     free(rs->rules);
+    sindex_free(&rs->idx);
+    free(rs->fancy);
     rs->rules = NULL;
+    rs->fancy = NULL;
+    rs->fancy_n = rs->fancy_cap = 0;
     rs->n = 0;
     rs->cap = 0;
 }
@@ -157,6 +289,24 @@ static int ruleset_add(struct ruleset *rs, const char *raw) {
     }
     if (!r->pattern && r->type != RULE_REGEX) return -1;
     rs->n++;
+
+    /* Место в индексе — сразу при добавлении, а не отдельным проходом после загрузки: иначе
+     * появилось бы состояние «правила загружены, индекс ещё нет», в котором подбор молча
+     * отвечает «не совпало». Такую ошибку не видно вовсе — трафик просто идёт мимо канала. */
+    if (r->type == RULE_EXACT || r->type == RULE_NAMESPACE) {
+        unsigned tag = r->type == RULE_EXACT ? RTAG_EXACT : RTAG_NAMESPACE;
+        if (sindex_put(&rs->idx, rs, ruleset_key, r->pattern, (uint32_t)(rs->n - 1), tag) != 0)
+            return -1;
+    } else {
+        if (rs->fancy_n == rs->fancy_cap) {
+            size_t nc = rs->fancy_cap ? rs->fancy_cap * 2 : 16;
+            uint32_t *nf = realloc(rs->fancy, nc * sizeof(*nf));
+            if (!nf) return -1;
+            rs->fancy = nf;
+            rs->fancy_cap = nc;
+        }
+        rs->fancy[rs->fancy_n++] = (uint32_t)(rs->n - 1);
+    }
     return 0;
 }
 
@@ -203,6 +353,16 @@ static int rule_matches(const struct rule *r, const char *host_lower) {
     return 0;
 }
 
+/* Совпадает ли имя с каким-нибудь правилом набора.
+ *
+ * Точные и доменные правила проверяются НЕ ПЕРЕБОРОМ, а по суффиксам имени: доменное
+ * правило совпадает тогда и только тогда, когда его шаблон — это само имя или его суффикс,
+ * начинающийся на границе точки. Значит достаточно спросить индекс про «a.b.c», «b.c», «c»
+ * — то есть сделать столько поисков, сколько в имени точек плюс один. Для обычного имени
+ * это два-четыре обращения вместо тысяч сравнений строк.
+ *
+ * Правило «точное» отличается тем, что годится только на первом шаге: оно совпадает с самим
+ * именем и не совпадает с его поддоменами. Метка в индексе это и различает. */
 static int ruleset_match(const struct ruleset *rs, const char *host) {
     char lower[MAX_HOSTNAME];
     size_t n = strlen(host);
@@ -210,8 +370,21 @@ static int ruleset_match(const struct ruleset *rs, const char *host) {
     memcpy(lower, host, n);
     lower[n] = '\0';
     str_lower(lower);
-    for (size_t i = 0; i < rs->n; i++)
-        if (rule_matches(&rs->rules[i], lower)) return 1;
+
+    for (const char *suf = lower;; ) {
+        uint32_t hit = sindex_get(&rs->idx, rs, ruleset_key, suf);
+        if (hit) {
+            unsigned tag = hit >> SIDX_TAG_SHIFT;
+            if (tag & RTAG_NAMESPACE) return 1;
+            if ((tag & RTAG_EXACT) && suf == lower) return 1;
+        }
+        const char *dot = strchr(suf, '.');
+        if (!dot) break;
+        suf = dot + 1;
+    }
+
+    for (size_t i = 0; i < rs->fancy_n; i++)
+        if (rule_matches(&rs->rules[rs->fancy[i]], lower)) return 1;
     return 0;
 }
 
@@ -800,6 +973,22 @@ struct fakeip_table {
 static struct fakeip_table g_fakeip;
 static const char *g_fakeip_state_path;
 
+/* Индекс домен -> номер записи. Тот же приём, что у правил, и по той же причине: без него
+ * каждый ответ стоил трёх переборов таблицы со сравнением строк, а загрузка состояния была
+ * квадратичной — файл на 5000 записей означал 12,5 миллиона сравнений при старте. */
+static struct sindex g_fakeip_idx;
+
+static const char *fakeip_key(const void *owner, uint32_t idx) {
+    return ((const struct fakeip_table *)owner)->entries[idx].domain;
+}
+
+/* Номер записи домена или -1. Единственное место поиска: три прежних копии этого перебора
+ * (найти, прочитать реальный адрес, записать его) разошлись бы при первом же изменении. */
+static long fakeip_find(const char *domain) {
+    uint32_t hit = sindex_get(&g_fakeip_idx, &g_fakeip, fakeip_key, domain);
+    return hit ? (long)((hit & SIDX_IDX_MASK) - 1) : -1;
+}
+
 static uint32_t fakeip_index_to_addr(size_t idx) { return FAKEIP_POOL_BASE + (uint32_t)idx; }
 
 /* Next pool index to hand out — a HIGH-WATER MARK, not the entry count.
@@ -826,6 +1015,16 @@ static int fakeip_table_add(struct fakeip_table *t, const char *domain, uint32_t
     t->entries[t->n].addr = addr;
     t->entries[t->n].real_host = 0;
     t->n++;
+    if (t == &g_fakeip &&
+        sindex_put(&g_fakeip_idx, t, fakeip_key, t->entries[t->n - 1].domain,
+                   (uint32_t)(t->n - 1), 0) != 0) {
+        /* Индекс не вырос — запись всё равно добавлена, но найти её будет нечем. Честнее
+         * откатить, чем оставить домен, который существует и не находится: иначе он получит
+         * второй адрес при следующем запросе, а DNAT будет показывать на один из них. */
+        free(t->entries[t->n - 1].domain);
+        t->n--;
+        return -1;
+    }
     if (addr >= FAKEIP_POOL_BASE) {
         size_t idx = (size_t)(addr - FAKEIP_POOL_BASE);
         if (idx + 1 > g_fakeip_next) g_fakeip_next = idx + 1;
@@ -835,9 +1034,8 @@ static int fakeip_table_add(struct fakeip_table *t, const char *domain, uint32_t
 
 /* 0 iff DOMAIN already has an allocation. */
 static int fakeip_table_has(const struct fakeip_table *t, const char *domain) {
-    for (size_t i = 0; i < t->n; i++)
-        if (strcmp(t->entries[i].domain, domain) == 0) return 0;
-    return -1;
+    (void)t;
+    return fakeip_find(domain) >= 0 ? 0 : -1;
 }
 
 /* State file format: one entry per line.
@@ -934,11 +1132,10 @@ static void fakeip_state_rewrite(void) {
  * the pool is exhausted (caller falls back to relaying the real answer
  * unchanged — fail open, never block DNS over an exhausted pool). */
 static int fakeip_lookup_or_alloc(const char *domain, uint32_t *out_addr) {
-    for (size_t i = 0; i < g_fakeip.n; i++) {
-        if (strcmp(g_fakeip.entries[i].domain, domain) == 0) {
-            *out_addr = g_fakeip.entries[i].addr;
-            return 0;
-        }
+    long at = fakeip_find(domain);
+    if (at >= 0) {
+        *out_addr = g_fakeip.entries[at].addr;
+        return 0;
     }
     if (g_fakeip_next >= FAKEIP_POOL_SIZE) return -1;
     uint32_t addr = fakeip_index_to_addr(g_fakeip_next);
@@ -954,22 +1151,16 @@ static int fakeip_lookup_or_alloc(const char *domain, uint32_t *out_addr) {
  * the extended 3-field form persists. */
 /* The real backend we last installed for this domain, or 0 if we never did. */
 static uint32_t fakeip_entry_get_real(const char *domain) {
-    for (size_t i = 0; i < g_fakeip.n; i++)
-        if (strcmp(g_fakeip.entries[i].domain, domain) == 0)
-            return g_fakeip.entries[i].real_host;
-    return 0;
+    long at = fakeip_find(domain);
+    return at >= 0 ? g_fakeip.entries[at].real_host : 0;
 }
 
 static void fakeip_entry_set_real(const char *domain, uint32_t real_host) {
-    for (size_t i = 0; i < g_fakeip.n; i++) {
-        if (strcmp(g_fakeip.entries[i].domain, domain) == 0) {
-            if (g_fakeip.entries[i].real_host != real_host) {
-                g_fakeip.entries[i].real_host = real_host;
-                fakeip_state_rewrite();
-            }
-            return;
-        }
-    }
+    long at = fakeip_find(domain);
+    if (at < 0) return;
+    if (g_fakeip.entries[at].real_host == real_host) return;
+    g_fakeip.entries[at].real_host = real_host;
+    fakeip_state_rewrite();
 }
 
 /* ---------------------------------------------------------------------- */

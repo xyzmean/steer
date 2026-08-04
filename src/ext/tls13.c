@@ -578,6 +578,18 @@ int tls13_handshake(struct tls13 *t, int fd,
     return 0;
 }
 
+int tls13_has_record(const struct tls13 *t) {
+    size_t have = t->rbuf_n - t->rbuf_off;
+    if (have < 5) return 0;
+    const unsigned char *h = t->rbuf + t->rbuf_off;
+    size_t len = ((size_t)h[3] << 8) | h[4];
+    return have >= 5 + len;
+}
+
+size_t tls13_buffered(const struct tls13 *t) {
+    return t->rbuf_n - t->rbuf_off;
+}
+
 size_t tls13_take_pending(struct tls13 *t, unsigned char *out, size_t cap) {
     size_t have = t->rbuf_n - t->rbuf_off;
     if (!have) return 0;
@@ -632,9 +644,13 @@ int tls13_write(struct tls13 *t, const unsigned char *data, size_t n) {
  *
  * Ждать, пока сокет станет читаемым, — дело вызывающего: у него есть poll, у нас его нет
  * и быть не должно. */
-int tls13_read(struct tls13 *t, unsigned char *out, size_t cap, size_t *got) {
+/* Общее тело обоих чтений: разобрать одну запись и оставить открытый текст ТАМ, ГДЕ ОН
+ * ЛЕЖИТ — в буфере соединения. Копию делает только tls13_read, и только потому, что его
+ * вызывающему нужен свой буфер. */
+static int read_one(struct tls13 *t, const unsigned char **body, size_t *body_n) {
     if (!t->ready) return TLS13_ESTATE;
-    *got = 0;
+    *body = NULL;
+    *body_n = 0;
 
     /* Запись расшифровывается НА МЕСТЕ в буфере соединения: копировать её ещё раз значило
      * бы гонять по памяти лишние 16 КБ на каждую запись. */
@@ -665,8 +681,23 @@ int tls13_read(struct tls13 *t, unsigned char *out, size_t cap, size_t *got) {
     if (inner != 0x17) return 0;
     if (pt == 0) return 0;                     /* пустая запись — законная набивка Vision */
 
-    if (pt > cap) return TLS13_ETOOBIG;
-    memcpy(out, rec, pt);
-    *got = pt;
+    *body = rec;
+    *body_n = pt;
     return 0;
+}
+
+int tls13_read(struct tls13 *t, unsigned char *out, size_t cap, size_t *got) {
+    const unsigned char *body = NULL;
+    size_t n = 0;
+    int rc = read_one(t, &body, &n);
+    *got = 0;
+    if (rc || !n) return rc;
+    if (n > cap) return TLS13_ETOOBIG;
+    memcpy(out, body, n);
+    *got = n;
+    return 0;
+}
+
+int tls13_read_ref(struct tls13 *t, const unsigned char **body, size_t *body_n) {
+    return read_one(t, body, body_n);
 }

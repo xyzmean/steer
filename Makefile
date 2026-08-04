@@ -11,9 +11,17 @@ $(BUILD)/steer: src/steer.c src/spec.c src/dnsd.c src/failover.c src/aggregate.c
 	@mkdir -p $(BUILD)
 	$(CC) $(CFLAGS) -o $@ src/steer.c src/spec.c src/dnsd.c src/failover.c src/aggregate.c
 
-test: all
+test: all $(BUILD)/dnsmatch
 	@sh tests/run.sh
 	@sh tests/gen.sh
+	@$(BUILD)/dnsmatch
+
+# Подбор доменного правила проверяется отдельной программой, а не через движок: сам подбор
+# статический внутри dnsd.c, и дотянуться до него иначе значило бы добавить в движок
+# подкоманду ради теста. Файл включает исходник резолвера — см. tests/dnsmatch.c.
+$(BUILD)/dnsmatch: tests/dnsmatch.c src/dnsd.c src/spec.c src/spec.h
+	@mkdir -p $(BUILD)
+	$(CC) $(CFLAGS) -o $@ tests/dnsmatch.c src/spec.c
 
 clean:
 	rm -rf $(BUILD)

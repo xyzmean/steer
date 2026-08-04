@@ -23,17 +23,23 @@ build() {  # СУФФИКС ДОП_ФЛАГИ
         # shellcheck disable=SC2086
         zig cc -target "$TARGET" -mcpu="$MCPU" -O2 -c \
             -I"$MBED_INC" -I"$EXT_INC" \
-            -DMBEDTLS_CONFIG_FILE='"mbedtls_config.h"' $extra \
+            -DMBEDTLS_CONFIG_FILE='"steer_mbedtls_config.h"' $extra \
             "$f" -o "$m.o" 2>/dev/null || true
     done
     # shellcheck disable=SC2086
     zig cc -target "$TARGET" -mcpu="$MCPU" -static -O2 \
         -I"$MBED_INC" -I"$EXT_INC" \
-        -DMBEDTLS_CONFIG_FILE='"mbedtls_config.h"' $extra \
+        -DMBEDTLS_CONFIG_FILE='"steer_mbedtls_config.h"' $extra \
         -o "$OUT-$suffix" /src/tests/crypto-bench.c "$work"/*.o
 }
 
-build plain ""
-build aesce "-DMBEDTLS_AESCE_C"
-build aesce-big "-DMBEDTLS_AESCE_C -DMBEDTLS_GCM_LARGE_TABLE"
+# Ускорение теперь включается самой конфигурацией (см. steer_mbedtls_config.h), поэтому
+# «без ускорения» задаётся его ОТКЛЮЧЕНИЕМ, а не включением: иначе первый вариант перестал
+# бы быть базой сравнения и три числа означали бы одно и то же.
+# Замерено на x86_64: большая таблица GHASH не даёт ничего (331,9 против 328,5 МБ/с) —
+# при аппаратном AES библиотека считает GHASH инструкциями и таблицу не открывает. Вариант
+# оставлен, чтобы это можно было перепроверить на другом железе, а не поверить на слово.
+build plain "-DSTEER_NO_AES_ACCEL"
+build aesce ""
+build aesce-big "-DMBEDTLS_GCM_LARGE_TABLE"
 ls -la "$OUT"-*

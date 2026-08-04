@@ -83,6 +83,21 @@ int vless_probe_timed(const struct vless_node *node, int timeout_s, char *why, s
 int vless_send(struct vless_conn *c, const unsigned char *d, size_t n);
 int vless_recv(struct vless_conn *c, unsigned char *d, size_t cap, size_t *got);
 
+/* Приём БЕЗ ЛИШНЕЙ КОПИИ там, где транспорт это позволяет.
+ *
+ * *data указывает либо внутрь соединения (на расшифрованную на месте запись), либо в buf —
+ * вызывающему всё равно, он читает по указателю. Через это место идёт весь скачиваемый
+ * трафик, поэтому копия здесь стоила прохода по памяти на каждый байт загрузки.
+ *
+ * Правило одно: использовать данные ДО следующего вызова по этому соединению. Подробнее —
+ * в tls13.h у tls13_read_ref. */
+int vless_recv_zc(struct vless_conn *c, unsigned char *buf, size_t cap,
+                  const unsigned char **data, size_t *got);
+
+/* Лежат ли у нас уже прочитанные данные, которых ядро не покажет как готовность сокета.
+ * Подробности — в client.c. */
+int vless_has_data(const struct vless_conn *c);
+
 void vless_close(struct vless_conn *c);
 const char *vless_strerror(int rc);
 

@@ -29,6 +29,7 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <poll.h>
+#include <sys/epoll.h>
 #include <time.h>
 #include <arpa/inet.h>
 #include <pthread.h>
@@ -71,8 +72,57 @@
  * соединения» на весь файл, а не два разных числа, спорящих друг с другом. */
 #define IDLE_EVICT_S 120
 
+/* ---- таблица соединений: горячее отдельно от толстого -----------------------
+ *
+ * Раньше это была одна структура, и в ней рядом лежали флаг `used` (1 байт, читается на
+ * каждом проходе цикла) и `struct vless_conn` (18 832 байта: буфер записей TLS, контексты
+ * шифров, состояние HTTP/2). Запись выходила 19 056 байт, и горячие поля оказывались по
+ * ОБОИМ её краям: `used` в начале, `rtx`, `last` и `srv_closed` в конце — то есть на двух
+ * разных страницах в 18 КБ друг от друга.
+ *
+ * Чего это стоило. Один виток цикла проходил таблицу целиком четырнадцать раз: сборка
+ * набора для poll, подсчёт живых, подсчёт заявок, поиск ближайшего срока повтора, разбор
+ * готовых заявок, рассылка отложенных подтверждений, истёкшие сроки, закрытые сервером,
+ * уборка задержавшихся. Триста двадцать записей × две страницы × четырнадцать проходов —
+ * это 4480 обращений в память НА ВИТОК, и все они мимо кэша: 320 × 19 КБ = 5,8 МБ, а L1
+ * на MIPS 24Kc — 32 КБ, второго уровня нет вовсе. Каждое обращение — поход в память со
+ * промахом TLB заодно.
+ *
+ * Замерено на x86_64 (там кэш огромный и промахи прячет L3, то есть это НИЖНЯЯ оценка):
+ * при восьми занятых слотах из 320 холостой обход стоил 3,4 мкс на виток против 0,15 мкс
+ * по компактной таблице живых — в 23 раза. На 24Kc, где каждое из 4480 обращений это
+ * настоящая задержка памяти (~150 нс), те же обходы дают 0,67 мс на виток, то есть сами
+ * по себе ограничивают цикл 1500 витками в секунду — ровно тот потолок «1300–2000
+ * проходов», который здесь и наблюдался, и ровно та работа, которой не видно ни в одном
+ * счётчике: она вне таймеров poll, recv и разбора.
+ *
+ * Отсюда три решения, и они держатся друг за друга:
+ *
+ *   1. толстая половина живёт в ОТДЕЛЬНОМ массиве (struct sess). Проход цикла её не
+ *      касается вовсе, а страницы под неё берутся только теми соединениями, по которым
+ *      реально идёт ввод-вывод — простаивающий слот больше не стоит двух резидентных
+ *      страниц;
+ *   2. горячая половина — 112 байт, то есть две строки кэша, и поля прохода собраны в
+ *      первой;
+ *   3. проходов по ВСЕЙ таблице не осталось ни одного: цикл идёт по g_live, где лежат
+ *      только занятые слоты, а поиск по потоку — через хэш, а не перебором.
+ *
+ * Порядок важен: сам по себе список живых не помог бы, пока запись занимает 19 КБ, — при
+ * 320 живых соединениях обход всё равно упирался бы в память. И наоборот. */
+
+/* Толстая половина: нужна только тому соединению, по которому идёт ввод-вывод. */
+struct sess {
+    struct vless_conn v;
+    struct vision vis;
+    /* Разобранный UUID узла: нужен один раз на соединение — в заголовке запроса VLESS и
+     * при заводе Vision. В горячей половине ему делать нечего. */
+    unsigned char uuid[16];
+};
+
 struct conn {
-    int used;
+    /* Первая строка кэша — ровно то, что читает проход цикла. Порядок полей здесь не
+     * косметика: разложив их как попало, мы вернули бы вторую строку в каждый обход. */
+    uint8_t used;
     /* Рукопожатие к узлу идёт в отдельном потоке, и пока идёт — соединение НЕДОТРОЖИМО.
      *
      * Зачем это вообще. Рукопожатие стоит 250-400 мс, и делалось оно прямо в цикле: цикл
@@ -85,28 +135,53 @@ struct conn {
      *
      * pending=1 означает: заявка отдана установщику, ответа ещё нет. В этом состоянии
      * соединение нельзя ни закрыть, ни вытеснить, ни убрать по простою — установщик пишет
-     * в c->v, и освободить запись под ним значит писать в освобождённую память. Проверка
+     * в сессию, и освободить запись под ним значит писать в освобождённую память. Проверка
      * стоит во всех трёх местах, где conn удаляется. */
-    int pending;
-    int done;                 /* установщик закончил: читать только с ACQUIRE */
-    int rc;                   /* его результат: 0 или код ошибки vless_* */
-    struct flow_key key;
-    struct vless_conn v;
-    struct vision vis;
-    unsigned char uuid[16];
-    /* Порядковые номера с точки зрения КЛИЕНТА: what we ack, what we send. */
-    uint32_t client_seq;      /* следующий ожидаемый от клиента */
-    uint32_t our_seq;         /* следующий, который отправим клиенту */
-    int header_sent;          /* заголовок VLESS уже ушёл серверу */
-    int established;
-    /* Сколько из отправленного клиент подтвердил и сколько он готов принять. */
-    uint32_t client_ack;
-    uint16_t client_win;
-    uint8_t client_wscale;    /* множитель из опций SYN: окно = client_win << wscale */
+    uint8_t pending;
+    /* Сервер закрыл поток, но у нас ещё есть неподтверждённое клиенту. Подробности ниже,
+     * у closed_at; здесь поле стоит потому, что его читает проход цикла. */
+    uint8_t srv_closed;
+    /* Дескриптор соединения сейчас в epoll и ждёт готовности к чтению.
+     *
+     * Нужен, чтобы epoll_ctl вызывался только на ИЗМЕНЕНИЕ состояния, а не на каждом
+     * витке. Состояние меняется редко (окно клиента открылось или закрылось), а витков
+     * тысячи в секунду — вызывать системный вызов на каждый значило бы заменить обход
+     * таблицы обходом ядра. */
+    uint8_t armed;
+    /* В буфере записей уже лежит ЦЕЛАЯ запись, а мы прервались (упёрлись в предел порции
+     * или в окно клиента).
+     *
+     * Без этого флага такая запись зависала до следующих данных от сервера: epoll молчит —
+     * сокет-то пуст, всё уже прочитано у него в наш буфер, — и виток цикла не приходил.
+     * С poll поведение было тем же, просто ошибка не бросалась в глаза: на выгрузке данные
+     * идут потоком и следующее чтение всё разгребало, а вот ХВОСТ ответа мог простоять до
+     * таймаута повтора у клиента. */
+    uint8_t rx_ready;
+    uint8_t header_sent;      /* заголовок VLESS уже ушёл серверу */
+    uint8_t established;
     /* Клиенту причитается подтверждение, но мы его отложили до конца разбора порции из
      * TUN. Подтверждать каждый пакет отдельно — это лишняя запись в устройство на каждый
      * пакет выгрузки, притом что все они подтверждаются одним ACK с последним номером. */
-    int ack_due;
+    uint8_t ack_due;
+    uint8_t dup_acks;         /* подряд идущие подтверждения того же номера */
+    /* Быстрый повтор уже сделан и нового подтверждения ещё не было.
+     *
+     * Без этого флага повтор сам себя разгоняет: на повторную порцию клиент отвечает
+     * подтверждением с тем же номером (данные-то он уже принял), три таких — и мы повторяем
+     * снова. Один быстрый повтор на одно продвижение подтверждения — то же правило, по
+     * которому это работает в TCP. */
+    uint8_t fast_done;
+    uint8_t client_wscale;    /* множитель из опций SYN: окно = client_win << wscale */
+    /* Сколько из отправленного клиент подтвердил и сколько он готов принять. */
+    uint16_t client_win;
+    /* Место в g_live и следующий в цепочке хэша. Индексы, а не указатели: два байта против
+     * восьми, и вся горячая запись обязана влезть в две строки кэша. */
+    int16_t livepos;
+    int16_t hnext;
+    /* Порядковые номера с точки зрения КЛИЕНТА: what we ack, what we send. */
+    uint32_t our_seq;         /* следующий, который отправим клиенту */
+    uint32_t client_ack;
+    uint32_t client_seq;      /* следующий ожидаемый от клиента */
     /* ---- повторная передача клиенту ----
      *
      * Начало кольца — это ровно client_ack, а его длина — ровно our_seq - client_ack:
@@ -123,15 +198,13 @@ struct conn {
      * последний раз). Ноль означает «неподтверждённого нет». */
     uint64_t rtx_at;
     uint32_t rto_ms;          /* текущий таймаут, растёт вдвое на каждый повтор */
-    int dup_acks;             /* подряд идущие подтверждения того же номера */
-    /* Быстрый повтор уже сделан и нового подтверждения ещё не было.
-     *
-     * Без этого флага повтор сам себя разгоняет: на повторную порцию клиент отвечает
-     * подтверждением с тем же номером (данные-то он уже принял), три таких — и мы повторяем
-     * снова. Один быстрый повтор на одно продвижение подтверждения — то же правило, по
-     * которому это работает в TCP. */
-    int fast_done;
-    /* Сервер закрыл поток, но у нас ещё есть неподтверждённое клиенту.
+    time_t last;
+    /* --- дальше то, что проход цикла НЕ читает: только работа с пакетом и установка. --- */
+    struct flow_key key;
+    int fd;                   /* копия сокета сессии: нужна при снятии с epoll */
+    int done;                 /* установщик закончил: читать только с ACQUIRE */
+    int rc;                   /* его результат: 0 или код ошибки vless_* */
+    /* Когда сервер закрылся: предел ожидания подтверждений.
      *
      * Закрывать соединение в этот момент НЕЛЬЗЯ, и это ровно та ошибка, из-за которой
      * повторная передача не помогала под потерями: вместе с соединением уничтожалось кольцо,
@@ -141,10 +214,13 @@ struct conn {
      *
      * Поэтому: сервера больше не читаем, но живём и повторяем, пока клиент не подтвердит
      * всё. FIN уходит после этого. */
-    int srv_closed;
-    uint64_t closed_at;       /* когда сервер закрылся: предел ожидания подтверждений */
-    time_t last;
+    uint64_t closed_at;
 };
+
+/* Горячая запись обязана оставаться маленькой — в этом весь смысл разделения. Проверка
+ * сборкой, а не обещанием в комментарии: буфер, добавленный сюда «на время отладки», иначе
+ * вернёт таблицу к 5,8 МБ, и заметить это можно будет только по скорости на роутере. */
+typedef char conn_hot_size_check[sizeof(struct conn) <= 192 ? 1 : -1];
 
 /* Сколько ждём подтверждений после закрытия сервером. Секунды, а не «сколько понадобится»:
  * клиент мог уйти совсем, и тогда кольцо не опустеет никогда. */
@@ -305,10 +381,66 @@ static int client_can_take_record(const struct conn *c) {
  * Общая таблица под мьютексом означала бы замок на каждый пакет, а пакетов семьсот на
  * мегабайт: второе ядро ушло бы на борьбу за первое. */
 static __thread struct conn g_conns[MAX_CONNS];
+static __thread struct sess g_sess[MAX_CONNS];
+/* Сессия соединения. Считается по индексу, а НЕ хранится указателем: указатель это восемь
+ * байт в горячей записи, которых ей взять негде.
+ *
+ * Годится только внутри потока-владельца: g_conns и g_sess — __thread, и у другого потока
+ * своя база. Установщик поэтому получает указатель на сессию в самой заявке, а не считает
+ * его сам — иначе он адресовал бы чужую таблицу по индексу из нашей. */
+#define SESS(c) (&g_sess[(size_t)((c) - g_conns)])
+
+/* Занятые слоты, плотно. Все проходы цикла идут ТОЛЬКО по этому массиву — зачем, написано
+ * выше у struct conn. */
+static __thread uint16_t g_live[MAX_CONNS];
+static __thread int g_live_n;
+/* Свободные слоты. Без него поиск места был бы перебором таблицы на каждый SYN. */
+static __thread uint16_t g_freelist[MAX_CONNS];
+static __thread int g_free_n;
+
+/* Хэш потока -> слот. Открытых цепочек, а не проб: удаление из цепочки не оставляет
+ * «надгробий», которые при 320 слотах и десятках тысяч соединений в час превратили бы
+ * таблицу в линейный перебор.
+ *
+ * 512 корзин на 320 слотов — заполнение 0,63, то есть средняя цепочка короче полутора
+ * записей. Память: 1 КБ, влезает в L1 целиком.
+ *
+ * Зачем вообще: conn_find вызывается на КАЖДЫЙ пакет из TUN, а их до семи тысяч в секунду.
+ * Перебором это 320 сравнений по записи в 19 КБ — то есть 320 промахов кэша на пакет,
+ * 2,2 миллиона в секунду. Хэш даёт одно обращение. */
+#define CONN_BUCKETS 512
+static __thread int16_t g_bucket[CONN_BUCKETS];
+
+static inline unsigned flow_hash(const struct flow_key *k) {
+    /* Порты вместе с адресами: соединения к одному узлу отличаются только исходным портом,
+     * и хэш без него сложил бы все соединения браузера в одну корзину. */
+    uint32_t h = k->src ^ (k->dst * 0x9E3779B1u) ^
+                 ((uint32_t)k->sport << 16) ^ (uint32_t)k->dport;
+    h ^= h >> 15;
+    h *= 0x2545F491u;
+    h ^= h >> 13;
+    return h & (CONN_BUCKETS - 1);
+}
+
 /* Номер потока — только для диагностики: по нему видно, раскладывает ли ядро нагрузку или
  * всё село в одну очередь. Без этого «стало быстрее вдвое» и «работает один поток из двух»
  * в отчёте выглядят одинаково. */
 static __thread int g_worker;
+
+/* Время, снятое ОДИН раз за виток цикла.
+ *
+ * Раньше clock_gettime и time вызывались из каждого места, где нужна метка: по два на
+ * пакет из TUN (а их до семи тысяч в секунду), по одному на каждую отправку клиенту, плюс
+ * по одному в каждом из обходов таблицы. На x86 это vDSO и почти бесплатно, а на mipsel
+ * ядра OpenWrt vDSO для clock_gettime нет вовсе — то есть каждый вызов был настоящим
+ * системным вызовом с переключением режима.
+ *
+ * Точности виток не портит: всё, что этими метками измеряется, — сроки в сотнях
+ * миллисекунд (порог повтора не меньше 200 мс, простой 120 с), а виток длится доли
+ * миллисекунды. Счётчики диагностики по-прежнему берут время сами: они мерят как раз то,
+ * что внутри витка, и усреднённая метка сделала бы их бессмысленными. */
+static __thread uint64_t g_now_ns;
+static __thread time_t g_now_s;
 
 /* ---- счётчики цикла ---------------------------------------------------------
  *
@@ -413,7 +545,10 @@ static int g_trace;
 #define CONNECTORS 4
 #define CONNQ 32
 
-struct connjob { struct conn *c; const struct vless_node *node; };
+/* Сессия передаётся указателем, а не считается установщиком по индексу: g_sess у каждого
+ * потока своя, и SESS() в чужом потоке адресовал бы чужую таблицу. Ошибка была бы из тех,
+ * что проявляются перепутанными кусками чужого соединения раз в сутки. */
+struct connjob { struct conn *c; struct vless_conn *v; const struct vless_node *node; };
 static struct {
     struct connjob q[CONNQ];
     unsigned head, n;
@@ -432,9 +567,9 @@ static void *connector(void *arg) {
         g_cq.n--;
         pthread_mutex_unlock(&g_cq.mu);
 
-        int rc = vless_connect(j.node, &j.c->v, 8);
+        int rc = vless_connect(j.node, j.v, 8);
         j.c->rc = rc;
-        /* RELEASE: цикл читает done с ACQUIRE, и всё, что записано в c->v выше, обязано
+        /* RELEASE: цикл читает done с ACQUIRE, и всё, что записано в сессию выше, обязано
          * быть видно ему к этому моменту. Без барьера это ровно та ошибка, которая
          * проявляется раз в сутки на другой архитектуре. */
         __atomic_store_n(&j.c->done, 1, __ATOMIC_RELEASE);
@@ -459,22 +594,64 @@ static int conn_submit(struct conn *c, const struct vless_node *node) {
         pthread_attr_destroy(&a);
     }
     if (g_cq.n == CONNQ) { pthread_mutex_unlock(&g_cq.mu); return -1; }
-    g_cq.q[(g_cq.head + g_cq.n) % CONNQ] = (struct connjob){ .c = c, .node = node };
+    g_cq.q[(g_cq.head + g_cq.n) % CONNQ] =
+        (struct connjob){ .c = c, .v = &SESS(c)->v, .node = node };
     g_cq.n++;
     pthread_cond_signal(&g_cq.cv);
     pthread_mutex_unlock(&g_cq.mu);
     return 0;
 }
 
+/* Таблица заводится один раз на поток: свободны все слоты, корзины пусты. */
+static void conn_table_init(void) {
+    g_live_n = 0;
+    g_free_n = 0;
+    for (int i = MAX_CONNS - 1; i >= 0; i--) {
+        g_conns[i].livepos = -1;
+        g_conns[i].hnext = -1;
+        g_freelist[g_free_n++] = (uint16_t)i;
+    }
+    for (int i = 0; i < CONN_BUCKETS; i++) g_bucket[i] = -1;
+}
+
 static struct conn *conn_find(const struct flow_key *k) {
-    for (int i = 0; i < MAX_CONNS; i++) {
+    for (int16_t i = g_bucket[flow_hash(k)]; i >= 0; i = g_conns[i].hnext) {
         struct conn *c = &g_conns[i];
-        if (!c->used) continue;
         if (c->key.src == k->src && c->key.dst == k->dst &&
             c->key.sport == k->sport && c->key.dport == k->dport)
             return c;
     }
     return NULL;
+}
+
+/* Внести слот в список живых и в хэш. Вызывается одним местом — рождением соединения. */
+static void conn_link(struct conn *c) {
+    int16_t idx = (int16_t)(c - g_conns);
+    c->livepos = (int16_t)g_live_n;
+    g_live[g_live_n++] = (uint16_t)idx;
+    unsigned b = flow_hash(&c->key);
+    c->hnext = g_bucket[b];
+    g_bucket[b] = idx;
+}
+
+/* Убрать из списка живых и из хэша. Дыра в g_live закрывается последним элементом: порядок
+ * обхода никому не важен, а сдвиг хвоста стоил бы тем дороже, чем больше соединений. */
+static void conn_unlink(struct conn *c) {
+    int16_t idx = (int16_t)(c - g_conns);
+    if (c->livepos >= 0) {
+        int last = --g_live_n;
+        uint16_t moved = g_live[last];
+        g_live[c->livepos] = moved;
+        g_conns[moved].livepos = c->livepos;
+        c->livepos = -1;
+    }
+    unsigned b = flow_hash(&c->key);
+    int16_t *slot = &g_bucket[b];
+    while (*slot >= 0) {
+        if (*slot == idx) { *slot = c->hnext; break; }
+        slot = &g_conns[*slot].hnext;
+    }
+    c->hnext = -1;
 }
 
 static void conn_drop(struct conn *c);
@@ -499,13 +676,12 @@ static void conn_drop(struct conn *c);
  *
  * Возвращает NULL только если вытеснять нечего, то есть все соединения свежие. */
 static struct conn *conn_new(const struct tun_dev *tun) {
-    for (int i = 0; i < MAX_CONNS; i++)
-        if (!g_conns[i].used) return &g_conns[i];
+    if (g_free_n) return &g_conns[g_freelist[--g_free_n]];
 
-    time_t now = time(NULL);
+    time_t now = g_now_s;
     struct conn *old = NULL;
-    for (int i = 0; i < MAX_CONNS; i++) {
-        struct conn *c = &g_conns[i];
+    for (int li = 0; li < g_live_n; li++) {
+        struct conn *c = &g_conns[g_live[li]];
         /* Закрытые сервером — первые кандидаты в любом возрасте: они уже ничего не принесут,
          * а живут только чтобы додать клиенту остаток. */
         if (c->pending) continue;        /* установщик пишет в эту запись — не трогать */
@@ -554,14 +730,30 @@ static struct conn *conn_new(const struct tun_dev *tun) {
                 MAX_CONNS, (unsigned long)(now - old->last));
     }
     conn_drop(old);
-    return old;
+    /* conn_drop вернул слот в список свободных — забираем его оттуда же, а не по прежнему
+     * указателю. Иначе слот остался бы и у нас, и в списке, и следующий SYN получил бы
+     * ЗАНЯТУЮ запись: одно соединение под двумя потоками, перепутанные данные, и найти это
+     * можно только по симптому «иногда приходит чужая страница». */
+    return &g_conns[g_freelist[--g_free_n]];
 }
 
+/* Освободить слот. Из epoll дескриптор уходит сам при close — отдельного epoll_ctl не
+ * нужно, и делать его после close значило бы ходить в ядро с закрытым номером. */
 static void conn_drop(struct conn *c) {
-    TR("закрываю conn#%ld fd=%d\n", (long)(c - g_conns), c->v.fd);
-    if (c->used) vless_close(&c->v);
+    TR("закрываю conn#%ld fd=%d\n", (long)(c - g_conns), c->fd);
+    if (c->used) {
+        vless_close(&SESS(c)->v);
+        conn_unlink(c);
+        g_freelist[g_free_n++] = (uint16_t)(c - g_conns);
+    }
     rtx_done(&c->rtx);
+    /* Толстую половину НЕ трём целиком: 18,8 КБ memset на каждое закрытие это 18,8 КБ,
+     * прогнанных через кэш ради нулей, которые всё равно перепишет vless_connect (он
+     * начинается с memset своей структуры). Здесь достаточно обнулить то, что читаем сами. */
     memset(c, 0, sizeof(*c));
+    c->livepos = -1;
+    c->hnext = -1;
+    memset(&SESS(c)->vis, 0, sizeof(SESS(c)->vis));
 }
 
 /* Отправить серверу данные в правильной форме: с заголовком VLESS на первом кадре и в
@@ -576,7 +768,13 @@ static void conn_drop(struct conn *c) {
 
 static int upstream_send(struct conn *c, const struct vless_node *node,
                          const unsigned char *data, size_t n) {
+    struct sess *s = SESS(c);
+    /* Буфер нужен ТОЛЬКО чтобы приклеить заголовок или кадр Vision к данным одной записью.
+     * Когда клеить нечего — а это обычный случай, потому что заголовок уходит один раз на
+     * соединение, а Vision заканчивает набивку первым же кадром, — данные отдаются прямо из
+     * пакета, без копии вовсе. */
     static __thread unsigned char out[TUNNEL_BUF];
+    const unsigned char *body = data;
     size_t len = 0;
 
     if (!c->header_sent) {
@@ -585,26 +783,44 @@ static int upstream_send(struct conn *c, const struct vless_node *node,
         unsigned char ip4[4];
         memcpy(ip4, &c->key.dst, 4);
         /* dport уже в хостовом порядке — см. комментарий в tun.h. */
-        len = vless_build_request(c->uuid, VLESS_CMD_TCP, NULL, ip4,
+        len = vless_build_request(s->uuid, VLESS_CMD_TCP, NULL, ip4,
                                   c->key.dport, node->flow, out, sizeof(out));
         if (!len) return SEND_FATAL;
     }
 
-    if (node->flow[0]) {
-        static __thread unsigned char framed[TUNNEL_BUF];
-        size_t fn = vision_wrap(&c->vis, data, n, framed, sizeof(framed));
+    /* Оборачивать нужно только пока Vision не закончил набивку. После кадра end vision_wrap
+     * сводится к копированию данных на месте — а копию мы делали ДВАЖДЫ: сначала в framed,
+     * потом из него в out. То есть каждый байт выгрузки проходил по памяти трижды (третий
+     * раз — внутри tls13_write, где он обязателен: шифрование идёт на месте в записи).
+     * Теперь до шифрования копий ноль или одна. */
+    /* Состояние Vision снимается ДО обёртки и возвращается, если отправка не удалась.
+     *
+     * Иначе первый кадр терялся безвозвратно при закрытом окне HTTP/2: vision_wrap уже
+     * пометил бы UUID отправленным и набивку законченной, а h2_write не отправил НИЧЕГО
+     * (он либо всё, либо ничего). Клиент повторяет тот же пакет, мы отправляем его уже без
+     * кадра и без UUID — сервер такого не ждёт и закрывает поток. Снаружи это выглядело бы
+     * как «узел с vision и grpc иногда не работает», причём «иногда» означало бы «когда
+     * сервер не успел принять», то есть на быстром канале чаще.
+     *
+     * Шестьдесят четыре байта копии против невоспроизводимой поломки протокола. */
+    struct vision vis_before = s->vis;
+    if (node->flow[0] && !s->vis.sent_end) {
+        size_t fn = vision_wrap(&s->vis, data, n, out + len, sizeof(out) - len);
         if (!fn) return SEND_FATAL;
-        if (len + fn > sizeof(out)) return SEND_FATAL;
-        memcpy(out + len, framed, fn);
         len += fn;
-    } else {
+        body = out;
+    } else if (len) {
+        /* Заголовок уже лежит в out — данные приклеиваем к нему. */
         if (len + n > sizeof(out)) return SEND_FATAL;
         memcpy(out + len, data, n);
         len += n;
+        body = out;
+    } else {
+        len = n;
     }
 
     /* Через vless_send: упаковку транспорта знает клиент, а не туннель. */
-    int rc = vless_send(&c->v, out, len);
+    int rc = vless_send(&s->v, body, len);
     if (rc == H2_EWINDOW) {
         /* Окно HTTP/2 закрыто: сервер не успевает принимать. Это НЕ отказ — это то, для
          * чего управление потоком и существует. Ничего не ушло (h2_write либо отправляет
@@ -613,6 +829,7 @@ static int upstream_send(struct conn *c, const struct vless_node *node,
          *
          * Первая версия считала это ошибкой и разрывала соединение. Выглядело как
          * «выгрузка обрывается на случайном месте» — месте, где сервер впервые не успел. */
+        s->vis = vis_before;                /* кадр не ушёл — обёртка как бы не делалась */
         return SEND_AGAIN;
     }
     if (rc) return SEND_FATAL;
@@ -650,7 +867,7 @@ static int emit_to_client(struct conn *c, const struct tun_dev *tun,
            c->rtx.len, c->rtx.cap, n);
         return -1;
     }
-    if (!c->rtx.len) { c->rtx_at = now_ns(); c->rto_ms = rto_floor(); }
+    if (!c->rtx.len) { c->rtx_at = g_now_ns; c->rto_ms = rto_floor(); }
     rtx_push(&c->rtx, p, (uint32_t)n);
 
     size_t seg = tun->gso ? (size_t)TUN_GSO_MAX : (size_t)TUN_MSS;
@@ -698,7 +915,7 @@ static void rtx_resend(struct conn *c, const struct tun_dev *tun, const char *wh
        (long)(c - g_conns), n, c->client_ack, why);
     if (tun_write_data(tun, hdr, body, n) != 0) return;
     if (g_stats) { g_st.rtx_sends++; g_st.rtx_bytes += n; }
-    c->rtx_at = now_ns();
+    c->rtx_at = g_now_ns;
     c->rto_ms = c->rto_ms * 2 > RTO_MAX_MS ? RTO_MAX_MS : c->rto_ms * 2;
 }
 
@@ -709,13 +926,19 @@ static int downstream_pump(struct conn *c, const struct vless_node *node,
      * стека на каждый вызов, а поток обработки здесь один. */
     static __thread unsigned char buf[TUNNEL_BUF];
     size_t got = 0;
-    /* Через vless_recv, а не tls13_read напрямую: у grpc и xhttp между TLS и VLESS лежит
+    /* Через клиента, а не tls13_read напрямую: у grpc и xhttp между TLS и VLESS лежит
      * HTTP/2, и чтение мимо него отдавало бы кадры вместо данных. Прямой вызов работал,
      * пока транспорт был единственный, и это ровно тот случай, когда «работает» и
-     * «правильно» разошлись молча. */
-    TR("чтение conn#%ld fd=%d\n", (long)(c - g_conns), c->v.fd);
+     * «правильно» разошлись молча.
+     *
+     * Вариант _zc отдаёт указатель на расшифрованную запись там, где копия не нужна: на
+     * голом tcp данные так и остаются в буфере соединения. Буфер buf при этом всё равно
+     * нужен — под транспорты поверх HTTP/2, где кадр собирается из нескольких записей. */
+    struct sess *s = SESS(c);
+    TR("чтение conn#%ld fd=%d\n", (long)(c - g_conns), c->fd);
     uint64_t r0 = g_stats ? now_ns() : 0;
-    int rc = vless_recv(&c->v, buf, sizeof(buf), &got);
+    const unsigned char *rx = buf;
+    int rc = vless_recv_zc(&s->v, buf, sizeof(buf), &rx, &got);
     if (g_stats) g_st.recv_ns += now_ns() - r0;
     g_rx_total += got;
     if (g_stats) { g_st.recs++; g_st.rec_bytes += got; }
@@ -734,7 +957,7 @@ static int downstream_pump(struct conn *c, const struct vless_node *node,
      *
      * Это зеркало ошибки на отправке: там заголовок ЗАПРОСА тоже идёт до кадра, а не
      * внутри него. Один и тот же принцип, который я дважды прочитал наоборот. */
-    const unsigned char *cur = buf;
+    const unsigned char *cur = rx;
     size_t left = got;
 
     if (!c->established) {
@@ -759,7 +982,7 @@ static int downstream_pump(struct conn *c, const struct vless_node *node,
             size_t used = 0;
             const unsigned char *pl = NULL;
             size_t pl_n = 0;
-            int ur = vision_unwrap(&c->vis, cur, left, &used, &pl, &pl_n);
+            int ur = vision_unwrap(&s->vis, cur, left, &used, &pl, &pl_n);
             if (ur != 0 || !used) {
                 /* Разбор больше не может «не хватить данных»: он потоковый и переносит
                  * состояние между вызовами. Сюда попадаем только на настоящей ошибке —
@@ -788,8 +1011,8 @@ static int downstream_pump(struct conn *c, const struct vless_node *node,
     /* Сервер объявил прямое копирование — сообщаем об этом соединению, чтобы следующее
      * чтение шло мимо расшифровки. Ставится ЗДЕСЬ, потому что команда живёт в кадрах
      * Vision, а про них знает только этот код. */
-    if (c->vis.recv_direct && !c->v.rx_direct) {
-        c->v.rx_direct = 1;
+    if (s->vis.recv_direct && !s->v.rx_direct) {
+        s->v.rx_direct = 1;
         TR("сервер перешёл на прямое копирование — читаем сокет как есть\n");
     }
 
@@ -841,13 +1064,17 @@ static void handle_packet(const struct tun_dev *tun, const struct vless_node *no
         memset(c, 0, sizeof(*c));
         c->used = 1;
         c->key = k;
+        c->fd = -1;
+        /* Место в списках — ПОСЛЕ memset и ПОСЛЕ ключа: хэш считается по ключу, а memset
+         * обнулил бы отметки о месте в цепочке. */
+        conn_link(c);
         c->client_seq = k.seq + 1;                  /* SYN занимает один номер */
         c->our_seq = 1;                             /* свой поток начинаем с 1 */
         c->client_ack = 1;                          /* столько он уже подтвердил (SYN-ACK) */
         c->client_win = k.window ? k.window : 8192;
         c->client_wscale = k.wscale;
         c->rto_ms = rto_floor();
-        c->last = time(NULL);
+        c->last = g_now_s;
         /* Кольцо повтора НЕ выделяется на SYN. Прежде выделялось, и рассуждение было такое:
          * лениво означало бы, что отказ выделения приходит посреди передачи, когда отвечать
          * клиенту уже нечем. Рассуждение верное для кольца, которое обязано существовать, —
@@ -861,8 +1088,8 @@ static void handle_packet(const struct tun_dev *tun, const struct vless_node *no
          * Зачем так: браузер держит десятки соединений живыми, ничего по ним не передавая
          * (HTTP/2 keep-alive), и за каждое платилось 32 КБ, которых потом не хватало на новые.
          * Теперь простаивающее соединение стоит только своей записи в таблице. */
-        if (vless_uuid_parse(node->uuid, c->uuid) != 0) { conn_drop(c); return; }
-        vision_init(&c->vis, c->uuid);
+        if (vless_uuid_parse(node->uuid, SESS(c)->uuid) != 0) { conn_drop(c); return; }
+        vision_init(&SESS(c)->vis, SESS(c)->uuid);
 
         TR("SYN: заявка установщику\n");
         /* Рукопожатие уходит в пул, SYN-ACK отправится, когда поток будет готов (см. ниже,
@@ -873,7 +1100,7 @@ static void handle_packet(const struct tun_dev *tun, const struct vless_node *no
              * отбрасывать SYN нельзя — за это уже пришлось расплатиться однажды, — поэтому
              * говорим в лог и отпускаем запись: клиент повторит SYN сам. */
             static __thread time_t said_q;
-            time_t nw = time(NULL);
+            time_t nw = g_now_s;
             if (nw - said_q >= 5) {
                 said_q = nw;
                 fprintf(stderr, "steer tunnel: очередь установки соединений полна (%d), "
@@ -894,7 +1121,7 @@ static void handle_packet(const struct tun_dev *tun, const struct vless_node *no
 
 
     if (!c) return;                                 /* данные без соединения — игнор */
-    c->last = time(NULL);
+    c->last = g_now_s;
 
     /* Учитываем подтверждения и окно клиента с ЛЮБОГО его пакета, включая чистые ACK: без
      * этого мы не знаем, сколько он принял, и продолжаем лить в устройство. Именно чистые
@@ -910,7 +1137,7 @@ static void handle_packet(const struct tun_dev *tun, const struct vless_node *no
             c->fast_done = 0;
             /* Есть продвижение — таймаут снова короткий, и он отсчитывается от нового
              * самого старого байта, а не от прежнего. */
-            c->rtx_at = c->rtx.len ? now_ns() : 0;
+            c->rtx_at = c->rtx.len ? g_now_ns : 0;
             c->rto_ms = rto_floor();
         } else if (k.ack == c->client_ack && c->rtx.len && !data_n && !c->fast_done &&
                    k.window == c->client_win && !(k.tcp_flags & (TCP_SYN | TCP_FIN))) {
@@ -968,7 +1195,7 @@ static void handle_packet(const struct tun_dev *tun, const struct vless_node *no
          *
          * Больше нельзя: цикл здесь один на все соединения, и каждая миллисекунда ожидания
          * — это миллисекунда, на которую стоят остальные. */
-        struct pollfd sp = { .fd = c->v.fd, .events = POLLIN };
+        struct pollfd sp = { .fd = c->fd, .events = POLLIN };
         if (poll(&sp, 1, 5) > 0 && (sp.revents & POLLIN)) {
             if (downstream_pump(c, node, tun) != 0) { conn_drop(c); return; }
             sr = upstream_send(c, node, pkt + off, data_n);
@@ -997,9 +1224,9 @@ static void handle_packet(const struct tun_dev *tun, const struct vless_node *no
 
 /* Разослать отложенные подтверждения. Вызывается после разбора порции пакетов из TUN. */
 static void flush_acks(const struct tun_dev *tun) {
-    for (int i = 0; i < MAX_CONNS; i++) {
-        struct conn *c = &g_conns[i];
-        if (!c->used || !c->ack_due) continue;
+    for (int li = 0; li < g_live_n; li++) {
+        struct conn *c = &g_conns[g_live[li]];
+        if (!c->ack_due) continue;
         c->ack_due = 0;
         unsigned char ackp[64];
         size_t al = tcp_build(ackp, sizeof(ackp), c->key.dst, c->key.src,
@@ -1047,6 +1274,56 @@ static void tun_bring_up(const char *dev, int table) {
     run_quiet(q);
 }
 
+/* ВЫЧЕРПАТЬ сокет соединения, а не прочитать по одной записи за виток цикла.
+ *
+ * Разница принципиальная. Пока мы не читаем, у сервера закрывается окно, и заново открыть
+ * его стоит круга до сервера — десятки миллисекунд. Читая по одной записи на итерацию, мы
+ * получаем скорость «запись за круг», то есть задержку вместо полосы: замерено 3 Мбит/с там,
+ * где криптография держит 800.
+ *
+ * Пределов три: окно клиента (иначе потеряем сегмент), объём и число чтений за виток —
+ * чтобы одно активное соединение не заморозило остальные.
+ *
+ * Отдельной функцией, потому что вызывается из двух мест: по событию epoll и по флагу
+ * rx_ready. Копия этой логики в двух местах означала бы, что предел порции соблюдается в
+ * одном из них и не соблюдается в другом. */
+static void drain_conn(struct conn *c, const struct vless_node *node,
+                       const struct tun_dev *tun) {
+    struct sess *s = SESS(c);
+    int reads = 0;
+    uint64_t drained_from = g_rx_total;
+    c->rx_ready = 0;
+    for (;;) {
+        if (downstream_pump(c, node, tun) != 0) {
+            /* Сервер закрыл. Соединение НЕ закрываем, пока клиент не подтвердит всё
+             * отправленное: пока в кольце есть неподтверждённое, его надо повторять, а
+             * закрыв соединение, мы уничтожим и кольцо. FIN уйдёт из общего прохода. */
+            c->srv_closed = 1;
+            c->closed_at = g_now_ns;
+            TR("сервер закрыл conn#%ld, ждём подтверждения %u байт\n",
+               (long)(c - g_conns), c->rtx.len);
+            return;
+        }
+        if (++reads >= DRAIN_MAX_READS || g_rx_total - drained_from >= DRAIN_MAX_BYTES) {
+            if (g_stats) g_st.drain_full++;
+            /* Прервались на своём пределе, а данные, может быть, ещё в буфере: отметим, что
+             * ждать события на сокете для них не нужно. */
+            c->rx_ready = (uint8_t)(vless_has_data(&s->v) != 0);
+            return;
+        }
+        if (!client_can_take_record(c)) {
+            c->rx_ready = (uint8_t)(vless_has_data(&s->v) != 0);
+            return;
+        }
+        /* Целая запись уже прочитана у сокета — спрашивать ядро незачем. */
+        if (vless_has_data(&s->v)) continue;
+        /* Есть ли ещё что читать. Без этой проверки следующее чтение заблокируется на
+         * таймауте сокета (восемь секунд) и остановит весь цикл. */
+        struct pollfd sp = { .fd = c->fd, .events = POLLIN };
+        if (poll(&sp, 1, 0) <= 0 || !(sp.revents & POLLIN)) return;
+    }
+}
+
 /* Что нужно потоку, чтобы работать: своя очередь устройства, узел и свой номер. Больше
  * ничего — остальное состояние у него собственное (__thread). */
 struct worker {
@@ -1064,75 +1341,48 @@ static void *worker_loop(void *arg) {
 
     g_st.win_min = 0xFFFFFFFFu;
     uint64_t stats_at = g_stats ? now_ns() : 0;
-    uint64_t loop_at = 0;   /* когда вернулся прошлый poll — для оценки периода прохода */
-    memset(g_conns, 0, sizeof(g_conns));
+    uint64_t loop_at = 0;   /* когда вернулось прошлое ожидание — для оценки периода витка */
+    conn_table_init();
     unsigned char pkt[TUNNEL_BUF];
 
+    /* epoll, а не poll, и это не вкусовщина.
+     *
+     * poll получает СПИСОК дескрипторов на каждый вызов: список надо собрать в памяти,
+     * скопировать в ядро, а ядро — обойти целиком и опросить каждый дескриптор. При 320
+     * живых соединениях и двух тысячах витков в секунду это 640 тысяч опросов в секунду,
+     * из которых интересны единицы. На роутере, где один вызов poll на 320 дескрипторов
+     * стоит сотни микросекунд, цикл упирался в него раньше, чем в криптографию.
+     *
+     * epoll хранит набор в ядре и отдаёт ТОЛЬКО готовое: цена вызова не зависит от числа
+     * соединений. Взамен приходится следить за составом набора — этим и занят флаг armed:
+     * epoll_ctl вызывается на изменение состояния, а не на каждом витке. */
+    int ep = epoll_create1(0);
+    if (ep < 0) {
+        fprintf(stderr, "steer tunnel: epoll недоступен (%s) — поток не запущен\n",
+                strerror(errno));
+        return NULL;
+    }
+    /* Метка TUN не может совпасть с номером соединения: слотов MAX_CONNS, метка выше. */
+    const uint32_t TUN_TOKEN = MAX_CONNS;
+    {
+        struct epoll_event e = { .events = EPOLLIN, .data = { .u32 = TUN_TOKEN } };
+        if (epoll_ctl(ep, EPOLL_CTL_ADD, tun_fd, &e) != 0) {
+            fprintf(stderr, "steer tunnel: TUN не встал в epoll (%s)\n", strerror(errno));
+            close(ep);
+            return NULL;
+        }
+    }
+    struct epoll_event evs[MAX_CONNS + 1];
+
     for (;;) {
-        struct pollfd pf[1 + MAX_CONNS];
-        struct conn *map[MAX_CONNS];
-        int nf = 0;
-        pf[nf].fd = tun_fd;
-        pf[nf].events = POLLIN;
-        nf++;
-        for (int i = 0; i < MAX_CONNS; i++) {
-            if (!g_conns[i].used) continue;
-            /* Устанавливающиеся не опрашиваем: сокета ещё нет, и c->v под установщиком. */
-            if (g_conns[i].pending) continue;
-            /* У закрытых сервером читать нечего — они живут только чтобы додать клиенту. */
-            if (g_conns[i].srv_closed) continue;
-            /* Не спрашиваем сервер о новых данных, пока клиент не разгрёб прежние.
-             *
-             * Это и есть управление потоком, которого у нас иначе нет: прочитав, мы обязаны
-             * сразу записать в устройство, а очередь устройства не бесконечна. Переполнив
-             * её, мы теряем сегмент — и без повторной передачи соединение подвисает
-             * навсегда: клиент подтверждает старое, мы отдаём новое, и никто не сходится.
-             *
-             * Замер: на роутере без этой проверки передача вставала на втором мегабайте. */
-            /* Окно и «в пути» пишем ВСЕГДА, а не только когда отказались читать.
-             *
-             * Прежде они считались внутри ветки отказа, и при «ждали окна 0/с» в отчёте
-             * стояли нули — то есть ровно там, где надо понять, почему поток встал, чисел
-             * не было вовсе. А встать он может и не упираясь в окно: сегмент, отброшенный
-             * приёмником, мы не повторим никогда, и выглядит это как тишина при свободном
-             * окне. Различить два случая можно только видя оба числа. */
-            if (g_stats) {
-                uint32_t room = client_room(&g_conns[i]);
-                uint32_t infl = g_conns[i].our_seq - g_conns[i].client_ack;
-                if (room < g_st.win_min) g_st.win_min = room;
-                if (room > g_st.win_max) g_st.win_max = room;
-                if (infl > g_st.inflight_max) g_st.inflight_max = infl;
-                g_st.wscale_seen = g_conns[i].client_wscale;
-            }
-            if (!client_can_take_record(&g_conns[i])) {
-                if (g_stats) g_st.win_skips++;
-                continue;
-            }
-            pf[nf].fd = g_conns[i].v.fd;
-            pf[nf].events = POLLIN;
-            map[nf - 1] = &g_conns[i];
-            nf++;
-        }
-        if (g_stats) {
-            uint32_t live = 0;
-            for (int i = 0; i < MAX_CONNS; i++) if (g_conns[i].used) live++;
-            g_st.conns = live;
-        }
-
-        /* Паузы на «пустой проход» здесь БЫЛА и убрана. Она душила одиночное соединение:
-         * недособранная запись стоила миллисекунды, то есть ~8 МБ/с потолка — замерено
-         * 9 Мбит/с на одном потоке против 192 на восьми. Остаток записи теперь добирается
-         * коротким ожиданием на самом сокете (см. read_record), поэтому холостых проходов
-         * не остаётся и тормозить цикл незачем. */
-        /* Таймаут poll — до ближайшего срока повтора, а не всегда секунда.
-         *
-         * Иначе повтор через 50 мс ждал бы, пока цикл проснётся сам: при живом трафике это
-         * происходит сразу, а при потере последнего сегмента просыпаться уже нечему —
-         * ровно тот случай, для которого таймер и нужен. */
+        /* Время снимается ОДИН раз на виток и лежит в g_now_ns/g_now_s — почему, написано
+         * там же, у их объявления. */
         uint64_t now = now_ns();
+        g_now_ns = now;
+        g_now_s = (time_t)(now / 1000000000ull);
 
-        /* Период прохода: сколько прошло с прошлого места ожидания. Считаем РАБОЧУЮ часть,
-         * а не время в poll: порог RTO должен закрывать то, на что мы заняты, а сон в poll
+        /* Период витка: сколько прошло с прошлого места ожидания. Считаем РАБОЧУЮ часть,
+         * а не время в ожидании: порог RTO должен закрывать то, на что мы заняты, а сон
          * прерывается пришедшим подтверждением сразу. Сглаживание 1/8 — как в оценке RTT в
          * TCP, чтобы одна долгая итерация не задирала порог надолго. */
         if (loop_at) {
@@ -1144,27 +1394,81 @@ static void *worker_loop(void *arg) {
             else                  g_loop_ms -= (g_loop_ms - busy) / 8;
         }
 
+        /* ОДИН проход по живым соединениям на весь виток. Раньше их было четырнадцать по
+         * ВСЕЙ таблице — см. комментарий у struct conn, там числа.
+         *
+         * Здесь считается сразу всё, что нужно перед ожиданием: состав набора epoll, число
+         * заявок в работе, соединения с уже прочитанными данными и ближайший срок повтора. */
+        int pend = 0, forced = 0;
+        /* Таймаут — до ближайшего срока повтора, а не всегда секунда: иначе повтор ждал бы,
+         * пока цикл проснётся сам. При живом трафике это происходит сразу, а при потере
+         * последнего сегмента просыпаться уже нечему — ровно тот случай, для которого
+         * таймер и нужен. */
+        int wait_ms = 1000;
+        for (int li = 0; li < g_live_n; li++) {
+            struct conn *c = &g_conns[g_live[li]];
+            if (c->pending) { pend++; continue; }
+
+            /* Окно и «в пути» пишем ВСЕГДА, а не только когда отказались читать.
+             *
+             * Прежде они считались внутри ветки отказа, и при «ждали окна 0/с» в отчёте
+             * стояли нули — то есть ровно там, где надо понять, почему поток встал, чисел
+             * не было вовсе. А встать он может и не упираясь в окно: сегмент, отброшенный
+             * приёмником, мы не повторим никогда, и выглядит это как тишина при свободном
+             * окне. Различить два случая можно только видя оба числа. */
+            if (g_stats) {
+                uint32_t room = client_room(c);
+                uint32_t infl = c->our_seq - c->client_ack;
+                if (room < g_st.win_min) g_st.win_min = room;
+                if (room > g_st.win_max) g_st.win_max = room;
+                if (infl > g_st.inflight_max) g_st.inflight_max = infl;
+                g_st.wscale_seen = c->client_wscale;
+            }
+
+            /* Спрашивать сервер о новых данных, пока клиент не разгрёб прежние, нельзя.
+             *
+             * Это и есть управление потоком, которого у нас иначе нет: прочитав, мы обязаны
+             * сразу записать в устройство, а очередь устройства не бесконечна. Переполнив
+             * её, мы теряем сегмент — и клиент ждёт повтора там, где мог бы не ждать.
+             *
+             * Замер: на роутере без этой проверки передача вставала на втором мегабайте.
+             *
+             * У закрытых сервером читать нечего вовсе — они живут только чтобы додать
+             * клиенту остаток. */
+            int want = !c->srv_closed && client_can_take_record(c);
+            if (!want && !c->srv_closed && g_stats) g_st.win_skips++;
+            if (want != (int)c->armed) {
+                struct epoll_event e = { .events = EPOLLIN,
+                                         .data = { .u32 = (uint32_t)(c - g_conns) } };
+                if (epoll_ctl(ep, want ? EPOLL_CTL_ADD : EPOLL_CTL_DEL, c->fd, &e) == 0 ||
+                    !want)
+                    c->armed = (uint8_t)want;
+            }
+            /* Данные уже у нас, и ядро о них не сообщит: разберём их без ожидания. */
+            if (want && c->rx_ready) forced++;
+
+            if (c->rtx.len && c->rtx_at) {
+                int64_t left = (int64_t)c->rto_ms - (int64_t)((now - c->rtx_at) / 1000000);
+                if (left < 0) left = 0;
+                if (left < wait_ms) wait_ms = (int)left;
+            }
+        }
+        if (g_stats) g_st.conns = (uint32_t)g_live_n;
+
         /* Пока есть заявки в работе, просыпаемся часто: готовность установщика приходит не
          * событием на дескрипторе, а флагом в памяти. Двадцать миллисекунд — это худшая
          * добавка к времени соединения, и она в десять раз меньше самого рукопожатия.
          *
-         * Отдельная труба для побудки была бы точнее, но это лишний дескриптор в каждом
-         * проходе и лишняя ветка в разборе poll; для прототипа цена не оправдана. */
-        int pend = 0;
-        for (int i = 0; i < MAX_CONNS; i++) if (g_conns[i].used && g_conns[i].pending) pend++;
+         * Отдельная труба для побудки была бы точнее, но это лишний дескриптор и лишняя
+         * ветка в разборе событий; для прототипа цена не оправдана. */
+        if (pend && wait_ms > 20) wait_ms = 20;
+        if (forced) wait_ms = 0;
 
-        int wait_ms = pend ? 20 : 1000;
-        for (int i = 0; i < MAX_CONNS; i++) {
-            const struct conn *c = &g_conns[i];
-            if (!c->used || !c->rtx.len || !c->rtx_at) continue;
-            int64_t left = (int64_t)c->rto_ms - (int64_t)((now - c->rtx_at) / 1000000);
-            if (left < 0) left = 0;
-            if (left < wait_ms) wait_ms = (int)left;
-        }
-
-        int r = poll(pf, (unsigned)nf, wait_ms);
+        int r = epoll_wait(ep, evs, MAX_CONNS + 1, wait_ms);
         uint64_t after_poll = now_ns();
         loop_at = after_poll;
+        g_now_ns = after_poll;
+        g_now_s = (time_t)(after_poll / 1000000000ull);
         if (g_stats) {
             g_st.poll_ns += after_poll - now;
             g_st.iters++;
@@ -1180,12 +1484,19 @@ static void *worker_loop(void *arg) {
 
         /* Готовые заявки: отсюда и уходит SYN-ACK. Разбираем ДО чтения из TUN — клиент,
          * получив подтверждение, тут же пришлёт данные, и пусть они попадут в этот же
-         * проход, а не в следующий. */
-        for (int i = 0; i < MAX_CONNS; i++) {
-            struct conn *c = &g_conns[i];
-            if (!c->used || !c->pending) continue;
-            if (!__atomic_load_n(&c->done, __ATOMIC_ACQUIRE)) continue;
+         * проход, а не в следующий.
+         *
+         * Обход по живым, и только когда заявки вообще есть: в устоявшемся состоянии их
+         * нет, и проход не делается вовсе. */
+        /* Индекс двигается ВРУЧНУЮ: conn_drop переставляет в g_live последний элемент на
+         * место освободившегося, и обычный li++ проскочил бы его не глядя. Один раз это уже
+         * стоило соединений, живших до таймаута вместо разбора. */
+        for (int li = 0; pend && li < g_live_n; ) {
+            struct conn *c = &g_conns[g_live[li]];
+            if (!c->pending || !__atomic_load_n(&c->done, __ATOMIC_ACQUIRE)) { li++; continue; }
             c->pending = 0;
+            pend--;
+            c->fd = SESS(c)->v.fd;
             if (c->rc != 0) {
                 /* С причиной, а не «не открылся»: код различает «TCP не соединился»,
                  * «сервер не признал ключ» и «сервер не согласился на HTTP/2». */
@@ -1200,7 +1511,7 @@ static void *worker_loop(void *arg) {
                                       0, c->client_seq, TCP_RST | TCP_ACK, NULL, 0, 0, 0, -1);
                 if (rl) tun_write_ctl(&tun, rst, rl);
                 conn_drop(c);
-                continue;
+                continue;                       /* слот занял другой — не двигаем индекс */
             }
             unsigned char sa[64];
             size_t sl = tcp_build(sa, sizeof(sa), c->key.dst, c->key.src,
@@ -1208,11 +1519,19 @@ static void *worker_loop(void *arg) {
                                   c->our_seq++, c->client_seq, TCP_SYN | TCP_ACK,
                                   NULL, 0, 65535, TUN_MSS, OUR_WSCALE);
             if (sl) tun_write_ctl(&tun, sa, sl);
-            c->last = time(NULL);
+            c->last = g_now_s;
             TR("SYN-ACK отправлен (seq=%u ack=%u)\n", c->our_seq - 1, c->client_seq);
+            li++;
         }
 
-        if (pf[0].revents & POLLIN) {
+        /* Готовность TUN ищем среди событий. Разбираем его ПЕРВЫМ, до чтения у серверов:
+         * подтверждения клиента открывают окно, и разобрав их раньше, мы в этом же витке
+         * успеваем взять у сервера следующую порцию. */
+        int tun_ready = 0;
+        for (int i = 0; i < r; i++)
+            if (evs[i].data.u32 == TUN_TOKEN) { tun_ready = 1; break; }
+
+        if (tun_ready) {
             /* ВЫЧЕРПЫВАЕМ устройство, а не читаем по пакету за проход.
              *
              * Во время скачивания из TUN приходят подтверждения клиента, и именно они
@@ -1234,107 +1553,104 @@ static void *worker_loop(void *arg) {
             }
             flush_acks(&tun);
         }
-        for (int i = 1; i < nf; i++) {
-            if (!(pf[i].revents & (POLLIN | POLLHUP | POLLERR))) continue;
-            struct conn *c = map[i - 1];
-            if (!c->used) continue;
-
-            /* ВЫЧЕРПЫВАЕМ сокет, а не читаем по одной записи за проход цикла.
-             *
-             * Разница принципиальная. Пока мы не читаем, у сервера закрывается окно, и
-             * заново открыть его стоит круга до сервера — десятки миллисекунд. Читая по
-             * одной записи на итерацию, мы получаем скорость «запись за круг», то есть
-             * задержку вместо полосы: замерено 3 Мбит/с там, где криптография держит 800.
-             *
-             * Предел здесь двойной: окно клиента (иначе потеряем сегмент, а повторной
-             * передачи нет) и число записей за проход — чтобы одно активное соединение не
-             * заморозило остальные. */
-            int reads = 0;
-            uint64_t drained_from = g_rx_total;
-            for (;;) {
-                if (downstream_pump(c, node, &tun) != 0) {
-                    /* Сервер закрыл. Соединение НЕ закрываем, пока клиент не подтвердит всё
-                     * отправленное: пока в кольце есть неподтверждённое, его надо повторять,
-                     * а закрыв соединение, мы уничтожим и кольцо. FIN уйдёт в fin_if_drained. */
-                    c->srv_closed = 1;
-                    c->closed_at = now_ns();
-                    TR("сервер закрыл conn#%ld, ждём подтверждения %u байт\n",
-                       (long)(c - g_conns), c->rtx.len);
-                    break;
-                }
-                if (++reads >= DRAIN_MAX_READS ||
-                    g_rx_total - drained_from >= DRAIN_MAX_BYTES) {
-                    if (g_stats) g_st.drain_full++;
-                    break;
-                }
-                if (!client_can_take_record(c)) break;
-                /* Есть ли ещё что читать. Без этой проверки следующее чтение заблокируется
-                 * на таймауте сокета и остановит весь цикл на секунды. */
-                struct pollfd sp = { .fd = c->v.fd, .events = POLLIN };
-                if (poll(&sp, 1, 0) <= 0 || !(sp.revents & POLLIN)) break;
-            }
+        for (int i = 0; i < r; i++) {
+            if (evs[i].data.u32 == TUN_TOKEN) continue;
+            struct conn *c = &g_conns[evs[i].data.u32];
+            /* Слот мог освободиться в этом же витке — на FIN или RST от клиента — и даже
+             * достаться новому соединению. Новое всегда pending, поэтому две эти проверки и
+             * закрывают весь случай: иначе мы полезли бы в сессию, которую прямо сейчас
+             * заполняет установщик. */
+            if (!c->used || c->pending) continue;
+            /* Уже прочитанное разбирает второй проход ниже — здесь пропускаем, чтобы одно
+             * соединение не получило двойную порцию за виток и не отняло её у остальных. */
+            if (c->rx_ready) continue;
+            /* Готовность посчитана ДО разбора порции из TUN, а в ней могло приехать
+             * подтверждение с меньшим окном. Читать в этом случае нельзя: отданное за окно
+             * приёмник молча выбросит, и закрывать дыру придётся повтором. Проверка стоит
+             * копейки и снимает зависимость от того, успел ли epoll узнать о снятии. */
+            if (c->srv_closed || !client_can_take_record(c)) continue;
+            drain_conn(c, node, &tun);
         }
 
-        /* Истёкшие сроки — повторяем. После обработки пакетов, а не до: подтверждение,
-         * приехавшее в этом же проходе, могло снять надобность. */
-        now = now_ns();
-        for (int i = 0; i < MAX_CONNS; i++) {
-            struct conn *c = &g_conns[i];
-            if (!c->used || !c->rtx.len || !c->rtx_at) continue;
-            if ((now - c->rtx_at) / 1000000 >= c->rto_ms)
+        /* Соединения, у которых данные уже лежат в буфере: ядро о них не сообщит, и без
+         * этого прохода запись ждала бы новых байт от сервера. Проход делается только когда
+         * такие есть — их число посчитано перед ожиданием. */
+        for (int li = 0; forced && li < g_live_n; li++) {
+            struct conn *c = &g_conns[g_live[li]];
+            if (!c->rx_ready || c->pending) continue;
+            forced--;
+            drain_conn(c, node, &tun);
+        }
+
+        /* Один проход на все сроки: повтор, закрытие после сервера, уборка задержавшихся.
+         * Раньше это были три отдельных обхода ВСЕЙ таблицы — то есть три прохода по 5,8 МБ
+         * ради нескольких соединений.
+         *
+         * Время обновляем: между ожиданием и этим местом мог пройти весь разбор порции из
+         * TUN и чтение у серверов, то есть миллисекунды. */
+        g_now_ns = now_ns();
+        g_now_s = (time_t)(g_now_ns / 1000000000ull);
+        now = g_now_ns;
+        for (int li = 0; li < g_live_n; ) {
+            struct conn *c = &g_conns[g_live[li]];
+            if (c->pending) { li++; continue; }  /* установщик пишет в сессию — не трогать */
+
+            /* Истёкшие сроки — повторяем. После обработки пакетов, а не до: подтверждение,
+             * приехавшее в этом же витке, могло снять надобность. */
+            if (c->rtx.len && c->rtx_at &&
+                (now - c->rtx_at) / 1000000 >= c->rto_ms)
                 rtx_resend(c, &tun, "истёк таймаут");
-        }
 
-        /* Закрытые сервером: как только клиент подтвердил всё — FIN и закрываем. Если не
-         * подтвердил за отведённое время, закрываем всё равно: клиент мог уйти совсем. */
-        for (int i = 0; i < MAX_CONNS; i++) {
-            struct conn *c = &g_conns[i];
-            if (!c->used || !c->srv_closed) continue;
-            int drained = c->rtx.len == 0;
-            if (!drained && (now - c->closed_at) / 1000000 < CLOSE_DRAIN_MS) continue;
-            if (!drained)
-                TR("conn#%ld: клиент не подтвердил %u байт за %d мс, закрываю\n",
-                   (long)(c - g_conns), c->rtx.len, CLOSE_DRAIN_MS);
-            /* FIN, иначе клиент будет ждать данных, которых больше не будет. */
-            unsigned char fin[64];
-            size_t fl = tcp_build(fin, sizeof(fin), c->key.dst, c->key.src,
-                                  c->key.dport, c->key.sport,
-                                  c->our_seq, c->client_seq, TCP_FIN | TCP_ACK,
-                                  NULL, 0, 0, 0, -1);
-            if (fl) tun_write_ctl(&tun, fin, fl);
-            conn_drop(c);
-        }
+            /* Закрытые сервером: как только клиент подтвердил всё — FIN и закрываем. Если не
+             * подтвердил за отведённое время, закрываем всё равно: клиент мог уйти совсем. */
+            if (c->srv_closed) {
+                int drained = c->rtx.len == 0;
+                if (!drained && (now - c->closed_at) / 1000000 < CLOSE_DRAIN_MS) { li++; continue; }
+                if (!drained)
+                    TR("conn#%ld: клиент не подтвердил %u байт за %d мс, закрываю\n",
+                       (long)(c - g_conns), c->rtx.len, CLOSE_DRAIN_MS);
+                /* FIN, иначе клиент будет ждать данных, которых больше не будет. */
+                unsigned char fin[64];
+                size_t fl = tcp_build(fin, sizeof(fin), c->key.dst, c->key.src,
+                                      c->key.dport, c->key.sport,
+                                      c->our_seq, c->client_seq, TCP_FIN | TCP_ACK,
+                                      NULL, 0, 0, 0, -1);
+                if (fl) tun_write_ctl(&tun, fin, fl);
+                conn_drop(c);
+                continue;                        /* на место этого встал другой */
+            }
 
-        /* Уборка задержавшихся: без неё таблица заполняется соединениями, которые клиент
-         * бросил без FIN, и новые перестают открываться.
-         *
-         * Порог — тот же IDLE_EVICT_S, что и у вытеснения: «мёртвое соединение» должно
-         * означать одно и то же в обоих местах. Пробовал шестьдесят, рассчитывая освобождать
-         * слоты раньше, — и получил RST по живым соединениям HTTP/2, которые браузер
-         * переиспользует после минуты простоя.
-         *
-         * RST обязателен. Прежде здесь было молчаливое conn_drop, и клиент оставался с
-         * соединением, которое считает открытым: следующий запрос по нему уходил в пустоту
-         * и ждал таймаута — то есть наша уборка выглядела для человека как зависший сайт. */
-        time_t stale = time(NULL);
-        for (int i = 0; i < MAX_CONNS; i++) {
-            struct conn *c = &g_conns[i];
             /* Пустое кольцо отдаём обратно системе. Соединение при этом полностью рабочее:
-             * при следующих данных кольцо появится снова. Именно здесь, а не сразу по
+             * при следующих данных кольцо появится снова. Именно после простоя, а не сразу по
              * опустошении, — иначе на каждом залпе подтверждений шли бы malloc и free. */
-            if (c->pending) continue;    /* установщик пишет в эту запись — не трогать */
-            if (c->used && c->rtx.cap && !c->rtx.len && !c->pending && stale - c->last > 5) rtx_done(&c->rtx);
-            if (!c->used || stale - c->last <= IDLE_EVICT_S) continue;
-            unsigned char rst[64];
-            size_t rl = tcp_build(rst, sizeof(rst), c->key.dst, c->key.src,
-                                  c->key.dport, c->key.sport,
-                                  c->our_seq, c->client_seq, TCP_RST | TCP_ACK, NULL, 0, 0, 0, -1);
-            if (rl) tun_write_ctl(&tun, rst, rl);
-            conn_drop(c);
+            if (c->rtx.cap && !c->rtx.len && g_now_s - c->last > 5) rtx_done(&c->rtx);
+
+            /* Уборка задержавшихся: без неё таблица заполняется соединениями, которые клиент
+             * бросил без FIN, и новые перестают открываться.
+             *
+             * Порог — тот же IDLE_EVICT_S, что и у вытеснения: «мёртвое соединение» должно
+             * означать одно и то же в обоих местах. Пробовал шестьдесят, рассчитывая
+             * освобождать слоты раньше, — и получил RST по живым соединениям HTTP/2, которые
+             * браузер переиспользует после минуты простоя.
+             *
+             * RST обязателен. Прежде здесь было молчаливое conn_drop, и клиент оставался с
+             * соединением, которое считает открытым: следующий запрос по нему уходил в
+             * пустоту и ждал таймаута — то есть наша уборка выглядела как зависший сайт. */
+            if (g_now_s - c->last > IDLE_EVICT_S) {
+                unsigned char rst[64];
+                size_t rl = tcp_build(rst, sizeof(rst), c->key.dst, c->key.src,
+                                      c->key.dport, c->key.sport,
+                                      c->our_seq, c->client_seq, TCP_RST | TCP_ACK,
+                                      NULL, 0, 0, 0, -1);
+                if (rl) tun_write_ctl(&tun, rst, rl);
+                conn_drop(c);
+                continue;
+            }
+            li++;
         }
     }
-    for (int i = 0; i < MAX_CONNS; i++)
-        if (g_conns[i].used) conn_drop(&g_conns[i]);
+    while (g_live_n) conn_drop(&g_conns[g_live[0]]);
+    close(ep);
     close(tun_fd);
     return NULL;
 }

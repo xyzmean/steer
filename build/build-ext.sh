@@ -13,7 +13,18 @@ OUT="$3"
 
 MBED_INC=/opt/mbedtls/include
 EXT_INC=/src/src/ext
-CFG='-DMBEDTLS_CONFIG_FILE="mbedtls_config.h"'
+# Имя файла НЕ mbedtls_config.h, и это не вкусовщина.
+#
+# build_info.h делает `#include MBEDTLS_CONFIG_FILE` кавычками, а кавычки ищутся сначала
+# рядом с включающим файлом — то есть в /opt/mbedtls/include/mbedtls/, где лежит
+# mbedtls_config.h самой библиотеки. Наш файл с тем же именем не выигрывал у него НИКОГДА:
+# mbedtls собиралась с ПОЛНОЙ конфигурацией по умолчанию, со своим TLS-стеком, DTLS, RSA,
+# X.509 и таблицами OID, а весь src/ext/mbedtls_config.h был мёртвым текстом.
+#
+# Обнаружилось по строкам «id-ce-certificatePolicies» в готовом бинарнике: их там быть не
+# могло, X509 в нашей конфигурации выключен. Цена молчаливая — 240 КБ флеша на overlay в
+# 6,9 МБ.
+CFG='-DMBEDTLS_CONFIG_FILE="steer_mbedtls_config.h"'
 
 WORK="/tmp/mb-$(echo "$TARGET$MCPU" | tr -c 'a-zA-Z0-9' '_')"
 mkdir -p "$WORK"
