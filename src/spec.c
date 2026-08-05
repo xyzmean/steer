@@ -233,6 +233,9 @@ static void parse_channels(struct js *j) {
             if (!strcmp(key, "name")) js_str(j, c.name, sizeof(c.name));
             else if (!strcmp(key, "out")) js_str(j, c.out, sizeof(c.out));
             else if (!strcmp(key, "from")) str_array(j, c.from, MAX_FROM, &c.from_n);
+            /* Отсутствие поля и `true` значат одно: правило работает. Проверяем на 'f',
+             * потому что спека без этого поля обязана вести себя как прежде. */
+            else if (!strcmp(key, "enabled")) { js_ws(j); c.disabled = (*j->p == 'f'); js_skip(j); }
             else if (!strcmp(key, "match")) {
                 if (js_lit(j, '{') != 0) die("channels.%s: match must be an object", c.name);
                 js_ws(j);
@@ -402,6 +405,21 @@ void load_spec(const char *path) {
 
     for (size_t i = 0; i < g_ch_n; i++) {
         struct channel *c = &g_ch[i];
+        /* Выключенное правило не проверяем: оно не действует, а отказ применить спеку из-за
+         * него означал бы, что выключить сломанное правило нельзя — только удалить. */
+        if (c->disabled) continue;
+
+        /* Адреса и MAC-и в одном «кому» — нельзя. nft не умеет «или» внутри правила, и
+         * смешанный список пришлось бы либо разбивать на два правила (тогда порядок и
+         * приоритет расходятся с тем, что человек написал), либо взять половину молча — а
+         * тогда часть устройств правило не касается, и понять это нечем. Отказываем громко. */
+        if (c->from_n > 1) {
+            int macs = 0;
+            for (size_t k = 0; k < c->from_n; k++) if (strchr(c->from[k], ':')) macs++;
+            if (macs && macs != (int)c->from_n)
+                die("канал %s: в «кому» смешаны адреса и MAC-адреса. nft не умеет «или» внутри "
+                    "правила — разделите на два канала", c->name);
+        }
         struct output *o = out_by_name(c->out);
         /* Через out_has_device, а не сравнением с OUT_INTERFACE: у выхода kind=vless
          * последствие ровно то же — весь трафик клиента, включая доступ к роутеру и

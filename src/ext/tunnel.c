@@ -44,6 +44,27 @@
 #include "tunnel.h"
 #include "../spec.h"
 
+/* ---- журнал с уровнем --------------------------------------------------------
+ *
+ * Формат: `steer[warn] tunnel: …`. Уровень идёт РОВНО в этом виде и первым — это контракт с
+ * интерфейсом, а не украшение. Прежде все строки уходили в stderr, procd помечал их как
+ * daemon.err, и «поток не открылся» стояло рядом с «узлов 26» одинаково красным: интерфейс не
+ * мог их различить, а человек не мог понять, на что смотреть.
+ *
+ * Разбирать прозу движка интерфейсу нельзя — формулировки меняются, и разбор молча отваливается.
+ * Поэтому уровень выделен в отдельное поле фиксированной формы: меняться будет текст, а не
+ * префикс.
+ *
+ * Уровни всего два. `warn` — то, из-за чего трафик пошёл не так или не пошёл вовсе. `info` —
+ * то, что случилось при штатной работе. Третий уровень («ошибка») не нужен: процесс, которому
+ * совсем плохо, завершается с ненулевым кодом, и это видно иначе.
+ */
+#define LOG_W  "steer[warn] tunnel: "
+#define LOG_I  "steer[info] tunnel: "
+/* Без слова tunnel: подъём выхода и разбор подписки — это ещё не туннель. */
+#define LOG_W2 "steer[warn]: "
+#define LOG_I2 "steer[info]: "
+
 /* Сколько соединений держим одновременно. Каждое — это сокет к серверу плюс TLS-состояние,
  * то есть около 3 КБ; 64 соединения это ~200 КБ, что для роутера с 15 МБ приемлемо, а для
  * домашней сети более чем достаточно. Упираться в предел лучше заметно (новые соединения
@@ -620,7 +641,7 @@ static int connq_release(struct conn *base) {
         struct timespec ts = { .tv_sec = 0, .tv_nsec = 10 * 1000 * 1000 };
         nanosleep(&ts, NULL);
     }
-    fprintf(stderr, "steer tunnel: установщик не доложил за 15 с, таблица не освобождается\n");
+    fprintf(stderr, LOG_W "установщик не доложил за 15 с, таблица не освобождается\n");
     return -1;
 }
 
@@ -754,7 +775,7 @@ static struct conn *conn_new(const struct tun_dev *tun) {
         static __thread time_t said;
         if (now != said && now - said >= 2) {
             said = now;
-            fprintf(stderr, "steer tunnel: все %d соединений заняты и активны, новые "
+            fprintf(stderr, LOG_W "все %d соединений заняты и активны, новые "
                             "отклоняются — список слишком широк для этого роутера\n", MAX_CONNS);
         }
         return NULL;
@@ -772,7 +793,7 @@ static struct conn *conn_new(const struct tun_dev *tun) {
     static __thread time_t said_evict;
     if (now - said_evict >= 10) {
         said_evict = now;
-        fprintf(stderr, "steer tunnel: таблица полна (%d), вытесняю ещё живые соединения "
+        fprintf(stderr, LOG_W "таблица полна (%d), вытесняю ещё живые соединения "
                         "(последнее молчало %lu с) — список слишком широк для этого роутера\n",
                 MAX_CONNS, (unsigned long)(now - old->last));
     }
@@ -1150,7 +1171,7 @@ static void handle_packet(const struct tun_dev *tun, const struct vless_node *no
             time_t nw = g_now_s;
             if (nw - said_q >= 5) {
                 said_q = nw;
-                fprintf(stderr, "steer tunnel: очередь установки соединений полна (%d), "
+                fprintf(stderr, LOG_W "очередь установки соединений полна (%d), "
                                 "SYN отклонён — процессор не успевает\n", CONNQ);
             }
             conn_drop(c);
@@ -1420,7 +1441,7 @@ static void *worker_loop(void *arg) {
      * закрытия второй из двух очередей все 40 потоков пришли в первую. */
     int ep = epoll_create1(0);
     if (ep < 0) {
-        fprintf(stderr, "steer tunnel: epoll недоступен (%s) — поток не запущен, "
+        fprintf(stderr, LOG_W "epoll недоступен (%s) — поток не запущен, "
                         "очередь отдана остальным\n", strerror(errno));
         close(tun_fd);
         return NULL;
@@ -1430,7 +1451,7 @@ static void *worker_loop(void *arg) {
     {
         struct epoll_event e = { .events = EPOLLIN, .data = { .u32 = TUN_TOKEN } };
         if (epoll_ctl(ep, EPOLL_CTL_ADD, tun_fd, &e) != 0) {
-            fprintf(stderr, "steer tunnel: TUN не встал в epoll (%s) — поток не запущен, "
+            fprintf(stderr, LOG_W "TUN не встал в epoll (%s) — поток не запущен, "
                             "очередь отдана остальным\n", strerror(errno));
             close(ep);
             close(tun_fd);
@@ -1566,7 +1587,7 @@ static void *worker_loop(void *arg) {
             if (c->rc != 0) {
                 /* С причиной, а не «не открылся»: код различает «TCP не соединился»,
                  * «сервер не признал ключ» и «сервер не согласился на HTTP/2». */
-                fprintf(stderr, "steer tunnel: поток к %s не открылся: %s (rc=%d)\n",
+                fprintf(stderr, LOG_W "поток к %s не открылся: %s (rc=%d)\n",
                         node->host, vless_strerror(c->rc), c->rc);
                 /* RST, а не молчание: клиент иначе ждёт до таймаута. Молчать я пробовал —
                  * страница с видео перестала открываться вовсе, потому что браузер
@@ -1780,17 +1801,17 @@ int tunnel_run(struct output *o, const struct vless_node *node) {
      * управление, то есть уже после apply. Значит привязать может только тот, кто знает
      * момент готовности, — а это мы. */
     bind_device(o, dev);
-    fprintf(stderr, "steer tunnel: %s привязан к таблице %d\n", dev, o->table);
-    fprintf(stderr, "steer tunnel: %s -> %s (%s:%u %s%s)\n", dev, node->name,
+    fprintf(stderr, LOG_I "%s привязан к таблице %d\n", dev, o->table);
+    fprintf(stderr, LOG_I "%s -> %s (%s:%u %s%s)\n", dev, node->name,
             node->host, node->port, node->type, node->flow[0] ? " +vision" : "");
     /* Печатается всегда: без разгрузки и без второй очереди скорость падает в разы, и знать,
      * что именно досталось, надо до замеров, а не после. */
-    fprintf(stderr, "steer tunnel: разгрузка записи в %s %s; потоков %d из %d запрошенных\n",
+    fprintf(stderr, LOG_I "разгрузка записи в %s %s; потоков %d из %d запрошенных\n",
             dev, queues[0].gso ? "включена (сегменты до 16 КБ, суммы считает ядро)"
                                : "НЕДОСТУПНА — нарезаем по 1460 и считаем суммы сами",
             n, want);
     if (n < want)
-        fprintf(stderr, "steer tunnel: очередей меньше запрошенного — ядро без "
+        fprintf(stderr, LOG_W "очередей меньше запрошенного — ядро без "
                         "IFF_MULTI_QUEUE, работаем в один поток\n");
 
     /* Потоки со второго по последний — отдельными, первый работает в этом же. Так процесс
@@ -1800,7 +1821,7 @@ int tunnel_run(struct output *o, const struct vless_node *node) {
     int started = 0;
     for (int i = 1; i < n; i++) {
         if (pthread_create(&tids[started], NULL, worker_loop, &workers[i]) != 0) {
-            fprintf(stderr, "steer tunnel: поток %d не создался, работаем без него\n", i);
+            fprintf(stderr, LOG_W "поток %d не создался, работаем без него\n", i);
             close(workers[i].tun.fd);
             continue;
         }
@@ -1821,9 +1842,9 @@ int tunnel_run(struct output *o, const struct vless_node *node) {
     int served = 0;
     for (int i = 0; i < n; i++) served += workers[i].served;
     if (!served)
-        fprintf(stderr, "steer tunnel: %s не поднялся ни одной очередью из %d\n", dev, n);
+        fprintf(stderr, LOG_W "%s не поднялся ни одной очередью из %d\n", dev, n);
     else
-        fprintf(stderr, "steer tunnel: %s больше не несёт трафик — все очереди (%d) "
+        fprintf(stderr, LOG_W "%s больше не несёт трафик — все очереди (%d) "
                         "завершились\n", dev, n);
     return 1;
 }
@@ -1844,16 +1865,16 @@ static int load_nodes(const char *spec_path, const char *out_name, struct output
                       size_t *cnt, size_t *skipped, size_t *foreign) {
     load_spec(spec_path);
     struct output *o = out_by_name(out_name);
-    if (!o) { fprintf(stderr, "steer: выхода %s нет в спеке\n", out_name); return 2; }
+    if (!o) { fprintf(stderr, LOG_W2 "выхода %s нет в спеке\n", out_name); return 2; }
     if (o->kind != OUT_VLESS) {
-        fprintf(stderr, "steer: выход %s не vless (kind другой)\n", out_name);
+        fprintf(stderr, LOG_W2 "выход %s не vless (kind другой)\n", out_name);
         return 2;
     }
     *out = o;
 
     /* Подписка читается с диска: скачивание — дело управляющего слоя. */
     FILE *f = fopen(o->sub_file, "r");
-    if (!f) { fprintf(stderr, "steer: %s не читается\n", o->sub_file); return 2; }
+    if (!f) { fprintf(stderr, LOG_W2 "%s не читается\n", o->sub_file); return 2; }
     static char raw[262144], dec[262144];
     size_t n = fread(raw, 1, sizeof(raw) - 1, f);
     raw[n] = '\0';
@@ -1971,18 +1992,18 @@ int cmd_vless(const char *spec_path, const char *out_name) {
     if (rc) return rc;
     struct vless_node *nodes = g_nodes;
     if (!cnt) {
-        fprintf(stderr, "steer: в подписке нет пригодных узлов "
+        fprintf(stderr, LOG_W2 "в подписке нет пригодных узлов "
                         "(пропущено %zu, чужих протоколов %zu)\n", skipped, foreign);
         return 1;
     }
-    fprintf(stderr, "steer: узлов %zu (пропущено %zu, чужих %zu)\n", cnt, skipped, foreign);
+    fprintf(stderr, LOG_I2 "узлов %zu (пропущено %zu, чужих %zu)\n", cnt, skipped, foreign);
 
     /* Выбор узла. node=-1 означает «первый рабочий», и это умолчание не из лени: номер
      * узла в подписке меняется при её обновлении, а проверка находит живой сама. */
     int chosen = -1;
     if (o->node_index >= 0) {
         if ((size_t)o->node_index >= cnt) {
-            fprintf(stderr, "steer: узла %d нет (всего %zu)\n", o->node_index, cnt);
+            fprintf(stderr, LOG_W2 "узла %d нет (всего %zu)\n", o->node_index, cnt);
             return 1;
         }
         chosen = o->node_index;
@@ -1990,15 +2011,15 @@ int cmd_vless(const char *spec_path, const char *out_name) {
         for (size_t i = 0; i < cnt; i++) {
             char why[256];
             if (vless_probe(&nodes[i], 8, why, sizeof(why)) == 0) {
-                fprintf(stderr, "steer: выбран %s (%s)\n", nodes[i].name, why);
+                fprintf(stderr, LOG_I2 "выбран %s (%s)\n", nodes[i].name, why);
                 chosen = (int)i;
                 break;
             }
-            fprintf(stderr, "steer: %s — %s\n", nodes[i].name, why);
+            fprintf(stderr, LOG_I2 "%s — %s\n", nodes[i].name, why);
         }
     }
     if (chosen < 0) {
-        fprintf(stderr, "steer: ни один узел подписки не отвечает\n");
+        fprintf(stderr, LOG_W2 "ни один узел подписки не отвечает\n");
         return 1;
     }
 

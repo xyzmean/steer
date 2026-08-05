@@ -131,6 +131,86 @@ check "чего не было, то остаётся нулём" "1" \
 check "нули не пишутся числами" "0" \
     "$(printf '%s\n' "$out" | grep -c 'counter packets 0 bytes 0')"
 
+# ---- выключенное правило ------------------------------------------------------
+#
+# «Выключено» обязано значить «не действует», а не «действует тише»: правило не превращается ни
+# в набор, ни в правило ядра. Проверяется именно на выводе компилятора, потому что ошибка здесь
+# выглядела бы безобиднее всего — интерфейс показывает выключатель, а трафик продолжает идти.
+# Адрес у выключенного списка СВОЙ, которого нет во включённом: иначе «не попал в набор»
+# проверялось бы адресом, который туда попадает законно, и тест прошёл бы при сломанном коде.
+printf '10.77.77.0/24\n' > "$tmp/off.lst"
+cat > "$tmp/off.json" <<EOF
+{ "schema": 1, "from_default": ["192.168.1.0/24"],
+  "outputs": { "vpn": { "kind": "interface", "device": "wg0" } },
+  "channels": [
+    { "name": "on",  "match": { "prefixes_file": "$tmp/a.lst" }, "out": "vpn" },
+    { "name": "off", "enabled": false, "match": { "prefixes_file": "$tmp/off.lst" }, "out": "vpn" }
+  ] }
+EOF
+offout="$("$BIN" apply --dry-run --spec "$tmp/off.json" --state-dir "$tmp/state-off")"
+check "включённое рядом с выключенным работает" "1" \
+    "$(printf '%s\n' "$offout" | grep -c 'comment "steer:vpn_ip"')"
+# Оба правила ведут в один выход и один вид, то есть слиплись бы в одну группу. Попади
+# выключенное в неё — его адрес оказался бы в наборе.
+check "список выключенного в набор не попал" "0" \
+    "$(printf '%s\n' "$offout" | grep -c '10.77.77.0/24')"
+# И одного набора с одним правилом достаточно: выключенное не создаёт своих.
+check "лишних наборов не появилось" "1" \
+    "$(printf '%s\n' "$offout" | grep -c '    set ')"
+
+# Спека без поля обязана значить то же, что значила: умолчание — включено.
+check "поля нет — правило работает" "1" \
+    "$(printf '%s\n' "$out" | grep -c 'comment "steer:vpn_ip"')"
+
+# Выключенное правило не проверяется: иначе сломанное правило нельзя было бы выключить,
+# только удалить.
+cat > "$tmp/offbad.json" <<EOF
+{ "schema": 1, "from_default": ["192.168.1.0/24"],
+  "outputs": { "vpn": { "kind": "interface", "device": "wg0" } },
+  "channels": [
+    { "name": "bad", "enabled": false, "match": { "any": true }, "out": "vpn" }
+  ] }
+EOF
+"$BIN" apply --dry-run --spec "$tmp/offbad.json" --state-dir "$tmp/state-ob" >/dev/null 2>&1
+check "выключенное правило не мешает применить спеку" "0" "$?"
+
+# ---- «кому» по MAC ------------------------------------------------------------
+#
+# Адрес у устройства меняется (DHCP выдаёт другой после перезагрузки), и правило начинает
+# касаться не того. MAC живёт, пока живёт устройство. На встречном пути наш клиент —
+# ПОЛУЧАТЕЛЬ, поэтому там ether daddr, а не saddr: перепутать их значит считать нуль
+# скачанного при работающем правиле.
+cat > "$tmp/mac.json" <<EOF
+{ "schema": 1,
+  "outputs": { "vpn": { "kind": "interface", "device": "wg0" } },
+  "channels": [
+    { "name": "tv", "from": ["a4:83:e7:2c:11:0f"],
+      "match": { "prefixes_file": "$tmp/a.lst" }, "out": "vpn" }
+  ] }
+EOF
+macout="$("$BIN" apply --dry-run --spec "$tmp/mac.json" --state-dir "$tmp/state-mac")"
+check "MAC в метке: ether saddr" "1" \
+    "$(printf '%s\n' "$macout" | grep -c 'ether saddr { a4:83:e7:2c:11:0f } ip daddr @vpn_ip')"
+check "MAC на встречном пути: ether daddr" "1" \
+    "$(printf '%s\n' "$macout" | grep -c 'ether daddr { a4:83:e7:2c:11:0f } ip saddr @vpn_ip')"
+check "и никакого ip saddr с MAC-ом" "0" \
+    "$(printf '%s\n' "$macout" | grep -c 'ip saddr { a4:')"
+
+# Смешивать адреса и MAC-и в одном правиле нельзя: nft не умеет «или» внутри правила, и
+# молчаливая половина означала бы, что часть устройств правило не касается.
+cat > "$tmp/mix.json" <<EOF
+{ "schema": 1,
+  "outputs": { "vpn": { "kind": "interface", "device": "wg0" } },
+  "channels": [
+    { "name": "mix", "from": ["192.168.1.5", "a4:83:e7:2c:11:0f"],
+      "match": { "prefixes_file": "$tmp/a.lst" }, "out": "vpn" }
+  ] }
+EOF
+"$BIN" apply --dry-run --spec "$tmp/mix.json" --state-dir "$tmp/state-mix" >/dev/null 2>&1
+# Сравниваем с фактом отказа, а не с числом: код у die свой (2), и привязка к нему сделала бы
+# тест хрупким к тому, что нас здесь не касается.
+check "смешанное «кому» отвергается" "отказ" "$([ $? -ne 0 ] && echo отказ || echo приняло)"
+
 # Precedence is the spec's central promise: 198.51.100.5 is in BOTH lists, and the
 # rule that claims it must be the one written first.
 first="$(printf '%s\n' "$out" | grep -n 'comment "steer:' | head -1 | sed 's/.*steer://; s/".*//')"

@@ -149,11 +149,11 @@ int tun_open(struct tun_dev *d, int max_queues, const char *name) {
      * ни строки, и «туннель не поднялся» выглядело как «туннель просто не работает». */
     if (g_open_stage == 1 && (g_open_errno == ENOENT || g_open_errno == ENXIO ||
                               g_open_errno == ENODEV)) {
-        fprintf(stderr, "steer tunnel: нет /dev/net/tun (%s) — не установлен kmod-tun\n",
+        fprintf(stderr, "steer[warn] tunnel: нет /dev/net/tun (%s) — не установлен kmod-tun\n",
                 strerror(g_open_errno));
         return TUN_ENODEV;
     }
-    fprintf(stderr, "steer tunnel: устройство %s не создалось: %s (%s)\n", name,
+    fprintf(stderr, "steer[warn] tunnel: устройство %s не создалось: %s (%s)\n", name,
             strerror(g_open_errno ? g_open_errno : EINVAL),
             g_open_stage == 1 ? "не открылся /dev/net/tun" : "отказал TUNSETIFF");
     return TUN_ESETUP;
