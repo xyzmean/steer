@@ -308,15 +308,47 @@ check "all three entries present" "1" \
 check "auto-merge lets the kernel fold the duplicate" "1" \
     "$(printf '%s\n' "$mout" | grep -A3 'set vpn_ip' | grep -c 'auto-merge')"
 
-# A channel cannot hold both kinds: they reach the set by different routes.
+# ---- одно правило про СЕРВИС, а не про вид списка -----------------------------
+#
+# Адреса и домены в одном правиле разрешены. Раньше запрещались: набор один, а заполняются они
+# по-разному — адреса из файла при компиляции, домены кладёт резолвер. Из этого следовало, что
+# человек выбирает не сервис, а вид списка, и «YouTube адресами» с «YouTube доменами» жили
+# двумя правилами.
+#
+# Ограничение оказалось нашим: набор с `flags interval,timeout` держит и постоянные элементы, и
+# временные. Проверяется здесь, потому что сломать это легко и незаметно — набор без timeout
+# примет адреса из файла и молча откажет резолверу, а выглядит это как «домены не работают».
 cat > "$tmp/xspec.json" <<EOF
 { "schema": 1, "outputs": { "vpn": { "kind": "interface", "device": "wg0" } },
   "channels": [ { "name": "mixed",
                   "match": { "prefixes_files": ["$tmp/m1.lst"], "domains_files": ["$tmp/d.lst"] },
                   "out": "vpn" } ] }
 EOF
-"$BIN" apply --dry-run --spec "$tmp/xspec.json" --state-dir "$tmp/state-m" >/dev/null 2>&1
-check "refuses addresses and domains in one channel" "2" "$?"
+mixout="$("$BIN" apply --dry-run --spec "$tmp/xspec.json" --state-dir "$tmp/state-m" 2>&1)"
+check "адреса и домены в одном правиле принимаются" "1" \
+    "$(printf '%s\n' "$mixout" | grep -c 'set vpn_dom')"
+check "набор смешанного правила с timeout" "1" \
+    "$(printf '%s\n' "$mixout" | grep -c 'flags interval,timeout')"
+check "и адреса из файла в нём есть" "1" \
+    "$(printf '%s\n' "$mixout" | grep -c 'elements = {')"
+check "набора _ip при этом не появилось" "0" \
+    "$(printf '%s\n' "$mixout" | grep -c 'set vpn_ip')"
+
+# Два ОТДЕЛЬНЫХ правила одного сервиса — адресное и доменное — в один outbound и для одних
+# клиентов сливаются в один набор. Это и есть «выбирать по сервису»: два способа описать одно и
+# то же перестают быть двумя правилами в ядре.
+cat > "$tmp/twospec.json" <<EOF
+{ "schema": 1, "outputs": { "vpn": { "kind": "interface", "device": "wg0" } },
+  "channels": [
+    { "name": "адресами", "match": { "prefixes_files": ["$tmp/m1.lst"] }, "out": "vpn" },
+    { "name": "доменами", "match": { "domains_files": ["$tmp/d.lst"] }, "out": "vpn" }
+  ] }
+EOF
+twoout="$("$BIN" apply --dry-run --spec "$tmp/twospec.json" --state-dir "$tmp/state-two" 2>&1)"
+check "два правила одного сервиса — один набор" "1" \
+    "$(printf '%s\n' "$twoout" | grep -c '    set ')"
+check "и одно правило в цепочке метки" "1" \
+    "$(printf '%s\n' "$twoout" | grep -c 'comment \"steer:')"
 
 # ---- does the spec need the resolver ----------------------------------------
 # The init script asks the engine this. It used to grep the spec for the literal

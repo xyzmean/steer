@@ -276,10 +276,16 @@ static void parse_channels(struct js *j) {
         if (!c.out[0]) die("channel %s has no out", c.name);
         if (!c.prefixes_n && !c.domains_n && !c.any)
             die("channel %s matches nothing (want prefixes_files, domains_files or any)", c.name);
-        /* Addresses and domains reach the set by different routes — one from a file,
-         * one from the resolver — so one channel cannot hold both. */
-        if (c.prefixes_n && c.domains_n)
-            die("channel %s mixes addresses and domains — split it in two", c.name);
+        /* Адреса и домены в одном правиле — МОЖНО.
+         *
+         * Раньше запрещалось: набор один, а заполняются они по-разному — адреса читаются из
+         * файла при компиляции, домены кладёт резолвер по мере запросов. Из этого следовало,
+         * что человек выбирает не сервис, а ВИД СПИСКА: «YouTube (адреса)» и «YouTube
+         * (домены)» приходилось заводить двумя правилами, хотя это один сервис.
+         *
+         * Ограничение оказалось нашим, а не ядра: набор с `flags interval,timeout` держит и
+         * постоянные элементы из файла, и временные от резолвера — проверено опытом на живом
+         * nft. Поэтому запрет снят, а набор такой группы объявляется с timeout. */
         if (g_ch_n >= MAX_CHANNELS) die("too many channels", NULL);
         g_ch[g_ch_n++] = c;
         js_ws(j);

@@ -83,8 +83,14 @@ struct group {
     int realip;
     const char (*from)[64];
     size_t from_n;
+    /* ТОЛЬКО адресные файлы: их элементы уходят в набор при компиляции. Доменные читает
+     * резолвер сам, из спеки, поэтому здесь их держать незачем — а держали, и из-за этого
+     * группа не могла быть смешанной. */
     const char *files[MAX_CHANNELS * MAX_FILES];
     size_t files_n;
+    /* Сколько доменных списков в группе. Нужно только чтобы сказать это человеку в status:
+     * набор у них общий, а вот «сколько списков» он спрашивает про правило. */
+    size_t dfiles_n;
     /* Which channels fed it — reported so a counter still has names behind it. */
     const char *members[MAX_CHANNELS];
     size_t members_n;
@@ -117,8 +123,10 @@ static void build_groups(void) {
         for (; k < g_grp_n; k++) {
             struct group *g = &g_grp[k];
             if (strcmp(g->out, c->out) != 0) continue;
-            if (g->domains != domains) continue;
-            if (domains && g->realip != c->realip) continue;
+            /* Вид больше НЕ разделяет группы: адресное и доменное правило одного сервиса,
+             * ведущие в один outbound для одних клиентов, — это одно правило и один набор.
+             * Разделение по виду было следствием запрета смешивать, а не требованием ядра. */
+            if (domains && g->domains && g->realip != c->realip) continue;
             if (!same_from(c, g)) continue;
             break;
         }
@@ -126,21 +134,38 @@ static void build_groups(void) {
             struct group *g = &g_grp[g_grp_n++];
             memset(g, 0, sizeof(*g));
             g->out = c->out;
-            g->domains = domains;
+            g->domains = 0;
             g->realip = c->realip;
             g->from = c->from_n ? c->from : g_from_default;
             g->from_n = c->from_n ? c->from_n : g_from_default_n;
+            /* Имя ставим предварительно, окончательное — ниже: домены могут прийти вторым
+             * правилом, и тогда набор обязан называться _dom, иначе резолвер его не найдёт
+             * (он вычисляет имя сам, по тому же правилу). */
             snprintf(g->name, sizeof(g->name), "%.24s_%s", c->out, domains ? "dom" : "ip");
             /* An `any` channel has no set: it claims everything from those clients. */
             if (c->any && !c->prefixes_n && !c->domains_n)
                 snprintf(g->name, sizeof(g->name), "%.24s_all", c->out);
         }
         struct group *g = &g_grp[k];
-        const char (*src)[256] = domains ? c->domains_files : c->prefixes_files;
-        size_t n = domains ? c->domains_n : c->prefixes_n;
-        for (size_t f = 0; f < n && g->files_n < (sizeof(g->files) / sizeof(g->files[0])); f++)
-            g->files[g->files_n++] = src[f];
+        /* Домены только помечаем: их файлы читает резолвер. Режим берём у первого доменного
+         * правила в группе — у адресного его нет вовсе, и брать оттуда нечего. */
+        if (domains) {
+            if (!g->domains) g->realip = c->realip;
+            g->domains = 1;
+            g->dfiles_n += c->domains_n;
+        }
+        for (size_t f = 0; f < c->prefixes_n &&
+                           g->files_n < (sizeof(g->files) / sizeof(g->files[0])); f++)
+            g->files[g->files_n++] = c->prefixes_files[f];
         if (g->members_n < MAX_CHANNELS) g->members[g->members_n++] = c->name;
+    }
+    /* Окончательные имена. Группа с доменами — всегда _dom, потому что имя набора резолвер
+     * вычисляет тем же правилом и по-другому его не найдёт. Группы `any` не трогаем: у них
+     * набора нет вовсе. */
+    for (size_t i = 0; i < g_grp_n; i++) {
+        struct group *g = &g_grp[i];
+        if (!g->files_n && !g->domains) continue;
+        snprintf(g->name, sizeof(g->name), "%.24s_%s", g->out, g->domains ? "dom" : "ip");
     }
 }
 
@@ -258,7 +283,8 @@ static void count_list(const char *path, size_t *total, size_t *bad,
 static void check_address_lists(void) {
     for (size_t i = 0; i < g_grp_n; i++) {
         struct group *g = &g_grp[i];
-        if (g->domains) continue;               /* доменный набор заполняет резолвер */
+        /* Раньше здесь стоял пропуск доменных групп целиком. Теперь у группы могут быть и
+         * адресные файлы: пропускать её значило бы не заметить пустой или сломанный список. */
         for (size_t k = 0; k < g->files_n; k++) {
             size_t total = 0, bad = 0, bad_line = 0;
             char sample[128];
@@ -407,12 +433,23 @@ static void generate(FILE *f) {
         struct group *g = &g_grp[i];
         if (!g->files_n && !g->domains) continue;      /* an `any` group has no set */
         if (g->domains) {
-            /* Declared EMPTY: the resolver fills it as answers arrive, and a set with
-             * no inline `elements =` keeps its contents across a reload. Timeouts come
-             * from each answer's TTL, so an address a CDN stops using expires instead
-             * of accumulating forever. */
+            /* timeout — из-за резолвера: он кладёт адреса с TTL ответа, и адрес, который CDN
+             * перестал отдавать, истекает сам, а не копится вечно.
+             *
+             * Адресные списки в ТОЙ ЖЕ группе печатаются элементами без timeout, то есть
+             * остаются навсегда. Что набор держит и те, и другие — проверено на живом nft, а
+             * не выведено: элемент без своего timeout в наборе с этим флагом постоянный. Это
+             * и позволяет одному правилу быть про сервис, а не про вид списка. */
             fprintf(f, "    set %s {\n        type ipv4_addr\n"
-                       "        flags interval,timeout\n        auto-merge\n    }\n", g->name);
+                       "        flags interval,timeout\n        auto-merge\n", g->name);
+            if (g->files_n) {
+                fprintf(f, "        elements = { ");
+                size_t written = 0;
+                for (size_t k = 0; k < g->files_n; k++)
+                    written += emit_elements(f, g->files[k], written);
+                fprintf(f, " }\n");
+            }
+            fprintf(f, "    }\n");
         } else {
             /* auto-merge because several lists in one group WILL overlap — an address
              * list and a service list cover the same hosting — and folding duplicates
@@ -808,7 +845,7 @@ static int cmd_status(const char *spec) {
          * значении уже разошлось по установленным версиям splify2. Переопределить его
          * значило бы, что новый движок со старым интерфейсом молча показывает не то. */
         if (dn) printf(",\"down_packets\":%lu,\"down_bytes\":%lu", dn_p, dn_b);
-        printf(",\"lists\":%zu,\"channels\":[", g_grp[i].files_n);
+        printf(",\"lists\":%zu,\"channels\":[", g_grp[i].files_n + g_grp[i].dfiles_n);
         for (size_t m = 0; m < g_grp[i].members_n; m++)
             printf("%s\"%s\"", m ? "," : "", g_grp[i].members[m]);
         printf("]}");
