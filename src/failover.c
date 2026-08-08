@@ -28,6 +28,7 @@
 #include <arpa/inet.h>
 #include <poll.h>
 #include <net/if.h>
+#include <ifaddrs.h>
 #include "spec.h"
 
 /* Таблица и приоритет правила для проб. Далеко от 300+, которые раздаёт реестр:
@@ -44,21 +45,21 @@ int run_quiet(const char *const argv[]);   /* из steer.c */
 /* Адрес источника устройства: без него правило пробы не к чему привязать, а само
  * отсутствие адреса уже означает, что устройство не готово нести трафик. */
 static int device_src(const char *dev, char *out, size_t n) {
-    char cmd[192];
-    snprintf(cmd, sizeof(cmd), "ip -4 -o addr show %s 2>/dev/null", dev);
-    FILE *pf = popen(cmd, "r");
-    if (!pf) return 0;
-    char line[256];
+    struct ifaddrs *ifaddr, *ifa;
     int found = 0;
-    while (!found && fgets(line, sizeof(line), pf)) {
-        char ifname[32], addr[64];
-        if (sscanf(line, "%*d: %31s inet %63s", ifname, addr) != 2) continue;
-        char *slash = strchr(addr, '/');
-        if (slash) *slash = '\0';
-        snprintf(out, n, "%s", addr);
-        found = 1;
+
+    if (getifaddrs(&ifaddr) == -1) return 0;
+
+    for (ifa = ifaddr; ifa != NULL && !found; ifa = ifa->ifa_next) {
+        if (ifa->ifa_addr == NULL) continue;
+        if (ifa->ifa_addr->sa_family == AF_INET && strcmp(ifa->ifa_name, dev) == 0) {
+            struct sockaddr_in *s4 = (struct sockaddr_in *)ifa->ifa_addr;
+            if (inet_ntop(AF_INET, &s4->sin_addr, out, n) != NULL) {
+                found = 1;
+            }
+        }
     }
-    pclose(pf);
+    freeifaddrs(ifaddr);
     return found;
 }
 
@@ -180,14 +181,34 @@ static int device_healthy_for(const struct output *o, const char *dev) {
  * direct — правило снимается, трафик идёт как обычный (осознанный выбор);
  * zapret — то же, что direct, но нужен работающий обход DPI, иначе это просто
  *          direct под другим именем, о чём и сообщаем. */
+#include <dirent.h>
+#include <ctype.h>
+
 static int zapret_running(void) {
-    FILE *pf = popen("ps w 2>/dev/null", "r");
-    if (!pf) return 0;
-    char line[512];
+    DIR *d = opendir("/proc");
+    if (!d) return 0;
+    struct dirent *dir;
     int found = 0;
-    while (!found && fgets(line, sizeof(line), pf))
-        if (strstr(line, "nfqws")) found = 1;
-    pclose(pf);
+    char path[256];
+    char buf[512];
+    
+    while ((dir = readdir(d)) != NULL && !found) {
+        if (!isdigit(dir->d_name[0])) continue;
+        snprintf(path, sizeof(path), "/proc/%s/cmdline", dir->d_name);
+        int fd = open(path, O_RDONLY | O_CLOEXEC);
+        if (fd >= 0) {
+            ssize_t n = read(fd, buf, sizeof(buf) - 1);
+            if (n > 0) {
+                buf[n] = '\0';
+                for (ssize_t i = 0; i < n; i++) {
+                    if (buf[i] == '\0') buf[i] = ' ';
+                }
+                if (strstr(buf, "nfqws")) found = 1;
+            }
+            close(fd);
+        }
+    }
+    closedir(d);
     return found;
 }
 

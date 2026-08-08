@@ -1145,6 +1145,9 @@ static int fakeip_lookup_or_alloc(const char *domain, uint32_t *out_addr) {
     return 0;
 }
 
+static int g_fakeip_dirty = 0;
+static time_t g_fakeip_last_rewrite = 0;
+
 /* Records the last-seen real backend for an allocated domain. Called after a
  * successful DNAT-map insert so the mapping can survive a restart via the
  * rehydrate pass (run_proxy's startup). Triggers a one-shot state rewrite so
@@ -1160,7 +1163,7 @@ static void fakeip_entry_set_real(const char *domain, uint32_t real_host) {
     if (at < 0) return;
     if (g_fakeip.entries[at].real_host == real_host) return;
     g_fakeip.entries[at].real_host = real_host;
-    fakeip_state_rewrite();
+    g_fakeip_dirty = 1;
 }
 
 /* ---------------------------------------------------------------------- */
@@ -1506,6 +1509,14 @@ static int run_proxy(int listen_port, int upstream_port) {
     struct epoll_event events[32];
     while (g_running) {
         if (g_reload_pending) { g_reload_pending = 0; reload_rules(); }
+        if (g_fakeip_dirty) {
+            time_t now = time(NULL);
+            if (now - g_fakeip_last_rewrite >= 2) {
+                fakeip_state_rewrite();
+                g_fakeip_dirty = 0;
+                g_fakeip_last_rewrite = now;
+            }
+        }
         int n = epoll_wait(g_epfd, events, 32, 1000);
         if (n < 0) {
             if (errno == EINTR) continue;
