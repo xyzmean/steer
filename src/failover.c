@@ -21,6 +21,13 @@
 #include <sys/wait.h>
 #include <fcntl.h>
 #include <time.h>
+#include <errno.h>
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <netinet/tcp.h>
+#include <arpa/inet.h>
+#include <poll.h>
+#include <net/if.h>
 #include "spec.h"
 
 /* Таблица и приоритет правила для проб. Далеко от 300+, которые раздаёт реестр:
@@ -66,6 +73,44 @@ static int device_present(const char *dev) {
     return up;
 }
 
+/* Доступен ли внешний адрес ПО TCP через данное устройство.
+ *
+ * Зачем отдельная проверка, а не device_healthy: VLESS-туннель пропускает ТОЛЬКО TCP
+ * (клиент завершает TCP у себя и соединяется с сервером обычным сокетом — ICMP сквозь
+ * него не идёт принципиально). device_healthy пингует ICMP, и для выхода kind=vless
+ * отвечал «мёртв» на полностью рабочем туннеле: на живом роутере это выглядело как
+ * вечное «vl: не отвечает — перезапускаю интерфейс» в журнале и гоняло ifdown/ifup
+ * по устройству, которым netifd вовсе не управляет.
+ *
+ * SO_BINDTODEVICE привязывает сокет именно к этому устройству, не полагаясь на метки и
+ * таблицы маршрутизации: проба обязана идти тем путём, который мы проверяем. Неблокирующий
+ * connect с poll — чтобы на чёрной дыре не стоять дольше таймаута. */
+static int tcp_reachable(const char *dev, const char *host, int port, int timeout_s) {
+    struct in_addr a;
+    if (inet_aton(host, &a) == 0) return 0;
+    int fd = socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
+    if (fd < 0) return 0;
+    if (setsockopt(fd, SOL_SOCKET, SO_BINDTODEVICE, dev, strlen(dev) + 1) != 0) {
+        close(fd);
+        return 0;
+    }
+    struct sockaddr_in sa = { .sin_family = AF_INET, .sin_port = htons((uint16_t)port),
+                              .sin_addr = a };
+    int ok = 0;
+    int rc = connect(fd, (struct sockaddr *)&sa, sizeof(sa));
+    if (rc == 0) ok = 1;                          /* соединилось мгновенно — обычно сосед по L2 */
+    else if (errno == EINPROGRESS) {
+        struct pollfd pw = { .fd = fd, .events = POLLOUT, .revents = 0 };
+        if (poll(&pw, 1, timeout_s * 1000) > 0) {
+            int err = 0; socklen_t el = sizeof(err);
+            if (getsockopt(fd, SOL_SOCKET, SO_ERROR, &err, &el) == 0 && err == 0)
+                ok = 1;
+        }
+    }
+    close(fd);
+    return ok;
+}
+
 /* Живо ли устройство на самом деле. operstate у туннеля почти всегда "unknown" и
  * остаётся таким, когда пир давно молчит, — поэтому решает пакет, дошедший до
  * настоящего адреса, а не то, что о себе сообщает интерфейс. */
@@ -102,6 +147,31 @@ static int device_healthy(const char *dev) {
     const char *flush[] = { "ip", "-4", "route", "flush", "table", tbl, NULL };
     run_quiet(flush);
     return ok;
+}
+
+/* Живо ли устройство ДЛЯ КОНКРЕТНОГО ВЫХОДА.
+ *
+ * Вид выхода решает, чем проверять. Для kind=interface (wireguard, openvpn и т.п.)
+ * ICMP годится: ядро проксирует его вместе с TCP/UDP. Для kind=vless ICMP НЕ проходит
+ * вовсе — туннель завершает TCP у себя и наружу соединяется сокетом, поэтому пинг к
+ * внешнему адресу через VLESS-устройство всегда теряется. Та же самая «не отвечает» на
+ * рабочем туннеле, что и с masquerade для traceroute, только по отношению к ICMP целиком.
+ *
+ * Поэтому VLESS проверяем TCP-рукопожатием к знакомому адресату: это ровно то, что туннель
+ * и пропускает, и ровно то, что делает реальный трафик. Два кандидата — на случай, когда
+ * один адрес недоступен именно в этом туннеле (та же причина, что у PROBE_TARGETS). */
+#define TCP_PROBE_PORT 80
+#define TCP_PROBE_TIMEOUT 4
+
+static int device_healthy_for(const struct output *o, const char *dev) {
+    if (!device_present(dev)) return 0;
+    if (o->kind == OUT_VLESS) {
+        for (int i = 0; PROBE_TARGETS[i]; i++)
+            if (tcp_reachable(dev, PROBE_TARGETS[i], TCP_PROBE_PORT, TCP_PROBE_TIMEOUT))
+                return 1;
+        return 0;
+    }
+    return device_healthy(dev);
 }
 
 /* Куда направить таблицу выхода, когда живых устройств нет.
@@ -235,12 +305,29 @@ static int restart_allowed(const char *dev) {
     return 1;
 }
 
-static int revive(const char *dev, int verbose) {
+static int revive(const struct output *o, const char *dev, int verbose) {
     if (!restart_allowed(dev)) {
         if (verbose)
             fprintf(stderr, "steer: %s: перезапуск был недавно, пропускаю\n", dev);
         return 0;
     }
+
+    /* VLESS-устройство создаёт процесс «steer vless», а НЕ netifd. ifdown/ifup здесь
+     * бесполезны — netifd про это устройство не знает («Interface vl not found») — и на
+     * живом роутере это выглядело как вечный холостой цикл перезапусков в журнале.
+     * Падение процесса vless ловит procd (init-скрипт ставит respawn), и подъём заново
+     * выбирает рабочий узел сам. У сторожа для vless одна задача: сообщить, что туннель
+     * молчит, и подождать — кому именно ждать, тот поднимется сам. */
+    if (o->kind == OUT_VLESS) {
+        fprintf(stderr, "steer: %s: не отвечает по TCP — VLESS-процесс должен подняться "
+                        "заново через procd; жду\n", dev);
+        for (int i = 0; i < 10; i++) {
+            sleep(1);
+            if (device_healthy_for(o, dev)) return 1;
+        }
+        return 0;
+    }
+
     fprintf(stderr, "steer: %s: не отвечает — перезапускаю интерфейс\n", dev);
     const char *down[] = { "ifdown", dev, NULL };
     const char *up[] = { "ifup", dev, NULL };
@@ -250,7 +337,7 @@ static int revive(const char *dev, int verbose) {
      * ещё поднимается. Ждём короткими шагами, чтобы не держать проход дольше нужного. */
     for (int i = 0; i < 10; i++) {
         sleep(1);
-        if (device_healthy(dev)) return 1;
+        if (device_healthy_for(o, dev)) return 1;
     }
     return 0;
 }
@@ -272,7 +359,7 @@ int cmd_failover(const char *spec, int verbose) {
          * основной незачем — трафик уже пойдёт. Перезапуск дороже проверки и на
          * секунды роняет то, что перезапускают. */
         for (size_t k = 0; k < o->devices_n; k++) {
-            if (device_healthy(o->devices[k])) { chosen = o->devices[k]; break; }
+            if (device_healthy_for(o, o->devices[k])) { chosen = o->devices[k]; break; }
             if (verbose)
                 fprintf(stderr, "steer: %s: %s не отвечает\n", o->name, o->devices[k]);
         }
@@ -281,7 +368,7 @@ int cmd_failover(const char *spec, int verbose) {
          * тот же, поэтому основной туннель получает попытку первым. */
         if (!chosen)
             for (size_t k = 0; k < o->devices_n; k++)
-                if (revive(o->devices[k], verbose)) { chosen = o->devices[k]; break; }
+                if (revive(o, o->devices[k], verbose)) { chosen = o->devices[k]; break; }
 
         if (chosen) {
             snprintf(o->device, sizeof(o->device), "%s", chosen);
