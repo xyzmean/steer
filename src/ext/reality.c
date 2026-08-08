@@ -567,7 +567,13 @@ int reality_build_hello(const struct reality_cfg *cfg, struct reality_state *st,
          * (`copy(hello.Raw[39:], hello.SessionId)` при ещё пустом SessionId), и сервер
          * повторяет расчёт так же. Копируем Hello, чтобы обнулить в копии: сам Hello
          * должен уехать серверу с подписью, а не с нулями. */
-        static unsigned char aad[4096];
+        /* __thread, не общий static: рукопожатие асинхронное (CONNECTORS потоков в
+         * tunnel.c), и этот буфер пишется прямо перед AEAD. Общий static под
+         * параллельными соединителями один перетирал бы AAD другому посреди
+         * mbedtls_gcm_crypt_and_tag — тег не сходился, и сервер Reality молча
+         * проксировал на маскировочный сайт. Все sibling-буферы в этом коде тоже
+         * __thread; этот был единственным исключением. */
+        static __thread unsigned char aad[4096];
         size_t aad_n = b.len - 5;
         if (aad_n > sizeof(aad)) return REALITY_ETOOBIG;
         memcpy(aad, raw, aad_n);
