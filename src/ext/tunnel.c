@@ -1199,8 +1199,20 @@ static void handle_packet(const struct tun_dev *tun, const struct vless_node *no
     if (k.tcp_flags & TCP_ACK) {
         /* Сравнение с учётом переполнения счётчика: разность как знаковая. */
         if ((int32_t)(k.ack - c->client_ack) > 0) {
-            rtx_drop(&c->rtx, k.ack - c->client_ack);   /* ДО сдвига: отсчёт от старого */
-            c->client_ack = k.ack;
+            /* Продвигаем client_ack ТОЛЬКО на подтверждённое и не дальше our_seq.
+             *
+             * Инвариант кольца: начало == client_ack, длина == our_seq - client_ack. Раньше
+             * client_ack приравнивался к k.ack безусловно. rtx_drop при этом ограничивал
+             * сброс до rtx.len и не портил кольцо, но само значение уезжало вперёд: злонамеренный
+             * (или сошедший с ума) клиент, подтвердивший байты ЗА пределами отправленных нами,
+             * уводил client_ack за our_seq. Тогда inflight = our_seq - client_ack оборачивался в
+             * огромное uint32, client_can_take_record навсегда возвращал ложь, и соединение
+             * зависало. Решаем сразу двумя сторонами: двигаем ровно на реально сброшенное из
+             * кольца (возврат rtx_drop), плюс не позволяем перепрыгнуть our_seq. */
+            uint32_t advance = k.ack - c->client_ack;
+            if ((int32_t)(k.ack - c->our_seq) > 0) advance = c->our_seq - c->client_ack;
+            advance = rtx_drop(&c->rtx, advance);   /* ДО сдвига: отсчёт от старого */
+            c->client_ack += advance;
             c->dup_acks = 0;
             c->fast_done = 0;
             /* Есть продвижение — таймаут снова короткий, и он отсчитывается от нового
