@@ -333,6 +333,41 @@ int main(void) {
             free(huge);
         }
     }
+    {
+        /* I-006: Trailing comma в domains_files (путь str_list). Раньше str_list на
+         * `[...,]` после последнего элемента делал continue, js_str видел ']' (не '"'),
+         * возвращал -1 → return n ДО js_lit(']'), закрывающая скобка оставалась
+         * несъеденной, и вызывающий цикл parse_channels while(*j.p != '}') крутился на
+         * ']' вечно (100% CPU, зависание демона steer apply). Должен быть die()/exit(2). */
+        const char *s = SPEC(
+            "\"outputs\":{\"direct\":{\"kind\":\"direct\"}},"
+            "\"channels\":[{\"name\":\"t\",\"out\":\"direct\","
+            "\"match\":{\"domains_files\":[\"/tmp/a.lst\",]}}]}");
+        check("trailing comma в domains_files: отказ (I-006)", 2, load_from_str(s));
+    }
+    {
+        /* I-006: тот же дефект в str_array — путь `from`. str_array, как и str_list,
+         * выходил через break до js_lit(']'), и оставшаяся ']' могла увести вызывающий
+         * цикл в бесконечное вращение (js_str для ключа возвращает -1, возврат не
+         * проверяется, j->p не двигается). */
+        const char *s = SPEC(
+            "\"outputs\":{\"wg\":{\"kind\":\"interface\",\"device\":\"wg0\"}},"
+            "\"channels\":[{\"name\":\"t\",\"out\":\"wg\","
+            "\"from\":[\"10.0.0.1\",],"
+            "\"match\":{\"domains_file\":\"/tmp/a.lst\"}}]}");
+        check("trailing comma в from: отказ (I-006)", 2, load_from_str(s));
+    }
+    {
+        /* I-006: тот же дефект в inline-парсере devices внутри parse_outputs. Цикл
+         * `else for(;;)` после `,` делает continue, js_str видит ']', break — и не
+         * доходит до js_lit(']'). Оставшаяся ']' ломает parse_outputs аналогично. */
+        const char *s = SPEC(
+            "\"outputs\":{\"wg\":{\"kind\":\"interface\","
+            "\"devices\":[\"wg0\",]}},"
+            "\"channels\":[{\"name\":\"t\",\"out\":\"wg\","
+            "\"match\":{\"domains_file\":\"/tmp/a.lst\"}}]}");
+        check("trailing comma в devices: отказ (I-006)", 2, load_from_str(s));
+    }
 
     printf("\n%s\n", fails ? "ЕСТЬ ПРОВАЛЫ" : "все проверки прошли");
     return fails ? 1 : 0;

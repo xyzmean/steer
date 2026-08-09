@@ -110,7 +110,16 @@ static size_t str_list(struct js *j, char dst[][256], size_t max) {
         if (n >= max) die("too many entries in list", NULL);
         snprintf(dst[n++], 256, "%s", t);
         js_ws(j);
-        if (*j->p == ',') { j->p++; continue; }
+        if (*j->p == ',') {
+            /* Trailing comma (`[...,]`) раньше уходил в continue, js_str на ']' возвращал
+             * -1 → return n до js_lit(']'), и несъеденная ']' вешала вызывающий цикл, не
+             * проверяющий возврат js_str (цикл match в parse_channels). Отказываем громко,
+             * как и на любой malformed форме. */
+            j->p++;
+            js_ws(j);
+            if (*j->p == ']') die("list: trailing comma (expected a string)", NULL);
+            continue;
+        }
         break;
     }
     js_lit(j, ']');
@@ -128,7 +137,14 @@ static int str_array(struct js *j, char dst[][64], size_t max, size_t *n) {
         if (*n >= max) die("too many entries in array", NULL);
         snprintf(dst[(*n)++], 64, "%s", t);
         js_ws(j);
-        if (*j->p == ',') { j->p++; continue; }
+        if (*j->p == ',') {
+            /* См. str_list: trailing comma → громкий отказ, а не продвижение к ']' и риск
+             * зависания вызывающего цикла на несъеденной скобке. */
+            j->p++;
+            js_ws(j);
+            if (*j->p == ']') die("array: trailing comma (expected a string)", NULL);
+            continue;
+        }
         break;
     }
     return js_lit(j, ']');
@@ -164,7 +180,14 @@ static void parse_outputs(struct js *j) {
                         if (o.devices_n >= MAX_DEVICES) die("outputs.%s: too many devices", o.name);
                         snprintf(o.devices[o.devices_n++], 32, "%s", t);
                         js_ws(j);
-                        if (*j->p == ',') { j->p++; continue; }
+                        if (*j->p == ',') {
+                            /* См. str_list: trailing comma → отказ, не продвижение к ']' и
+                             * риск зависания parse_outputs на несъеденной скобке. */
+                            j->p++;
+                            js_ws(j);
+                            if (*j->p == ']') die("outputs.%s: trailing comma in devices", o.name);
+                            continue;
+                        }
                         js_lit(j, ']');
                         break;
                     }
