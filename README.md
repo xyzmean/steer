@@ -94,7 +94,8 @@ Defines the destination routing interfaces.
 #### `channels`
 Defines routing policies. Evaluated in order (top to bottom). The first match wins.
 - **`name`**: Channel identifier.
-- **`from`**: (Optional) Source IP addresses or MAC addresses (e.g., `["192.168.1.50", "00:11:22:33:44:55"]`).
+- **`from`**: (Optional) Source IP or MAC addresses. All entries must be the **same type** — a `from` array may contain IPs **or** MACs, but mixing the two is rejected (e.g., `["192.168.1.50", "192.168.1.51"]` or `["00:11:22:33:44:55"]`). To route both a host and a MAC, define two channels.
+- **`enabled`**: (Optional, default `true`) Set to `false` to keep a channel in the spec without installing any rules — it generates no nft set and no chain entry, and is skipped by sanity checks. Handy for temporarily disabling a broken rule without deleting it.
 - **`out`**: The name of the output (defined in `outputs`) where matched traffic should go.
 - **`match`**: Conditions for the traffic:
   - **`domains_files`**: Array of file paths containing domains to match. Uses the built-in `dnsd` resolver.
@@ -110,6 +111,15 @@ Defines routing policies. Evaluated in order (top to bottom). The first match wi
 - `steer explain <ip|domain>` — Explains exactly which channel and output a given address or domain will use.
 - `steer fit --budget N <file>` — Aggregates and trims an IP list to fit within `N` memory elements.
 - `steer failover` — Checks output health and updates active interfaces based on priority.
+
+### Log levels (journal contract)
+
+steer writes diagnostics to the system journal (stderr). Each line carries a stable prefix that names its severity — this prefix is the parseable contract, since the prose wording may change between releases:
+
+- `steer[warn]` — a real concern: something is broken or routing traffic the wrong way.
+- `steer[info]` — informational status, not an alarm.
+
+A control plane (e.g., splify2) should classify a line by this prefix rather than by its text. The prefix appears before a subsystem label (for example, `steer[warn] tunnel: ...`).
 
 ## Building from Source
 

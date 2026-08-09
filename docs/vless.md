@@ -39,3 +39,18 @@ Since `steer` processes raw IP packets but the VLESS server expects TCP streams,
 - **No Reordering Buffer**: Out-of-order packets from the client are dropped and left for the client's OS to retransmit, saving router memory.
 - **Multi-Threading**: Uses `IFF_MULTI_QUEUE` to allocate queues per CPU core (up to 4). Symmetric hashing ensures both halves of a TCP connection map to the same thread, eliminating the need for locks in the data path.
 - **Memory Scaling**: Memory is allocated dynamically per connection (max 64 concurrent connections by default) to prevent OOM kills on memory-constrained routers.
+
+## Exit Codes
+
+`steer vless <output>` always exits with a **non-zero code (`1`)** when the tunnel process returns at all, and emits a single reason line to the journal (`steer[warn]` prefix). The exit code is `1` on every terminating path — a clean `0` would be a lie here, because the process only ends when the tunnel is no longer carrying traffic. procd / the control plane should treat non-zero as "tunnel is down" and read the reason line for the cause.
+
+Previous versions returned `-40` / `-41` from `tun_open`, which `main` truncated to bytes `216` / `215` — numbers meaningless to both humans and the control plane. These are now unified to `1` with a named reason.
+
+| Exit | Reason (journal line) | Cause |
+|------|-----------------------|-------|
+| `1`  | `steer[warn] tunnel: нет /dev/net/tun (...) — не установлен kmod-tun` | `/dev/net/tun` missing — the `kmod-tun` package is not installed. |
+| `1`  | `steer[warn] tunnel: устройство <dev> не создалось: ... (отказал TUNSETIFF)` | The TUN device could not be created (`TUNSETIFF` failed, or `/dev/net/tun` would not open). |
+| `1`  | `steer[warn] tunnel: <dev> не поднялся ни одной очередью из <N>` | No worker queue was ever established before the process ended. |
+| `1`  | `steer[warn] tunnel: <dev> больше не несёт трафик — все очереди (<N>) завершились` | The tunnel ran, but all queues have now drained/ended, so the tunnel is no longer serving traffic. |
+
+A control plane restarting the tunnel on non-zero exit should distinguish the `kmod-tun` / device-creation failures (infrastructure problem, restart won't help) from the "queues ended" case (transient, restart may recover).

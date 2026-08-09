@@ -37,9 +37,10 @@ Defines the destination routing interfaces.
 ### Channels
 Defines routing rules. The array order dictates the priority (first match wins).
 - **`name`**: Identifier for the channel.
-- **`from`**: Array of source IP or MAC addresses.
+- **`enabled`**: (Optional, default `true`). When `false`, the channel stays in the spec but installs no nft set and no chain rule, and is skipped by the sanity checks. Use this to keep a rule on file while disabling it.
+- **`from`**: Array of source IP **or** MAC addresses. All entries in one array must be the same type — mixing IP and MAC addresses in a single `from` array is rejected with an error, because nft cannot express "IP or MAC" inside one rule. To match both a host and a MAC, define separate channels.
 - **`match`**: Object containing conditions:
-  - **`domains_files`** / **`domains_file`**: Paths to domain lists.
+  - **`domains_files`** / **`domains_file`**: Paths to domain lists. A channel may combine `domains_files` and `prefixes_files` (address + domain matching in one channel is supported).
   - **`prefixes_files`** / **`prefixes_file`**: Paths to IP lists.
   - **`mode`**: DNS mode for domain channels. `fakeip` (issues addresses from `198.18.0.0/15`, default) or `realip`.
   - **`any`** & **`allow_all`**: Must both be `true` to match all traffic from the specified sources.
@@ -56,15 +57,67 @@ Requested via `steer status`. Returns the currently applied configuration and li
     "vpn": { "kind": "interface", "device": "awg0", "up": true, "mark": "0x00100000", "table": 300, "in_firewall": true, "nat": true }
   },
   "channels": [
-    { "name": "vpn_dom", "out": "vpn", "kind": "domains", "live": true, "packets": 5009, "bytes": 1799237, "channels": ["youtube", "google"] }
+    { "name": "vpn_dom", "out": "vpn", "kind": "domains", "live": true, "packets": 5009, "bytes": 1799237, "down_packets": 4120, "down_bytes": 5981023, "lists": 2, "channels": ["youtube", "google"] }
   ]
 }
 ```
 - **`channels`**: In the output, these represent merged groups (channels sharing the same output and matching criteria), not the original 1-to-1 spec channels.
 - **`live`**: `false` means the rule is missing from the kernel.
+- **`packets` / `bytes`**: Outbound (upload) counters — packets leaving the router toward the output. `bytes` deliberately keeps this "outbound" meaning for backward compatibility with installed control planes.
+- **`down_packets` / `down_bytes`**: Inbound (download) counters, counted on the `postrouting_down` chain. Emitted only when the channel carries download traffic. Do not repurpose `bytes` for download — existing UIs read it as upload.
+- **`lists`**: Number of source list files backing this merged group.
 - **`in_firewall` / `nat`**: Diagnostic flags indicating if the tunnel is correctly configured in the OpenWrt firewall.
 
-## 3. Architecture Invariants
+## 3. Input Limits and Validation
+
+The specification is strict JSON. Inputs that violate these rules cause `steer` to refuse the spec (exit non-zero) rather than proceed with a silently broken state.
+
+- **Strict JSON, no trailing comma**: arrays like `[...,]` are rejected. Use standard JSON. (Previously a trailing comma could hang the parser; it now fails loudly.)
+- **File size**: the spec file must be **≤ 256 KiB**. A larger file is rejected (`spec too large (max 256 KiB)`) rather than silently truncated.
+- **Array sizes** (overflow is rejected, not silently dropped):
+  - `domains_files` / `prefixes_files`: ≤ 16 entries each.
+  - `from` / `from_default`: ≤ 16 entries.
+  - `outputs.*.devices`: ≤ 8 entries.
+  - `outputs`: ≤ 16. `channels`: ≤ 64.
+- **String length**: each `from`/`devices` entry is capped at its documented width (256 / 64 / 32 bytes respectively).
+
+These caps exist to fit the fixed memory budget of low-end routers. A control plane assembling large specs should keep within them.
+
+## 4. Diagnostics (Output)
+
+Requested via `steer diag [--spec FILE]`. Runs a set of health checks and emits JSON:
+
+```json
+{
+  "schema": 1,
+  "checks": [
+    { "id": "table", "verdict": "ok", "what": "nft-таблица steer на месте", "why": "" }
+  ],
+  "warn": 0,
+  "fail": 0
+}
+```
+
+- Each check object has `id`, `verdict`, `what`, `why`.
+- **Verdicts** are one of four values:
+  - `ok` — checked and good.
+  - `note` — advice, not a finding: it works and will keep working, but is worth knowing. **`note` is deliberately excluded from the `warn`/`fail` counters** and must not be treated as "not ok". (Without this, always-true advice — e.g. a browser with DoH bypassing the router's DNS — would permanently paint a healthy router red.)
+  - `warn` — it works, but there is something that explains a likely future complaint.
+  - `fail` — broken; traffic is going the wrong way.
+- **Check `id`s** currently emitted: `table`, `down_chain`, `set`, `dns_redirect`, `dnsd`, `doh`, `ipv6`, `output`. The set may grow between releases; consumers must tolerate unknown ids.
+- **Exit code**: `steer diag` exits `1` only when at least one check is `fail`; `note` and `warn` never cause a non-zero exit.
+- **Top-level counters**: `warn` = number of `warn` verdicts; `fail` = number of `fail` verdicts. There is no `note` counter.
+
+## 5. Log Prefixes (Journal Contract)
+
+steer logs to the journal (stderr) with a fixed severity prefix on every line. This prefix — not the prose wording — is the contract a control plane should classify by, because the wording may change between releases:
+
+- `steer[warn]` — a real concern (something broken or mis-routed).
+- `steer[info]` — informational status, not an alarm.
+
+A subsystem label follows the prefix (e.g. `steer[warn] tunnel: ...`). Parse the prefix to decide severity.
+
+## 6. Architecture Invariants
 - **First Match Wins**: Rules are evaluated top-to-bottom.
 - **File-Based Matching**: Matches rely strictly on external file paths to conserve memory.
 - **Stateless Configuration**: Dynamic changes (like failover) update the routing tables directly without modifying the core nftables ruleset.
