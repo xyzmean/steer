@@ -887,14 +887,21 @@ static int nftlk_elem_msg(uint16_t nft_msg_type, const char *table,
 
 /* Adds an IPv4 element to a timeout-flagged set (nft 'timeout'). ttl is in
  * seconds; clamped to [1, 86400] so a hostile/huge record TTL can never pin
- * an entry for longer than a day. */
+ * an entry for longer than a day. ttl == 0 is a PERMANENT element (no timeout
+ * attribute at all): used for fake-IP, which must outlive the client's cached
+ * answer — see fakeip_route_set. */
 static int nft_add_element(const char *set_name, uint32_t key_host, uint32_t ttl) {
-    if (ttl < 1) ttl = 1;
-    if (ttl > 86400) ttl = 86400;
+    uint64_t timeout_ms;
+    if (ttl == 0) {
+        timeout_ms = 0;                          /* permanent: no NFTA_SET_ELEM_TIMEOUT */
+    } else {
+        if (ttl < 1) ttl = 1;
+        if (ttl > 86400) ttl = 86400;
+        timeout_ms = (uint64_t)ttl * 1000;
+    }
     uint32_t key_net = htonl(key_host);
     int rc = nftlk_elem_msg(NFT_MSG_NEWSETELEM, g_nft_table, set_name,
-                            &key_net, 1 /* interval set */, NULL,
-                            (uint64_t)ttl * 1000);
+                            &key_net, 1 /* interval set */, NULL, timeout_ms);
     if (rc == -EINVAL)
         fprintf(stderr, "splify-dnsd: %s rejected an interval element (-EINVAL) — "
                         "is it declared without `flags interval`?\n", set_name);
@@ -963,6 +970,16 @@ struct fakeip_entry {
     char *domain; /* lowercased, matches the ruleset's own lowercasing */
     uint32_t addr;      /* host byte order */
     uint32_t real_host; /* last-seen real backend, host order; 0 if unknown */
+    /* Which domain channel's nft set this fake IP currently sits in (-1 = none).
+     * NOT persisted to the state file: it is re-derived on (re)query and on the
+     * rehydrate pass, so the 2-field/3-field formats on disk stay unchanged. The
+     * whole reason this field exists is the fake-IP route fix: a fake IP used to
+     * expire from its channel set (timeout = DNS TTL) while the conntrack session
+     * it belonged to lived for minutes, and the packet then fell through to the
+     * main route — i.e. the WAN — silently bypassing the tunnel. Now the fake IP
+     * is a PERMANENT element of its channel set, exactly like it is permanent in
+     * the DNAT map, so the path stays stable for the whole lifetime of the flow. */
+    int set_idx;
 };
 
 struct fakeip_table {
@@ -1014,6 +1031,7 @@ static int fakeip_table_add(struct fakeip_table *t, const char *domain, uint32_t
     if (!t->entries[t->n].domain) return -1;
     t->entries[t->n].addr = addr;
     t->entries[t->n].real_host = 0;
+    t->entries[t->n].set_idx = -1;        /* unknown until the resolver routes it */
     t->n++;
     if (t == &g_fakeip &&
         sindex_put(&g_fakeip_idx, t, fakeip_key, t->entries[t->n - 1].domain,
@@ -1166,6 +1184,29 @@ static void fakeip_entry_set_real(const char *domain, uint32_t real_host) {
     g_fakeip_dirty = 1;
 }
 
+/* Ensures DOMAIN's fake IP is a PERMANENT member of channel NEW_SET_IDX's nft set
+ * (g_dch[new_set_idx].set), moving it from its previous channel set if the domain
+ * has been re-classified. Defined after g_dch (below): it needs the channel table.
+ *
+ * Why this is NOT a timeout element (and why it has to live here, beside the real
+ * backend bookkeeping): a fake IP is a STABLE, exclusive allocation — it never
+ * moves in the pool, and the DNAT map holds it forever. The channel set is the
+ * routing decision (`ip daddr @set -> meta mark set`), and it used to inherit the
+ * real answer's TTL. That TTL (often 30-60s for a CDN) is far shorter than the
+ * long-lived TCP/QUIC sessions clients open against the resolved domain. When the
+ * element expired, the mark rule stopped matching, the packet fell through to the
+ * default route — the WAN — and the session to the VPN-hosted site broke for a
+ * second. Reproduced on the router: conntrack showed claude.ai flows with
+ * mark=0 leaving via the WAN address while the tunnel itself stayed perfectly
+ * healthy. A permanent element makes the route match the lifetime of the
+ * allocation, which is what a routing decision should do.
+ *
+ * Channel reassignment: if the ruleset is edited so a domain now matches a
+ * different channel, the fake IP must move to that channel's set — leaving it in
+ * the old one would keep steering it the old way. Best-effort on the delete: a
+ * missing element is exactly the post-restart state and is harmless. */
+static void fakeip_route_set(const char *domain, int new_set_idx);
+
 /* ---------------------------------------------------------------------- */
 /* proxy state                                                           */
 /* ---------------------------------------------------------------------- */
@@ -1194,6 +1235,38 @@ struct dchan {
 static struct dchan g_dch[MAX_CHANNELS];
 static size_t g_dch_n;
 static const char *g_fakeip_map = "fakeip";
+
+static void fakeip_route_set(const char *domain, int new_set_idx) {
+    long at = fakeip_find(domain);
+    if (at < 0) return;
+    if (new_set_idx < 0 || (size_t)new_set_idx >= g_dch_n) return;
+
+    int old = g_fakeip.entries[at].set_idx;
+    if (old == new_set_idx) {
+        /* Same channel: the permanent element is already there (or survived from a
+         * previous run). Re-assert idempotently so a kernel that lost it (an fw4
+         * reload flushed the sets) gets it back without waiting for a re-resolve. */
+        nft_add_element(g_dch[new_set_idx].set, g_fakeip.entries[at].addr, 0);
+        return;
+    }
+
+    /* Remove from the OLD channel's set so the old mark rule no longer claims it.
+     * ENOENT is fine: nothing to delete (restart, or it never landed). */
+    if (old >= 0 && (size_t)old < g_dch_n) {
+        uint32_t k_net = htonl(g_fakeip.entries[at].addr);
+        int drc = nftlk_elem_msg(NFT_MSG_DELSETELEM, g_nft_table, g_dch[old].set,
+                                 &k_net, 1, NULL, 0);
+        if (drc != 0 && drc != -ENOENT && getenv("SPLIFY_DNSD_DEBUG"))
+            fprintf(stderr, "nftlk: channel-move delete from %s rc=%d\n",
+                    g_dch[old].set, drc);
+    }
+
+    /* Insert into the NEW channel's set as a permanent element. EEXIST is already
+     * the desired state. */
+    nft_add_element(g_dch[new_set_idx].set, g_fakeip.entries[at].addr, 0);
+    g_fakeip.entries[at].set_idx = new_set_idx;
+}
+
 static volatile int g_reload_pending = 0;
 static volatile int g_running = 1;
 
@@ -1381,13 +1454,15 @@ static void handle_upstream_response(struct pending *p) {
                  * the DNAT map from state without re-resolving every domain. */
                 fakeip_entry_set_real(qname, real_host);
 
-                /* Routing set is best-effort and not correctness-critical: a
-                 * missing entry just means default policy applies (fine). Fire
-                 * after the reply — the netlink send itself is sub-ms. */
-                /* A domain in the geo list goes ONLY into the geo set: it names a
-                 * specific interface, and adding the same fake IP to the VPN set
-                 * as well would leave which mark wins to chain order. */
-                nft_add_element(g_dch[hit].set, fake_addr, ips[0].ttl);
+                /* Route the fake IP into its channel's set as a PERMANENT element.
+                 * This replaces the old `nft_add_element(..., ips[0].ttl)`: a TTL
+                 * equal to the real answer's expired mid-session and the packet
+                 * then bypassed the tunnel (see fakeip_route_set). Best-effort:
+                 * a missing entry means default policy, which is fine. A domain
+                 * in the geo list goes ONLY into the geo set: it names a specific
+                 * interface, and adding the same fake IP to the VPN set as well
+                 * would leave which mark wins to chain order. */
+                fakeip_route_set(qname, hit);
 
                 uint8_t out[512];
                 size_t len = build_rewritten_response(buf, qend, out, sizeof(out), 1, fake_addr);
@@ -1482,14 +1557,21 @@ static int run_proxy(int listen_port, int upstream_port) {
     reload_rules();
     if (g_fakeip_state_path) fakeip_state_load(g_fakeip_state_path);
 
-    /* Rehydrate the DNAT map after a (re)start. fw4 reload / a daemon restart
-     * wipes the live splify_fakeip_map contents (the schema is reinstalled by
-     * splify-apply, but the elements are gone). For every domain we already
-     * know a real backend for (from the extended 3-field state), re-insert
-     * fake->real now, so clients don't have to re-resolve to un-wedge an
-     * existing fake IP. Best-effort: a failed insert just leaves that domain
-     * to be re-resolved on demand. */
-    size_t restored = 0;
+    /* Rehydrate the DNAT map AND the channel sets after a (re)start. fw4 reload /
+     * a daemon restart wipes the live splify_fakeip_map contents AND the fake-IP
+     * elements in each channel set (the schema is reinstalled by splify-apply,
+     * but the elements are gone). For every domain we already know a real backend
+     * for (from the extended 3-field state), re-insert fake->real now, so clients
+     * don't have to re-resolve to un-wedge an existing fake IP.
+     *
+     * The channel set is re-installed for EVERY domain we have (real backend
+     * known or not): the route must match for the whole lifetime of the
+     * allocation, and waiting for a re-resolve after a restart would reopen the
+     * same window the permanent element exists to close. The channel is
+     * re-derived here by matching the stored domain against the freshly loaded
+     * rules — reload_rules() above already built them. Best-effort throughout: a
+     * failed insert just leaves that domain to be re-resolved on demand. */
+    size_t restored = 0, routed = 0;
     if (nk_open == 0) {
         for (size_t i = 0; i < g_fakeip.n; i++) {
             /* known_real = 0: after a restart the kernel map is empty as far as we
@@ -1499,12 +1581,21 @@ static int run_proxy(int listen_port, int upstream_port) {
                 nft_map_set_element(g_fakeip_map, g_fakeip.entries[i].addr,
                                      g_fakeip.entries[i].real_host, 0) == 0)
                 restored++;
+            /* Re-derive the channel for the stored domain and re-assert the
+             * permanent route element. fakeip_route_set sets set_idx, so a later
+             * re-resolve that lands in the same channel is a no-op. */
+            int hit = -1;
+            for (size_t c = 0; c < g_dch_n && hit < 0; c++)
+                if (!g_dch[c].realip &&
+                    ruleset_match(&g_dch[c].rules, g_fakeip.entries[i].domain))
+                    hit = (int)c;
+            if (hit >= 0) { fakeip_route_set(g_fakeip.entries[i].domain, hit); routed++; }
         }
     }
     fprintf(stderr, "steer dnsd: listening on :%d -> upstream 127.0.0.1:%d "
-            "(netlink:%s fakeip:%zu loaded, %zu map rehydrated)\n",
+            "(netlink:%s fakeip:%zu loaded, %zu map rehydrated, %zu routes restored)\n",
             listen_port, upstream_port, nk_open == 0 ? "ok" : "FAILED",
-            g_fakeip.n, restored);
+            g_fakeip.n, restored, routed);
 
     struct epoll_event events[32];
     while (g_running) {
