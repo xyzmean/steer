@@ -19,5 +19,6 @@ build/tun-gso-*
 build/gcm-size
 build/bench
 build/dnsmatch
+build/specmatch
 build/crypto-vec
 build/bx-*
