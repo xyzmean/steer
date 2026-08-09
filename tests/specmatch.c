@@ -27,6 +27,8 @@
 #include <setjmp.h>
 #include <stdio.h>
 #include <string.h>
+#include <stdlib.h>
+#include <unistd.h>
 
 static jmp_buf g_jmp;
 static int g_exit_code;          /* код, с которым die/exit пытались завершить тест */
@@ -288,6 +290,48 @@ int main(void) {
         p += sprintf(p, "]}}]}");
         check("ровно 16 domains_files: принимается", 0, load_from_str(big));
         check("ровно 16 domains_files: domains_n=16", 16, (int)g_ch[0].domains_n);
+    }
+    {
+        /* I-001: Больше MAX_FILES domains_files вызывает отказ, а не тихое обрезание */
+        char big[16384];
+        char *p = big;
+        p += sprintf(p, "%s\"outputs\":{\"direct\":{\"kind\":\"direct\"}},"
+                        "\"channels\":[{\"name\":\"many\",\"out\":\"direct\",\"match\":{"
+                        "\"domains_files\":[", SPEC_OPEN);
+        for (int i = 0; i < 17; i++) {
+            p += sprintf(p, "\"/tmp/d%d.lst\"", i);
+            if (i < 16) p += sprintf(p, ",");
+        }
+        p += sprintf(p, "]}}]}");
+        check("больше 16 domains_files: отказ (I-001)", 2, load_from_str(big));
+    }
+    {
+        /* I-001: Больше MAX_FROM from вызывает отказ */
+        char big[16384];
+        char *p = big;
+        p += sprintf(p, "%s\"outputs\":{\"direct\":{\"kind\":\"direct\"}},"
+                        "\"channels\":[{\"name\":\"many\",\"out\":\"direct\","
+                        "\"from\":[", SPEC_OPEN);
+        for (int i = 0; i < 17; i++) {
+            p += sprintf(p, "\"10.0.0.%d\"", i);
+            if (i < 16) p += sprintf(p, ",");
+        }
+        p += sprintf(p, "],\"match\":{\"any\":true,\"allow_all\":true}}]}");
+        check("больше 16 from: отказ (I-001)", 2, load_from_str(big));
+    }
+    {
+        /* I-002: Спека больше 256 КБ вызывает отказ */
+        char *huge = malloc(262200);
+        if (huge) {
+            memset(huge, ' ', 262199);
+            huge[262199] = '\0';
+            char *p = huge;
+            p += sprintf(p, "%s\"outputs\":{\"direct\":{\"kind\":\"direct\"}},\"channels\":[]", SPEC_OPEN);
+            *p = ' ';
+            huge[262198] = '}';
+            check("спека больше 256 КБ: отказ (I-002)", 2, load_from_str(huge));
+            free(huge);
+        }
     }
 
     printf("\n%s\n", fails ? "ЕСТЬ ПРОВАЛЫ" : "все проверки прошли");

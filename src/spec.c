@@ -107,7 +107,8 @@ static size_t str_list(struct js *j, char dst[][256], size_t max) {
     for (;;) {
         char t[256];
         if (js_str(j, t, sizeof(t)) != 0) return n;
-        if (n < max) snprintf(dst[n++], 256, "%s", t);
+        if (n >= max) die("too many entries in list", NULL);
+        snprintf(dst[n++], 256, "%s", t);
         js_ws(j);
         if (*j->p == ',') { j->p++; continue; }
         break;
@@ -124,7 +125,8 @@ static int str_array(struct js *j, char dst[][64], size_t max, size_t *n) {
     for (;;) {
         char t[64];
         if (js_str(j, t, sizeof(t)) != 0) return -1;
-        if (*n < max) snprintf(dst[(*n)++], 64, "%s", t);
+        if (*n >= max) die("too many entries in array", NULL);
+        snprintf(dst[(*n)++], 64, "%s", t);
         js_ws(j);
         if (*j->p == ',') { j->p++; continue; }
         break;
@@ -159,8 +161,8 @@ static void parse_outputs(struct js *j) {
                     else for (;;) {
                         char t[32];
                         if (js_str(j, t, sizeof(t)) != 0) break;
-                        if (o.devices_n < MAX_DEVICES)
-                            snprintf(o.devices[o.devices_n++], 32, "%s", t);
+                        if (o.devices_n >= MAX_DEVICES) die("outputs.%s: too many devices", o.name);
+                        snprintf(o.devices[o.devices_n++], 32, "%s", t);
                         js_ws(j);
                         if (*j->p == ',') { j->p++; continue; }
                         js_lit(j, ']');
@@ -300,6 +302,10 @@ void load_spec(const char *path) {
     if (!f) die("%s: cannot open", path);
     static char buf[262144];
     size_t n = fread(buf, 1, sizeof(buf) - 1, f);
+    if (n == sizeof(buf) - 1) {
+        int c = fgetc(f);
+        if (c != EOF) die("spec too large (max 256 KiB)", NULL);
+    }
     buf[n] = '\0';
     if (f != stdin) fclose(f);
 
