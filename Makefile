@@ -11,11 +11,12 @@ $(BUILD)/steer: src/steer.c src/spec.c src/dnsd.c src/failover.c src/aggregate.c
 	@mkdir -p $(BUILD)
 	$(CC) $(CFLAGS) -o $@ src/steer.c src/spec.c src/dnsd.c src/failover.c src/aggregate.c
 
-test: all $(BUILD)/dnsmatch $(BUILD)/specmatch
+test: all $(BUILD)/dnsmatch $(BUILD)/specmatch $(BUILD)/failovermatch
 	@sh tests/run.sh
 	@sh tests/gen.sh
 	@$(BUILD)/dnsmatch
 	@$(BUILD)/specmatch
+	@$(BUILD)/failovermatch
 
 # Подбор доменного правила проверяется отдельной программой, а не через движок: сам подбор
 # статический внутри dnsd.c, и дотянуться до него иначе значило бы добавить в движок
@@ -31,6 +32,10 @@ $(BUILD)/dnsmatch: tests/dnsmatch.c src/dnsd.c src/spec.c src/spec.h
 $(BUILD)/specmatch: tests/specmatch.c src/spec.c src/spec.h
 	@mkdir -p $(BUILD)
 	$(CC) $(CFLAGS) -o $@ tests/specmatch.c
+
+$(BUILD)/failovermatch: tests/failovermatch.c src/failover.c
+	@mkdir -p $(BUILD)
+	$(CC) $(CFLAGS) -o $@ tests/failovermatch.c
 
 clean:
 	rm -rf $(BUILD)

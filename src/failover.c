@@ -29,6 +29,7 @@
 #include <poll.h>
 #include <net/if.h>
 #include <ifaddrs.h>
+#include <signal.h>
 #include "spec.h"
 
 /* Таблица и приоритет правила для проб. Далеко от 300+, которые раздаёт реестр:
@@ -189,7 +190,7 @@ static int zapret_running(void) {
     if (!d) return 0;
     struct dirent *dir;
     int found = 0;
-    char path[256];
+    char path[300];
     char buf[512];
     
     while ((dir = readdir(d)) != NULL && !found) {
@@ -363,7 +364,23 @@ static int revive(const struct output *o, const char *dev, int verbose) {
     return 0;
 }
 
+static void cleanup_probe_rule(void) {
+    char prio[16];
+    snprintf(prio, sizeof(prio), "%d", PROBE_PRIO);
+    const char *del[] = { "ip", "-4", "rule", "del", "priority", prio, NULL };
+    run_quiet(del);
+}
+
+static void sig_cleanup(int sig) {
+    cleanup_probe_rule();
+    _exit(128 + sig);
+}
+
 int cmd_failover(const char *spec, int verbose) {
+    atexit(cleanup_probe_rule);
+    signal(SIGINT, sig_cleanup);
+    signal(SIGTERM, sig_cleanup);
+
     load_spec(spec);
     registry_assign();
 

@@ -677,6 +677,8 @@ static void conn_table_init(void) {
     for (int i = MAX_CONNS - 1; i >= 0; i--) {
         g_conns[i].livepos = -1;
         g_conns[i].hnext = -1;
+        g_conns[i].fd = -1;
+        SESS(&g_conns[i])->v.fd = -1;
         g_freelist[g_free_n++] = (uint16_t)i;
     }
     for (int i = 0; i < CONN_BUCKETS; i++) g_bucket[i] = -1;
@@ -819,6 +821,8 @@ static void conn_drop(struct conn *c) {
      * прогнанных через кэш ради нулей, которые всё равно перепишет vless_connect (он
      * начинается с memset своей структуры). Здесь достаточно обнулить то, что читаем сами. */
     memset(c, 0, sizeof(*c));
+    c->fd = -1;
+    SESS(c)->v.fd = -1;
     c->livepos = -1;
     c->hnext = -1;
     memset(&SESS(c)->vis, 0, sizeof(SESS(c)->vis));

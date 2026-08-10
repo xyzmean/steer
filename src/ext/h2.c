@@ -333,7 +333,10 @@ int h2_read(struct h2 *h, unsigned char *out, size_t cap, size_t *got) {
         h->pend_n = 0;
     }
 
-    size_t r = 0;
+    /* I-009: window size can be negative if we sent too many bytes before receiving WINDOW_UPDATE.
+     * We MUST cast it to (int32_t) to check correctly. */
+    if ((int32_t)c->window <= 0) return 1;
+    size_t chunk = (size_t)c->window > end - p ? (size_t)(end - p) : (size_t)c->window;
     int rc = h->io.read(h->io.ctx, rec + avail, sizeof(rec) - avail, &r);
     if (rc) return rc;
     avail += r;
