@@ -20,5 +20,7 @@ build/gcm-size
 build/bench
 build/dnsmatch
 build/specmatch
+build/failovermatch
+build/h2match
 build/crypto-vec
 build/bx-*

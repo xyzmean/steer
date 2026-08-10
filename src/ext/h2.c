@@ -424,7 +424,13 @@ int h2_read(struct h2 *h, unsigned char *out, size_t cap, size_t *got) {
  * должен куда-то деть уже прочитанные данные. */
 int h2_write(struct h2 *h, const unsigned char *d, size_t n) {
     if (!h->started) return H2_EPROTO;
-    if (n > (size_t)h->send_win || n > (size_t)h->send_win_conn) return H2_EWINDOW;
+    /* Сравнение ЗНАКОВОЕ. send_win/send_win_conn — int32_t и законно уходят в минус:
+     * SETTINGS с INITIAL_WINDOW_SIZE меньше 65535 вычитает разницу из уже выданного
+     * окна (RFC 7540 §6.9.2). Приведение к size_t превращало -60000 в 1,8·10^19, и
+     * проверка окна не срабатывала никогда — кадр уходил за пределы окна, а сервер
+     * отвечал RST_STREAM с FLOW_CONTROL_ERROR. */
+    if (n > INT32_MAX) return H2_ETOOBIG;
+    if ((int32_t)n > h->send_win || (int32_t)n > h->send_win_conn) return H2_EWINDOW;
 
     while (n) {
         size_t chunk = n > DEFAULT_MAX_FRAME ? DEFAULT_MAX_FRAME : n;
