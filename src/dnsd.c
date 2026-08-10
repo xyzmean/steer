@@ -439,8 +439,10 @@ static int parse_name_adv(const uint8_t *pkt, size_t len, size_t pos, char *out,
     return 0;
 }
 
-#define DNS_TYPE_A    1
-#define DNS_TYPE_AAAA 28
+#define DNS_TYPE_A     1
+#define DNS_TYPE_AAAA  28
+#define DNS_TYPE_SVCB  64
+#define DNS_TYPE_HTTPS 65
 
 struct answer_ip {
     uint32_t addr; /* network byte order */
@@ -1402,13 +1404,15 @@ static void handle_upstream_response(struct pending *p) {
         return;
     }
 
-    /* Matched a rule. AAAA is suppressed outright (NODATA) rather than
-     * relayed: splify has no IPv6 routing at all (VPN_SET/DIRECT_SET are
-     * IPv4-only, same as the rest of the project), so letting a real AAAA
-     * answer through would hand a dual-stack client a real, completely
-     * unmanaged address that bypasses the split entirely — and Happy-
-     * Eyeballs-style clients commonly PREFER IPv6 when it's offered. */
-    if (qtype == DNS_TYPE_AAAA) {
+    /* Matched a rule. AAAA, HTTPS (65), and SVCB (64) are suppressed outright
+     * (NODATA) rather than relayed:
+     * - AAAA: splify has no IPv6 routing at all (VPN_SET/DIRECT_SET are IPv4-only),
+     *   so letting a real AAAA answer through would hand a dual-stack client a real
+     *   unmanaged address bypassing the tunnel.
+     * - HTTPS/SVCB: upstream HTTPS responses contain ipv4hint/ipv6hint (real IPs) and
+     *   h3 (QUIC ALPN). Letting real IPv4/IPv6 hints through causes modern browsers to
+     *   attempt direct connections to real IPs outside fake-IP DNAT/set, causing 1-3s delays. */
+    if (qtype == DNS_TYPE_AAAA || qtype == DNS_TYPE_HTTPS || qtype == DNS_TYPE_SVCB) {
         uint8_t out[512];
         size_t len = build_rewritten_response(buf, qend, out, sizeof(out), 0, 0);
         sendto(g_listen_fd, len ? out : buf, len ? len : (size_t)n, 0,

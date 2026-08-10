@@ -108,6 +108,16 @@ int main(void) {
               fakeip_entry_get_real("one.test") == 0x01020304u);
         check("fake-IP: у другого домена своего нет", 1, fakeip_entry_get_real("two.test") == 0);
     }
+    {
+        /* Проверка типов DNS и подавления HTTPS/SVCB */
+        check("DNS_TYPE_HTTPS == 65", 65, DNS_TYPE_HTTPS);
+        check("DNS_TYPE_SVCB == 64", 64, DNS_TYPE_SVCB);
+        uint8_t dummy[12] = {0};
+        uint8_t out[512];
+        size_t len = build_rewritten_response(dummy, 12, out, sizeof(out), 0, 0);
+        check("build_rewritten_response NODATA len == 12", 12, len);
+        check("build_rewritten_response NODATA ancount == 0", 0, out[7]);
+    }
 
     printf("\n%s\n", fails ? "ЕСТЬ ПРОВАЛЫ" : "все проверки прошли");
     return fails ? 1 : 0;
