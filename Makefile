@@ -11,7 +11,7 @@ $(BUILD)/steer: src/steer.c src/spec.c src/dnsd.c src/failover.c src/aggregate.c
 	@mkdir -p $(BUILD)
 	$(CC) $(CFLAGS) -o $@ src/steer.c src/spec.c src/dnsd.c src/failover.c src/aggregate.c
 
-test: all ext-syntax $(BUILD)/dnsmatch $(BUILD)/specmatch $(BUILD)/failovermatch $(BUILD)/h2match $(BUILD)/diagsim
+test: all ext-syntax $(BUILD)/dnsmatch $(BUILD)/specmatch $(BUILD)/failovermatch $(BUILD)/h2match $(BUILD)/submatch $(BUILD)/diagsim
 	@sh tests/run.sh
 	@sh tests/gen.sh
 	@sh tests/diagmatch.sh
@@ -19,6 +19,7 @@ test: all ext-syntax $(BUILD)/dnsmatch $(BUILD)/specmatch $(BUILD)/failovermatch
 	@$(BUILD)/specmatch
 	@$(BUILD)/failovermatch
 	@$(BUILD)/h2match
+	@$(BUILD)/submatch
 
 # Движок, собранный как расширенный, но без самой расширенной части: нужен стенду
 # diagmatch, потому что спеку с `kind: vless` базовая сборка отвергает парсером, а
@@ -67,11 +68,18 @@ $(BUILD)/h2match: tests/h2match.c src/ext/h2.c src/ext/h2.h src/ext/tls13.h
 	@mkdir -p $(BUILD)
 	$(CC) $(CFLAGS) -Itests/stub -o $@ tests/h2match.c
 
+# Разбор подписки — единственное место, куда в движок попадает чужой текст из интернета.
+# Ни сети, ни mbedtls он не требует, поэтому стенд включает исходник напрямую и входит
+# в обычный make test, в отличие от остального src/ext (см. ext-syntax).
+$(BUILD)/submatch: tests/submatch.c src/ext/sub.c src/ext/vless.h
+	@mkdir -p $(BUILD)
+	$(CC) $(CFLAGS) -o $@ tests/submatch.c
+
 # НЕ rm -rf $(BUILD): в build/ живут отслеживаемые Dockerfile, build-ext.sh и
 # лабораторные исходники, без которых ./build.sh из свежего клона не работает —
 # .gitignore об этом прямо предупреждает, а clean их сносил (I-023). Удаляются
 # только артефакты: то, что здесь же и собирается, плюс упаковка из build.sh.
 clean:
 	rm -rf $(BUILD)/steer $(BUILD)/steer-* $(BUILD)/dnsmatch $(BUILD)/specmatch \
-	       $(BUILD)/failovermatch $(BUILD)/h2match $(BUILD)/diagsim $(BUILD)/libmbed-*.a \
+	       $(BUILD)/failovermatch $(BUILD)/h2match $(BUILD)/submatch $(BUILD)/diagsim $(BUILD)/libmbed-*.a \
 	       $(BUILD)/*.err $(BUILD)/pkg $(BUILD)/scripts out
