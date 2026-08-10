@@ -109,14 +109,51 @@ int main(void) {
         check("fake-IP: у другого домена своего нет", 1, fakeip_entry_get_real("two.test") == 0);
     }
     {
-        /* Проверка типов DNS и подавления HTTPS/SVCB */
-        check("DNS_TYPE_HTTPS == 65", 65, DNS_TYPE_HTTPS);
-        check("DNS_TYPE_SVCB == 64", 64, DNS_TYPE_SVCB);
-        uint8_t dummy[12] = {0};
+        /* Подавление HTTPS (65) и SVCB (64) на совпавшем домене. Проверяется не
+         * константа, а форма ответа: клиент должен получить NODATA — тот же вопрос,
+         * ноль записей — и ни одной подсказки ipv4hint из настоящего ответа. Иначе
+         * браузер идёт по реальному адресу мимо туннеля и ждёт таймаута, что и
+         * выглядит как задержка на первом открытии сайта.
+         *
+         * Ответ собирается руками: заголовок, вопрос «www.test HTTPS IN», затем
+         * запись с ipv4hint. build_rewritten_response обязан обрезать всё после
+         * вопроса. */
+        uint8_t resp[64];
+        size_t n = 0;
+        resp[n++] = 0x12; resp[n++] = 0x34;          /* id */
+        resp[n++] = 0x81; resp[n++] = 0x80;          /* QR + RD + RA */
+        resp[n++] = 0x00; resp[n++] = 0x01;          /* qdcount = 1 */
+        resp[n++] = 0x00; resp[n++] = 0x01;          /* ancount = 1 */
+        resp[n++] = 0x00; resp[n++] = 0x00;          /* nscount */
+        resp[n++] = 0x00; resp[n++] = 0x00;          /* arcount */
+        resp[n++] = 3; memcpy(resp + n, "www", 3);  n += 3;
+        resp[n++] = 4; memcpy(resp + n, "test", 4); n += 4;
+        resp[n++] = 0;                               /* конец имени */
+        resp[n++] = 0x00; resp[n++] = DNS_TYPE_HTTPS;
+        resp[n++] = 0x00; resp[n++] = 0x01;          /* class IN */
+        size_t qend = n;
+        resp[n++] = 0xC0; resp[n++] = 0x0C;          /* ответ: указатель на вопрос */
+        resp[n++] = 0x00; resp[n++] = DNS_TYPE_HTTPS;
+        resp[n++] = 0x00; resp[n++] = 0x01;
+        resp[n++] = 0x00; resp[n++] = 0x00; resp[n++] = 0x00; resp[n++] = 0x3C;
+        resp[n++] = 0x00; resp[n++] = 0x0B;          /* rdlength */
+        resp[n++] = 0x00; resp[n++] = 0x01;          /* priority 1 */
+        resp[n++] = 0x00;                            /* target = . */
+        resp[n++] = 0x00; resp[n++] = 0x04;          /* key 4 = ipv4hint */
+        resp[n++] = 0x00; resp[n++] = 0x04;
+        resp[n++] = 1; resp[n++] = 2; resp[n++] = 3; resp[n++] = 4;
+
         uint8_t out[512];
-        size_t len = build_rewritten_response(dummy, 12, out, sizeof(out), 0, 0);
-        check("build_rewritten_response NODATA len == 12", 12, len);
-        check("build_rewritten_response NODATA ancount == 0", 0, out[7]);
+        size_t len = build_rewritten_response(resp, qend, out, sizeof(out), 0, 0);
+        check("HTTPS: ответ обрезан по конец вопроса", (int)qend, (int)len);
+        check("HTTPS: ancount обнулён", 0, out[7]);
+        check("HTTPS: вопрос сохранён (qdcount)", 1, out[5]);
+        check("HTTPS: тип вопроса не подменён", DNS_TYPE_HTTPS, out[qend - 3]);
+        check("HTTPS: id ответа тот же", 0x1234, (out[0] << 8) | out[1]);
+        check("HTTPS: ipv4hint 1.2.3.4 клиенту не ушёл", 0,
+              memcmp(out + qend - 4, "\x01\x02\x03\x04", 4) == 0);
+        check("SVCB разбирается тем же путём, что HTTPS", 1,
+              DNS_TYPE_SVCB == 64 && DNS_TYPE_HTTPS == 65);
     }
 
     printf("\n%s\n", fails ? "ЕСТЬ ПРОВАЛЫ" : "все проверки прошли");

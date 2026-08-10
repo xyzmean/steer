@@ -1478,10 +1478,10 @@ static void handle_upstream_response(struct pending *p) {
         }
     }
 
-    /* Fallback: matched but nothing to substitute (qtype other than A/AAAA
-     * — e.g. HTTPS/SVCB — zero real A answers yet, or the fake-IP pool is
-     * exhausted). Relay the real answer unchanged — fail open, never block
-     * the DNS transaction. */
+    /* Fallback: matched but nothing to substitute (qtype outside A/AAAA/HTTPS/SVCB
+     * — MX, TXT, PTR and the like — zero real A answers yet, or the fake-IP pool
+     * is exhausted). Relay the real answer unchanged — fail open, never block the
+     * DNS transaction. */
     sendto(g_listen_fd, buf, (size_t)n, 0, (struct sockaddr *)&p->client, p->client_len);
 }
 
