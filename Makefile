@@ -4,20 +4,31 @@
 CFLAGS ?= -O2 -Wall -Wextra
 BUILD  := build
 
-.PHONY: all test clean
+.PHONY: all test clean ext-syntax
 all: $(BUILD)/steer
 
 $(BUILD)/steer: src/steer.c src/spec.c src/dnsd.c src/failover.c src/aggregate.c src/spec.h
 	@mkdir -p $(BUILD)
 	$(CC) $(CFLAGS) -o $@ src/steer.c src/spec.c src/dnsd.c src/failover.c src/aggregate.c
 
-test: all $(BUILD)/dnsmatch $(BUILD)/specmatch $(BUILD)/failovermatch $(BUILD)/h2match
+test: all ext-syntax $(BUILD)/dnsmatch $(BUILD)/specmatch $(BUILD)/failovermatch $(BUILD)/h2match
 	@sh tests/run.sh
 	@sh tests/gen.sh
 	@$(BUILD)/dnsmatch
 	@$(BUILD)/specmatch
 	@$(BUILD)/failovermatch
 	@$(BUILD)/h2match
+
+# Синтаксическая проверка расширенного движка (R-014/I-024). Полная сборка src/ext идёт
+# только в build.sh через docker с mbedtls, поэтому локальный make test оставался зелёным,
+# даже когда ext не компилировался вовсе — так в main пролез 654e4e6. -fsyntax-only ловит
+# ровно тот класс ошибок (несуществующее имя, снесённое объявление), заглушки mbedtls уже
+# лежат в tests/stub — их завёл стенд h2match. Компоновку по-прежнему проверяет build.sh.
+ext-syntax:
+	@for f in src/ext/*.c; do \
+		$(CC) $(CFLAGS) -fsyntax-only -Itests/stub -Isrc $$f || exit 1; \
+	done
+	@echo "ext-syntax: src/ext компилируется"
 
 # Подбор доменного правила проверяется отдельной программой, а не через движок: сам подбор
 # статический внутри dnsd.c, и дотянуться до него иначе значило бы добавить в движок
@@ -45,5 +56,11 @@ $(BUILD)/h2match: tests/h2match.c src/ext/h2.c src/ext/h2.h src/ext/tls13.h
 	@mkdir -p $(BUILD)
 	$(CC) $(CFLAGS) -Itests/stub -o $@ tests/h2match.c
 
+# НЕ rm -rf $(BUILD): в build/ живут отслеживаемые Dockerfile, build-ext.sh и
+# лабораторные исходники, без которых ./build.sh из свежего клона не работает —
+# .gitignore об этом прямо предупреждает, а clean их сносил (I-023). Удаляются
+# только артефакты: то, что здесь же и собирается, плюс упаковка из build.sh.
 clean:
-	rm -rf $(BUILD)
+	rm -rf $(BUILD)/steer $(BUILD)/steer-* $(BUILD)/dnsmatch $(BUILD)/specmatch \
+	       $(BUILD)/failovermatch $(BUILD)/h2match $(BUILD)/libmbed-*.a \
+	       $(BUILD)/*.err $(BUILD)/pkg $(BUILD)/scripts out
