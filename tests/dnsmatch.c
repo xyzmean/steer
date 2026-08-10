@@ -156,6 +156,63 @@ int main(void) {
               DNS_TYPE_SVCB == 64 && DNS_TYPE_HTTPS == 65);
     }
 
+    {
+        /* Быстрый путь: разбор ЗАПРОСА и ответ, собранный из него.
+         *
+         * Задержка fake-ip держалась на том, что каждый запрос ждал круга до
+         * upstream — даже когда ответ от него не зависел. Здесь проверяются оба
+         * условия, на которых быстрый путь стоит: parse_query читает вопрос и
+         * отвергает не-вопросы, а ответ из запроса несёт правильные флаги —
+         * QR (иначе клиент выбросит пакет как чужой запрос) и RA, без AA/TC. */
+        uint8_t q[64];
+        size_t n = 0;
+        q[n++] = 0xAB; q[n++] = 0xCD;               /* id */
+        q[n++] = 0x01; q[n++] = 0x00;               /* RD, это запрос */
+        q[n++] = 0x00; q[n++] = 0x01;               /* qdcount = 1 */
+        q[n++] = 0x00; q[n++] = 0x00;
+        q[n++] = 0x00; q[n++] = 0x00;
+        q[n++] = 0x00; q[n++] = 0x00;
+        q[n++] = 3; memcpy(q + n, "www", 3);  n += 3;
+        q[n++] = 4; memcpy(q + n, "test", 4); n += 4;
+        q[n++] = 0;
+        q[n++] = 0x00; q[n++] = 0x01;               /* тип A */
+        q[n++] = 0x00; q[n++] = 0x01;               /* class IN */
+
+        char name[MAX_HOSTNAME];
+        uint16_t qtype = 0;
+        size_t qend = 0;
+        check("запрос: разобран", 0, parse_query(q, n, name, sizeof(name), &qtype, &qend));
+        check("запрос: имя", 0, strcmp(name, "www.test"));
+        check("запрос: тип A", DNS_TYPE_A, qtype);
+        check("запрос: конец вопроса", (int)n, (int)qend);
+
+        /* Ответ (QR=1) быстрый путь обязан отвергнуть: он для запросов. */
+        uint8_t r[64];
+        memcpy(r, q, n);
+        r[2] |= 0x80;
+        check("ответ вместо запроса: отвергнут", -1,
+              parse_query(r, n, name, sizeof(name), &qtype, &qend));
+
+        /* NODATA из запроса: та же форма, что из ответа, плюс флаги ответа. */
+        uint8_t out[512];
+        size_t len = build_rewritten_response(q, qend, out, sizeof(out), 0, 0);
+        make_response_flags(out);
+        check("ответ из запроса: длина — конец вопроса", (int)qend, (int)len);
+        check("ответ из запроса: QR выставлен", 0x80, out[2] & 0x80);
+        check("ответ из запроса: RD перенесён", 0x01, out[2] & 0x01);
+        check("ответ из запроса: AA/TC не выдуманы", 0, out[2] & 0x06);
+        check("ответ из запроса: RA выставлен, RCODE ноль", 0x80, out[3]);
+        check("ответ из запроса: id клиента", 0xABCD, (out[0] << 8) | out[1]);
+
+        /* A с подстановкой: fake-IP уходит в ответ из запроса тем же
+         * build_rewritten_response, что и раньше из ответа. */
+        len = build_rewritten_response(q, qend, out, sizeof(out), 1, 0xC6120005u);
+        make_response_flags(out);
+        check("A из запроса: ancount = 1", 1, out[7]);
+        check("A из запроса: fake-IP в rdata", 0,
+              memcmp(out + len - 4, "\xC6\x12\x00\x05", 4));
+    }
+
     printf("\n%s\n", fails ? "ЕСТЬ ПРОВАЛЫ" : "все проверки прошли");
     return fails ? 1 : 0;
 }

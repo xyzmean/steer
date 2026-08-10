@@ -4,10 +4,15 @@
  * resolve time, based on richer domain-rule matching (exact / namespace /
  * wildcard / regex) than dnsmasq's `nftset=` directive supports.
  *
- * It NEVER resolves anything itself: every client query is forwarded
+ * It NEVER resolves anything itself: a query that needs real data is forwarded
  * byte-for-byte to the real resolver (dnsmasq, 127.0.0.1:53). For a domain
  * that does NOT match a rule (the overwhelming majority), the answer is
- * relayed back byte-for-byte, unmodified. For a domain that DOES match, the
+ * relayed back byte-for-byte, unmodified. For a MATCHED domain the answer is
+ * synthesized straight from the QUERY whenever it does not depend on upstream
+ * data — a repeat A for an already-mapped fake IP, and AAAA/HTTPS/SVCB (always
+ * NODATA for a matched name) — so the client-visible latency of fake-ip is one
+ * upstream round-trip on the very first A of a new domain and ~zero after;
+ * the upstream is still asked in the background to keep the DNAT map fresh. For a domain that DOES match, the
  * real answer is NOT relayed — the client is instead handed a synthetic,
  * domain-exclusive "fake" IPv4 from a private pool (198.18.0.0/15) that this
  * daemon allocates and persists 1:1 per domain (see the fakeip_* pool
@@ -505,6 +510,40 @@ static int parse_response(const uint8_t *pkt, size_t len, char *out_qname,
     }
     return found;
 }
+
+/* Разбор ВОПРОСА клиентского запроса: имя, тип, конец секции вопроса. Той же
+ * механикой, что parse_response, но на пути «клиент → upstream», где ответа ещё
+ * нет. Не-запрос (QR=1), не один вопрос или мусор — -1: вызывающий пересылает
+ * пакет наверх как раньше, быстрый путь просто не срабатывает. */
+static int parse_query(const uint8_t *pkt, size_t len, char *out_qname,
+                       size_t qname_len, uint16_t *out_qtype, size_t *out_qend) {
+    if (len < 12) return -1;
+    if (pkt[2] & 0x80) return -1;               /* QR: это уже ответ */
+    uint16_t qdcount = (pkt[4] << 8) | pkt[5];
+    if (qdcount != 1) return -1;
+    size_t next = 0;
+    if (parse_name_adv(pkt, len, 12, out_qname, qname_len, &next) != 0) return -1;
+    if (next + 4 > len) return -1;
+    *out_qtype = (uint16_t)((pkt[next] << 8) | pkt[next + 1]);
+    *out_qend = next + 4;
+    return 0;
+}
+
+/* Ответ, собранный из ЗАПРОСА, обязан сам выставить флаги ответа — в отличие от
+ * ответа, собранного из ответа upstream, где они уже стоят. QR — это ответ; opcode
+ * и RD переносятся из запроса; RA — рекурсию даёт upstream, и мы отвечаем за него;
+ * AA/TC/RCODE — нули. */
+static void make_response_flags(uint8_t *pkt) {
+    pkt[2] = (uint8_t)(0x80 | (pkt[2] & 0x79));
+    pkt[3] = 0x80;
+}
+
+/* Определена ниже, у обработчика ответов: быстрый путь собирает ответ клиенту тем же
+ * кодом, которым он собирается из ответа upstream, — двух сборщиков одного пакета
+ * быть не должно. */
+static size_t build_rewritten_response(const uint8_t *orig, size_t qend,
+                                        uint8_t *out, size_t out_cap,
+                                        int with_answer, uint32_t fake_addr_host);
 
 /* ---------------------------------------------------------------------- */
 /* nftables integration — direct netlink (no fork/exec, no `nft` CLI)     */
@@ -1218,6 +1257,11 @@ static void fakeip_route_set(const char *domain, int new_set_idx);
 struct pending {
     int fd;
     int in_use;
+    /* Клиенту уже ответили из быстрого пути: ответ upstream нужен только чтобы
+     * обновить DNAT-карту и реальный адрес, отправлять его клиенту нельзя —
+     * второй ответ на тот же id клиент в лучшем случае выбросит, а в худшем
+     * (другой адрес в A) примет за подмену. */
+    int quiet;
     struct sockaddr_storage client;
     socklen_t client_len;
     time_t expire;
@@ -1310,6 +1354,65 @@ static void handle_client_query(int upstream_port) {
     ssize_t n = recvfrom(g_listen_fd, buf, sizeof(buf), 0, (struct sockaddr *)&from, &fromlen);
     if (n <= 0) return;
 
+    /* Быстрый путь: на вопрос, ответ на который НЕ ЗАВИСИТ от upstream, отвечаем
+     * прямо из запроса. Это и есть задержка fake-ip глазами клиента: раньше каждый
+     * запрос — включая повторный A для уже выданного fake-IP и AAAA/HTTPS/SVCB,
+     * ответ на которые для совпавшего домена всегда NODATA, — ждал полного круга
+     * до резолвера и обратно. Теперь круг платит только первый A нового домена:
+     * лишь ему нужен настоящий адрес, без которого нечего класть в DNAT. */
+    char qname[MAX_HOSTNAME];
+    uint16_t qtype = 0;
+    size_t qend = 0;
+    int quiet = 0;
+    if (parse_query(buf, (size_t)n, qname, sizeof(qname), &qtype, &qend) == 0) {
+        int hit = -1;
+        for (size_t i = 0; i < g_dch_n && hit < 0; i++)
+            if (ruleset_match(&g_dch[i].rules, qname)) hit = (int)i;
+        if (hit >= 0 && !g_dch[hit].realip) {
+            if (qtype == DNS_TYPE_AAAA || qtype == DNS_TYPE_HTTPS ||
+                qtype == DNS_TYPE_SVCB) {
+                /* Подавление — свойство правила, а не данных из ответа: NODATA
+                 * можно построить из самого вопроса, наверх не ходим вовсе. */
+                uint8_t out[512];
+                size_t len = build_rewritten_response(buf, qend, out, sizeof(out), 0, 0);
+                if (len) {
+                    make_response_flags(out);
+                    sendto(g_listen_fd, out, len, 0,
+                           (struct sockaddr *)&from, fromlen);
+                    return;
+                }
+            } else if (qtype == DNS_TYPE_A) {
+                /* Ищем в нижнем регистре: записи создаются из ответов, где имя —
+                 * эхо запроса клиента, а клиенты пишут строчными. Промах по
+                 * регистру не ломает ничего — просто уходим на прежний путь. */
+                char lname[MAX_HOSTNAME];
+                snprintf(lname, sizeof(lname), "%s", qname);
+                str_lower(lname);
+                long at = fakeip_find(lname);
+                if (at >= 0 && g_fakeip.entries[at].real_host) {
+                    /* DNAT для этого fake-IP уже стоит (real_host запоминается
+                     * только после успешного ack от ядра либо восстановлен
+                     * rehydrate-проходом) — значит, ответ клиенту безопасен до
+                     * похода наверх. Сам поход не отменяется, а уходит в фон:
+                     * ответ upstream обновит карту, если backend переехал. */
+                    uint8_t out[512];
+                    size_t len = build_rewritten_response(buf, qend, out, sizeof(out),
+                                                          1, g_fakeip.entries[at].addr);
+                    if (len) {
+                        make_response_flags(out);
+                        sendto(g_listen_fd, out, len, 0,
+                               (struct sockaddr *)&from, fromlen);
+                        /* Маршрут переутверждаем идемпотентно: fw4 reload смывает
+                         * элементы наборов, и ждать ре-резолва клиент не должен.
+                         * Цена — один netlink-обмен, ядро отвечает EEXIST. */
+                        fakeip_route_set(lname, hit);
+                        quiet = 1;
+                    }
+                }
+            }
+        }
+    }
+
     struct pending *p = pending_alloc();
     if (!p) return; /* under load: drop, client's own resolver will retry/timeout */
 
@@ -1324,6 +1427,7 @@ static void handle_client_query(int upstream_port) {
 
     p->fd = fd;
     p->in_use = 1;
+    p->quiet = quiet;
     p->client = from;
     p->client_len = fromlen;
     p->expire = time(NULL) + PENDING_TTL_SEC;
@@ -1381,6 +1485,7 @@ static void handle_upstream_response(struct pending *p) {
     epoll_ctl(g_epfd, EPOLL_CTL_DEL, p->fd, NULL);
     close(p->fd);
     p->in_use = 0;
+    int quiet = p->quiet;
 
     if (n <= 0) return;
 
@@ -1400,7 +1505,9 @@ static void handle_upstream_response(struct pending *p) {
         for (size_t i = 0; i < g_dch_n && hit < 0; i++)
             if (ruleset_match(&g_dch[i].rules, qname)) hit = (int)i;
     if (nips < 0 || hit < 0) {
-        sendto(g_listen_fd, buf, (size_t)n, 0, (struct sockaddr *)&p->client, p->client_len);
+        if (!quiet)
+            sendto(g_listen_fd, buf, (size_t)n, 0,
+                   (struct sockaddr *)&p->client, p->client_len);
         return;
     }
 
@@ -1413,10 +1520,12 @@ static void handle_upstream_response(struct pending *p) {
      *   h3 (QUIC ALPN). Letting real IPv4/IPv6 hints through causes modern browsers to
      *   attempt direct connections to real IPs outside fake-IP DNAT/set, causing 1-3s delays. */
     if (qtype == DNS_TYPE_AAAA || qtype == DNS_TYPE_HTTPS || qtype == DNS_TYPE_SVCB) {
-        uint8_t out[512];
-        size_t len = build_rewritten_response(buf, qend, out, sizeof(out), 0, 0);
-        sendto(g_listen_fd, len ? out : buf, len ? len : (size_t)n, 0,
-               (struct sockaddr *)&p->client, p->client_len);
+        if (!quiet) {
+            uint8_t out[512];
+            size_t len = build_rewritten_response(buf, qend, out, sizeof(out), 0, 0);
+            sendto(g_listen_fd, len ? out : buf, len ? len : (size_t)n, 0,
+                   (struct sockaddr *)&p->client, p->client_len);
+        }
         return;
     }
 
@@ -1430,7 +1539,9 @@ static void handle_upstream_response(struct pending *p) {
         if (qtype == DNS_TYPE_A)
             for (int k = 0; k < nips; k++)
                 nft_add_element(g_dch[hit].set, ntohl(ips[k].addr), ips[k].ttl);
-        sendto(g_listen_fd, buf, (size_t)n, 0, (struct sockaddr *)&p->client, p->client_len);
+        if (!quiet)
+            sendto(g_listen_fd, buf, (size_t)n, 0,
+                   (struct sockaddr *)&p->client, p->client_len);
         return;
     }
 
@@ -1468,6 +1579,10 @@ static void handle_upstream_response(struct pending *p) {
                  * would leave which mark wins to chain order. */
                 fakeip_route_set(qname, hit);
 
+                /* Клиенту из быстрого пути уже ушёл fake-IP; этот ответ был нужен
+                 * только ради строк выше — обновить карту и реальный адрес. */
+                if (quiet) return;
+
                 uint8_t out[512];
                 size_t len = build_rewritten_response(buf, qend, out, sizeof(out), 1, fake_addr);
                 if (len > 0) {
@@ -1482,7 +1597,8 @@ static void handle_upstream_response(struct pending *p) {
      * — MX, TXT, PTR and the like — zero real A answers yet, or the fake-IP pool
      * is exhausted). Relay the real answer unchanged — fail open, never block the
      * DNS transaction. */
-    sendto(g_listen_fd, buf, (size_t)n, 0, (struct sockaddr *)&p->client, p->client_len);
+    if (!quiet)
+        sendto(g_listen_fd, buf, (size_t)n, 0, (struct sockaddr *)&p->client, p->client_len);
 }
 
 static int run_proxy(int listen_port, int upstream_port) {
