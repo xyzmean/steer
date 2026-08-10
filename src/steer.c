@@ -598,7 +598,13 @@ static int names_device(const char *hay, const char *device) {
 
 static struct fwcheck fw_check(const char *device) {
     struct fwcheck r = { 0, 0 };
-    FILE *f = popen("nft list ruleset 2>/dev/null", "r");
+    /* --terse: без содержимого наборов. Проверка смотрит на имена устройств в правилах
+     * и цепочках, а элементы наборов ей не нужны — при этом их бывают десятки тысяч, и
+     * полный дамп на слабом роутере стоил секунды НА КАЖДЫЙ ВЫЗОВ. Вызовов же по одному
+     * на выход в status (его интерфейс опрашивает каждые пять секунд), в diag и в apply:
+     * ровно этим status и apply тормозили. Флаг есть в nft с 0.9.4 (OpenWrt 21+); на
+     * случай древней сборки — откат к полному дампу, медленно, но не слепо. */
+    FILE *f = popen("nft -t list ruleset 2>/dev/null || nft list ruleset 2>/dev/null", "r");
     if (!f) return r;
     char line[2048];
     char chain[128] = "";
@@ -642,7 +648,8 @@ static void report_traceroute_dep(void) {
             return;
         }
     }
-    FILE *f = popen("nft list ruleset 2>/dev/null", "r");
+    /* Тот же --terse, что в fw_check, и по той же причине: ищется правило, а не элементы. */
+    FILE *f = popen("nft -t list ruleset 2>/dev/null || nft list ruleset 2>/dev/null", "r");
     int ok = 0;
     if (f) {
         char line[2048];
@@ -706,6 +713,61 @@ static int run(const char *const argv[]) {
 
 int run_quiet(const char *const argv[]) { return run(argv); }
 
+/* ---- снятие мёртвых правил маршрутизации ------------------------------------
+ *
+ * rename/remove выхода оставляли в ядре ip rule fwmark и его таблицу навсегда:
+ * apply ставит правила только для ТЕКУЩИХ выходов по их НОВЫМ меткам, метка
+ * назначается по имени из реестра, и правило переименованного выхода не снимал
+ * никто (I-019). Мёртвые правила не матчатся — метку с них уже никто не ставит, —
+ * но копятся с каждым переименованием и засоряют `ip rule show` ровно тогда,
+ * когда по нему пытаются понять, куда ушёл трафик.
+ *
+ * Снимок прежнего реестра берётся ДО registry_assign — тот перезаписывает файл
+ * текущими выходами, и после него сравнивать уже не с чем. Живой считается метка,
+ * которую несёт ЛЮБОЙ текущий недирект-выход: устройство здесь не проверяется
+ * нарочно, у vless его создаёт сам процесс туннеля, и снять правило выхода за то,
+ * что его устройство ещё не поднялось, значило бы обрубить туннель на ровном
+ * месте. */
+struct oldreg { unsigned mark; int table; };
+static struct oldreg g_oldreg[MAX_OUTPUTS];
+static size_t g_oldreg_n;
+
+static void registry_snapshot(void) {
+    char path[512];
+    snprintf(path, sizeof(path), "%s/registry", g_state_dir);
+    FILE *f = fopen(path, "r");
+    if (!f) return;
+    char name[32];
+    unsigned mark;
+    int table;
+    while (g_oldreg_n < MAX_OUTPUTS &&
+           fscanf(f, "%31s %x %d\n", name, &mark, &table) == 3) {
+        g_oldreg[g_oldreg_n].mark = mark;
+        g_oldreg[g_oldreg_n].table = table;
+        g_oldreg_n++;
+    }
+    fclose(f);
+}
+
+static void cleanup_stale_routing(void) {
+    for (size_t i = 0; i < g_oldreg_n; i++) {
+        int live = 0;
+        for (size_t k = 0; k < g_out_n; k++)
+            if (g_out[k].kind != OUT_DIRECT && g_out[k].mark == g_oldreg[i].mark) {
+                live = 1;
+                break;
+            }
+        if (live) continue;
+        char mark[24], table[16];
+        snprintf(mark, sizeof(mark), "0x%08x", g_oldreg[i].mark);
+        snprintf(table, sizeof(table), "%d", g_oldreg[i].table);
+        const char *del[] = { "ip", "rule", "del", "fwmark", mark, "table", table, NULL };
+        while (run(del) == 0) ;
+        const char *flush[] = { "ip", "route", "flush", "table", table, NULL };
+        run(flush);
+    }
+}
+
 /* Policy routing for interface outputs. Rules are removed before being added so a
  * re-apply cannot stack duplicates — `ip rule add` is happy to add the same rule
  * twice, and the second copy is invisible until someone deletes the first. */
@@ -744,6 +806,10 @@ static void apply_routing(void) {
 
 static int cmd_apply(const char *spec, int dry) {
     load_spec(spec);
+    /* Снимок реестра — строго до registry_assign: тот перезапишет файл текущими
+     * выходами, и метки удалённых/переименованных будут потеряны вместе с
+     * единственным способом снять их правила из ядра. */
+    registry_snapshot();
     registry_assign();
     build_groups();
     /* Проверка списков — ДО генерации и до dry-run.
@@ -783,6 +849,7 @@ static int cmd_apply(const char *spec, int dry) {
     }
     unlink(tmp);
     apply_routing();
+    cleanup_stale_routing();
     report_output_deps();
     report_traceroute_dep();
     printf("steer: applied %zu channel(s), %zu output(s)\n", g_ch_n, g_out_n);
@@ -951,7 +1018,11 @@ static long set_count(const char *name) {
 
 static int nft_has(const char *what) {
     char cmd[256];
-    snprintf(cmd, sizeof(cmd), "nft list table inet steer 2>/dev/null | grep -qF '%s'", what);
+    /* --terse: ищутся цепочки, элементы наборов не нужны — а их дамп на большом
+     * наборе стоит дороже всех остальных проверок diag вместе взятых. */
+    snprintf(cmd, sizeof(cmd),
+             "{ nft -t list table inet steer 2>/dev/null || "
+             "nft list table inet steer 2>/dev/null; } | grep -qF '%s'", what);
     return system(cmd) == 0;
 }
 
