@@ -32,7 +32,19 @@ int main(void) {
         fprintf(stderr, "FAIL: cleanup_probe_rule did not run ip rule del\n");
         return 1;
     }
-    
+
+    /* I-022: probe-rule снимается В НАЧАЛЕ прохода, а не только при завершении.
+     * atexit/SIGTERM не покрывают SIGKILL и OOM-killer, поэтому проход обязан
+     * прибрать за предыдущим процессом до того, как поставит своё правило.
+     * Выходов нет — значит единственный `ip rule del` может прийти только из
+     * уборки в начале, и его отсутствие означает регресс ровно этой строки. */
+    rule_deleted = 0;
+    cmd_failover("/dev/null", 0);
+    if (rule_deleted < 1) {
+        fprintf(stderr, "FAIL: cmd_failover does not clean the stale probe rule up front\n");
+        return 1;
+    }
+
     printf("OK\n");
     return 0;
 }

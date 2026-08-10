@@ -380,6 +380,12 @@ int cmd_failover(const char *spec, int verbose) {
     atexit(cleanup_probe_rule);
     signal(SIGINT, sig_cleanup);
     signal(SIGTERM, sig_cleanup);
+    /* Снять probe-rule, оставшийся от ПРЕЖНЕГО прохода, прежде чем ставить свой.
+     * atexit и обработчики выше закрывают обычное завершение, но не SIGKILL и не
+     * OOM-killer (I-022): после жёсткого убийства правило жило в ядре до ручной
+     * чистки. Уборка в начале прохода восстанавливает состояние независимо от
+     * того, как умер предыдущий процесс, и идемпотентна — нет правила, нет дела. */
+    cleanup_probe_rule();
 
     load_spec(spec);
     registry_assign();
