@@ -22,5 +22,6 @@ build/dnsmatch
 build/specmatch
 build/failovermatch
 build/h2match
+build/diagsim
 build/crypto-vec
 build/bx-*

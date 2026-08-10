@@ -11,13 +11,24 @@ $(BUILD)/steer: src/steer.c src/spec.c src/dnsd.c src/failover.c src/aggregate.c
 	@mkdir -p $(BUILD)
 	$(CC) $(CFLAGS) -o $@ src/steer.c src/spec.c src/dnsd.c src/failover.c src/aggregate.c
 
-test: all ext-syntax $(BUILD)/dnsmatch $(BUILD)/specmatch $(BUILD)/failovermatch $(BUILD)/h2match
+test: all ext-syntax $(BUILD)/dnsmatch $(BUILD)/specmatch $(BUILD)/failovermatch $(BUILD)/h2match $(BUILD)/diagsim
 	@sh tests/run.sh
 	@sh tests/gen.sh
+	@sh tests/diagmatch.sh
 	@$(BUILD)/dnsmatch
 	@$(BUILD)/specmatch
 	@$(BUILD)/failovermatch
 	@$(BUILD)/h2match
+
+# Движок, собранный как расширенный, но без самой расширенной части: нужен стенду
+# diagmatch, потому что спеку с `kind: vless` базовая сборка отвергает парсером, а
+# проверять диагностику интереснее всего именно на VLESS-выходе. Три подкоманды
+# расширенной сборки заменены заглушками — см. tests/vless-stub.c.
+$(BUILD)/diagsim: src/steer.c src/spec.c src/dnsd.c src/failover.c src/aggregate.c \
+                  src/spec.h tests/vless-stub.c
+	@mkdir -p $(BUILD)
+	$(CC) $(CFLAGS) -DSTEER_EXTENDED -o $@ src/steer.c src/spec.c src/dnsd.c \
+	      src/failover.c src/aggregate.c tests/vless-stub.c
 
 # Синтаксическая проверка расширенного движка (R-014/I-024). Полная сборка src/ext идёт
 # только в build.sh через docker с mbedtls, поэтому локальный make test оставался зелёным,
@@ -62,5 +73,5 @@ $(BUILD)/h2match: tests/h2match.c src/ext/h2.c src/ext/h2.h src/ext/tls13.h
 # только артефакты: то, что здесь же и собирается, плюс упаковка из build.sh.
 clean:
 	rm -rf $(BUILD)/steer $(BUILD)/steer-* $(BUILD)/dnsmatch $(BUILD)/specmatch \
-	       $(BUILD)/failovermatch $(BUILD)/h2match $(BUILD)/libmbed-*.a \
+	       $(BUILD)/failovermatch $(BUILD)/h2match $(BUILD)/diagsim $(BUILD)/libmbed-*.a \
 	       $(BUILD)/*.err $(BUILD)/pkg $(BUILD)/scripts out
