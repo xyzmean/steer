@@ -95,6 +95,43 @@ int main(void) {
         check("тип по умолчанию tcp", "tcp", n.type);
     }
 
+    /* ---- склеенные ссылки: панель может не поставить разделитель (I-028) ----
+     *
+     * Отступ к началу следующей ссылки шёл «пока слева буквы и цифры» и съедал хвост
+     * имени: в «#onevless://…» граница вставала перед «onevless», вторая ссылка
+     * переставала начинаться с vless:// и уходила в чужие протоколы. Терялся каждый
+     * второй узел, а первому обнулялось имя. */
+    {
+        struct vless_node nodes[8];
+        size_t skipped = 0, foreign = 0;
+        size_t n = vless_parse_sub("vless://a@h1:443#one" "vless://b@h2:443#two",
+                                   nodes, 8, &skipped, &foreign);
+        check_n("две склеенные ссылки разобраны как две", 2, (long)n);
+        check("первая: имя не съело вторую", "one", nodes[0].name);
+        check("вторая: хост свой", "h2", nodes[1].host);
+        check_n("склеенные: чужих протоколов нет", 0, (long)foreign);
+    }
+    {
+        /* Имя без '#'-хвоста: граница обязана встать по схеме, не по цифрам порта. */
+        struct vless_node nodes[8];
+        size_t skipped = 0, foreign = 0;
+        size_t n = vless_parse_sub("vless://a@h1:443" "vless://b@h2:8443",
+                                   nodes, 8, &skipped, &foreign);
+        check_n("склейка без имён: две ссылки", 2, (long)n);
+        check_n("первой не откусили порт", 443, (long)nodes[0].port);
+        check_n("второй достался свой порт", 8443, (long)nodes[1].port);
+    }
+    {
+        /* Имя, оканчивающееся именем схемы, — граница всё равно по байтам перед '://'. */
+        struct vless_node nodes[8];
+        size_t skipped = 0, foreign = 0;
+        size_t n = vless_parse_sub("vless://a@h1:443#Express" "ss://b@h2:443#other",
+                                   nodes, 8, &skipped, &foreign);
+        check_n("имя кончается на имя схемы: узел один", 1, (long)n);
+        check("имя не обрезано", "Express", nodes[0].name);
+        check_n("следующая ссылка учтена как чужая", 1, (long)foreign);
+    }
+
     /* ---- арифметика подписки (I-027) --------------------------------------
      *
      * Заголовок sub.c обещает: «в ней 26 узлов, а steer видит 17» должно объясняться
