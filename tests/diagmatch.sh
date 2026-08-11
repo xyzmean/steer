@@ -98,6 +98,35 @@ sed 's/"out": "vpn"/"out": "direct"/' "$tmp/vless.json" > "$tmp/vless-unused.jso
 outu="$($DIAG diag --spec "$tmp/vless-unused.json" 2>/dev/null)"
 check "vless без каналов: про UDP молчим" "" "$(printf '%s' "$outu" | verdict udp)"
 
+# ---- публичный резолвер внутри списка канала (I-030) ------------------------
+# Категории издателя собираются по ASN целиком, поэтому 8.8.8.0/24 (Google Public DNS)
+# лежит внутри «YouTube» и «Google», а 1.1.1.0/24 — внутри «Cloudflare». Уйдя в туннель
+# VLESS, запрос к такому резолверу получает ICMP-отказ вместо ответа, и клиент, у которого
+# этот резолвер прописан руками, остаётся без DNS вовсе.
+echo '1.1.1.0/24' >> "$tmp/cf.lst"
+outr="$($DIAG diag --spec "$tmp/vless.json" 2>/dev/null)"
+check "резолвер в списке: сказано" "warn" "$(printf '%s' "$outr" | verdict resolver)"
+check "назван сам адрес" "1" \
+      "$(printf '%s' "$outr" | grep -c '1\.1\.1\.0/24' || true)"
+
+# Выход-устройство несёт UDP как есть — резолвер в списке для него не проблема.
+outri="$($DIAG diag --spec "$tmp/iface.json" 2>/dev/null)"
+check "выход interface: про резолвер молчим" "" "$(printf '%s' "$outri" | verdict resolver)"
+
+# Перенаправление DNS есть только при доменных правилах: тогда запросы клиентов из
+# from_default до туннеля не доходят, и приговор смягчается до совета.
+echo 'example.com' > "$tmp/dom.lst"
+sed 's#"prefixes_files": \["'"$tmp"'/cf.lst"\]#"prefixes_files": ["'"$tmp"'/cf.lst"], "domains_files": ["'"$tmp"'/dom.lst"]#' \
+    "$tmp/vless.json" > "$tmp/vless-dom.json"
+outrd="$($DIAG diag --spec "$tmp/vless-dom.json" 2>/dev/null)"
+check "есть редирект DNS: приговор мягче" "note" "$(printf '%s' "$outrd" | verdict resolver)"
+
+# Список без резолверов — молчим: иначе метка станет постоянной.
+grep -v '^1\.1\.1\.0/24$' "$tmp/cf.lst" > "$tmp/cf-clean.lst"
+sed "s#$tmp/cf.lst#$tmp/cf-clean.lst#" "$tmp/vless.json" > "$tmp/vless-clean.json"
+outrc="$($DIAG diag --spec "$tmp/vless-clean.json" 2>/dev/null)"
+check "список без резолверов: молчим" "" "$(printf '%s' "$outrc" | verdict resolver)"
+
 # ---- отчёт остаётся разбираемым --------------------------------------------
 check "проверок в отчёте с vless больше, чем без него" "1" \
       "$([ "$(printf '%s' "$outv" | count)" -gt "$(printf '%s' "$out" | count)" ] && echo 1 || echo 0)"
