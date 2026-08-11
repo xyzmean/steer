@@ -12,7 +12,7 @@ Steer is built with strict resource constraints in mind, optimized for the lower
 - **Resource Efficiency:** Designed to run on weak hardware. Uses `nftables` sets loaded in a single transaction.
 - **Advanced DNS Handling:** Built-in `dnsd` resolver for domain-based routing with `fake-ip` (default) and `real-ip` modes.
 - **Failover:** Automatic fallback between multiple interfaces (e.g., VPN tunnels) with priority support.
-- **VLESS/Reality Support:** First-class support for VLESS/Reality via the `steer-extended` package, with native TUN integration.
+- **VLESS/Reality Support:** First-class support for VLESS/Reality via the `steer-extended` package, with native TUN integration. Carries both TCP and UDP, so QUIC/HTTP-3, WireGuard/WARP and game traffic work through a VLESS output.
 - **Memory Fitter:** Automatically fits large IP lists (like national blocklists) into router memory using density-based aggregation (`steer fit`).
 
 ## Installation

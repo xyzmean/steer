@@ -140,12 +140,35 @@ struct sess {
     /* Разобранный UUID узла: нужен один раз на соединение — в заголовке запроса VLESS и
      * при заводе Vision. В горячей половине ему делать нечего. */
     unsigned char uuid[16];
+    /* ---- сборка датаграммы UDP (только у потоков UDP) ----
+     *
+     * VLESS несёт датаграммы потоком: [длина(2)][данные] и снова. Записи TLS про эти
+     * границы не знают ничего — датаграмма может приехать двумя записями, а одна запись
+     * принести полторы, — поэтому недособранное приходится держать между чтениями.
+     *
+     * Здесь, а не в горячей половине: проход цикла про сборку не знает и знать не должен.
+     * Место занимают только те соединения, по которым реально идёт UDP, — страницы под
+     * struct sess берутся по факту обращения, ровно как у буферов TLS рядом.
+     *
+     * dg_want == 0 означает «ждём длину». lenb хранит первый байт длины, если запись
+     * кончилась ровно между двумя байтами длины: случай редкий, но молча теряющий
+     * синхронизацию потока навсегда.
+     *
+     * dg_skip — сколько байт слишком большой датаграммы осталось выбросить. Выбросить её
+     * НАДО ЦЕЛИКОМ и точно: оборвав отсчёт, мы приняли бы её хвост за длину следующей. */
+    unsigned char dg[UDP_DGRAM_MAX];
+    uint16_t dg_want, dg_have;
+    uint32_t dg_skip;
+    unsigned char lenb, lenb_n;
 };
 
 struct conn {
     /* Первая строка кэша — ровно то, что читает проход цикла. Порядок полей здесь не
      * косметика: разложив их как попало, мы вернули бы вторую строку в каждый обход. */
     uint8_t used;
+    /* Поток UDP, а не соединение TCP. Читает проход цикла: у UDP нет ни окна, ни кольца
+     * повтора, поэтому и решения «брать ли у сервера ещё» принимаются иначе. */
+    uint8_t is_udp;
     /* Рукопожатие к узлу идёт в отдельном потоке, и пока идёт — соединение НЕДОТРОЖИМО.
      *
      * Зачем это вообще. Рукопожатие стоит 250-400 мс, и делалось оно прямо в цикле: цикл
@@ -459,9 +482,14 @@ static __thread int16_t g_bucket[CONN_BUCKETS];
 
 static inline unsigned flow_hash(const struct flow_key *k) {
     /* Порты вместе с адресами: соединения к одному узлу отличаются только исходным портом,
-     * и хэш без него сложил бы все соединения браузера в одну корзину. */
+     * и хэш без него сложил бы все соединения браузера в одну корзину.
+     *
+     * Протокол — тоже часть ключа, и это не про распределение по корзинам, а про
+     * правильность: пятёрка «адреса, порты» без протокола у TCP-соединения и у потока UDP
+     * может совпасть буква в букву (клиент вправе взять один и тот же исходный порт для
+     * того и другого), и тогда датаграмма попала бы в TCP-соединение или наоборот. */
     uint32_t h = k->src ^ (k->dst * 0x9E3779B1u) ^
-                 ((uint32_t)k->sport << 16) ^ (uint32_t)k->dport;
+                 ((uint32_t)k->sport << 16) ^ (uint32_t)k->dport ^ ((uint32_t)k->proto << 8);
     h ^= h >> 15;
     h *= 0x2545F491u;
     h ^= h >> 13;
@@ -521,6 +549,10 @@ static __thread struct {
     /* Повторы. Ноль здесь означает «клиент получает всё с первого раза», а не «повтор не
      * работает», и различить это можно только имея число рядом с потерями. */
     uint64_t rtx_sends, rtx_bytes;
+    /* Датаграммы, которые не удалось отправить в момент прихода. У TCP такой случай
+     * прячется в «ждали окна» и лечится повтором клиента, а у UDP это ПОТЕРЯ — и единственное
+     * место, где её видно. Ноль здесь и жалобы на QUIC рядом означают, что дело не в нас. */
+    uint64_t udp_drops;
     /* Сколько соединений было живо на последнем проходе: «поток встал» и «поток закрылся»
      * в остальных числах выглядят одинаково — оба дают нули. */
     uint32_t conns;
@@ -544,6 +576,7 @@ static void stats_dump(uint64_t window_ns) {
             "tun-stats[%d]: %.1f МБ/с | циклов %.0f/с | poll %.0f%% | чтений у сервера %.0f/с "
             "(по %.1f КБ) | записей клиенту %.0f/с (%.0f мкс) | ждали окна %.0f/с | "
             "предел чтения %.0f/с | соединений %u | повторов %.0f/с (%.0f КБ/с) | "
+            "потеряно датаграмм %.0f/с | "
             "окно клиента %u..%u (масштаб %u), в пути до %u | порог повтора %u мс | "
             "чтение у сервера %.0f%% | разбор из TUN %.0f%% | чтение из TUN %.0f%%\n",
             g_worker,
@@ -558,6 +591,7 @@ static void stats_dump(uint64_t window_ns) {
             (double)g_st.drain_full / s,
             g_st.conns,
             (double)g_st.rtx_sends / s, (double)g_st.rtx_bytes / s / 1024.0,
+            (double)g_st.udp_drops / s,
             g_st.win_min == 0xFFFFFFFFu ? 0 : g_st.win_min, g_st.win_max,
             g_st.wscale_seen, g_st.inflight_max, rto_floor(),
             100.0 * (double)g_st.recv_ns / (double)window_ns,
@@ -894,7 +928,8 @@ static struct conn *conn_find(const struct flow_key *k) {
     for (int16_t i = g_bucket[flow_hash(k)]; i >= 0; i = g_conns[i].hnext) {
         struct conn *c = &g_conns[i];
         if (c->key.src == k->src && c->key.dst == k->dst &&
-            c->key.sport == k->sport && c->key.dport == k->dport)
+            c->key.sport == k->sport && c->key.dport == k->dport &&
+            c->key.proto == k->proto)
             return c;
     }
     return NULL;
@@ -989,11 +1024,17 @@ static struct conn *conn_new(const struct tun_dev *tun) {
         return NULL;
     }
 
-    unsigned char rst[64];
-    size_t rl = tcp_build(rst, sizeof(rst), old->key.dst, old->key.src,
-                          old->key.dport, old->key.sport,
-                          old->our_seq, old->client_seq, TCP_RST | TCP_ACK, NULL, 0, 0, 0, -1);
-    if (rl) tun_write_ctl(tun, rst, rl);
+    /* RST — только вытесняемому TCP: он ждёт ответа по открытому соединению и без отказа
+     * досиживал бы до своего таймаута. У потока UDP такого ожидания нет вовсе, а RST на
+     * датаграмму — пакет, которого клиентский стек не поймёт. */
+    if (!old->is_udp) {
+        unsigned char rst[64];
+        size_t rl = tcp_build(rst, sizeof(rst), old->key.dst, old->key.src,
+                              old->key.dport, old->key.sport,
+                              old->our_seq, old->client_seq, TCP_RST | TCP_ACK,
+                              NULL, 0, 0, 0, -1);
+        if (rl) tun_write_ctl(tun, rst, rl);
+    }
     /* В лог — не чаще раза в десять секунд. Вытеснение мёртвого соединения это уборка, а не
      * событие: на живом роутере таких строк набегало по тридцать шесть за сорок секунд, и все
      * они сообщали «всё хорошо» тревожным тоном. Лог, который кричит в норме, перестают
@@ -1033,6 +1074,13 @@ static void conn_drop(struct conn *c) {
     c->livepos = -1;
     c->hnext = -1;
     memset(&SESS(c)->vis, 0, sizeof(SESS(c)->vis));
+    /* Счётчики сборки датаграммы — но НЕ сам буфер: 4 КБ нулей на каждое закрытие это те
+     * же 4 КБ через кэш ради данных, которые всё равно перепишет следующая датаграмма.
+     * Читаем мы только счётчики, и обнулить достаточно их — ровно то же правило, по
+     * которому целиком не трётся и толстая половина. */
+    SESS(c)->dg_want = SESS(c)->dg_have = 0;
+    SESS(c)->dg_skip = 0;
+    SESS(c)->lenb_n = 0;
 }
 
 /* Отправить серверу данные в правильной форме: с заголовком VLESS на первом кадре и в
@@ -1061,9 +1109,18 @@ static int upstream_send(struct conn *c, const struct vless_node *node,
          * (или через наш резолвер, который вернул fake-IP и подменит адрес в DNAT). */
         unsigned char ip4[4];
         memcpy(ip4, &c->key.dst, 4);
-        /* dport уже в хостовом порядке — см. комментарий в tun.h. */
-        len = vless_build_request(s->uuid, VLESS_CMD_TCP, NULL, ip4,
-                                  c->key.dport, node->flow, out, sizeof(out));
+        /* Поток UDP объявляется командой 2 и БЕЗ flow.
+         *
+         * Vision (xtls-rprx-vision) — это про TCP: он подменяет копирование потока после
+         * рукопожатия, а у датаграмм такого потока нет. Xray это и требует: аккаунту с
+         * flow=xtls-rprx-vision он запрещает vision на TCP-запросе без flow, но UDP-запрос
+         * с пустым flow принимает — именно так ходит UDP у самого Xray. Прислать здесь flow
+         * значило бы получить закрытый поток без внятной причины.
+         *
+         * dport уже в хостовом порядке — см. комментарий в tun.h. */
+        len = vless_build_request(s->uuid, c->is_udp ? VLESS_CMD_UDP : VLESS_CMD_TCP,
+                                  NULL, ip4, c->key.dport,
+                                  c->is_udp ? NULL : node->flow, out, sizeof(out));
         if (!len) return SEND_FATAL;
     }
 
@@ -1083,7 +1140,7 @@ static int upstream_send(struct conn *c, const struct vless_node *node,
      *
      * Шестьдесят четыре байта копии против невоспроизводимой поломки протокола. */
     struct vision vis_before = s->vis;
-    if (node->flow[0] && !s->vis.sent_end) {
+    if (node->flow[0] && !c->is_udp && !s->vis.sent_end) {
         size_t fn = vision_wrap(&s->vis, data, n, out + len, sizeof(out) - len);
         if (!fn) return SEND_FATAL;
         len += fn;
@@ -1133,8 +1190,13 @@ static void send_synack(struct conn *c, const struct tun_dev *tun) {
 
 /* RST клиенту и освобождение записи. Номер обязан быть our_seq: клиент уже получил
  * SYN-ACK, а ESTABLISHED-приёмник принимает RST только с ожидаемым номером — нулевой
- * он молча игнорирует (challenge ACK), и соединение осталось бы висеть до таймаута. */
+ * он молча игнорирует (challenge ACK), и соединение осталось бы висеть до таймаута.
+ *
+ * У потока UDP отвечать нечем: сбрасывать нечего, соединения в понимании клиента нет
+ * вовсе. Молча закрываем — клиент узнает об этом отсутствием ответа, как узнаёт о любой
+ * потерянной датаграмме. */
 static void conn_reset(struct conn *c, const struct tun_dev *tun) {
+    if (c->is_udp) { conn_drop(c); return; }
     unsigned char rst[64];
     size_t rl = tcp_build(rst, sizeof(rst), c->key.dst, c->key.src,
                           c->key.dport, c->key.sport,
@@ -1162,6 +1224,124 @@ static int early_flush(struct conn *c, const struct vless_node *node) {
     free(c->early);
     c->early = NULL;
     c->early_n = c->early_off = 0;
+    return 0;
+}
+
+/* Придержать данные до готовности потока. 0 — взяли, -1 — не поместилось или нет памяти.
+ *
+ * Одна функция на TCP и UDP, потому что придерживается в обоих случаях РОВНО ТО, что уйдёт
+ * серверу: у TCP это поток байт как есть, у UDP — уже обрамлённые датаграммы. Границы
+ * датаграмм при этом сохраняются сами, без второго счётчика: длина каждой лежит в её же
+ * первых двух байтах. */
+static int early_hold(struct conn *c, const unsigned char *d, size_t n) {
+    if (n > EARLY_CAP - c->early_n) return -1;
+    if (!c->early) {
+        c->early = malloc(EARLY_CAP);
+        if (!c->early) return -1;
+    }
+    memcpy(c->early + c->early_n, d, n);
+    c->early_n += (uint32_t)n;
+    return 0;
+}
+
+/* ---- UDP -------------------------------------------------------------------- */
+/* Номер IP-пакета для датаграмм, отдаваемых клиенту. Осмыслен только при нарезке: по нему
+ * клиент склеивает фрагменты одной датаграммы и не путает их с чужими. Свой у каждого
+ * потока обработки — общий счётчик означал бы борьбу за строку кэша ради числа, которое
+ * никому не важно, кроме сборщика фрагментов. */
+static __thread uint16_t g_ip_id;
+
+/* Датаграмма серверу: двухбайтовая длина и данные ОДНИМ куском.
+ *
+ * Одним обязательно: h2_write отправляет либо всё, либо ничего, и датаграмма, разрезанная
+ * на два вызова, при закрытом окне уехала бы половиной — сервер прочитал бы длину и стал
+ * ждать хвост, которого нет, а следующая датаграмма приехала бы внутрь предыдущей. */
+static int udp_send_dgram(struct conn *c, const struct vless_node *node,
+                          const unsigned char *p, size_t n) {
+    static __thread unsigned char fr[2 + UDP_DGRAM_MAX];
+    if (n > UDP_DGRAM_MAX) return SEND_FATAL;
+    fr[0] = (unsigned char)(n >> 8);
+    fr[1] = (unsigned char)n;
+    memcpy(fr + 2, p, n);
+    /* Сессия ещё устанавливается: писать в неё нельзя — в ней работает установщик, — а
+     * датаграмму придержать можно. Проверка стоит ЗДЕСЬ, в единственном месте, которое
+     * знает про обрамление: разложенная по вызывающим, она была бы вторым правилом «кто
+     * имеет право трогать сессию», и второе однажды разошлось бы с первым. */
+    if (c->pending)
+        return early_hold(c, fr, 2 + n) == 0 ? SEND_OK : SEND_AGAIN;
+    return upstream_send(c, node, fr, 2 + n);
+}
+
+/* Разобрать поток датаграмм от узла и отдать их клиенту.
+ *
+ * Состояние сборки живёт в сессии между вызовами: границы датаграммы, кадра HTTP/2 и записи
+ * TLS не совпадают ни в одном месте, и «дочитать до конца датаграммы» здесь нельзя — чтение
+ * заблокировалось бы и остановило весь цикл. Возвращает 0 или -1. */
+static int udp_downstream(struct conn *c, const struct tun_dev *tun,
+                          const unsigned char *d, size_t n) {
+    struct sess *s = SESS(c);
+    while (n) {
+        /* Слишком крупная датаграмма выбрасывается РОВНО ПО ДЛИНЕ. Оборвать отсчёт нельзя:
+         * её хвост тут же был бы прочитан как длина следующей, и поток разъехался бы
+         * навсегда — то есть одна такая датаграмма убивала бы соединение. */
+        if (s->dg_skip) {
+            uint32_t take = s->dg_skip < n ? s->dg_skip : (uint32_t)n;
+            d += take;
+            n -= take;
+            s->dg_skip -= take;
+            continue;
+        }
+        if (!s->dg_want) {
+            if (s->lenb_n) {                        /* первый байт длины приехал раньше */
+                s->dg_want = (uint16_t)((s->lenb << 8) | d[0]);
+                s->lenb_n = 0;
+                d++;
+                n--;
+            } else if (n == 1) {
+                /* Запись кончилась ровно между двумя байтами длины. Случай редкий, и
+                 * именно поэтому его надо обработать: потерянный байт длины — это не
+                 * потерянная датаграмма, а сдвиг всего потока после неё. */
+                s->lenb = d[0];
+                s->lenb_n = 1;
+                return 0;
+            } else {
+                s->dg_want = (uint16_t)((d[0] << 8) | d[1]);
+                d += 2;
+                n -= 2;
+            }
+            if (!s->dg_want) continue;              /* длина 0: отдавать нечего */
+            if (s->dg_want > UDP_DGRAM_MAX) {
+                static __thread time_t said;
+                if (g_now_s - said >= 10) {
+                    said = g_now_s;
+                    fprintf(stderr, LOG_W "tunnel: датаграмма %u байт больше предела %d — "
+                            "выброшена\n", s->dg_want, UDP_DGRAM_MAX);
+                }
+                s->dg_skip = s->dg_want;
+                s->dg_want = 0;
+                continue;
+            }
+            s->dg_have = 0;
+        }
+        size_t need = (size_t)s->dg_want - s->dg_have;
+        size_t take = n < need ? n : need;
+        memcpy(s->dg + s->dg_have, d, take);
+        s->dg_have = (uint16_t)(s->dg_have + take);
+        d += take;
+        n -= take;
+        if (s->dg_have < s->dg_want) return 0;      /* хвост приедет следующей записью */
+
+        if (udp_write_to_client(tun, c->key.dst, c->key.src, c->key.dport, c->key.sport,
+                                s->dg, s->dg_want, ++g_ip_id) != 0)
+            return -1;
+        TR("клиенту датаграмма %u байт\n", s->dg_want);
+        s->dg_want = 0;
+        s->dg_have = 0;
+        /* Метка времени двигается на КАЖДОЙ датаграмме, а не только на пакетах клиента:
+         * поток, по которому идёт только приём (а таких у UDP полно — те же обновления от
+         * игрового сервера), иначе убрали бы по простою прямо во время работы. */
+        c->last = g_now_s;
+    }
     return 0;
 }
 
@@ -1298,6 +1478,11 @@ static int downstream_pump(struct conn *c, const struct vless_node *node,
         TR("заголовок ответа снят (%zu байт), осталось %zu\n", skip, left);
     }
 
+    /* Дальше пути расходятся: у TCP это поток в кадрах Vision, у UDP — датаграммы с
+     * двухбайтовой длиной и без всякого Vision (его в запросе UDP мы не объявляли). */
+    if (c->is_udp)
+        return left ? udp_downstream(c, tun, cur, left) : 0;
+
     size_t total = 0;
 
     while (left) {
@@ -1347,41 +1532,254 @@ static int downstream_pump(struct conn *c, const struct vless_node *node,
     return 0;
 }
 
+/* ---- сборка фрагментированной датаграммы клиента ---------------------------
+ *
+ * Клиент, которому понадобилось отправить датаграмму больше MTU, режет её сам — на выходе
+ * из его стека это уже несколько IP-фрагментов. Нести их по отдельности нельзя: заголовок
+ * UDP есть только в первом, а серверу нужна ЦЕЛАЯ датаграмма. Значит собирать.
+ *
+ * Слот ОДИН на поток обработки, а не на соединение, и это не экономия: фрагменты одной
+ * датаграммы идут подряд — их только что нарезал один и тот же стек, — поэтому больше
+ * одной незавершённой сборки одновременно не бывает почти никогда. Таблица сборки на 320
+ * соединений стоила бы мегабайты ради случая, которого нет.
+ *
+ * Фрагменты принимаются ТОЛЬКО ПО ПОРЯДКУ, и это сознательный отказ от общего случая.
+ * Перестановка на пути от клиента до роутера означала бы разные очереди в LAN, чего на
+ * одном сегменте не бывает; зато отказ от произвольного порядка убирает необходимость в
+ * карте занятых кусков — а с ней и весь класс ошибок с перекрывающимися фрагментами,
+ * которым в чужих реализациях посвящены отдельные CVE. Не по порядку — сборка сбрасывается,
+ * датаграмма теряется: для UDP это штатный исход.
+ *
+ * Срок жизни сборки — секунда. Брошенный хвост иначе занимал бы слот до следующей
+ * датаграммы с тем же номером, то есть отравлял бы её. */
+#define DEFRAG_TTL_NS 1000000000ull
+static __thread struct {
+    uint32_t src, dst;
+    uint16_t id;
+    uint16_t next_off;         /* сколько байт полезной нагрузки IP уже собрано */
+    uint64_t at;               /* когда пришёл первый фрагмент */
+    int active;
+    unsigned char buf[8 + UDP_DGRAM_MAX];   /* заголовок UDP плюс данные */
+} g_defrag;
+
+/* Собрать датаграмму из фрагментов. Возвращает длину готового пакета в out (то есть
+ * собранная датаграмма выглядит как обычный нефрагментированный пакет и разбирается тем же
+ * ip_parse), 0 — ждём следующий фрагмент, и 0 же при отказе: для UDP это одно и то же —
+ * датаграммы не будет. */
+static size_t udp_defrag(const unsigned char *pkt, size_t n, unsigned char *out,
+                         size_t out_cap) {
+    size_t ihl = (size_t)(pkt[0] & 0x0F) * 4;
+    if (ihl < 20 || n < ihl) return 0;
+    size_t total = (size_t)((pkt[2] << 8) | pkt[3]);
+    if (total > n || total < ihl) return 0;           /* заявленная длина больше пришедшей */
+    size_t payload_n = total - ihl;
+    unsigned frag = (unsigned)((pkt[6] << 8) | pkt[7]);
+    size_t off = (size_t)(frag & 0x1FFF) * 8;
+    int more = (frag & 0x2000) != 0;
+    uint16_t id = (uint16_t)((pkt[4] << 8) | pkt[5]);
+    uint32_t src, dst;
+    memcpy(&src, pkt + 12, 4);
+    memcpy(&dst, pkt + 16, 4);
+
+    if (g_defrag.active && g_now_ns - g_defrag.at > DEFRAG_TTL_NS)
+        g_defrag.active = 0;                         /* хвост брошен — слот свободен */
+
+    if (off == 0) {
+        /* Первый фрагмент: начинаем заново, даже если в слоте что-то лежало. Лежать там
+         * может только брошенное — своё продолжение придёт следом. */
+        if (payload_n < 8 || payload_n > sizeof(g_defrag.buf)) return 0;
+        memcpy(g_defrag.buf, pkt + ihl, payload_n);
+        g_defrag.src = src;
+        g_defrag.dst = dst;
+        g_defrag.id = id;
+        g_defrag.next_off = (uint16_t)payload_n;
+        g_defrag.at = g_now_ns;
+        g_defrag.active = 1;
+    } else {
+        if (!g_defrag.active || g_defrag.src != src || g_defrag.dst != dst ||
+            g_defrag.id != id || g_defrag.next_off != off) {
+            /* Чужой или не по порядку. Свою сборку при этом НЕ трогаем: пришедшее не имеет
+             * к ней отношения, а бросить её значило бы потерять из-за чужого пакета. */
+            if (g_defrag.active && g_defrag.src == src && g_defrag.dst == dst &&
+                g_defrag.id == id)
+                g_defrag.active = 0;                 /* своё, но вне порядка — сборке конец */
+            return 0;
+        }
+        if (payload_n > sizeof(g_defrag.buf) - g_defrag.next_off) {
+            g_defrag.active = 0;                     /* датаграмма больше нашего предела */
+            return 0;
+        }
+        memcpy(g_defrag.buf + g_defrag.next_off, pkt + ihl, payload_n);
+        g_defrag.next_off = (uint16_t)(g_defrag.next_off + payload_n);
+    }
+    if (more) return 0;                              /* продолжение ещё в пути */
+
+    /* Собрали. Отдаём как обычный пакет: заголовок IP на 20 байт, длина по факту, флагов
+     * фрагментации нет — дальше его разбирает тот же путь, что и всё остальное. */
+    size_t asm_total = 20 + g_defrag.next_off;
+    g_defrag.active = 0;
+    if (asm_total > out_cap) return 0;
+    /* Длина в заголовке UDP обязана совпасть с собранной: сервер читает именно её, и
+     * фрагмент, потерянный ядром клиента, дал бы здесь короткую датаграмму с чужой длиной. */
+    size_t udp_len = (size_t)((g_defrag.buf[4] << 8) | g_defrag.buf[5]);
+    if (udp_len != g_defrag.next_off) return 0;
+    memset(out, 0, 20);
+    out[0] = 0x45;
+    out[2] = (unsigned char)(asm_total >> 8);
+    out[3] = (unsigned char)asm_total;
+    out[4] = (unsigned char)(id >> 8);
+    out[5] = (unsigned char)id;
+    out[8] = 64;
+    out[9] = 17;
+    memcpy(out + 12, &src, 4);
+    memcpy(out + 16, &dst, 4);
+    memcpy(out + 20, g_defrag.buf, g_defrag.next_off);
+    return asm_total;
+}
+
+/* Датаграмма из TUN: своя сессия VLESS на каждый поток «адрес-порт → адрес-порт».
+ *
+ * Почему сессия на поток, а не одна на всё. Адрес назначения в VLESS едет в заголовке
+ * запроса, то есть задаётся ОДИН РАЗ и на весь поток. Нести в одном потоке нескольких
+ * адресатов умеет XUDP (это Mux.Cool поверх VLESS, со своим кадрированием и своими
+ * идентификаторами), и выигрывает он там, где адресатов много и каждому по одной
+ * датаграмме — то есть на DNS. Для того, ради чего UDP здесь и нужен — QUIC, WireGuard,
+ * игры, — адресат один, поток живёт минутами, и XUDP не даёт ничего, кроме своего формата,
+ * в котором можно ошибиться.
+ *
+ * Рукопожатие на поток теперь недорого: первая датаграмма ждёт его в буфере ранних данных,
+ * а пул запасных сессий отдаёт готовый поток сразу — то же, что и у SYN. Ровно поэтому
+ * поддержка UDP появилась именно после той работы, а не до: без неё каждая новая
+ * QUIC-сессия стоила бы 100-400 мс на пустом месте. */
+static void udp_packet(const struct tun_dev *tun, const struct vless_node *node,
+                       struct conn *c, const struct flow_key *k,
+                       const unsigned char *pkt, size_t n, size_t off) {
+    size_t dn = n - off;
+    /* Сюда попадают только целые датаграммы: фрагменты собирает udp_defrag ещё до разбора
+     * заголовка, и неполной датаграммы здесь быть не может. Проверка всё равно стоит —
+     * отправить серверу обрубок под видом целой датаграммы хуже, чем потерять её. */
+    if (k->frag || !dn || dn > UDP_DGRAM_MAX) return;
+
+    if (!c) {
+        c = conn_new(tun);
+        if (!c) return;                             /* все потоки свежие — клиент повторит */
+        memset(c, 0, sizeof(*c));
+        c->used = 1;
+        c->is_udp = 1;
+        c->key = *k;
+        c->fd = -1;
+        conn_link(c);                               /* после ключа: хэш считается по нему */
+        c->last = g_now_s;
+        if (vless_uuid_parse(node->uuid, SESS(c)->uuid) != 0) { conn_drop(c); return; }
+        /* Vision не заводим вовсе: в запросе UDP flow не объявлен, значит кадров не будет
+         * ни в ту, ни в другую сторону. */
+
+        if (g_spare_want > 0 && spare_checkout(&SESS(c)->v) == 0) {
+            c->fd = SESS(c)->v.fd;
+            TR("UDP: взята запасная сессия\n");
+        } else if (conn_submit(c, node) == 0) {
+            c->pending = 1;
+            TR("UDP: заявка установщику\n");
+        } else {
+            /* Очередь установки полна. Сказать об этом надо: снаружи это выглядит как
+             * «QUIC не работает через туннель», а причина — процессор, а не протокол. */
+            static __thread time_t said_q;
+            if (g_now_s - said_q >= 5) {
+                said_q = g_now_s;
+                fprintf(stderr, LOG_W "очередь установки соединений полна (%d), "
+                                "датаграмма отброшена — процессор не успевает\n", CONNQ);
+            }
+            conn_drop(c);
+            return;
+        }
+        spare_refill(node);
+    }
+
+    c->last = g_now_s;
+
+    /* Хвост ранних датаграмм, не уместившийся в окно h2 при готовности потока, обязан уйти
+     * ПЕРВЫМ. Свежая датаграмма вперёд него — это не «переставленные датаграммы», с чем
+     * QUIC живёт, а разрезанный пополам кадр: в потоке к узлу датаграммы идут одним
+     * байтовым потоком, и вставка между двумя половинами ломает разбор у сервера
+     * НАВСЕГДА. На голом tcp такого не бывает (там отправка либо целиком, либо ошибка), а
+     * на grpc и xhttp окно закрывается штатно. */
+    if (!c->pending && c->early) {
+        int fr = early_flush(c, node);
+        if (fr < 0) { conn_drop(c); return; }
+        if (fr > 0) {
+            if (g_stats) g_st.udp_drops++;
+            TR("хвост ранних датаграмм не ушёл — свежую теряем\n");
+            return;
+        }
+    }
+
+    int sr = udp_send_dgram(c, node, pkt + off, dn);
+    if (sr == SEND_OK) {
+        TR("датаграмма клиента %zu байт -> серверу\n", dn);
+        return;
+    }
+    if (sr == SEND_AGAIN) {
+        /* Окно h2 закрыто или буфер ранних данных полон. У TCP на этом месте пакет просто
+         * не подтверждается и клиент повторяет его сам; у UDP подтверждений нет, и
+         * придержать датаграмму негде — значит теряем её. Это не поблажка: потеря
+         * датаграммы — штатное событие для любого протокола поверх UDP, и все они умеют
+         * её пережить, а вот отправка НЕ ПО ПОРЯДКУ сломала бы, например, QUIC. */
+        if (g_stats) g_st.udp_drops++;
+        TR("датаграмма отброшена: отправить сейчас нельзя\n");
+        return;
+    }
+    TR("поток UDP сломан, закрываю\n");
+    conn_drop(c);
+}
+
 /* Один пакет из TUN. */
 static void handle_packet(const struct tun_dev *tun, const struct vless_node *node,
                           const unsigned char *pkt, size_t n) {
     struct flow_key k;
     size_t off = 0;
+
+    /* Фрагменты UDP собираем ДО разбора: у продолжения нет заголовка UDP, и разбирать в нём
+     * нечего — ip_parse такой пакет и не примет. Собранное выглядит обычным пакетом и идёт
+     * дальше общим путём, поэтому знать про фрагменты больше никому не нужно. */
+    if (n >= 20 && (pkt[0] >> 4) == 4 && pkt[9] == 17 &&
+        (((pkt[6] << 8) | pkt[7]) & 0x3FFF)) {
+        static __thread unsigned char asm_pkt[20 + 8 + UDP_DGRAM_MAX];
+        size_t an = udp_defrag(pkt, n, asm_pkt, sizeof(asm_pkt));
+        if (!an) { TR("фрагмент UDP: %s\n", "ждём продолжения или отказ"); return; }
+        TR("датаграмма собрана из фрагментов: %zu байт\n", an);
+        pkt = asm_pkt;
+        n = an;
+    }
+
     if (ip_parse(pkt, n, &k, &off) != 0) { TR("пакет не разобран (%zu байт)\n", n); return; }
     TR("%u.%u.%u.%u:%u -> %u.%u.%u.%u:%u proto=%u flags=0x%02x len=%zu\n",
        k.src&255,(k.src>>8)&255,(k.src>>16)&255,(k.src>>24)&255, k.sport,
        k.dst&255,(k.dst>>8)&255,(k.dst>>16)&255,(k.dst>>24)&255, k.dport,
        k.proto, k.tcp_flags, n - off);
 
-    /* UDP и прочее не пересылаем: VLESS UDP требует отдельной обёртки, а основной UDP,
-     * который важен для маршрутизации, — это DNS, и его перехватывает резолвер steer.
+    /* Всё, что не TCP и не UDP, туннель нести не умеет: это ICMP, ESP и прочее, для чего
+     * у VLESS команды нет вовсе.
      *
-     * Но и НЕ МОЛЧИМ. Прежде такой пакет просто выбрасывался, и это стоило целых сайтов:
-     * браузер идёт к Cloudflare по QUIC, то есть UDP на 443, и тишину понимает как «ещё не
-     * ответили», а не «нельзя». Он ждёт и повторяет, и на сайтах, настойчиво предпочитающих
-     * QUIC, страница не открывалась вовсе — при живом туннеле, где TCP до тех же адресов
-     * проходил за 250 мс семь раз из семи. ICMP-отказ превращает ожидание в мгновенный
-     * переход на TCP, который у нас работает.
+     * И НЕ МОЛЧИМ. Прежде такой пакет просто выбрасывался, и это стоило целых сайтов —
+     * тогда в этой ветке был ещё и UDP: браузер идёт к Cloudflare по QUIC, то есть UDP на
+     * 443, и тишину понимает как «ещё не ответили», а не «нельзя». Он ждёт и повторяет, и
+     * на сайтах, настойчиво предпочитающих QUIC, страница не открывалась вовсе. ICMP-отказ
+     * превращал ожидание в мгновенный переход на TCP.
      *
-     * Проверка dport на 53 — чтобы не отвечать отказом на DNS: его перехватывает резолвер,
-     * и попавший сюда запрос означает, что перехват не настроен. Отказ там сломал бы
-     * разрешение имён вместо того, чтобы просто не помочь. */
-    if (k.proto != 6) {
-        if (!(k.proto == 17 && k.dport == 53)) {
-            unsigned char un[128];
-            size_t ul = icmp_unreach_build(un, sizeof(un), pkt, n);
-            if (ul) tun_write_ctl(tun, un, ul);
-        }
-        TR("не TCP (proto=%u), отказ\n", k.proto);
+     * Теперь UDP несётся честно (ветка ниже), и отказ остался только тому, чему помочь
+     * по-прежнему нечем. Для ICMP это правильный ответ и по существу: эмуляция ping через
+     * прокси вводит в заблуждение — успешный ping не означает рабочий путь. */
+    if (k.proto != 6 && k.proto != 17) {
+        unsigned char un[128];
+        size_t ul = icmp_unreach_build(un, sizeof(un), pkt, n);
+        if (ul) tun_write_ctl(tun, un, ul);
+        TR("ни TCP, ни UDP (proto=%u), отказ\n", k.proto);
         return;
     }
 
     struct conn *c = conn_find(&k);
+
+    if (k.proto == 17) { udp_packet(tun, node, c, &k, pkt, n, off); return; }
 
     if (k.tcp_flags & TCP_SYN) {
         if (c) {
@@ -1480,13 +1878,8 @@ static void handle_packet(const struct tun_dev *tun, const struct vless_node *no
         if (k.tcp_flags & TCP_ACK) c->client_win = k.window;
         size_t dn = n - off;
         if (!dn || k.seq != c->client_seq) return;
-        if (c->early_n + dn > EARLY_CAP) return;    /* без ACK — клиент повторит позже */
-        if (!c->early) {
-            c->early = malloc(EARLY_CAP);
-            if (!c->early) return;
-        }
-        memcpy(c->early + c->early_n, pkt + off, dn);
-        c->early_n += (uint32_t)dn;
+        /* Не поместилось — не подтверждаем: клиент повторит сам, когда поток будет готов. */
+        if (early_hold(c, pkt + off, dn) != 0) return;
         c->client_seq += (uint32_t)dn;
         c->last = g_now_s;
         c->ack_due = 1;
@@ -1707,7 +2100,7 @@ static void drain_conn(struct conn *c, const struct vless_node *node,
             c->rx_ready = (uint8_t)(vless_has_data(&s->v) != 0);
             return;
         }
-        if (!client_can_take_record(c)) {
+        if (!c->is_udp && !client_can_take_record(c)) {
             c->rx_ready = (uint8_t)(vless_has_data(&s->v) != 0);
             return;
         }
@@ -1862,7 +2255,10 @@ static void *worker_loop(void *arg) {
              *
              * У закрытых сервером читать нечего вовсе — они живут только чтобы додать
              * клиенту остаток. */
-            int want = !c->srv_closed && client_can_take_record(c);
+            /* У потока UDP окна нет, а значит нет и повода не читать: датаграмма уходит
+             * клиенту сразу и целиком, копить её негде и не нужно. Придерживать чтение
+             * было бы не управлением потоком, а задержкой на пустом месте. */
+            int want = !c->srv_closed && (c->is_udp || client_can_take_record(c));
             if (!want && !c->srv_closed && g_stats) g_st.win_skips++;
             if (want != (int)c->armed) {
                 struct epoll_event e = { .events = EPOLLIN,
@@ -2007,8 +2403,13 @@ static void *worker_loop(void *arg) {
             /* Готовность посчитана ДО разбора порции из TUN, а в ней могло приехать
              * подтверждение с меньшим окном. Читать в этом случае нельзя: отданное за окно
              * приёмник молча выбросит, и закрывать дыру придётся повтором. Проверка стоит
-             * копейки и снимает зависимость от того, успел ли epoll узнать о снятии. */
-            if (c->srv_closed || !client_can_take_record(c)) continue;
+             * копейки и снимает зависимость от того, успел ли epoll узнать о снятии.
+             *
+             * У потока UDP окна нет: спрашивать про него — значит не читать НИКОГДА, потому
+             * что окно там нулевое по определению (см. client_room). Ровно на этом UDP и не
+             * работал в первой версии: датаграмма уходила серверу, ответ лежал в сокете, а
+             * читать его никто не приходил. */
+            if (c->srv_closed || (!c->is_udp && !client_can_take_record(c))) continue;
             drain_conn(c, node, &tun);
         }
 
@@ -2054,6 +2455,15 @@ static void *worker_loop(void *arg) {
                 (now - c->rtx_at) / 1000000 >= c->rto_ms)
                 rtx_resend(c, &tun, "истёк таймаут");
 
+            /* Поток UDP, закрытый узлом: ждать нечего и прощаться нечем — ни кольца
+             * неподтверждённого, ни FIN у датаграмм не бывает. Освобождаем сразу; если
+             * клиент пришлёт ещё датаграмму, откроется новый поток. */
+            if (c->srv_closed && c->is_udp) {
+                TR("узел закрыл поток UDP conn#%ld\n", (long)(c - g_conns));
+                conn_drop(c);
+                continue;                        /* на место этого встал другой */
+            }
+
             /* Закрытые сервером: как только клиент подтвердил всё — FIN и закрываем. Если не
              * подтвердил за отведённое время, закрываем всё равно: клиент мог уйти совсем. */
             if (c->srv_closed) {
@@ -2090,13 +2500,13 @@ static void *worker_loop(void *arg) {
              * соединением, которое считает открытым: следующий запрос по нему уходил в
              * пустоту и ждал таймаута — то есть наша уборка выглядела как зависший сайт. */
             if (g_now_s - c->last > IDLE_EVICT_S) {
-                unsigned char rst[64];
-                size_t rl = tcp_build(rst, sizeof(rst), c->key.dst, c->key.src,
-                                      c->key.dport, c->key.sport,
-                                      c->our_seq, c->client_seq, TCP_RST | TCP_ACK,
-                                      NULL, 0, 0, 0, -1);
-                if (rl) tun_write_ctl(&tun, rst, rl);
-                conn_drop(c);
+                /* Порог тот же, что у TCP, и это не экономия на константе. Простаивающий
+                 * поток UDP — это, как правило, QUIC между запросами: у него свой таймаут
+                 * простоя, и он короче нашего, то есть клиент бросит соединение первым.
+                 * Убрав поток раньше него, мы поменяли бы у следующей датаграммы исходный
+                 * порт НА СТОРОНЕ УЗЛА — для получателя это новый путь, и QUIC пришлось бы
+                 * заново подтверждать его. Столько же держит и conntrack ядра. */
+                conn_reset(c, &tun);                /* у UDP это просто закрытие, без RST */
                 continue;
             }
             li++;

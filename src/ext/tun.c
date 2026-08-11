@@ -13,8 +13,8 @@
  *
  * Границы реализации названы честно:
  *   TCP  — работает: состояние соединения отслеживается, поток VLESS на соединение;
- *   UDP  — не поддержан (VLESS UDP требует отдельной обёртки; DNS всё равно перехватывает
- *          резолвер steer, а это основной UDP, который важен для маршрутизации);
+ *   UDP  — работает: поток VLESS на пару адрес-порт, датаграммы едут с двухбайтовой
+ *          длиной (VLESS cmd=2). Этим же путём идут QUIC и WireGuard;
  *   ICMP — не пересылается: ping через прокси требует эмуляции, которая полезна только для
  *          диагностики, а вводит в заблуждение (успешный ping не означает рабочий путь).
  */
@@ -183,6 +183,21 @@ int ip_parse(const unsigned char *p, size_t n, struct flow_key *k, size_t *paylo
     k->proto = p[9];
     memcpy(&k->src, p + 12, 4);
     memcpy(&k->dst, p + 16, 4);
+
+    /* Фрагменты. Раньше эти два байта не читались вовсе, и для TCP это проходило
+     * незамеченным: в продолжении фрагмента на месте заголовка лежат данные, из них
+     * выходили случайные порты, соединение по ним не находилось, и пакет тихо пропадал —
+     * то есть верный итог по неверной причине.
+     *
+     * Для UDP такой итог уже не годится: случайные порты — это НОВЫЙ поток, а новый поток
+     * означает рукопожатие с узлом. Мусорный фрагмент открывал бы сессию к узлу.
+     *
+     * Продолжение фрагмента (смещение не ноль) разобрать нечем — заголовка в нём нет,
+     * поэтому отказ. У первого фрагмента заголовок есть, но датаграмма неполна: он
+     * размечается флагом, а решает вызывающий (см. handle_packet). */
+    unsigned frag = (unsigned)((p[6] << 8) | p[7]);
+    if (frag & 0x1FFF) return -1;                    /* не первый фрагмент — заголовка нет */
+    k->frag = (frag & 0x2000) ? 1 : 0;               /* MF: продолжение будет */
 
     if (k->proto == 6) {                             /* TCP */
         if (n < ihl + 20) return -1;
@@ -510,4 +525,121 @@ size_t tcp_build(unsigned char *out, size_t cap,
     t[16] = (unsigned char)(tsum >> 8);
     t[17] = (unsigned char)tsum;
     return total;
+}
+
+/* ---- UDP клиенту ----------------------------------------------------------- */
+/* Сумма псевдозаголовка UDP: то же, что у TCP, но с номером протокола 17. */
+static uint32_t udp_pseudo_sum(uint32_t src, uint32_t dst, size_t udp_len) {
+    unsigned char pseudo[12];
+    memcpy(pseudo, &src, 4);
+    memcpy(pseudo + 4, &dst, 4);
+    pseudo[8] = 0; pseudo[9] = 17;
+    pseudo[10] = (unsigned char)(udp_len >> 8); pseudo[11] = (unsigned char)udp_len;
+    return csum_add(pseudo, 12, 0);
+}
+
+/* Заголовок IPv4 с полями фрагментации. Отдельно от tcp_build не ради красоты: датаграмма
+ * может не влезть в MTU, и тогда один и тот же заголовок печатается несколько раз с разным
+ * смещением. */
+static void ip4_hdr(unsigned char *out, size_t total, uint32_t src, uint32_t dst,
+                    unsigned char proto, uint16_t id, unsigned frag_off, int more) {
+    memset(out, 0, 20);
+    out[0] = 0x45;
+    out[2] = (unsigned char)(total >> 8);
+    out[3] = (unsigned char)total;
+    out[4] = (unsigned char)(id >> 8);
+    out[5] = (unsigned char)id;
+    unsigned flags = (frag_off / 8) | (more ? 0x2000u : 0u);
+    out[6] = (unsigned char)(flags >> 8);
+    out[7] = (unsigned char)flags;
+    out[8] = 64;                                     /* TTL */
+    out[9] = proto;
+    memcpy(out + 12, &src, 4);
+    memcpy(out + 16, &dst, 4);
+    uint16_t ipsum = csum_fin(csum_add(out, 20, 0));
+    out[10] = (unsigned char)(ipsum >> 8);
+    out[11] = (unsigned char)ipsum;
+}
+
+/* Отдать клиенту датаграмму. Адреса и порты уже поменяны местами вызывающим: мы отвечаем
+ * от имени того, к кому клиент обращался.
+ *
+ * Фрагментация здесь не про экзотику. Датаграмма приезжает от узла ЦЕЛОЙ — по пути к нему
+ * её собрало ядро сервера, — и в MTU нашего устройства она может не влезть: классический
+ * случай это ответ DNS с EDNS0, где клиент сам объявил буфер в 4096 байт. Без нарезки
+ * такой ответ пришлось бы выбросить, то есть «UDP работает, а большие ответы теряются» —
+ * поломка, которую ищут месяцами. Собирает фрагменты обратно стек клиента, это его
+ * обычная работа.
+ *
+ * Смещение фрагмента считается в восьмибайтовых блоках, поэтому кусок обязан быть кратен
+ * восьми — кроме последнего. Возвращает 0 или -1. */
+int udp_write_to_client(const struct tun_dev *d, uint32_t src, uint32_t dst,
+                        uint16_t sport, uint16_t dport,
+                        const unsigned char *data, size_t n, uint16_t ip_id) {
+    /* Заголовок UDP плюс сама датаграмма: сумма UDP считается по ВСЕЙ датаграмме, а не по
+     * куску, поэтому собрать её надо целиком и только потом нарезать. Статический буфер, а
+     * не стек: 64 КБ на стеке в цикле, который и без того держит буфер записи TLS. */
+    static __thread unsigned char l4[8 + UDP_DGRAM_MAX];
+    if (n > UDP_DGRAM_MAX) return -1;
+
+    size_t udp_len = 8 + n;
+    l4[0] = (unsigned char)(sport >> 8); l4[1] = (unsigned char)sport;
+    l4[2] = (unsigned char)(dport >> 8); l4[3] = (unsigned char)dport;
+    l4[4] = (unsigned char)(udp_len >> 8); l4[5] = (unsigned char)udp_len;
+    l4[6] = 0; l4[7] = 0;
+    memcpy(l4 + 8, data, n);
+    uint32_t acc = udp_pseudo_sum(src, dst, udp_len);
+    acc = csum_add(l4, udp_len, acc);
+    uint16_t usum = csum_fin(acc);
+    /* Ноль в поле суммы означает «сумма не считалась», поэтому по RFC 768 его заменяют на
+     * 0xFFFF: обе величины дают один и тот же результат при проверке. */
+    if (!usum) usum = 0xFFFF;
+    l4[6] = (unsigned char)(usum >> 8);
+    l4[7] = (unsigned char)usum;
+
+    unsigned char pkt[20 + UDP_MTU_PAYLOAD];
+    size_t off = 0;
+    while (off < udp_len) {
+        size_t chunk = udp_len - off;
+        if (chunk > UDP_MTU_PAYLOAD) chunk = UDP_MTU_PAYLOAD & ~7u;
+        int more = off + chunk < udp_len;
+        ip4_hdr(pkt, 20 + chunk, src, dst, 17, ip_id, (unsigned)off, more);
+        memcpy(pkt + 20, l4 + off, chunk);
+        /* Через tun_writev, а НЕ через tun_write_ctl, и это не мелочь.
+         *
+         * tun_write_ctl не проверяет результат и не повторяет: он для служебных пакетов, где
+         * потеря дёшева — SYN-ACK или ACK клиент пришлёт заново сам. Здесь же уходят ДАННЫЕ,
+         * и при заполненной очереди устройства writev отвечает EAGAIN, то есть датаграмма
+         * пропадает молча.
+         *
+         * Замерено на живом роутере: страница по HTTP/3 через туннель то скачивалась за
+         * 840 мс, то вставала на четверти и добиралась до конца за двадцать секунд, то
+         * обрывалась совсем — при том, что узел присылал всё. QUIC потерю переживает, но не
+         * такую: очередь заполняется как раз на скачивании, то есть теряется не отдельная
+         * датаграмма, а подряд идущая пачка.
+         *
+         * Дождаться места дешевле: очередь TUN опустошает ядро, отдавая пакеты в LAN, и
+         * ожидание здесь измеряется миллисекундой. Ровно так же поступает путь TCP
+         * (tun_write_data), и по той же причине.
+         *
+         * Заголовок vnet при включённой разгрузке обязателен ВСЕГДА, а не только при
+         * нарезке: без него ядро прочитает первые десять байт нашего IP-заголовка как этот
+         * заголовок. Нарезку не просим — суммы посчитаны, пакет уже размером в MTU. */
+        struct iovec iov[2];
+        int nio = 0;
+        struct vnet_hdr vh;
+        if (d->gso) {
+            memset(&vh, 0, sizeof(vh));
+            vh.gso_type = VNET_GSO_NONE;
+            iov[nio].iov_base = &vh;
+            iov[nio].iov_len = sizeof(vh);
+            nio++;
+        }
+        iov[nio].iov_base = pkt;
+        iov[nio].iov_len = 20 + chunk;
+        nio++;
+        if (tun_writev(d, iov, nio) != 0) return -1;
+        off += chunk;
+    }
+    return 0;
 }

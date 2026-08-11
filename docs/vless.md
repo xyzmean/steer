@@ -11,9 +11,9 @@ It handles routing, native TUN interface creation, and cryptographic handshakes 
 - **Transports**: `tcp`, `grpc`, `xhttp` (implemented via minimal embedded HTTP/2).
 - **Security**: `reality`, `none`.
 - **Flow**: `xtls-rprx-vision`, or none.
-- **Traffic**: TCP over TUN.
+- **Traffic**: TCP and UDP over TUN — see [UDP and QUIC](#udp-and-quic).
 
-*Note: UDP over VLESS is not supported; ICMP "Port Unreachable" is returned to trigger immediate fallback to TCP on the client side.*
+*Note: ICMP is still not forwarded. Emulating ping through a proxy is misleading — a successful ping would not mean a working path — so anything that is neither TCP nor UDP is answered with ICMP "Port Unreachable".*
 
 ## Reality Implementation Details
 
@@ -39,6 +39,18 @@ Since `steer` processes raw IP packets but the VLESS server expects TCP streams,
 - **No Reordering Buffer**: Out-of-order packets from the client are dropped and left for the client's OS to retransmit, saving router memory.
 - **Multi-Threading**: Uses `IFF_MULTI_QUEUE` to allocate queues per CPU core (up to 4). Symmetric hashing ensures both halves of a TCP connection map to the same thread, eliminating the need for locks in the data path.
 - **Memory Scaling**: Memory is allocated dynamically per connection (max 64 concurrent connections by default) to prevent OOM kills on memory-constrained routers.
+
+## UDP and QUIC
+
+UDP travels as VLESS command 2: the request header names one destination, and the stream that follows is a sequence of datagrams, each prefixed with its length as two big-endian bytes. Both directions use the same framing. This is what carries QUIC (HTTP/3), WireGuard/WARP, game traffic and plain DNS.
+
+- **One node session per flow.** The destination lives in the *request header*, so it is fixed for the life of a stream: a session per `src:port → dst:port` pair is what the protocol shape dictates. Xray's XUDP (Mux.Cool for UDP) can multiplex several destinations over one stream, and it pays off exactly where there are many destinations with one datagram each — DNS. For what UDP is actually needed for here (QUIC, WireGuard, games) there is one destination and the flow lives for minutes, so XUDP would add its own framing and nothing else.
+- **Vision is not used for UDP**, and the request carries no `flow` addon. Vision replaces stream copying after the handshake, which has no meaning for datagrams; Xray agrees — an account with `flow=xtls-rprx-vision` may send UDP requests with an empty flow, and that is how Xray's own client behaves. Sending the flow here gets the stream closed with no useful diagnosis.
+- **Handshake cost is hidden.** The first datagram waits in the early-data buffer while the node handshake runs, and the spare-session pool usually hands over a ready stream immediately (see below). Without that work each new QUIC connection would pay 100-400 ms.
+- **Datagrams up to 4096 bytes.** Reassembling a partially received datagram needs a buffer *per flow*, and 64 KB × 320 flows is memory a router does not have. 4 KB covers everything in practice: QUIC and game traffic stay inside the MTU by themselves, and the largest legitimate case is a DNS answer with EDNS0, where clients advertise 4096. A larger datagram is skipped by its exact length — losing stream synchronisation would kill the flow, not just the datagram.
+- **Fragmentation, both ways.** A datagram larger than the MTU arrives from the client already split by its own stack; the tunnel reassembles it (one slot per worker thread, in-order fragments only) before handing it to the node. In the other direction a datagram larger than the MTU is cut into IP fragments and reassembled by the client's stack — without this, a large DNS answer would be silently dropped.
+- **Idle timeout is the same 120 s as TCP**, matching conntrack. Shorter would change the source port *on the node side* for the next datagram, and a QUIC peer would have to re-validate the path.
+- **Loss is loss.** If a datagram cannot be handed to the node at that moment (HTTP/2 window closed on grpc/xhttp), it is dropped rather than queued: every protocol over UDP survives a lost datagram, but none survives reordering. `STEER_TUN_STATS=1` reports these as `потеряно датаграмм`.
 
 ## Connection Setup Latency
 

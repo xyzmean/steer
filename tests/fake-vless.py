@@ -25,6 +25,7 @@ import sys
 import threading
 
 ADDR_IPV4, ADDR_DOMAIN, ADDR_IPV6 = 1, 2, 3
+CMD_TCP, CMD_UDP = 1, 2
 
 
 def recv_exactly(sock, n):
@@ -72,9 +73,13 @@ class Handler(socketserver.BaseRequestHandler):
         req = read_request(sock)
         if req is None:
             return
-        uuid, _, port = req
+        uuid, cmd, port = req
         if uuid != self.server.uuid:
             return                          # чужой ключ — молчим, как настоящий сервер
+
+        if cmd == CMD_UDP:
+            self.serve_udp(sock)
+            return
 
         # Порт 9 (discard) — соединение, которое ОТКРЫТО и молчит.
         #
@@ -138,6 +143,44 @@ class Handler(socketserver.BaseRequestHandler):
             pass
         reader.join(timeout=10)
         print("fake-vless: отдал %d байт" % sent, file=sys.stderr, flush=True)
+
+
+    def serve_udp(self, sock):
+        """Поток UDP (команда 2): датаграммы с двухбайтовой длиной, ЭХО обратно.
+
+        Эхо, а не осмысленный ответ, потому что проверяется ровно перенос датаграмм:
+        сохранились ли границы, дошли ли байты, и не склеились ли две в одну. Любой другой
+        ответ пришлось бы сверять с содержимым, а содержимое здесь и есть проверка.
+
+        Длина ответа берётся ЧУЖАЯ — та, что пришла: вернув свою, стенд перестал бы замечать
+        как раз ту ошибку, ради которой он написан (потерянную или сдвинутую длину).
+        """
+        sock.sendall(b"\x00\x00")               # ответ VLESS: версия, длины доп нет
+        buf = b""
+        n_dg = 0
+        try:
+            while True:
+                if len(buf) < 2:
+                    chunk = sock.recv(65536)
+                    if not chunk:
+                        break
+                    buf += chunk
+                    continue
+                want = (buf[0] << 8) | buf[1]
+                if len(buf) < 2 + want:
+                    chunk = sock.recv(65536)
+                    if not chunk:
+                        break
+                    buf += chunk
+                    continue
+                payload = buf[2:2 + want]
+                buf = buf[2 + want:]
+                n_dg += 1
+                # Отдаём тем же кадром. Датаграмма нулевой длины законна — её эхо тоже.
+                sock.sendall(bytes([want >> 8, want & 255]) + payload)
+        except OSError:
+            pass
+        print("fake-vless: UDP-поток закрыт, датаграмм %d" % n_dg, file=sys.stderr, flush=True)
 
 
 class Server(socketserver.ThreadingTCPServer):

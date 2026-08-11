@@ -104,8 +104,9 @@ Requested via `steer diag [--spec FILE]`. Runs a set of health checks and emits 
   - `note` — advice, not a finding: it works and will keep working, but is worth knowing. **`note` is deliberately excluded from the `warn`/`fail` counters** and must not be treated as "not ok". (Without this, always-true advice — e.g. a browser with DoH bypassing the router's DNS — would permanently paint a healthy router red.)
   - `warn` — it works, but there is something that explains a likely future complaint.
   - `fail` — broken; traffic is going the wrong way.
-- **Check `id`s** currently emitted: `table`, `down_chain`, `set`, `dns_redirect`, `dnsd`, `doh`, `ipv6`, `udp`, `output`. The set may grow between releases; consumers must tolerate unknown ids.
-  - `udp` — emitted as a `note` when at least one enabled channel leads to a `kind: vless` output. The VLESS tunnel carries TCP only: a UDP packet is answered with ICMP port-unreachable, so a browser falls back to TCP, but WARP/WireGuard and game traffic do not work through such an output at all.
+- **Check `id`s** currently emitted: `table`, `down_chain`, `set`, `dns_redirect`, `dnsd`, `doh`, `ipv6`, `resolver`, `output`. The set may grow *and shrink* between releases; consumers must tolerate unknown ids and must not require any particular id to be present.
+  - `udp` — **no longer emitted.** It used to be a `note` saying the VLESS tunnel carries TCP only. The tunnel now carries UDP (VLESS command 2), so QUIC, WireGuard and game traffic work through a `kind: vless` output. A consumer that treated the absence of this note as "old version" must instead read the version.
+  - `resolver` — emitted as a `note` when a `kind: vless` channel's address list contains a public resolver (for example `8.8.8.0/24` inside a Google or YouTube category). Such DNS queries do reach the resolver through the tunnel, but each query is a fresh UDP flow and therefore a fresh handshake to the node: names resolve, only slower. Never a `warn` — nothing is broken.
 - **Exit code**: `steer diag` exits `1` only when at least one check is `fail`; `note` and `warn` never cause a non-zero exit.
 - **Top-level counters**: `warn` = number of `warn` verdicts; `fail` = number of `fail` verdicts. There is no `note` counter.
 
