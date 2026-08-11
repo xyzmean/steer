@@ -15,6 +15,7 @@ test: all ext-syntax $(BUILD)/dnsmatch $(BUILD)/specmatch $(BUILD)/failovermatch
 	@sh tests/run.sh
 	@sh tests/gen.sh
 	@sh tests/diagmatch.sh
+	@sh tests/buildmatch.sh
 	@$(BUILD)/dnsmatch
 	@$(BUILD)/specmatch
 	@$(BUILD)/failovermatch

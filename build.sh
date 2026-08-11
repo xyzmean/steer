@@ -31,11 +31,10 @@ fi
 # Собираются из ОДНИХ исходников: extended это те же файлы плюс src/ext и mbedtls.
 # Разные бинарники из разного набора файлов означали бы два места, где чинить одну ошибку.
 BASE_SRC="src/steer.c src/spec.c src/dnsd.c src/failover.c src/aggregate.c"
-# Абсолютные пути внутри контейнера: расширенная сборка компилирует mbedtls из отдельного
-# каталога и делает cd туда, так что относительные пути к исходникам не находятся —
-# ошибка выглядела как «FileNotFound: src/ext/tls13.c», то есть будто файла нет вовсе.
-BASE_SRC_ABS="/src/src/steer.c /src/src/spec.c /src/src/dnsd.c /src/src/failover.c /src/src/aggregate.c"
-EXT_SRC_ABS="/src/src/ext/sub.c /src/src/ext/reality.c /src/src/ext/tls13.c /src/src/ext/vless_proto.c /src/src/ext/vision.c /src/src/ext/client.c /src/src/ext/tun.c /src/src/ext/tunnel.c /src/src/ext/h2.c /src/src/ext/rtx.c"
+# Список файлов расширенной сборки живёт в build/build-ext.sh и только там: он запускается
+# отдельным процессом с тремя аргументами, ничего отсюда не наследует, и вторая копия списка
+# здесь молча расходилась бы с первой. Что списки не разошлись с самим каталогом src/ext,
+# проверяет tests/buildmatch.sh.
 
 ISAS="
 mipsel_24kc:mipsel-linux-musl:mips32r2+soft_float
