@@ -11,7 +11,7 @@ $(BUILD)/steer: src/steer.c src/spec.c src/dnsd.c src/failover.c src/aggregate.c
 	@mkdir -p $(BUILD)
 	$(CC) $(CFLAGS) -o $@ src/steer.c src/spec.c src/dnsd.c src/failover.c src/aggregate.c
 
-test: all ext-syntax $(BUILD)/dnsmatch $(BUILD)/specmatch $(BUILD)/failovermatch $(BUILD)/h2match $(BUILD)/submatch $(BUILD)/diagsim
+test: all ext-syntax $(BUILD)/dnsmatch $(BUILD)/specmatch $(BUILD)/failovermatch $(BUILD)/h2match $(BUILD)/submatch $(BUILD)/fwmatch $(BUILD)/diagsim
 	@sh tests/run.sh
 	@sh tests/gen.sh
 	@sh tests/diagmatch.sh
@@ -21,6 +21,7 @@ test: all ext-syntax $(BUILD)/dnsmatch $(BUILD)/specmatch $(BUILD)/failovermatch
 	@$(BUILD)/failovermatch
 	@$(BUILD)/h2match
 	@$(BUILD)/submatch
+	@$(BUILD)/fwmatch
 
 # Движок, собранный как расширенный, но без самой расширенной части: нужен стенду
 # diagmatch, потому что спеку с `kind: vless` базовая сборка отвергает парсером, а
@@ -62,6 +63,15 @@ $(BUILD)/failovermatch: tests/failovermatch.c src/failover.c
 	@mkdir -p $(BUILD)
 	$(CC) $(CFLAGS) -o $@ tests/failovermatch.c
 
+# Зависимость выхода от чужого firewall: fw_check судит о конфигурации по тексту дампа
+# nft, и проверить эвристику можно только примерами. Стенд включает исходник движка и
+# подменяет popen на чтение из памяти — см. tests/fwmatch.c.
+$(BUILD)/fwmatch: tests/fwmatch.c src/steer.c src/spec.c src/dnsd.c src/failover.c \
+                  src/aggregate.c src/spec.h
+	@mkdir -p $(BUILD)
+	$(CC) $(CFLAGS) -o $@ tests/fwmatch.c src/spec.c src/dnsd.c src/failover.c \
+	      src/aggregate.c
+
 # Управление потоком HTTP/2 проверяется в памяти: h2.c общается с сетью только через
 # struct h2_io, поэтому стенд подменяет его целиком. -Itests/stub нужен, чтобы не тянуть
 # mbedtls ради типов, которые тест не трогает — см. tests/stub/mbedtls/sha256.h.
@@ -82,5 +92,6 @@ $(BUILD)/submatch: tests/submatch.c src/ext/sub.c src/ext/vless.h
 # только артефакты: то, что здесь же и собирается, плюс упаковка из build.sh.
 clean:
 	rm -rf $(BUILD)/steer $(BUILD)/steer-* $(BUILD)/dnsmatch $(BUILD)/specmatch \
-	       $(BUILD)/failovermatch $(BUILD)/h2match $(BUILD)/submatch $(BUILD)/diagsim $(BUILD)/libmbed-*.a \
+	       $(BUILD)/failovermatch $(BUILD)/h2match $(BUILD)/submatch $(BUILD)/fwmatch \
+	       $(BUILD)/diagsim $(BUILD)/libmbed-*.a \
 	       $(BUILD)/*.err $(BUILD)/pkg $(BUILD)/scripts out

@@ -596,8 +596,39 @@ static int names_device(const char *hay, const char *device) {
     return 0;
 }
 
+/* Имя цепочки — первое слово: и в заголовке (`chain srcnat_vpn {`), и в переходе
+ * (`jump srcnat_vpn comment ...`) оно стоит первым и кончается пробелом или скобкой. */
+static void chain_token(const char *s, char *out, size_t cap) {
+    size_t i = 0;
+    while (*s == ' ' || *s == '\t') s++;
+    while (i + 1 < cap && s[i] && s[i] != ' ' && s[i] != '\t' && s[i] != '\n'
+           && s[i] != '{' && s[i] != ';')
+        out[i] = s[i], i++;
+    out[i] = 0;
+}
+
+#define FWC_CHAINS 16
+static void remember_chain(char tab[FWC_CHAINS][64], size_t *n, const char *name) {
+    if (!*name || *n >= FWC_CHAINS) return;
+    for (size_t i = 0; i < *n; i++)
+        if (!strcmp(tab[i], name)) return;
+    snprintf(tab[(*n)++], 64, "%s", name);
+}
+
 static struct fwcheck fw_check(const char *device) {
     struct fwcheck r = { 0, 0 };
+    /* Зона может называться не так, как устройство, и тогда оба признака ниже молчат:
+     * fw4 пишет имя ЗОНЫ и в имя цепочки (`srcnat_vpn`), и в комментарий правила
+     * ("Masquerade IPv4 vpn traffic"), а устройство называет ТОЛЬКО на переходе в эту
+     * цепочку: `oifname "warp0" jump srcnat_vpn`. Снято с fw4 25.12: при зоне с именем,
+     * отличным от имени устройства, во всём наборе нет ни одной строки, где устройство
+     * стояло бы рядом со словом masquerade, — и выход получал «нет masquerade» при
+     * включённом masq (splicicd#8). Поэтому цепочка, в которую устройство уходит по oif,
+     * засчитывается вместе со своим содержимым. Порядок строк не предполагается: дамп
+     * может назвать цепочку и до перехода, и после, поэтому оба множества собираются за
+     * один проход и пересекаются в конце. */
+    char dev_chain[FWC_CHAINS][64], masq_chain[FWC_CHAINS][64];
+    size_t dev_chain_n = 0, masq_chain_n = 0;
     /* --terse: без содержимого наборов. Проверка смотрит на имена устройств в правилах
      * и цепочках, а элементы наборов ей не нужны — при этом их бывают десятки тысяч, и
      * полный дамп на слабом роутере стоил секунды НА КАЖДЫЙ ВЫЗОВ. Вызовов же по одному
@@ -625,11 +656,28 @@ static struct fwcheck fw_check(const char *device) {
          * line reported "no NAT" on a router whose NAT was working fine — a false
          * alarm that sent me diagnosing the wrong thing. So the enclosing chain name
          * counts as evidence too. */
+        /* Переход, на котором названо устройство: `oifname "warp0" jump srcnat_vpn`.
+         * Требование oif намеренное — masquerade живёт на выходе, и переход по входящему
+         * устройству (dstnat) про NAT наружу не говорит ничего. */
+        const char *j = strstr(line, "jump ");
+        if (j && strstr(line, "oif") && names_device(line, device)) {
+            char t[64];
+            chain_token(j + 5, t, sizeof t);
+            remember_chain(dev_chain, &dev_chain_n, t);
+        }
         if (strstr(line, "masquerade") || strstr(line, "snat")) {
             if (names_device(line, device) || names_device(chain, device)) r.masqueraded = 1;
+            else {
+                char t[64];
+                chain_token(chain, t, sizeof t);
+                remember_chain(masq_chain, &masq_chain_n, t);
+            }
         }
     }
     pclose(f);
+    for (size_t i = 0; i < dev_chain_n && !r.masqueraded; i++)
+        for (size_t k = 0; k < masq_chain_n; k++)
+            if (!strcmp(dev_chain[i], masq_chain[k])) { r.masqueraded = 1; break; }
     return r;
 }
 
