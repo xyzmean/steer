@@ -341,7 +341,10 @@ static size_t emit_elements(FILE *f, const char *path, size_t already) {
         /* Не-адреса пропускаем молча: про них уже сказал check_address_lists, а nft на
          * них отвергает ВЕСЬ набор, а не одну строку. */
         if (!looks_like_addr(p)) continue;
-        fprintf(f, "%s%s", n ? ", " : "", p);
+        /* fputs, а не fprintf: на списке в сотни тысяч элементов разбор
+         * форматной строки на каждый — это заметная доля времени apply. */
+        if (n) fputs(", ", f);
+        fputs(p, f);
         n++;
     }
     fclose(in);
@@ -615,6 +618,57 @@ static void remember_chain(char tab[FWC_CHAINS][64], size_t *n, const char *name
     snprintf(tab[(*n)++], 64, "%s", name);
 }
 
+/* Один дамп набора правил на процесс.
+ *
+ * fw_check дёргается по разу на выход, report_traceroute_dep добавляет свой
+ * дамп — то есть status (а его интерфейс опрашивает каждые пять секунд) и apply
+ * платили sh+nft и полный обход ruleset ядром по два-пять раз за запуск, на
+ * одни и те же данные. На слабом роутере это был главный фоновый расход CPU
+ * всей системы. Кэш корректен ровно потому, что все читатели работают ПОСЛЕ
+ * любых изменений набора правил в этом же процессе: в apply отчёты идут после
+ * `nft -f`, а status/diag ruleset не трогают. Дамп по-прежнему --terse (см.
+ * комментарий в fw_check), так что в памяти он занимает килобайты, а живёт до
+ * конца короткоживущего CLI-процесса. */
+/* Кэш всегда либо NULL, либо получен malloc'ом: tests/fwmatch.c сбрасывает его
+ * между пробами обычным free(), изображая свежий процесс на каждую пробу. */
+static char *g_ruleset_dump;
+
+static const char *ruleset_dump(void) {
+    if (g_ruleset_dump) return g_ruleset_dump;
+    size_t cap = 65536, n = 0;
+    char *buf = malloc(cap);
+    if (!buf) return ""; /* не кэшируем — следующий вызов попробует снова */
+    FILE *f = popen("nft -t list ruleset 2>/dev/null || "
+                    "nft list ruleset 2>/dev/null", "r");
+    if (!f) { buf[0] = '\0'; return g_ruleset_dump = buf; }
+    for (;;) {
+        if (n + 4096 + 1 > cap) {
+            char *nb = realloc(buf, cap *= 2);
+            if (!nb) break; /* сколько влезло — с тем и работаем */
+            buf = nb;
+        }
+        size_t r = fread(buf + n, 1, 4096, f);
+        if (!r) break;
+        n += r;
+    }
+    pclose(f);
+    buf[n] = '\0';
+    return g_ruleset_dump = buf;
+}
+
+/* Следующая «строка» кэша с семантикой fgets: длинная строка выдаётся кусками
+ * по cap-1 — читатели ниже написаны в этих терминах. Возвращает позицию
+ * продолжения или NULL в конце. */
+static const char *dump_line(const char *p, char *line, size_t cap) {
+    if (!p || !*p) return NULL;
+    size_t len = 0;
+    while (len < cap - 1 && p[len] && p[len] != '\n') len++;
+    if (len < cap - 1 && p[len] == '\n') len++;
+    memcpy(line, p, len);
+    line[len] = '\0';
+    return p + len;
+}
+
 static struct fwcheck fw_check(const char *device) {
     struct fwcheck r = { 0, 0 };
     /* Зона может называться не так, как устройство, и тогда оба признака ниже молчат:
@@ -631,16 +685,14 @@ static struct fwcheck fw_check(const char *device) {
     size_t dev_chain_n = 0, masq_chain_n = 0;
     /* --terse: без содержимого наборов. Проверка смотрит на имена устройств в правилах
      * и цепочках, а элементы наборов ей не нужны — при этом их бывают десятки тысяч, и
-     * полный дамп на слабом роутере стоил секунды НА КАЖДЫЙ ВЫЗОВ. Вызовов же по одному
-     * на выход в status (его интерфейс опрашивает каждые пять секунд), в diag и в apply:
-     * ровно этим status и apply тормозили. Флаг есть в nft с 0.9.4 (OpenWrt 21+); на
-     * случай древней сборки — откат к полному дампу, медленно, но не слепо. */
-    FILE *f = popen("nft -t list ruleset 2>/dev/null || nft list ruleset 2>/dev/null", "r");
-    if (!f) return r;
+     * полный дамп на слабом роутере стоил секунды НА КАЖДЫЙ ВЫЗОВ. Флаг есть в nft
+     * с 0.9.4 (OpenWrt 21+); на случай древней сборки — откат к полному дампу,
+     * медленно, но не слепо. Сам дамп берётся из ruleset_dump() — один на процесс. */
+    const char *pos = ruleset_dump();
     char line[2048];
     char chain[128] = "";
     int in_steer = 0;
-    while (fgets(line, sizeof(line), f)) {
+    while ((pos = dump_line(pos, line, sizeof(line))) != NULL) {
         /* Our own table mentions the device too; it proves nothing about NAT. */
         if (strstr(line, "table inet steer")) in_steer = 1;
         else if (!strncmp(line, "table ", 6)) in_steer = 0;
@@ -674,7 +726,6 @@ static struct fwcheck fw_check(const char *device) {
             }
         }
     }
-    pclose(f);
     for (size_t i = 0; i < dev_chain_n && !r.masqueraded; i++)
         for (size_t k = 0; k < masq_chain_n; k++)
             if (!strcmp(dev_chain[i], masq_chain[k])) { r.masqueraded = 1; break; }
@@ -696,15 +747,12 @@ static void report_traceroute_dep(void) {
             return;
         }
     }
-    /* Тот же --terse, что в fw_check, и по той же причине: ищется правило, а не элементы. */
-    FILE *f = popen("nft -t list ruleset 2>/dev/null || nft list ruleset 2>/dev/null", "r");
+    /* Тот же кэшированный дамп, что в fw_check: ищется правило, а не элементы. */
+    const char *pos = ruleset_dump();
     int ok = 0;
-    if (f) {
-        char line[2048];
-        while (fgets(line, sizeof(line), f))
-            if (strstr(line, "untracked") && strstr(line, "accept")) ok = 1;
-        pclose(f);
-    }
+    char line[2048];
+    while ((pos = dump_line(pos, line, sizeof(line))) != NULL)
+        if (strstr(line, "untracked") && strstr(line, "accept")) ok = 1;
     if (!ok)
         fprintf(stderr, "steer: traceroute_hops is on but no rule accepting untracked "
                         "packets was found — ICMP time-exceeded will be dropped by the "
@@ -879,6 +927,12 @@ static int cmd_apply(const char *spec, int dry) {
     int fd = mkstemp(tmp);
     if (fd < 0) die("cannot create a temporary ruleset", NULL);
     FILE *f = fdopen(fd, "w");
+    /* Крупный буфер на чисто дозаписывающий поток: musl по умолчанию даёт
+     * BUFSIZ в 1 КБ, и набор на сотни тысяч элементов дробился на тысячи
+     * мелких write. Статический — чтобы не зависеть от кучи в момент,
+     * когда рядом nft уже строит своё дерево разбора. */
+    static char genbuf[65536];
+    setvbuf(f, genbuf, _IOFBF, sizeof(genbuf));
     generate(f);
     fclose(f);
 

@@ -506,12 +506,32 @@ void registry_assign(void) {
         g_out[i].table = TABLE_BASE + (int)next_bit;
         next_bit++;
     }
+    /* Прежде чем писать — сравнить с тем, что уже на диске. registry_assign
+     * зовут все подкоманды, включая status, который интерфейс опрашивает каждые
+     * пять секунд: безусловная перезапись — это ~17 тысяч записей файла в сутки
+     * с неизменным содержимым. Сравнивается будущий текст целиком, а не «были ли
+     * новые назначения»: перезапись заодно вычищает строки исчезнувших выходов,
+     * и пропускать её можно только когда файл уже дословно совпадает. */
+    char want[1024]; /* 16 выходов по ≤53 байта строки — влезает с запасом */
+    size_t wn = 0;
+    for (size_t i = 0; i < g_out_n && wn < sizeof(want); i++)
+        if (g_out[i].kind != OUT_DIRECT) {
+            int w = snprintf(want + wn, sizeof(want) - wn, "%s %x %d\n",
+                             g_out[i].name, g_out[i].mark, g_out[i].table);
+            if (w < 0 || (size_t)w >= sizeof(want) - wn) break; /* не бывает, но не рвём буфер */
+            wn += (size_t)w;
+        }
+    f = fopen(path, "r");
+    if (f) {
+        char have[sizeof(want) + 1];
+        size_t hn = fread(have, 1, sizeof(have), f);
+        fclose(f);
+        if (hn == wn && memcmp(have, want, wn) == 0) return;
+    }
     mkdir(g_state_dir, 0755);
     f = fopen(path, "w");
     if (!f) return;             /* best effort: apply still works, next boot re-assigns */
-    for (size_t i = 0; i < g_out_n; i++)
-        if (g_out[i].kind != OUT_DIRECT)
-            fprintf(f, "%s %x %d\n", g_out[i].name, g_out[i].mark, g_out[i].table);
+    fwrite(want, 1, wn, f);
     fclose(f);
 }
 

@@ -49,6 +49,11 @@ static void probe(const char *what, const char *ruleset, const char *device,
                   int want_in_firewall, int want_masq) {
     char label[256];
     g_ruleset = ruleset;
+    /* Дамп кэшируется на процесс (см. ruleset_dump в steer.c), а каждая проба
+     * изображает ОТДЕЛЬНЫЙ запуск движка со своим набором правил — поэтому
+     * кэш сбрасывается: он всегда NULL или malloc'ов, free() достаточно. */
+    free(g_ruleset_dump);
+    g_ruleset_dump = NULL;
     struct fwcheck r = fw_check(device);
     snprintf(label, sizeof(label), "%s — устройство в firewall", what);
     check(label, r.in_firewall, want_in_firewall);
