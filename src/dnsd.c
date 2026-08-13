@@ -78,6 +78,26 @@
 #define MAX_RULE_LINES 65536
 #define MAX_HOSTNAME 256
 
+/* FAKEIP_ANSWER_TTL is independent of the real record's TTL — the fake IP
+ * itself never needs to expire from the client's cache the way a real
+ * record does (it's a stable, persistent allocation); this just needs to be
+ * short enough that the client re-queries periodically, e.g. after a NAT-map
+ * refresh. It is also the natural refresh cadence for everything derived
+ * from the answer (the DNAT map, the route element): the client cannot act
+ * on anything newer until its cached answer expires, so re-checking more
+ * often than the TTL buys nothing — see the throttles that reference it. */
+#define FAKEIP_ANSWER_TTL 60
+
+/* SPLIFY_DNSD_DEBUG решается один раз: getenv — линейный проход по environ с
+ * strncmp на каждую переменную, а спрашивали его до восьми раз на один
+ * запрос — только чтобы решить «не печатать». Окружение демона после старта
+ * не меняется, так что кэшировать ответ безопасно. */
+static int g_debug = -1;
+static int dbg(void) {
+    if (g_debug < 0) g_debug = getenv("SPLIFY_DNSD_DEBUG") != NULL;
+    return g_debug;
+}
+
 /* ---------------------------------------------------------------------- */
 /* индекс строк: имя -> номер записи                                      */
 /* ---------------------------------------------------------------------- */
@@ -861,7 +881,7 @@ static int nftlk_elem_msg(uint16_t nft_msg_type, const char *table,
     nfg->version      = NFNETLINK_V0;
     nfg->res_id       = 0; /* res_id encodes the hw protocol family; 0 = any */
 
-    if (getenv("SPLIFY_DNSD_DEBUG")) {
+    if (dbg()) {
         fprintf(stderr, "nftlk: fam_str='%s' -> nfgen_family=%u, total=%u bytes, hex:",
                 fam_str, nfg->nfgen_family, nh->nlmsg_len);
         for (uint32_t i = 0; i < nh->nlmsg_len; i++) {
@@ -888,7 +908,7 @@ static int nftlk_elem_msg(uint16_t nft_msg_type, const char *table,
                           .msg_iov = iov, .msg_iovlen = 3 };
     uint32_t want_seq = nh->nlmsg_seq;
     if (sendmsg(g_nlk_fd, &msg, 0) < 0) {
-        if (getenv("SPLIFY_DNSD_DEBUG")) fprintf(stderr, "nftlk: sendmsg fail errno=%d\n", errno);
+        if (dbg()) fprintf(stderr, "nftlk: sendmsg fail errno=%d\n", errno);
         return -1;
     }
 
@@ -900,19 +920,19 @@ static int nftlk_elem_msg(uint16_t nft_msg_type, const char *table,
     for (;;) {
         ssize_t r = recv(g_nlk_fd, rbuf, sizeof(rbuf), 0);
         if (r < (ssize_t)NLMSG_HDRLEN) {
-            if (getenv("SPLIFY_DNSD_DEBUG")) fprintf(stderr, "nftlk: ack recv short/timeout r=%zd errno=%d\n", r, errno);
+            if (dbg()) fprintf(stderr, "nftlk: ack recv short/timeout r=%zd errno=%d\n", r, errno);
             return -1; /* timeout / truncated */
         }
         struct nlmsghdr *rh = (struct nlmsghdr *)rbuf;
         if (rh->nlmsg_type == NLMSG_ERROR) {
             struct nlmsgerr *e = NLMSG_DATA(rh);
             if (rh->nlmsg_seq != want_seq) {
-                if (getenv("SPLIFY_DNSD_DEBUG"))
+                if (dbg())
                     fprintf(stderr, "nftlk: stale ack seq=%u (want %u), ignoring\n",
                             rh->nlmsg_seq, want_seq);
                 continue;
             }
-            if (e->error != 0 && getenv("SPLIFY_DNSD_DEBUG"))
+            if (e->error != 0 && dbg())
                 fprintf(stderr, "nftlk: kernel ack error=%d (%s) for %s/%s\n",
                         e->error, strerror(-e->error), tbl_str, obj_name);
             /* The kernel's errno is returned as-is (negative): EEXIST and ENOENT
@@ -976,7 +996,7 @@ static int nft_map_set_element(const char *map_name, uint32_t fake_host,
          * which is exactly the state the add below wants. */
         int drc = nftlk_elem_msg(NFT_MSG_DELSETELEM, g_nft_table, map_name,
                                  &k, 0, NULL, 0);
-        if (drc != 0 && drc != -ENOENT && getenv("SPLIFY_DNSD_DEBUG"))
+        if (drc != 0 && drc != -ENOENT && dbg())
             fprintf(stderr, "nftlk: map delete for update failed rc=%d\n", drc);
     }
     int rc = nftlk_elem_msg(NFT_MSG_NEWSETELEM, g_nft_table, map_name,
@@ -1021,6 +1041,22 @@ struct fakeip_entry {
      * is a PERMANENT element of its channel set, exactly like it is permanent in
      * the DNAT map, so the path stays stable for the whole lifetime of the flow. */
     int set_idx;
+    /* Дроссели горячего пути, оба — время последнего действия (0 = никогда).
+     * Не сохраняются: после рестарта первый запрос всё сделает заново, это
+     * и есть желаемое поведение.
+     *
+     * route_asserted — когда элемент канала последний раз переутверждался в
+     * ядре. Переутверждение — страховка от fw4 reload, смывшего наборы, а не
+     * рабочий путь: без дросселя каждый повторный запрос платил блокирующей
+     * nf_tables-транзакцией (sendmsg + recv ack, до 100 мс под commit mutex)
+     * за EEXIST, который ядро отвечало на уже стоящий элемент.
+     *
+     * refreshed — когда мы последний раз ходили за доменом к upstream ради
+     * обновления DNAT-карты. Клиент не может переспросить раньше, чем истечёт
+     * выданный ему TTL, поэтому фоновая сверка чаще FAKEIP_ANSWER_TTL не
+     * узнаёт ничего нового, а стоит полного круга сокет-эполл-резолвер. */
+    time_t route_asserted;
+    time_t refreshed;
 };
 
 struct fakeip_table {
@@ -1073,6 +1109,8 @@ static int fakeip_table_add(struct fakeip_table *t, const char *domain, uint32_t
     t->entries[t->n].addr = addr;
     t->entries[t->n].real_host = 0;
     t->entries[t->n].set_idx = -1;        /* unknown until the resolver routes it */
+    t->entries[t->n].route_asserted = 0;
+    t->entries[t->n].refreshed = 0;
     t->n++;
     if (t == &g_fakeip &&
         sindex_put(&g_fakeip_idx, t, fakeip_key, t->entries[t->n - 1].domain,
@@ -1179,11 +1217,17 @@ static void fakeip_state_rewrite(void) {
             fprintf(f, "%s\t%s\n", g_fakeip.entries[i].domain, fstr);
         }
     }
-    fflush(f);
-    if (rename(tmp, g_fakeip_state_path) != 0) {
+    /* Данные должны лечь на носитель ДО rename: иначе отключение питания между
+     * rename и фактической записью оставляет пустой state-файл — ровно ту
+     * потерю всей таблицы, от которой защищается разбор в fakeip_state_load. */
+    if (fflush(f) != 0 || fsync(fileno(f)) != 0) {
+        fclose(f);
         unlink(tmp);
+        return;
     }
     fclose(f);
+    if (rename(tmp, g_fakeip_state_path) != 0)
+        unlink(tmp);
 }
 
 /* Looks up domain's existing fake IP, or allocates the next free one and
@@ -1262,6 +1306,15 @@ struct pending {
      * второй ответ на тот же id клиент в лучшем случае выбросит, а в худшем
      * (другой адрес в A) примет за подмену. */
     int quiet;
+    /* Результат матчинга, вычисленный на приёме запроса: -2 — вопрос не
+     * разобрался (ответ пойдёт по полному пути), -1 — ни один канал не
+     * совпал, >=0 — номер канала. Ответ upstream несёт то же имя вопроса,
+     * что и запрос, поэтому повторять разбор и матчинг в ответе незачем —
+     * а для несовпавшего домена (подавляющее большинство трафика) это
+     * снимает с ответа и parse_response, и проход по всем каналам.
+     * Действителен, только пока rules_gen == g_rules_gen. */
+    int hit;
+    unsigned rules_gen;
     struct sockaddr_storage client;
     socklen_t client_len;
     time_t expire;
@@ -1291,7 +1344,17 @@ static void fakeip_route_set(const char *domain, int new_set_idx) {
     if (old == new_set_idx) {
         /* Same channel: the permanent element is already there (or survived from a
          * previous run). Re-assert idempotently so a kernel that lost it (an fw4
-         * reload flushed the sets) gets it back without waiting for a re-resolve. */
+         * reload flushed the sets) gets it back without waiting for a re-resolve.
+         *
+         * Но не чаще TTL ответа: без дросселя КАЖДЫЙ повторный запрос платил
+         * блокирующей nf_tables-транзакцией за ответ EEXIST — и второй раз тем
+         * же, когда фоновый ответ upstream доходил до этой же строки. После
+         * fw4 reload элемент вернётся с первым запросом по истечении TTL —
+         * раньше клиент со старым кешем и не придёт. */
+        time_t now = time(NULL);
+        if (now - g_fakeip.entries[at].route_asserted < FAKEIP_ANSWER_TTL)
+            return;
+        g_fakeip.entries[at].route_asserted = now;
         nft_add_element(g_dch[new_set_idx].set, g_fakeip.entries[at].addr, 0);
         return;
     }
@@ -1302,7 +1365,7 @@ static void fakeip_route_set(const char *domain, int new_set_idx) {
         uint32_t k_net = htonl(g_fakeip.entries[at].addr);
         int drc = nftlk_elem_msg(NFT_MSG_DELSETELEM, g_nft_table, g_dch[old].set,
                                  &k_net, 1, NULL, 0);
-        if (drc != 0 && drc != -ENOENT && getenv("SPLIFY_DNSD_DEBUG"))
+        if (drc != 0 && drc != -ENOENT && dbg())
             fprintf(stderr, "nftlk: channel-move delete from %s rc=%d\n",
                     g_dch[old].set, drc);
     }
@@ -1311,6 +1374,7 @@ static void fakeip_route_set(const char *domain, int new_set_idx) {
      * the desired state. */
     nft_add_element(g_dch[new_set_idx].set, g_fakeip.entries[at].addr, 0);
     g_fakeip.entries[at].set_idx = new_set_idx;
+    g_fakeip.entries[at].route_asserted = time(NULL);
 }
 
 static volatile int g_reload_pending = 0;
@@ -1319,7 +1383,15 @@ static volatile int g_running = 1;
 static void on_sighup(int sig) { (void)sig; g_reload_pending = 1; }
 static void on_sigterm(int sig) { (void)sig; g_running = 0; }
 
+/* Поколение правил: pending несёт результат матчинга, вычисленный на приёме
+ * запроса, и ответ вправе переиспользовать его только пока правила те же.
+ * SIGHUP посреди пятисекундного окна ожидания — редкость, но молча применить
+ * старое решение к новым правилам — это класс ошибок, который снаружи не
+ * виден вовсе. */
+static unsigned g_rules_gen;
+
 static void reload_rules(void) {
+    g_rules_gen++;
     for (size_t i = 0; i < g_dch_n; i++) {
         ruleset_free(&g_dch[i].rules);
         memset(&g_dch[i].rules, 0, sizeof(g_dch[i].rules));
@@ -1331,8 +1403,13 @@ static void reload_rules(void) {
                 g_dch[i].set, g_dch[i].rules.n);
 }
 
-static struct pending *pending_alloc(void) {
-    time_t now = time(NULL);
+/* Снятие протухших ожиданий. Вызывается из секундного тика цикла событий, а не
+ * на каждом запросе: полный проход по таблице (256 записей по ~160 байт — это
+ * ~40 КБ, весь L1 роутерного ядра) на каждый пакет вымывал из кеша и индекс
+ * правил, и таблицу fake-IP. Тик же заодно закрывает случай, который прежний
+ * реап «по дороге» не закрывал вовсе: на тихой сети слот запроса, чей upstream
+ * так и не ответил, висел с открытым fd до следующего чужого запроса. */
+static void pending_reap(time_t now) {
     for (int i = 0; i < MAX_PENDING; i++) {
         if (g_pending[i].in_use && g_pending[i].expire < now) {
             epoll_ctl(g_epfd, EPOLL_CTL_DEL, g_pending[i].fd, NULL);
@@ -1340,19 +1417,31 @@ static struct pending *pending_alloc(void) {
             g_pending[i].in_use = 0;
         }
     }
+}
+
+static struct pending *pending_alloc(void) {
+    for (int i = 0; i < MAX_PENDING; i++)
+        if (!g_pending[i].in_use) return &g_pending[i];
+    /* Всё занято — прежде чем ронять запрос, попробовать вернуть протухшее:
+     * редкий путь, но именно он сохраняет прежнюю ёмкость под всплеском. */
+    pending_reap(time(NULL));
     for (int i = 0; i < MAX_PENDING; i++)
         if (!g_pending[i].in_use) return &g_pending[i];
     return NULL;
 }
 
-static void handle_client_query(int upstream_port) {
+/* Возвращает 1, если датаграмма была и обработана, 0 — если читать нечего.
+ * Слушающий сокет неблокирующий, и цикл событий дочитывает очередь до EAGAIN:
+ * под всплеском (страница — это 20-40 запросов за миллисекунды) это один
+ * epoll_wait на пачку вместо круга через ядро на каждую датаграмму. */
+static int handle_client_query(int upstream_port) {
     uint8_t buf[MAX_PKT];
     /* Dual-stack listener -> the client may be IPv6 (or v4-mapped). The reply is
      * sent back to exactly these bytes, so the family never has to be inspected. */
     struct sockaddr_storage from;
     socklen_t fromlen = sizeof(from);
     ssize_t n = recvfrom(g_listen_fd, buf, sizeof(buf), 0, (struct sockaddr *)&from, &fromlen);
-    if (n <= 0) return;
+    if (n <= 0) return 0;
 
     /* Быстрый путь: на вопрос, ответ на который НЕ ЗАВИСИТ от upstream, отвечаем
      * прямо из запроса. Это и есть задержка fake-ip глазами клиента: раньше каждый
@@ -1364,8 +1453,9 @@ static void handle_client_query(int upstream_port) {
     uint16_t qtype = 0;
     size_t qend = 0;
     int quiet = 0;
+    int hit = -2; /* -2 = вопрос не разобрался; см. struct pending */
     if (parse_query(buf, (size_t)n, qname, sizeof(qname), &qtype, &qend) == 0) {
-        int hit = -1;
+        hit = -1;
         for (size_t i = 0; i < g_dch_n && hit < 0; i++)
             if (ruleset_match(&g_dch[i].rules, qname)) hit = (int)i;
         if (hit >= 0 && !g_dch[hit].realip) {
@@ -1379,12 +1469,13 @@ static void handle_client_query(int upstream_port) {
                     make_response_flags(out);
                     sendto(g_listen_fd, out, len, 0,
                            (struct sockaddr *)&from, fromlen);
-                    return;
+                    return 1;
                 }
             } else if (qtype == DNS_TYPE_A) {
-                /* Ищем в нижнем регистре: записи создаются из ответов, где имя —
-                 * эхо запроса клиента, а клиенты пишут строчными. Промах по
-                 * регистру не ломает ничего — просто уходим на прежний путь. */
+                /* Ключи таблицы — всегда в нижнем регистре (ответ приводится
+                 * перед вставкой), поэтому и искать нужно так же: клиент с
+                 * рандомизацией регистра (DNS-0x20) обязан попадать в ту же
+                 * запись, что и обычный. */
                 char lname[MAX_HOSTNAME];
                 snprintf(lname, sizeof(lname), "%s", qname);
                 str_lower(lname);
@@ -1393,8 +1484,7 @@ static void handle_client_query(int upstream_port) {
                     /* DNAT для этого fake-IP уже стоит (real_host запоминается
                      * только после успешного ack от ядра либо восстановлен
                      * rehydrate-проходом) — значит, ответ клиенту безопасен до
-                     * похода наверх. Сам поход не отменяется, а уходит в фон:
-                     * ответ upstream обновит карту, если backend переехал. */
+                     * похода наверх. */
                     uint8_t out[512];
                     size_t len = build_rewritten_response(buf, qend, out, sizeof(out),
                                                           1, g_fakeip.entries[at].addr);
@@ -1402,10 +1492,19 @@ static void handle_client_query(int upstream_port) {
                         make_response_flags(out);
                         sendto(g_listen_fd, out, len, 0,
                                (struct sockaddr *)&from, fromlen);
-                        /* Маршрут переутверждаем идемпотентно: fw4 reload смывает
-                         * элементы наборов, и ждать ре-резолва клиент не должен.
-                         * Цена — один netlink-обмен, ядро отвечает EEXIST. */
+                        /* Маршрут переутверждается идемпотентно (fw4 reload
+                         * смывает элементы наборов); дроссель внутри. */
                         fakeip_route_set(lname, hit);
+                        /* Поход наверх — только ради свежести DNAT-карты, и
+                         * чаще TTL ответа он ничего нового не узнаёт: клиент
+                         * до истечения TTL и не переспросит. Без дросселя
+                         * каждый повторный запрос оплачивал полный круг
+                         * сокет-эполл-резолвер плюс работу dnsmasq — на том же
+                         * единственном ядре. */
+                        time_t now = time(NULL);
+                        if (now - g_fakeip.entries[at].refreshed < FAKEIP_ANSWER_TTL)
+                            return 1;
+                        g_fakeip.entries[at].refreshed = now;
                         quiet = 1;
                     }
                 }
@@ -1414,20 +1513,26 @@ static void handle_client_query(int upstream_port) {
     }
 
     struct pending *p = pending_alloc();
-    if (!p) return; /* under load: drop, client's own resolver will retry/timeout */
+    if (!p) return 1; /* under load: drop, client's own resolver will retry/timeout */
 
     int fd = socket(AF_INET, SOCK_DGRAM, 0);
-    if (fd < 0) return;
+    if (fd < 0) return 1;
     struct sockaddr_in up = {0};
     up.sin_family = AF_INET;
     up.sin_port = htons((uint16_t)upstream_port);
     up.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
-    if (connect(fd, (struct sockaddr *)&up, sizeof(up)) != 0) { close(fd); return; }
-    if (send(fd, buf, (size_t)n, 0) < 0) { close(fd); return; }
+    if (connect(fd, (struct sockaddr *)&up, sizeof(up)) != 0) { close(fd); return 1; }
+    /* Неблокирующий, как и слушающий сокет: epoll-готовность не гарантирует,
+     * что recv не заблокируется (датаграмму могли отбросить по контрольной
+     * сумме между событием и чтением), а блокировка здесь стоит всего цикла. */
+    fcntl(fd, F_SETFL, O_NONBLOCK);
+    if (send(fd, buf, (size_t)n, 0) < 0) { close(fd); return 1; }
 
     p->fd = fd;
     p->in_use = 1;
     p->quiet = quiet;
+    p->hit = hit;
+    p->rules_gen = g_rules_gen;
     p->client = from;
     p->client_len = fromlen;
     p->expire = time(NULL) + PENDING_TTL_SEC;
@@ -1436,14 +1541,8 @@ static void handle_client_query(int upstream_port) {
     ev.events = EPOLLIN;
     ev.data.ptr = p;
     epoll_ctl(g_epfd, EPOLL_CTL_ADD, fd, &ev);
+    return 1;
 }
-
-/* FAKEIP_ANSWER_TTL is independent of the real record's TTL — the fake IP
- * itself never needs to expire from the client's cache the way a real
- * record does (it's a stable, persistent allocation); this just needs to be
- * short enough that the client re-queries periodically, e.g. after a NAT-map
- * refresh. */
-#define FAKEIP_ANSWER_TTL 60
 
 /* Builds a reply reusing the original response's header+question bytes
  * verbatim ([0, qend) — same transaction ID, same echoed question), with
@@ -1481,6 +1580,9 @@ static size_t build_rewritten_response(const uint8_t *orig, size_t qend,
 static void handle_upstream_response(struct pending *p) {
     uint8_t buf[MAX_PKT];
     ssize_t n = recv(p->fd, buf, sizeof(buf), 0);
+    /* Ложная готовность неблокирующего сокета — не конец ожидания: настоящий
+     * ответ ещё может прийти, слот и fd остаются жить до него или до реапа. */
+    if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) return;
 
     epoll_ctl(g_epfd, EPOLL_CTL_DEL, p->fd, NULL);
     close(p->fd);
@@ -1489,11 +1591,28 @@ static void handle_upstream_response(struct pending *p) {
 
     if (n <= 0) return;
 
+    /* Несовпавший домен (подавляющее большинство трафика): решение уже принято
+     * на приёме запроса, имя вопроса в ответе — те же байты, а правила с тех
+     * пор не менялись. Разбирать пакет и матчить его второй раз — значит
+     * оплачивать разбор каждой RR и проход по индексам всех каналов ради
+     * вывода, который уже известен: реле как есть. */
+    if (p->hit == -1 && p->rules_gen == g_rules_gen) {
+        if (!quiet)
+            sendto(g_listen_fd, buf, (size_t)n, 0,
+                   (struct sockaddr *)&p->client, p->client_len);
+        return;
+    }
+
     char qname[MAX_HOSTNAME];
     uint16_t qtype = 0;
     size_t qend = 0;
     struct answer_ip ips[32];
     int nips = parse_response(buf, (size_t)n, qname, sizeof(qname), &qtype, &qend, ips, 32);
+    /* В нижний регистр СРАЗУ: дальше это имя — ключ таблицы fake-IP и вход
+     * матчинга. Прежде вставка шла в регистре ответа (эхо запроса клиента), и
+     * клиент с DNS-0x20 плодил второй fake-IP на тот же домен, а быстрый путь,
+     * ищущий строчными, не находил такую запись никогда. */
+    if (nips >= 0) str_lower(qname);
 
     /* Unparseable (malformed, or the rare qdcount != 1) or no rule match:
      * relay the real answer unchanged, exactly as before this feature. */
@@ -1501,9 +1620,13 @@ static void handle_upstream_response(struct pending *p) {
      * belongs to the channel written first, and the fake IP goes into THAT set
      * only. Putting it in several sets would leave the winner to chain order. */
     int hit = -1;
-    if (nips >= 0)
-        for (size_t i = 0; i < g_dch_n && hit < 0; i++)
-            if (ruleset_match(&g_dch[i].rules, qname)) hit = (int)i;
+    if (nips >= 0) {
+        if (p->hit >= 0 && p->rules_gen == g_rules_gen)
+            hit = p->hit; /* матчинг уже сделан на приёме запроса */
+        else
+            for (size_t i = 0; i < g_dch_n && hit < 0; i++)
+                if (ruleset_match(&g_dch[i].rules, qname)) hit = (int)i;
+    }
     if (nips < 0 || hit < 0) {
         if (!quiet)
             sendto(g_listen_fd, buf, (size_t)n, 0,
@@ -1548,8 +1671,19 @@ static void handle_upstream_response(struct pending *p) {
     if (qtype == DNS_TYPE_A && nips > 0) {
         uint32_t fake_addr;
         if (fakeip_lookup_or_alloc(qname, &fake_addr) == 0) {
+            /* Какой адрес класть в DNAT. Порядок RR в ответе — не сигнал: CDN
+             * тасуют записи в каждом ответе, и «первый A сменился» означало
+             * delete+add транзакцию в ядре и перезапись state-файла на каждый
+             * ре-резолв — вечно, пока домен спрашивают. Если установленный
+             * backend всё ещё среди ответов, он всё ещё обслуживает домен —
+             * оставляем его; настоящий переезд (адреса нет в ответе) по-прежнему
+             * ведёт к замене. */
+            uint32_t known = fakeip_entry_get_real(qname);
             uint32_t real_host = ntohl(ips[0].addr);
-            if (getenv("SPLIFY_DNSD_DEBUG"))
+            if (known)
+                for (int k = 0; k < nips; k++)
+                    if (ntohl(ips[k].addr) == known) { real_host = known; break; }
+            if (dbg())
                 fprintf(stderr, "nftlk-debug: matched qname=%s qtype=%u nips=%d fake=0x%08x real=0x%08x nlk_fd=%d\n",
                         qname, qtype, nips, fake_addr, real_host, g_nlk_fd);
             /* DNAT map FIRST, synchronously, and ONLY hand the client the fake
@@ -1561,8 +1695,8 @@ static void handle_upstream_response(struct pending *p) {
              * nowhere, hanging on TCP retries for minutes. Now a failed/missing
              * ack makes us relay the REAL answer instead (fail-open). */
             int maprc = nft_map_set_element(g_fakeip_map, fake_addr, real_host,
-                                            fakeip_entry_get_real(qname));
-            if (getenv("SPLIFY_DNSD_DEBUG"))
+                                            known);
+            if (dbg())
                 fprintf(stderr, "nftlk-debug: nft_map_set_element -> %d\n", maprc);
             if (maprc == 0) {
                 /* Record the real backend so a post-restart rehydrate can rebuild
@@ -1654,6 +1788,9 @@ static int run_proxy(int listen_port, int upstream_port) {
         }
         fprintf(stderr, "steer dnsd: no IPv6 on this kernel — listening on IPv4 only\n");
     }
+    /* Неблокирующий: цикл событий дочитывает очередь датаграмм до EAGAIN, и
+     * готовность от epoll перестаёт быть обещанием, что recvfrom не повиснет. */
+    fcntl(g_listen_fd, F_SETFL, O_NONBLOCK);
 
     g_epfd = epoll_create1(0);
     if (g_epfd < 0) { perror("epoll_create1"); return 1; }
@@ -1718,11 +1855,23 @@ static int run_proxy(int listen_port, int upstream_port) {
             g_fakeip.n, restored, routed);
 
     struct epoll_event events[32];
+    time_t last_reap = 0;
     while (g_running) {
         if (g_reload_pending) { g_reload_pending = 0; reload_rules(); }
+        time_t now = time(NULL);
+        if (now != last_reap) {
+            /* Секундный тик: снять протухшие ожидания (см. pending_reap). */
+            pending_reap(now);
+            last_reap = now;
+        }
         if (g_fakeip_dirty) {
-            time_t now = time(NULL);
-            if (now - g_fakeip_last_rewrite >= 2) {
+            /* Перезапись — O(таблица) и с fsync, то есть настоящая запись на
+             * носитель. Раз в TTL ответа достаточно: файл — best-effort
+             * подсказка для rehydrate после рестарта, и потерять последние
+             * секунды изменений при жёстком отключении не страшно (домен
+             * просто ре-резолвится), а вот молотить носитель на каждый переезд
+             * backend'а под живым трафиком — страшно вполне. */
+            if (now - g_fakeip_last_rewrite >= FAKEIP_ANSWER_TTL) {
                 fakeip_state_rewrite();
                 g_fakeip_dirty = 0;
                 g_fakeip_last_rewrite = now;
@@ -1734,10 +1883,15 @@ static int run_proxy(int listen_port, int upstream_port) {
             break;
         }
         for (int i = 0; i < n; i++) {
-            if (events[i].data.ptr == NULL)
-                handle_client_query(upstream_port);
-            else
+            if (events[i].data.ptr == NULL) {
+                /* Дочитать очередь до конца (сокет неблокирующий), но не более
+                 * пачки: один разговорчивый клиент не должен заслонять ответы
+                 * upstream, которые ждут в этом же массиве событий. */
+                for (int k = 0; k < 64; k++)
+                    if (!handle_client_query(upstream_port)) break;
+            } else {
                 handle_upstream_response((struct pending *)events[i].data.ptr);
+            }
         }
     }
 
