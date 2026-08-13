@@ -129,11 +129,14 @@ static int cmp_range(const void *x, const void *y) {
     return 0;
 }
 
-/* Lossless: join ranges that overlap or touch. Nothing here widens coverage, so it
- * runs before every fit attempt and after every collapse level. */
-static void merge_lossless(struct list *l) {
+/* Слияние соседей, когда список УЖЕ упорядочен по lo. Выход collapse_level
+ * упорядочен по построению (обход идёт по возрастанию, и каждая ветка кладёт
+ * lo не меньше предыдущего — пересечения возможны, порядок нет), а этому
+ * проходу порядок и достаточен: сортировать его заново — значит гонять
+ * qsort по десяткам тысяч диапазонов на каждую ступень лестницы уровней,
+ * и на большом списке именно эти сортировки доминировали во времени fit. */
+static void merge_sorted(struct list *l) {
     if (l->n == 0) return;
-    qsort(l->v, l->n, sizeof(*l->v), cmp_range);
     size_t w = 0;
     for (size_t i = 1; i < l->n; i++) {
         /* +1 in 64-bit: hi can be 255.255.255.255 and hi+1 would wrap. */
@@ -144,6 +147,14 @@ static void merge_lossless(struct list *l) {
         }
     }
     l->n = w + 1;
+}
+
+/* Lossless: join ranges that overlap or touch. Nothing here widens coverage, so it
+ * runs before every fit attempt and after every collapse level. */
+static void merge_lossless(struct list *l) {
+    if (l->n == 0) return;
+    qsort(l->v, l->n, sizeof(*l->v), cmp_range);
+    merge_sorted(l);
 }
 
 /* ---- exclusions ---------------------------------------------------------- */
@@ -205,9 +216,14 @@ static uint64_t collapse_level(struct list *l, unsigned level, size_t min_count)
     if (level == 0 || level > 32 || l->n == 0) return 0;
     uint32_t mask = (uint32_t)(0xFFFFFFFFu << (32 - level));
     uint64_t waste = 0;
-    struct list out = {0};
 
-    size_t i = 0;
+    /* Уплотнение НА МЕСТЕ: каждая ветка записывает не больше диапазонов, чем
+     * прочла (широкий — 1 за 1, схлопывание — 1 за j-i, сохранение — j-i за
+     * j-i), поэтому позиция записи w никогда не обгоняет позицию чтения i.
+     * Прежний вариант собирал результат во второй список того же размера —
+     * то есть удваивал пиковую память ровно той операции, ради которой fit
+     * и существует: уместить большой список в память слабого роутера. */
+    size_t i = 0, w = 0;
     while (i < l->n) {
         uint32_t net = l->v[i].lo & mask;
         uint32_t net_end = net | ~mask;
@@ -215,7 +231,7 @@ static uint64_t collapse_level(struct list *l, unsigned level, size_t min_count)
         /* A range wider than one network cannot be "inside" it — keep it as is and
          * move on, or the walk would not advance. */
         if (l->v[i].hi > net_end) {
-            list_push(&out, l->v[i].lo, l->v[i].hi);
+            l->v[w++] = l->v[i];
             i++;
             continue;
         }
@@ -229,16 +245,18 @@ static uint64_t collapse_level(struct list *l, unsigned level, size_t min_count)
         int blocked = excl_hits(net, net_end);
         if (count >= min_count && (!blocked || g_excl_mode == EXCL_PUNCH)) {
             if (blocked) punch_record(net, net_end);
-            list_push(&out, net, net_end);
+            l->v[w].lo = net;
+            l->v[w].hi = net_end;
+            w++;
             waste += ((uint64_t)net_end - net + 1) - covered;
         } else {
-            for (size_t k = i; k < j; k++) list_push(&out, l->v[k].lo, l->v[k].hi);
+            for (size_t k = i; k < j; k++) l->v[w++] = l->v[k];
         }
         i = j;
     }
-    free(l->v);
-    *l = out;
-    merge_lossless(l);
+    l->n = w;
+    /* Выход упорядочен по построению — сортировка не нужна, только слияние. */
+    merge_sorted(l);
     return waste;
 }
 
