@@ -33,6 +33,37 @@ Defines the destination routing interfaces.
 - **`kind`**: Type of output (`interface`, `vless`, or `direct`).
 - **`devices` / `device`**: Interface name(s). If an array is used, it defines the failover priority order.
 - **`on_fail`**: Action if all interfaces fail. Options: `drop` (default, blackhole to prevent leaks), `direct`, `zapret`.
+- **`obfs`**: (Optional, `kind: interface` only.) Carries the tunnel's UDP transport inside a fake
+  TCP stream — WireGuard over TCP, wire-compatible with phantun. Adds 12 bytes of overhead
+  (a 20-byte TCP header instead of an 8-byte UDP one) and keeps datagram semantics: no
+  retransmission, no flow control, one datagram per segment. Present on both the base and the
+  extended package.
+  ```json
+  "vpn": {
+    "kind": "interface", "device": "wg0", "on_fail": "drop",
+    "obfs": { "mode": "wg-over-tcp",
+              "server": "203.0.113.10:4567",
+              "listen": "127.0.0.1:51820" }
+  }
+  ```
+  - **`mode`**: (Optional.) Only `wg-over-tcp` exists today; an absent value means it. An unknown
+    value is rejected rather than assumed.
+  - **`server`**: Address and port of the obfuscation server (`steer obfs-server` or upstream
+    `phantun_server`). Must be a literal IPv4 address, not a hostname: resolving a name would
+    mean asking DNS, which may itself be routed through the tunnel this server is bringing up.
+    The control plane resolves it and writes the address.
+  - **`listen`**: Local address and port the obfuscator listens on. It must equal the peer's
+    `Endpoint` in `/etc/config/network` — this is the one place where two configurations must
+    agree, and the engine cannot derive one from the other because WireGuard keys and peers are
+    not its property. A mismatch is silent: WireGuard sends into nowhere.
+  - **MTU**: the tunnel interface MTU must not exceed `link_mtu − 72` (outer IP 20 + fake TCP 20 +
+    WireGuard 32) — 1428 on a 1500-byte link, 1420 on PPPoE. Both ends of the tunnel must use the
+    same MTU. `steer diag` computes the limit from the actual egress device and warns with the
+    exact number.
+  - Enumerated by `steer outputs --obfs`; run by `steer obfs <output>` (a procd instance named
+    `obfs_<output>`). The process installs one nft rule of its own, in table `inet steer_obfs`,
+    which drops the kernel's RST for its own flow — without it the router's own stack tears down
+    the session. The rule lives outside `inet steer` because `apply` rebuilds that table whole.
 
 ### Channels
 Defines routing rules. The array order dictates the priority (first match wins).
@@ -67,6 +98,11 @@ Requested via `steer status`. Returns the currently applied configuration and li
 - **`down_packets` / `down_bytes`**: Inbound (download) counters, counted on the `postrouting_down` chain. Emitted only when the channel carries download traffic. Do not repurpose `bytes` for download — existing UIs read it as upload.
 - **`lists`**: Number of source list files backing this merged group.
 - **`in_firewall` / `nat`**: Diagnostic flags indicating if the tunnel is correctly configured in the OpenWrt firewall.
+- **`obfs`**: Present only when the output carries its transport over fake TCP. Mirrors the spec —
+  `{ "mode": "wg-over-tcp", "server": "203.0.113.10:4567", "listen": "127.0.0.1:51820" }`. It
+  deliberately carries **no liveness flag**: `status` is polled every few seconds and checking a
+  process means spawning one. The verdict on whether the obfuscator is running belongs to `diag`,
+  which is asked on demand.
 
 ## 3. Input Limits and Validation
 
@@ -104,8 +140,13 @@ Requested via `steer diag [--spec FILE]`. Runs a set of health checks and emits 
   - `note` — advice, not a finding: it works and will keep working, but is worth knowing. **`note` is deliberately excluded from the `warn`/`fail` counters** and must not be treated as "not ok". (Without this, always-true advice — e.g. a browser with DoH bypassing the router's DNS — would permanently paint a healthy router red.)
   - `warn` — it works, but there is something that explains a likely future complaint.
   - `fail` — broken; traffic is going the wrong way.
-- **Check `id`s** currently emitted: `table`, `down_chain`, `set`, `dns_redirect`, `dnsd`, `doh`, `ipv6`, `resolver`, `output`. The set may grow *and shrink* between releases; consumers must tolerate unknown ids and must not require any particular id to be present.
+- **Check `id`s** currently emitted: `table`, `down_chain`, `set`, `dns_redirect`, `dnsd`, `doh`, `ipv6`, `resolver`, `output`, `obfs`. The set may grow *and shrink* between releases; consumers must tolerate unknown ids and must not require any particular id to be present.
   - `udp` — **no longer emitted.** It used to be a `note` saying the VLESS tunnel carries TCP only. The tunnel now carries UDP (VLESS command 2), so QUIC, WireGuard and game traffic work through a `kind: vless` output. A consumer that treated the absence of this note as "old version" must instead read the version.
+  - `obfs` — emitted per output that has an `obfs` block, up to four times: the obfuscator process
+    is running (`fail` if not); its anti-RST rule is installed (`warn` if not — without it the
+    router's own kernel tears the session down); the route to the obfuscation server does **not**
+    go through the tunnel that server brings up (`fail` — that loop cannot be broken from inside);
+    and the tunnel MTU fits inside the fake TCP envelope (`warn`, with the exact number to set).
   - `resolver` — emitted as a `note` when a `kind: vless` channel's address list contains a public resolver (for example `8.8.8.0/24` inside a Google or YouTube category). Such DNS queries do reach the resolver through the tunnel, but each query is a fresh UDP flow and therefore a fresh handshake to the node: names resolve, only slower. Never a `warn` — nothing is broken.
 - **Exit code**: `steer diag` exits `1` only when at least one check is `fail`; `note` and `warn` never cause a non-zero exit.
 - **Top-level counters**: `warn` = number of `warn` verdicts; `fail` = number of `fail` verdicts. There is no `note` counter.

@@ -4,7 +4,9 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
+#include <arpa/inet.h>
 #include "spec.h"
+#include "obfs.h"
 
 /* Marks and tables live well away from what splify (0x40000/0x80000, tables
  * 200/202) and mwan3 use, so both can run on one box while the migration is in
@@ -150,6 +152,78 @@ static int str_array(struct js *j, char dst[][64], size_t max, size_t *n) {
     return js_lit(j, ']');
 }
 
+/* «адрес:порт» → адрес и порт. Живёт здесь, а не в obfs.c, потому что нужен обоим:
+ * парсеру спеки при чтении и обфускатору при разборе своих аргументов, а линкуются
+ * они всегда вместе. Порт по последнему двоеточию — чтобы форма не мешала будущему
+ * IPv6-литералу. */
+int obfs_split_hostport(const char *s, char *host, size_t hn, int *port) {
+    const char *colon = strrchr(s, ':');
+    if (!colon || colon == s) return -1;
+    size_t hl = (size_t)(colon - s);
+    if (hl + 1 > hn) return -1;
+    memcpy(host, s, hl);
+    host[hl] = '\0';
+    char *end = NULL;
+    long p = strtol(colon + 1, &end, 10);
+    if (!end || *end || p < 1 || p > 65535) return -1;
+    *port = (int)p;
+    return 0;
+}
+
+/* Обфускация транспорта выхода. Форма:
+ *
+ *   "obfs": { "mode": "wg-over-tcp", "server": "203.0.113.10:4567",
+ *             "listen": "127.0.0.1:51820" }
+ *
+ * `listen` обязателен и должен совпадать с `Endpoint` пира в /etc/config/network: это
+ * единственное место, где две настройки обязаны знать друг о друге, и вывести одну из
+ * другой движок не может — ключи и пиры не его. Несовпадение молчаливо: WireGuard шлёт
+ * в никуда, туннель не поднимается, и причина не видна ниоткуда, кроме tcpdump. */
+static void parse_obfs(struct js *j, struct output *o) {
+    if (js_lit(j, '{') != 0) die("outputs.%s: obfs должен быть объектом", o->name);
+    char mode[32] = "", server[80] = "", listen[80] = "";
+    js_ws(j);
+    while (*j->p != '}') {
+        char key[32];
+        if (js_str(j, key, sizeof(key)) != 0) die("outputs.%s: плохой ключ в obfs", o->name);
+        js_lit(j, ':');
+        if (!strcmp(key, "mode")) js_str(j, mode, sizeof(mode));
+        else if (!strcmp(key, "server")) js_str(j, server, sizeof(server));
+        else if (!strcmp(key, "listen")) js_str(j, listen, sizeof(listen));
+        else js_skip(j);
+        js_ws(j);
+        if (*j->p == ',') { j->p++; js_ws(j); }
+    }
+    j->p++;
+
+    /* Отсутствующий mode — это сегодняшний единственный режим: спека, написанная до
+     * появления второго, обязана значить то же, что значила. Неизвестный — отказ, а не
+     * молчаливое «наверное, тот самый»: обфускация, которой нет, выглядит как рабочий
+     * выход, из которого не выходит ни один пакет. */
+    if (mode[0] && strcmp(mode, "wg-over-tcp") != 0)
+        die("outputs.%s: неизвестный obfs.mode (сейчас есть только wg-over-tcp)", o->name);
+    if (!server[0]) die("outputs.%s: obfs нужен server вида адрес:порт", o->name);
+    if (obfs_split_hostport(server, o->obfs.server, sizeof(o->obfs.server),
+                            &o->obfs.server_port) != 0)
+        die("outputs.%s: obfs.server должен быть вида адрес:порт", o->name);
+    /* Имя, а не адрес — отказ. Имя пришлось бы разрешать, и разрешать его через тот
+     * самый DNS, который может идти в туннель, который поднимается через этот самый
+     * сервер. Управляющий слой резолвит один раз и кладёт сюда адрес — то же правило,
+     * что со списками: движок читает то, что ему положили. */
+    struct in_addr tmp;
+    if (inet_pton(AF_INET, o->obfs.server, &tmp) != 1)
+        die("outputs.%s: obfs.server должен быть адресом, а не именем", o->name);
+
+    if (!listen[0]) die("outputs.%s: obfs нужен listen — тот же адрес и порт, что в "
+                        "Endpoint пира WireGuard", o->name);
+    if (obfs_split_hostport(listen, o->obfs.listen, sizeof(o->obfs.listen),
+                            &o->obfs.listen_port) != 0)
+        die("outputs.%s: obfs.listen должен быть вида адрес:порт", o->name);
+    if (inet_pton(AF_INET, o->obfs.listen, &tmp) != 1)
+        die("outputs.%s: obfs.listen должен быть адресом, а не именем", o->name);
+    o->obfs.on = 1;
+}
+
 static void parse_outputs(struct js *j) {
     if (js_lit(j, '{') != 0) die("outputs: expected an object", NULL);
     js_ws(j);
@@ -193,6 +267,7 @@ static void parse_outputs(struct js *j) {
                     }
                 }
             }
+            else if (!strcmp(key, "obfs")) parse_obfs(j, &o);
             else if (!strcmp(key, "sub_file")) js_str(j, o.sub_file, sizeof(o.sub_file));
             else if (!strcmp(key, "node")) o.node_index = (int)js_num(j);
             else if (!strcmp(key, "on_fail")) {
@@ -234,6 +309,12 @@ static void parse_outputs(struct js *j) {
             if (!o.device[0] && o.devices_n) snprintf(o.device, sizeof(o.device), "%s", o.devices[0]);
             if (!o.device[0]) die("outputs.%s: kind interface needs a device", o.name);
         } else die("outputs.%s: неизвестный kind (нужен direct, interface или vless)", o.name);
+        /* Обфускация осмысленна только там, где транспорт — чужой UDP, до которого
+         * движку не дотянуться иначе. У vless свой транспорт внутри движка (и свои
+         * средства маскировки — Reality), у direct транспорта нет вовсе. Принять поле
+         * молча значило бы сказать «настроено», не настроив ничего. */
+        if (o.obfs.on && o.kind != OUT_INTERFACE)
+            die("outputs.%s: obfs есть только у kind=interface", o.name);
         if (g_out_n >= MAX_OUTPUTS) die("too many outputs", NULL);
         g_out[g_out_n++] = o;
         js_ws(j);

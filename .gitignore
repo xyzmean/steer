@@ -24,6 +24,7 @@ build/failovermatch
 build/h2match
 build/submatch
 build/fwmatch
+build/obfsmatch
 build/diagsim
 build/crypto-vec
 build/bx-*

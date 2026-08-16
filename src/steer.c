@@ -28,6 +28,7 @@
 #include <sys/time.h>
 
 #include "spec.h"
+#include "obfs.h"
 
 int dnsd_main(int argc, char **argv);
 int cmd_failover(const char *spec, int verbose);
@@ -996,6 +997,15 @@ static int cmd_status(const char *spec) {
             printf("],\"on_fail\":\"%s\"",
                    g_out[i].on_fail == FAIL_DROP ? "drop" :
                    g_out[i].on_fail == FAIL_ZAPRET ? "zapret" : "direct");
+            /* Обфускация — поле, а не отдельный вид выхода, поэтому и в статусе она
+             * поле. Признак живости здесь не печатается намеренно: status опрашивают
+             * раз в пять секунд, а pgrep — это запуск процесса; приговор о живости
+             * даёт diag, который спрашивают по нажатию. */
+            if (g_out[i].obfs.on)
+                printf(",\"obfs\":{\"mode\":\"wg-over-tcp\",\"server\":\"%s:%d\""
+                       ",\"listen\":\"%s:%d\"}",
+                       g_out[i].obfs.server, g_out[i].obfs.server_port,
+                       g_out[i].obfs.listen, g_out[i].obfs.listen_port);
         }
         printf("}");
     }
@@ -1153,6 +1163,46 @@ static const struct { const char *addr; const char *who; } RESOLVERS[] = {
     { "208.67.222.222",  "OpenDNS" },
     { "208.67.220.220",  "OpenDNS" },
 };
+
+/* MTU устройства из sysfs. -1, если устройства нет. Читаем файл, а не спрашиваем ip:
+ * это один открытый файл против запуска процесса, а ответ тот же. */
+static int dev_mtu(const char *dev) {
+    char path[128];
+    snprintf(path, sizeof(path), "/sys/class/net/%.32s/mtu", dev);
+    FILE *f = fopen(path, "r");
+    if (!f) return -1;
+    int mtu = -1;
+    if (fscanf(f, "%d", &mtu) != 1) mtu = -1;
+    fclose(f);
+    return mtu;
+}
+
+/* Через какое устройство ядро отправит пакет к адресу и каков MTU этого устройства.
+ * Возвращает MTU (или -1) и пишет имя устройства в dev.
+ *
+ * Адрес попадает в командную строку, поэтому обязан быть проверен ДО вызова: здесь он
+ * приходит из спеки, где парсер уже отверг всё, что не является литералом IPv4
+ * (inet_pton). Это то же требование, из-за которого в explain появилась проверка
+ * формы: подстановка непроверенной строки в вызов однажды уже была дырой. */
+static int route_egress(const char *addr, char *dev, size_t devn) {
+    dev[0] = '\0';
+    char cmd[160];
+    snprintf(cmd, sizeof(cmd), "ip route get %.45s 2>/dev/null", addr);
+    FILE *p = popen(cmd, "r");
+    if (!p) return -1;
+    char line[512];
+    if (fgets(line, sizeof(line), p)) {
+        char *d = strstr(line, " dev ");
+        if (d) {
+            d += 5;
+            size_t k = 0;
+            while (d[k] && d[k] != ' ' && d[k] != '\n' && k + 1 < devn) { dev[k] = d[k]; k++; }
+            dev[k] = '\0';
+        }
+    }
+    pclose(p);
+    return dev[0] ? dev_mtu(dev) : -1;
+}
 
 /* "A.B.C.D[/N]" → сеть и маска. 0, если строка не префикс.
  *
@@ -1394,6 +1444,65 @@ static int cmd_diag(const char *spec) {
         }
     }
 
+    /* 8. Обфускация транспорта (WireGuard поверх поддельного TCP).
+     *
+     *    Четыре проверки, и каждая — про отказ, который иначе виден только как «туннель
+     *    не поднимается»: процесса нет; правило против RST не встало (тогда сессию рвёт
+     *    собственное ядро); маршрут к серверу обфускации идёт через сам туннель (петля,
+     *    которую не разорвать изнутри); MTU туннеля больше того, что помещается в
+     *    поддельный TCP (тогда работает всё, кроме больших пакетов). */
+    for (size_t i = 0; i < g_out_n; i++) {
+        if (!g_out[i].obfs.on) continue;
+        char what[200], why[400], cmdline[128];
+
+        snprintf(cmdline, sizeof(cmdline), "pgrep -f 'steer obfs %.32s' >/dev/null 2>&1",
+                 g_out[i].name);
+        int alive = system(cmdline) == 0;
+        snprintf(what, sizeof(what), "выход %.40s: обфускатор %s",
+                 g_out[i].name, alive ? "работает" : "не запущен");
+        diag("obfs", alive ? "ok" : "fail", what,
+             alive ? "" : "перезапустите движок: /etc/init.d/steer restart");
+
+        /* nft_has смотрит в таблицу steer, здесь нужна соседняя — поэтому свой вызов. */
+        snprintf(cmdline, sizeof(cmdline),
+                 "nft list chain inet steer_obfs o_%.32s >/dev/null 2>&1", g_out[i].name);
+        int guard = system(cmdline) == 0;
+        if (!guard) {
+            snprintf(what, sizeof(what), "выход %.40s: правила против RST нет",
+                     g_out[i].name);
+            diag("obfs", "warn", what,
+                 "ядро отвечает RST на входящие сегменты обфускатора и рвёт его же сессию — "
+                 "проверьте, что nft доступен процессу");
+        }
+
+        char dev[64] = "";
+        int link_mtu = route_egress(g_out[i].obfs.server, dev, sizeof(dev));
+        if (dev[0] && !strcmp(dev, g_out[i].device)) {
+            snprintf(what, sizeof(what), "выход %.40s: маршрут к %.20s идёт через %.24s",
+                     g_out[i].name, g_out[i].obfs.server, dev);
+            diag("obfs", "fail", what,
+                 "сервер обфускации доступен только через туннель, который сам через него и "
+                 "поднимается: петля. Уберите адрес сервера из списков канала или пропишите "
+                 "к нему отдельный маршрут");
+        }
+
+        int wg_mtu = dev_mtu(g_out[i].device);
+        /* 20 внешний IP + 20 поддельный TCP + 32 сам WireGuard. Считаем от MTU того
+         * устройства, которым пакет уходит наружу, а не от 1500: на PPPoE это 1492, и
+         * разница ровно в те восемь байт, на которых «всё работает, кроме больших
+         * страниц». */
+        if (link_mtu > 0 && wg_mtu > 0 && wg_mtu > link_mtu - 72) {
+            snprintf(what, sizeof(what), "выход %.40s: MTU %d великоват для обфускации",
+                     g_out[i].name, wg_mtu);
+            snprintf(why, sizeof(why),
+                     "поверх поддельного TCP в %d байт канала помещается %d: поставьте "
+                     "интерфейсу %.24s MTU %d и тот же MTU на другой стороне туннеля, иначе "
+                     "пропадать будут только большие пакеты",
+                     link_mtu, link_mtu - 72, g_out[i].device, link_mtu - 72);
+            diag("obfs", "warn", what, why);
+        }
+    }
+
     printf("],\"warn\":%d,\"fail\":%d}\n", g_diag_warn, g_diag_fail);
     /* Код возврата — чтобы это годилось в скрипт, а не только глазам. */
     return g_diag_fail ? 1 : 0;
@@ -1572,7 +1681,10 @@ int main(int argc, char **argv) {
               "       steer vless-nodes OUTPUT    (узлы подписки, JSON)\n"
               "       steer vless-probe OUTPUT [--node N] [--timeout S]\n"
               "                                   (проверить узел и замерить задержку)\n"
-              "       steer outputs [--kind K]    (перечислить выходы)\n"
+              "       steer obfs OUTPUT           (WireGuard поверх поддельного TCP)\n"
+              "       steer obfs-server --listen PORT --forward АДРЕС:ПОРТ\n"
+              "                                   (серверная половина, для VPS)\n"
+              "       steer outputs [--kind K|--obfs]  (перечислить выходы)\n"
               "       steer needs-dnsd            (exit 0 if the spec has domain channels)\n"
               "       steer status [--spec FILE]\n"
               "       steer diag [--spec FILE]    (проверки состояния, JSON; код 1 при поломке)\n"
@@ -1608,16 +1720,50 @@ int main(int argc, char **argv) {
      * grep по ключу в JSON ломается при первом же переименовании поля, причём молча. */
     if (!strcmp(cmd, "outputs")) {
         const char *want = NULL;
-        for (int i = 2; i < argc; i++)
+        int want_obfs = 0;
+        for (int i = 2; i < argc; i++) {
             if (!strcmp(argv[i], "--kind") && i + 1 < argc) want = argv[i + 1];
+            /* Отдельный признак, а не вид: обфускация — свойство выхода, и
+             * init-скрипту нужен именно список тех, кому поднимать процесс. */
+            else if (!strcmp(argv[i], "--obfs")) want_obfs = 1;
+        }
         load_spec(spec);
         for (size_t i = 0; i < g_out_n; i++) {
             const char *k = g_out[i].kind == OUT_DIRECT ? "direct" :
                             g_out[i].kind == OUT_VLESS ? "vless" : "interface";
             if (want && strcmp(want, k) != 0) continue;
+            if (want_obfs && !g_out[i].obfs.on) continue;
             printf("%s\n", g_out[i].name);
         }
         return 0;
+    }
+    /* Серверная половина. Спека ей не нужна и не читается: сервер живёт на VPS, где
+     * ни выходов, ни каналов нет — есть порт, который слушать, и локальный WireGuard,
+     * которому пересылать. */
+    if (!strcmp(cmd, "obfs-server")) {
+        int lport = 0;
+        const char *fwd = NULL;
+        for (int i = 2; i < argc; i++) {
+            if (!strcmp(argv[i], "--listen") && i + 1 < argc) lport = atoi(argv[++i]);
+            else if (!strcmp(argv[i], "--forward") && i + 1 < argc) fwd = argv[++i];
+        }
+        if (lport < 1 || lport > 65535)
+            die("нужен --listen ПОРТ (порт поддельного TCP)", NULL);
+        if (!fwd) die("нужен --forward АДРЕС:ПОРТ (куда отдавать датаграммы)", NULL);
+        char host[80];
+        int fport = 0;
+        if (obfs_split_hostport(fwd, host, sizeof(host), &fport) != 0)
+            die("--forward должен быть вида адрес:порт, а не %s", fwd);
+        return obfs_server(lport, host, fport);
+    }
+    if (!strcmp(cmd, "obfs")) {
+        if (!arg) die("нужно имя выхода: steer obfs <output>", NULL);
+        load_spec(spec);
+        struct output *o = out_by_name(arg);
+        if (!o) die("нет такого выхода: %s", arg);
+        if (!o->obfs.on) die("у выхода %s не настроен obfs", arg);
+        return obfs_client(o->name, o->obfs.server, o->obfs.server_port,
+                           o->obfs.listen, o->obfs.listen_port);
     }
     if (!strcmp(cmd, "needs-dnsd")) {
         load_spec(spec);

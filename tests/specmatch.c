@@ -369,6 +369,84 @@ int main(void) {
         check("trailing comma в devices: отказ (I-006)", 2, load_from_str(s));
     }
 
+    /* ---- obfs: WireGuard поверх поддельного TCP ---------------------------------
+     *
+     * Проверяется ровно то, что молчаливо ломает туннель: принятое, но неполное
+     * описание обфускации выглядит как настроенный выход, из которого не выходит ни
+     * одного пакета. Поэтому каждый пропуск — отказ, а не умолчание. */
+    {
+        const char *s = SPEC(
+            "\"outputs\":{\"wg\":{\"kind\":\"interface\",\"device\":\"wg0\","
+            "\"obfs\":{\"mode\":\"wg-over-tcp\",\"server\":\"203.0.113.10:4567\","
+            "\"listen\":\"127.0.0.1:51820\"}}},"
+            "\"channels\":[]}");
+        check("obfs: спека принята", 0, load_from_str(s));
+        check("obfs: признак включён", 1, g_out[0].obfs.on);
+        check_str("obfs: адрес сервера", "203.0.113.10", g_out[0].obfs.server);
+        check("obfs: порт сервера", 4567, g_out[0].obfs.server_port);
+        check_str("obfs: локальный адрес", "127.0.0.1", g_out[0].obfs.listen);
+        check("obfs: локальный порт", 51820, g_out[0].obfs.listen_port);
+    }
+    {
+        /* Умолчание по режиму: спека без mode обязана значить сегодняшний
+         * единственный режим, иначе добавление второго сломало бы уже написанные. */
+        const char *s = SPEC(
+            "\"outputs\":{\"wg\":{\"kind\":\"interface\",\"device\":\"wg0\","
+            "\"obfs\":{\"server\":\"203.0.113.10:4567\",\"listen\":\"127.0.0.1:51820\"}}},"
+            "\"channels\":[]}");
+        check("obfs: без mode — тот же режим", 0, load_from_str(s));
+        check("obfs: без mode — признак включён", 1, g_out[0].obfs.on);
+    }
+    {
+        const char *s = SPEC(
+            "\"outputs\":{\"wg\":{\"kind\":\"interface\",\"device\":\"wg0\","
+            "\"obfs\":{\"mode\":\"udp2raw\",\"server\":\"203.0.113.10:4567\","
+            "\"listen\":\"127.0.0.1:51820\"}}},"
+            "\"channels\":[]}");
+        check("obfs: неизвестный mode — отказ", 2, load_from_str(s));
+    }
+    {
+        const char *s = SPEC(
+            "\"outputs\":{\"wg\":{\"kind\":\"interface\",\"device\":\"wg0\","
+            "\"obfs\":{\"server\":\"203.0.113.10\",\"listen\":\"127.0.0.1:51820\"}}},"
+            "\"channels\":[]}");
+        check("obfs: server без порта — отказ", 2, load_from_str(s));
+    }
+    {
+        /* Имя вместо адреса: разрешать его пришлось бы через DNS, который может идти
+         * в тот самый туннель, который поднимается через этот самый сервер. */
+        const char *s = SPEC(
+            "\"outputs\":{\"wg\":{\"kind\":\"interface\",\"device\":\"wg0\","
+            "\"obfs\":{\"server\":\"vpn.example.com:4567\",\"listen\":\"127.0.0.1:51820\"}}},"
+            "\"channels\":[]}");
+        check("obfs: имя вместо адреса — отказ", 2, load_from_str(s));
+    }
+    {
+        const char *s = SPEC(
+            "\"outputs\":{\"wg\":{\"kind\":\"interface\",\"device\":\"wg0\","
+            "\"obfs\":{\"server\":\"203.0.113.10:4567\"}}},"
+            "\"channels\":[]}");
+        check("obfs: без listen — отказ", 2, load_from_str(s));
+    }
+    {
+        /* У direct транспорта нет вовсе, обфусцировать нечего. Принять поле молча
+         * значило бы сказать «настроено», не настроив ничего. */
+        const char *s = SPEC(
+            "\"outputs\":{\"direct\":{\"kind\":\"direct\","
+            "\"obfs\":{\"server\":\"203.0.113.10:4567\",\"listen\":\"127.0.0.1:51820\"}}},"
+            "\"channels\":[]}");
+        check("obfs: на kind=direct — отказ", 2, load_from_str(s));
+    }
+    {
+        /* Спека без obfs обязана оставлять признак выключенным: поле, которого нет,
+         * не должно означать «включено» ни при какой раскладке памяти. */
+        const char *s = SPEC(
+            "\"outputs\":{\"wg\":{\"kind\":\"interface\",\"device\":\"wg0\"}},"
+            "\"channels\":[]}");
+        check("без obfs: спека принята", 0, load_from_str(s));
+        check("без obfs: признак выключен", 0, g_out[0].obfs.on);
+    }
+
     printf("\n%s\n", fails ? "ЕСТЬ ПРОВАЛЫ" : "все проверки прошли");
     return fails ? 1 : 0;
 }

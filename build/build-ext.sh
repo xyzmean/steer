@@ -64,7 +64,7 @@ zig cc -target "$TARGET" ${MCPU:+-mcpu=$MCPU} -static $OPT -s \
     -I"$MBED_INC" -I"$EXT_INC" $CFG -DSTEER_EXTENDED \
     -o "$OUT" \
     /src/src/steer.c /src/src/spec.c /src/src/dnsd.c /src/src/failover.c \
-    /src/src/aggregate.c \
+    /src/src/aggregate.c /src/src/obfs.c \
     /src/src/ext/sub.c /src/src/ext/reality.c /src/src/ext/tls13.c \
     /src/src/ext/vless_proto.c /src/src/ext/vision.c /src/src/ext/client.c \
     /src/src/ext/tun.c /src/src/ext/tunnel.c /src/src/ext/h2.c /src/src/ext/rtx.c \
