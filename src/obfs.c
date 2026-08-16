@@ -486,8 +486,20 @@ static int guard_up(const char *label, const char *peer_addr, int port, int is_s
      * осталась, а `add` поверх неё правило задвоил бы. */
     const char *delc[] = { "nft", "delete", "chain", "inet", "steer_obfs", g_chain, NULL };
     run_quiet(delc);
+    /* Приоритет raw, а не filter, и это разница между «работает» и «не работает».
+     *
+     * conntrack смотрит исходящий пакет на приоритете -200, то есть РАНЬШЕ цепочки
+     * filter. Пока правило стояло там, RST ядра успевал перевести запись conntrack в
+     * состояние CLOSE и лишь потом отбрасывался — а дальше каждый наш сегмент был для
+     * conntrack недействительным, и штатное правило fw4 «Prevent NAT leakage»
+     * (oifname wan ct state invalid drop) выбрасывало его, возвращая нам EPERM.
+     * Симптом был из самых злых: туннель то работает, то теряет большинство пакетов,
+     * и виновата якобы обфускация, а не одно число в приоритете цепочки.
+     *
+     * raw (-300) выполняется раньше conntrack, поэтому RST ядра не доживает даже до
+     * учёта: запись остаётся ESTABLISHED, и наши пакеты никого не смущают. */
     const char *addc[] = { "nft", "add", "chain", "inet", "steer_obfs", g_chain,
-                           "{ type filter hook output priority filter - 10; policy accept; }",
+                           "{ type filter hook output priority raw; policy accept; }",
                            NULL };
     if (run_quiet(addc) != 0) return -1;
 
@@ -605,6 +617,7 @@ int obfs_client(const char *out_name, const char *server, int server_port,
     memset(&peer, 0, sizeof(peer));
 
     unsigned long long up_pkts = 0, down_pkts = 0, dropped = 0;
+    long long last_send_warn = 0;
 
     for (;;) {
         struct pollfd fds[2];
@@ -646,15 +659,25 @@ int obfs_client(const char *out_name, const char *server, int server_port,
                 }
                 int sent = sendmmsg(raw, g_mm, (unsigned)k, 0);
                 if (sent < 0) {
-                    /* Переполненная очередь устройства — потеря пачки, а не повод рвать
-                     * сессию: наверху WireGuard, он переспросит сам. */
-                    if (errno == ENOBUFS || errno == EAGAIN || errno == EWOULDBLOCK) {
-                        dropped += (unsigned)k;
-                    } else {
-                        fprintf(stderr, LOG_W "%s: отправка не удалась: %s\n",
-                                out_name, strerror(errno));
-                        c.state = ST_CLOSED;
-                        break;
+                    /* Неудачная отправка — это потеря датаграммы, а НЕ повод рвать
+                     * сессию, каким бы ни был код ошибки.
+                     *
+                     * Стоило это дорого и выяснилось только на живом канале: ядро
+                     * возвращает EPERM, когда исходящий пакет отбросил netfilter, и
+                     * прежний код считал такой отказ смертельным. Сессия пересоздавалась,
+                     * следующая пачка получала тот же EPERM, и туннель уходил в вечный
+                     * цикл переподключений — 68 тысяч датаграмм, потерянных «до сессии»,
+                     * против 13 тысяч отправленных. Признак живости у нас ровно один и он
+                     * ниже: тишина в ответ дольше DEAD_MS. Отправка о жизни пути не судит.
+                     *
+                     * Жалуемся не чаще раза в пять секунд: на такой ошибке журнал
+                     * заполняется быстрее, чем читается. */
+                    dropped += (unsigned)k;
+                    long long tnow = now_ms();
+                    if (tnow - last_send_warn > 5000) {
+                        last_send_warn = tnow;
+                        fprintf(stderr, LOG_W "%s: пачку не принял стек (%s), потеряно %llu\n",
+                                out_name, strerror(errno), dropped);
                     }
                 } else {
                     up_pkts += (unsigned)sent;
