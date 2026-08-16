@@ -144,6 +144,14 @@ for pat in 'out/*.apk' 'out/*.ipk' 'out/*.tar.gz'; do
     check "релиз выкладывает $pat" "1" "$(grep -cF "$pat" "$wf")"
 done
 
+# ---- workflow вообще пригоден к запуску ---------------------------------------
+# Разбор вынесен в tests/wfcheck.py — там же объяснено, почему это нельзя проверить
+# глазами. Коротко: GitHub раскрывает выражения и внутри комментариев оболочки, и
+# пример выражения, написанный ради пояснения, роняет весь релиз ещё до первой команды.
+if command -v python3 >/dev/null 2>&1; then
+    check "release.yml пригоден к запуску" "" "$(python3 tests/wfcheck.py "$wf" 2>&1)"
+fi
+
 printf '\n%d проверок пройдено' "$pass"
 if [ "$fail" -gt 0 ]; then printf ', %d ПРОВАЛЕНО\n' "$fail"; exit 1; fi
 printf '\nвсе проверки прошли\n'
