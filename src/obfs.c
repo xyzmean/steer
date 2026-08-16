@@ -115,12 +115,36 @@ static long long now_ms(void) {
     return (long long)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
 }
 
-/* ---- контрольные суммы ----------------------------------------------------- */
+/* ---- контрольные суммы -----------------------------------------------------
+ *
+ * Сумма считается по КАЖДОМУ пакету и проходит по всей нагрузке, то есть на гигабите
+ * это гигабайт чтений в секунду — здесь стоит считать словами, а не байтами. Складываем
+ * 32-битными кусками в 64-битный накопитель: переносы копятся внутри и сворачиваются
+ * один раз в конце, а не на каждом шаге.
+ *
+ * Порядок байтов не трогаем нарочно. Сумма в интернете симметрична относительно
+ * перестановки байтов в паре: посчитать её в «неправильном» порядке и один раз
+ * переставить байты результата — то же самое, что считать в правильном. Поэтому
+ * промежуточные слова читаются как есть, а разворот делается единожды в csum_fin. */
 static uint32_t csum_add(const void *data, size_t len, uint32_t acc) {
     const uint8_t *p = data;
-    while (len > 1) { acc += (uint32_t)((p[0] << 8) | p[1]); p += 2; len -= 2; }
-    if (len) acc += (uint32_t)(p[0] << 8);
-    return acc;
+    uint64_t s = acc;
+    /* Развёрнуто по восемь байт и в 64-битный накопитель: переносы копятся внутри и
+     * сворачиваются один раз в конце, а не на каждом шаге. Порядок сборки пары
+     * оставлен прежним (старший байт первым) — он не зависит ни от порядка байтов
+     * машины, ни от выравнивания указателя, а невыровненное чтение слова на MIPS
+     * стоит ловушки ядра. Соблазн читать 32-битными словами здесь отвергнут
+     * сознательно: выигрыш пара процентов, а ошибка в сумме не ломается явно —
+     * пакет просто молча отбрасывается на той стороне. */
+    while (len >= 8) {
+        s += (uint32_t)((p[0] << 8) | p[1]) + (uint32_t)((p[2] << 8) | p[3])
+           + (uint32_t)((p[4] << 8) | p[5]) + (uint32_t)((p[6] << 8) | p[7]);
+        p += 8; len -= 8;
+    }
+    while (len > 1) { s += (uint32_t)((p[0] << 8) | p[1]); p += 2; len -= 2; }
+    if (len) s += (uint32_t)(p[0] << 8);
+    while (s >> 32) s = (s & 0xFFFFFFFF) + (s >> 32);
+    return (uint32_t)s;
 }
 
 static uint16_t csum_fin(uint32_t acc) {
@@ -340,6 +364,53 @@ static int raw_open(uint32_t daddr, uint32_t *saddr_out) {
     return fd;
 }
 
+/* ---- пакеты пачками --------------------------------------------------------
+ *
+ * На пакет приходилось по два системных вызова в каждую сторону плюс копирование
+ * нагрузки в буфер сегмента. При 1400 байтах на пакет это на порядок больше работы,
+ * чем сам разбор заголовка, и упирается всё именно в них, а не в арифметику.
+ *
+ * Две меры разом. Первая: recvmmsg/sendmmsg — до BATCH пакетов за вызов, то есть
+ * системных вызовов в BATCH раз меньше. Вторая: заголовок пишется ПЕРЕД нагрузкой в
+ * том же буфере, для чего при чтении резервируется место, — датаграмма не копируется
+ * вовсе, а отправляется с того места, куда её положило ядро.
+ *
+ * BATCH = 16, а не 64: пачка больше упирается уже не в вызовы, а в задержку — пакеты
+ * ждут, пока наберётся группа. Шестнадцати хватает, чтобы вызовов стало на порядок
+ * меньше, и они набираются за микросекунды на любой скорости, где это вообще важно. */
+#define BATCH 16
+#define HDR_ROOM 24                 /* с запасом на 20 байт заголовка */
+
+/* Статические, а не на стеке: 16 × 1.6 КБ на два направления — это 52 КБ, которые на
+ * стеке процесса с малым лимитом были бы риском, а в bss просто есть. */
+static uint8_t g_bat_rx[BATCH][OBFS_PKT_MAX];
+static uint8_t g_bat_tx[BATCH][HDR_ROOM + OBFS_MAX_PAYLOAD];
+static struct mmsghdr g_mm[BATCH];
+static struct iovec g_iov[BATCH];
+static struct sockaddr_in g_from[BATCH];
+
+/* Записать заголовок ВПЕРЁД нагрузки, лежащей по base + HDR_ROOM, и вернуть указатель
+ * на начало сегмента. Двигает seq так же, как это делает conn_send. */
+static uint8_t *build_ahead(struct fconn *c, uint8_t *base, size_t plen, size_t *seglen) {
+    uint8_t *seg = base + HDR_ROOM - sizeof(struct tcp_hdr);
+    struct tcp_hdr *t = (struct tcp_hdr *)seg;
+    memset(t, 0, sizeof(*t));
+    t->sport = htons(c->sport);
+    t->dport = htons(c->dport);
+    t->seq = htonl(c->seq);
+    t->ack = htonl(c->ack);
+    t->off = (uint8_t)((sizeof(*t) / 4) << 4);
+    t->flags = TH_PSH | TH_ACK;
+    t->win = htons(OBFS_WIN);
+    *seglen = sizeof(*t) + plen;
+    t->sum = htons(obfs_tcp_csum(c->saddr, c->daddr, seg, *seglen));
+    c->seq += (uint32_t)plen;
+    c->last_tx = now_ms();
+    c->last_ack = c->last_tx;
+    c->unacked = 0;
+    return seg;
+}
+
 static int conn_send(int fd, struct fconn *c, uint8_t flags,
                      const void *payload, size_t plen, int with_mss) {
     uint8_t buf[60 + OBFS_MAX_PAYLOAD];
@@ -533,7 +604,6 @@ int obfs_client(const char *out_name, const char *server, int server_port,
     socklen_t peer_len = 0;
     memset(&peer, 0, sizeof(peer));
 
-    uint8_t pkt[OBFS_PKT_MAX];
     unsigned long long up_pkts = 0, down_pkts = 0, dropped = 0;
 
     for (;;) {
@@ -543,71 +613,116 @@ int obfs_client(const char *out_name, const char *server, int server_port,
         int n = poll(fds, 2, TICK_MS);
         if (n < 0 && errno != EINTR) break;
 
-        /* Наружу: датаграмма WireGuard → один сегмент. */
+        /* Наружу: пачка датаграмм WireGuard → пачка сегментов, без копирования. */
         if (n > 0 && (fds[0].revents & POLLIN)) {
             for (;;) {
-                struct sockaddr_in from;
-                socklen_t fl2 = sizeof(from);
-                ssize_t r = recvfrom(udp, pkt, OBFS_MAX_PAYLOAD, 0,
-                                     (struct sockaddr *)&from, &fl2);
-                if (r <= 0) break;
-                peer = from;
-                peer_len = fl2;
-                if (c.state != ST_EST) { dropped++; continue; }
-                if (conn_send(raw, &c, TH_PSH | TH_ACK, pkt, (size_t)r, 0) != 0) {
-                    /* Переполненная очередь устройства — потеря одной датаграммы, а не
-                     * повод рвать сессию: наверху WireGuard, он переспросит сам. */
-                    if (errno == ENOBUFS || errno == EAGAIN || errno == EWOULDBLOCK) {
-                        dropped++;
-                        continue;
-                    }
-                    fprintf(stderr, LOG_W "%s: отправка не удалась: %s\n",
-                            out_name, strerror(errno));
-                    c.state = ST_CLOSED;
-                    break;
+                for (int i = 0; i < BATCH; i++) {
+                    g_iov[i].iov_base = g_bat_tx[i] + HDR_ROOM;
+                    g_iov[i].iov_len = OBFS_MAX_PAYLOAD;
+                    memset(&g_mm[i].msg_hdr, 0, sizeof(g_mm[i].msg_hdr));
+                    g_mm[i].msg_hdr.msg_iov = &g_iov[i];
+                    g_mm[i].msg_hdr.msg_iovlen = 1;
+                    g_mm[i].msg_hdr.msg_name = &g_from[i];
+                    g_mm[i].msg_hdr.msg_namelen = sizeof(g_from[i]);
                 }
-                up_pkts++;
+                int got = recvmmsg(udp, g_mm, BATCH, MSG_DONTWAIT, NULL);
+                if (got <= 0) break;
+                /* Отвечать надо тому, кто прислал последним: WireGuard может сменить
+                 * исходный порт, и запомненный адрес обязан быть свежим. */
+                peer = g_from[got - 1];
+                peer_len = sizeof(struct sockaddr_in);
+                if (c.state != ST_EST) { dropped += (unsigned)got; continue; }
+
+                int k = 0;
+                for (int i = 0; i < got; i++) {
+                    size_t seglen;
+                    uint8_t *seg = build_ahead(&c, g_bat_tx[i], g_mm[i].msg_len, &seglen);
+                    g_iov[k].iov_base = seg;
+                    g_iov[k].iov_len = seglen;
+                    memset(&g_mm[k].msg_hdr, 0, sizeof(g_mm[k].msg_hdr));
+                    g_mm[k].msg_hdr.msg_iov = &g_iov[k];
+                    g_mm[k].msg_hdr.msg_iovlen = 1;
+                    k++;
+                }
+                int sent = sendmmsg(raw, g_mm, (unsigned)k, 0);
+                if (sent < 0) {
+                    /* Переполненная очередь устройства — потеря пачки, а не повод рвать
+                     * сессию: наверху WireGuard, он переспросит сам. */
+                    if (errno == ENOBUFS || errno == EAGAIN || errno == EWOULDBLOCK) {
+                        dropped += (unsigned)k;
+                    } else {
+                        fprintf(stderr, LOG_W "%s: отправка не удалась: %s\n",
+                                out_name, strerror(errno));
+                        c.state = ST_CLOSED;
+                        break;
+                    }
+                } else {
+                    up_pkts += (unsigned)sent;
+                    if (sent < k) dropped += (unsigned)(k - sent);
+                }
+                if (got < BATCH) break;             /* очередь исчерпана */
             }
         }
 
-        /* Обратно: сегмент → датаграмма тому, кто прислал последнюю. */
+        /* Обратно: пачка сегментов → пачка датаграмм, тоже без копирования: iovec
+         * указывает прямо в нагрузку принятого пакета. */
         if (n > 0 && (fds[1].revents & POLLIN)) {
             for (;;) {
-                ssize_t r = recv(raw, pkt, sizeof(pkt), 0);
-                if (r <= 0) break;
-                struct obfs_seg s;
-                if (obfs_parse(pkt, (size_t)r, &s) != 0) continue;
-                /* Сырой сокет слышит весь TCP, доставляемый локально: чужое отсеиваем
-                 * по четвёрке. Фильтр BPF в ядре сюда просится, но локально
-                 * доставляемого TCP на роутере — только его собственное управление,
-                 * единицы пакетов в секунду; лишняя хрупкость дороже выигрыша. */
-                if (s.saddr != c.daddr || s.sport != c.dport ||
-                    s.daddr != c.saddr || s.dport != c.sport) continue;
+                for (int i = 0; i < BATCH; i++) {
+                    g_iov[i].iov_base = g_bat_rx[i];
+                    g_iov[i].iov_len = OBFS_PKT_MAX;
+                    memset(&g_mm[i].msg_hdr, 0, sizeof(g_mm[i].msg_hdr));
+                    g_mm[i].msg_hdr.msg_iov = &g_iov[i];
+                    g_mm[i].msg_hdr.msg_iovlen = 1;
+                }
+                int got = recvmmsg(raw, g_mm, BATCH, MSG_DONTWAIT, NULL);
+                if (got <= 0) break;
 
-                c.last_rx = now_ms();
+                int k = 0, closed = 0;
+                for (int i = 0; i < got; i++) {
+                    struct obfs_seg s;
+                    if (obfs_parse(g_bat_rx[i], g_mm[i].msg_len, &s) != 0) continue;
+                    /* Чужое отсеивает фильтр в ядре, но четвёрку проверяем и здесь:
+                     * фильтр мог не встать (старое ядро, отказ setsockopt), и тогда
+                     * без этой проверки в WireGuard уехал бы чужой байт. */
+                    if (s.saddr != c.daddr || s.sport != c.dport ||
+                        s.daddr != c.saddr || s.dport != c.sport) continue;
 
-                if (s.flags & TH_RST) {
-                    fprintf(stderr, LOG_W "%s: сервер оборвал сессию (RST)\n", out_name);
-                    c.state = ST_CLOSED;
-                    break;
+                    c.last_rx = now_ms();
+
+                    if (s.flags & TH_RST) {
+                        fprintf(stderr, LOG_W "%s: сервер оборвал сессию (RST)\n", out_name);
+                        c.state = ST_CLOSED;
+                        closed = 1;
+                        break;
+                    }
+                    if (c.state == ST_SYN_SENT && (s.flags & TH_SYN) && (s.flags & TH_ACK)) {
+                        c.ack = s.seq + 1;
+                        c.state = ST_EST;
+                        conn_send(raw, &c, TH_ACK, NULL, 0, 0);
+                        fprintf(stderr, LOG_I "%s: сессия установлена\n", out_name);
+                        continue;
+                    }
+                    if (s.plen && c.state == ST_EST) {
+                        c.ack = obfs_next_ack(c.ack, s.seq, s.plen);
+                        c.unacked++;
+                        /* Датаграмма отдаётся наверх в любом случае, даже вне порядка:
+                         * за порядок и подлинность отвечает WireGuard, а не мы. */
+                        g_iov[k].iov_base = (void *)(uintptr_t)s.payload;
+                        g_iov[k].iov_len = s.plen;
+                        memset(&g_mm[k].msg_hdr, 0, sizeof(g_mm[k].msg_hdr));
+                        g_mm[k].msg_hdr.msg_iov = &g_iov[k];
+                        g_mm[k].msg_hdr.msg_iovlen = 1;
+                        g_mm[k].msg_hdr.msg_name = &peer;
+                        g_mm[k].msg_hdr.msg_namelen = peer_len;
+                        k++;
+                    }
                 }
-                if (c.state == ST_SYN_SENT && (s.flags & TH_SYN) && (s.flags & TH_ACK)) {
-                    c.ack = s.seq + 1;
-                    c.state = ST_EST;
-                    conn_send(raw, &c, TH_ACK, NULL, 0, 0);
-                    fprintf(stderr, LOG_I "%s: сессия установлена\n", out_name);
-                    continue;
+                if (k && peer_len) {
+                    int sent = sendmmsg(udp, g_mm, (unsigned)k, 0);
+                    if (sent > 0) down_pkts += (unsigned)sent;
                 }
-                if (s.plen && c.state == ST_EST) {
-                    c.ack = obfs_next_ack(c.ack, s.seq, s.plen);
-                    c.unacked++;
-                    /* Датаграмма отдаётся наверх в любом случае, даже вне порядка: за
-                     * порядок и подлинность отвечает WireGuard, а не мы. */
-                    if (peer_len)
-                        sendto(udp, s.payload, s.plen, 0,
-                               (struct sockaddr *)&peer, peer_len);
-                    down_pkts++;
-                }
+                if (closed || got < BATCH) break;
             }
         }
 
@@ -757,7 +872,6 @@ int obfs_server(int listen_port, const char *forward, int forward_port) {
     fprintf(stderr, LOG_I "сервер: поддельный TCP :%d → udp %s:%d\n",
             listen_port, forward, forward_port);
 
-    uint8_t pkt[OBFS_PKT_MAX];
     for (;;) {
         struct pollfd fds[1 + MAX_SESS];
         struct sess *map[1 + MAX_SESS];
@@ -774,11 +888,19 @@ int obfs_server(int listen_port, const char *forward, int forward_port) {
         if (n < 0 && errno != EINTR) break;
 
         if (n > 0 && (fds[0].revents & POLLIN)) {
-            for (;;) {
-                ssize_t r = recv(rx, pkt, sizeof(pkt), 0);
-                if (r <= 0) break;
+          for (;;) {
+            for (int i = 0; i < BATCH; i++) {
+                g_iov[i].iov_base = g_bat_rx[i];
+                g_iov[i].iov_len = OBFS_PKT_MAX;
+                memset(&g_mm[i].msg_hdr, 0, sizeof(g_mm[i].msg_hdr));
+                g_mm[i].msg_hdr.msg_iov = &g_iov[i];
+                g_mm[i].msg_hdr.msg_iovlen = 1;
+            }
+            int got = recvmmsg(rx, g_mm, BATCH, MSG_DONTWAIT, NULL);
+            if (got <= 0) break;
+            for (int bi = 0; bi < got; bi++) {
                 struct obfs_seg s;
-                if (obfs_parse(pkt, (size_t)r, &s) != 0) continue;
+                if (obfs_parse(g_bat_rx[bi], g_mm[bi].msg_len, &s) != 0) continue;
                 if (s.dport != (uint16_t)listen_port) continue;
 
                 struct sess *ss = sess_find(s.saddr, s.sport);
@@ -831,17 +953,38 @@ int obfs_server(int listen_port, const char *forward, int forward_port) {
                     send(ss->udp, s.payload, s.plen, MSG_NOSIGNAL);
                 }
             }
+            if (got < BATCH) break;
+          }
         }
 
         for (int i = 1; i < nf; i++) {
             if (!(fds[i].revents & POLLIN)) continue;
             struct sess *ss = map[i];
             for (;;) {
-                ssize_t r = recv(ss->udp, pkt, OBFS_MAX_PAYLOAD, 0);
-                if (r <= 0) break;
-                if (conn_send(ss->tx, &ss->c, TH_PSH | TH_ACK, pkt, (size_t)r, 0) != 0 &&
+                /* Место под заголовок резервируется при чтении, поэтому датаграмма
+                 * уходит клиенту с того места, куда её положило ядро, — без копии. */
+                for (int b = 0; b < BATCH; b++) {
+                    g_iov[b].iov_base = g_bat_tx[b] + HDR_ROOM;
+                    g_iov[b].iov_len = OBFS_MAX_PAYLOAD;
+                    memset(&g_mm[b].msg_hdr, 0, sizeof(g_mm[b].msg_hdr));
+                    g_mm[b].msg_hdr.msg_iov = &g_iov[b];
+                    g_mm[b].msg_hdr.msg_iovlen = 1;
+                }
+                int got = recvmmsg(ss->udp, g_mm, BATCH, MSG_DONTWAIT, NULL);
+                if (got <= 0) break;
+                for (int b = 0; b < got; b++) {
+                    size_t seglen;
+                    uint8_t *seg = build_ahead(&ss->c, g_bat_tx[b], g_mm[b].msg_len, &seglen);
+                    g_iov[b].iov_base = seg;
+                    g_iov[b].iov_len = seglen;
+                    memset(&g_mm[b].msg_hdr, 0, sizeof(g_mm[b].msg_hdr));
+                    g_mm[b].msg_hdr.msg_iov = &g_iov[b];
+                    g_mm[b].msg_hdr.msg_iovlen = 1;
+                }
+                if (sendmmsg(ss->tx, g_mm, (unsigned)got, 0) < 0 &&
                     errno != ENOBUFS && errno != EAGAIN && errno != EWOULDBLOCK)
                     break;
+                if (got < BATCH) break;
             }
         }
 
