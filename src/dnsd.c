@@ -2019,13 +2019,27 @@ static int cmd_fakeip(const char *state_path, const char *domain) {
     return 0;
 }
 
+/* Флаги резолвера печатает он сам, а не таблица в src/cli.c: у dnsd свой разбор
+ * аргументов, и описание, лежащее отдельно от него, разошлось бы с ним при первой же
+ * правке. Формат строк — тот же, что у общих флагов. */
+void dnsd_usage_flags(FILE *out) {
+    fputs("  --spec ФАЙЛ              спека каналов (по умолчанию /etc/steer/spec.json)\n"
+          "  --listen-port ПОРТ       порт, на котором отвечать LAN (по умолчанию 5300)\n"
+          "  --upstream-port ПОРТ     порт апстрима, куда переспрашивать (по умолчанию 53)\n"
+          "  --fakeip-state ФАЙЛ      где хранить раздачу поддельных адресов\n"
+          "\n"
+          "Разовые проверки, вместо запуска резолвера:\n"
+          "  --selftest               прогнать разбор и сборку пакетов на своих фикстурах\n"
+          "  --match ПРАВИЛА ИМЯ      какое правило поймает это имя\n"
+          "  --fakeip СОСТОЯНИЕ ДОМЕН какой поддельный адрес выдан домену\n", out);
+}
+
 static void dnsd_usage(void) {
-    fprintf(stderr,
-        "usage: steer dnsd [--spec FILE] [--listen-port P] [--upstream-port P]\n"
-        "                  [--fakeip-state PATH]\n"
-        "       steer dnsd --selftest\n"
-        "       steer dnsd --match RULES_PATH HOSTNAME\n"
-        "       steer dnsd --fakeip STATE_PATH DOMAIN\n");
+    fputs("steer: dnsd: непонятный флаг\n"
+          "использование: steer dnsd [флаги]\n"
+          "флаги:\n", stderr);
+    dnsd_usage_flags(stderr);
+    fputs("подробности: steer help dnsd\n", stderr);
 }
 
 int dnsd_main(int argc, char **argv) {

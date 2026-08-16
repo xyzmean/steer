@@ -4,18 +4,24 @@
 CFLAGS ?= -O2 -Wall -Wextra
 BUILD  := build
 
+# Версия — из того же файла, что читает build.sh: `steer --version` на собранном руками
+# движке должен называть то же число, что окажется в имени пакета.
+VERSION := $(shell cat VERSION 2>/dev/null || echo dev)
+DEFS    := -DSTEER_VERSION='"$(VERSION)"'
+
 .PHONY: all test clean ext-syntax
 all: $(BUILD)/steer
 
 $(BUILD)/steer: src/steer.c src/spec.c src/dnsd.c src/failover.c src/aggregate.c \
-                src/obfs.c src/spec.h src/obfs.h
+                src/obfs.c src/cli.c src/spec.h src/obfs.h src/cli.h VERSION
 	@mkdir -p $(BUILD)
-	$(CC) $(CFLAGS) -o $@ src/steer.c src/spec.c src/dnsd.c src/failover.c src/aggregate.c \
-	      src/obfs.c
+	$(CC) $(CFLAGS) $(DEFS) -o $@ src/steer.c src/spec.c src/dnsd.c src/failover.c \
+	      src/aggregate.c src/obfs.c src/cli.c
 
 test: all ext-syntax $(BUILD)/dnsmatch $(BUILD)/specmatch $(BUILD)/failovermatch $(BUILD)/h2match $(BUILD)/submatch $(BUILD)/fwmatch $(BUILD)/obfsmatch $(BUILD)/diagsim
 	@sh tests/run.sh
 	@sh tests/gen.sh
+	@sh tests/climatch.sh
 	@sh tests/diagmatch.sh
 	@sh tests/buildmatch.sh
 	@$(BUILD)/dnsmatch
@@ -31,10 +37,10 @@ test: all ext-syntax $(BUILD)/dnsmatch $(BUILD)/specmatch $(BUILD)/failovermatch
 # проверять диагностику интереснее всего именно на VLESS-выходе. Три подкоманды
 # расширенной сборки заменены заглушками — см. tests/vless-stub.c.
 $(BUILD)/diagsim: src/steer.c src/spec.c src/dnsd.c src/failover.c src/aggregate.c \
-                  src/obfs.c src/spec.h tests/vless-stub.c
+                  src/obfs.c src/cli.c src/spec.h src/cli.h tests/vless-stub.c
 	@mkdir -p $(BUILD)
-	$(CC) $(CFLAGS) -DSTEER_EXTENDED -o $@ src/steer.c src/spec.c src/dnsd.c \
-	      src/failover.c src/aggregate.c src/obfs.c tests/vless-stub.c
+	$(CC) $(CFLAGS) $(DEFS) -DSTEER_EXTENDED -o $@ src/steer.c src/spec.c src/dnsd.c \
+	      src/failover.c src/aggregate.c src/obfs.c src/cli.c tests/vless-stub.c
 
 # Синтаксическая проверка расширенного движка (R-014/I-024). Полная сборка src/ext идёт
 # только в build.sh через docker с mbedtls, поэтому локальный make test оставался зелёным,
@@ -77,10 +83,10 @@ $(BUILD)/failovermatch: tests/failovermatch.c src/failover.c
 # nft, и проверить эвристику можно только примерами. Стенд включает исходник движка и
 # подменяет popen на чтение из памяти — см. tests/fwmatch.c.
 $(BUILD)/fwmatch: tests/fwmatch.c src/steer.c src/spec.c src/dnsd.c src/failover.c \
-                  src/aggregate.c src/obfs.c src/spec.h
+                  src/aggregate.c src/obfs.c src/cli.c src/spec.h src/cli.h
 	@mkdir -p $(BUILD)
 	$(CC) $(CFLAGS) -o $@ tests/fwmatch.c src/spec.c src/dnsd.c src/failover.c \
-	      src/aggregate.c src/obfs.c
+	      src/aggregate.c src/obfs.c src/cli.c
 
 # Управление потоком HTTP/2 проверяется в памяти: h2.c общается с сетью только через
 # struct h2_io, поэтому стенд подменяет его целиком. -Itests/stub нужен, чтобы не тянуть

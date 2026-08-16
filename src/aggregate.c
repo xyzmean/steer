@@ -296,18 +296,27 @@ static void read_file(const char *path, struct list *l, unsigned long *bad) {
     if (f != stdin) fclose(f);
 }
 
+/* Флаги фиттера печатает он сам, а не таблица в src/cli.c: у fit свой разбор
+ * аргументов, и описание, лежащее отдельно от него, разошлось бы с ним при первой же
+ * правке. Формат строк — тот же, что у общих флагов, чтобы `steer fit --help`
+ * читался как продолжение `steer help`, а не как чужой текст. */
+void aggregate_usage_flags(FILE *out) {
+    fputs("  --budget N               сколько элементов набора можно занять\n"
+          "  --exclude ФАЙЛ           префиксы, которые не должны попасть в результат\n"
+          "  --punch-out ФАЙЛ         объединять поверх исключений, а сами исключения\n"
+          "                           выписать сюда — их держат отдельным каналом выше\n"
+          "  --min-count N            сколько соседей оправдывают объединение (по умолчанию 2)\n"
+          "  --levels 'ДЛИНА:МИН ...' лестница объединения (по умолчанию 24:2 22:4 20:8 16:16)\n"
+          "  --report ФАЙЛ            куда положить JSON-отчёт о цене (по умолчанию stderr)\n"
+          "  --truncate               разрешить отрезать хвост, если иначе не влезает\n", out);
+}
+
 static void usage(void) {
-    fputs("usage: steer fit [--budget N] [--exclude FILE] [--min-count N]\n"
-          "                       [--report FILE] [--levels 'LVL:MIN ...'] [--truncate]\n"
-          "                       [--punch-out FILE] [IN]\n"
-          "\n"
-          "Fits a prefix list into at most N set elements. Without --budget it only\n"
-          "merges losslessly. Writes the fitted list to stdout and a JSON report of\n"
-          "what it cost to --report (default: stderr). Exits 1 when it does not fit.\n"
-          "\n"
-          "--truncate allows dropping the tail as a last resort. Without it a list that\n"
-          "cannot be compressed enough is emitted whole with fits:false, because a\n"
-          "silent hole above one address is worse than an honest refusal.\n", stderr);
+    fputs("steer: fit: непонятный флаг\n"
+          "использование: steer fit [ФАЙЛ] [флаги]\n"
+          "флаги:\n", stderr);
+    aggregate_usage_flags(stderr);
+    fputs("подробности: steer help fit\n", stderr);
     exit(2);
 }
 
@@ -331,7 +340,14 @@ int aggregate_main(int argc, char **argv) {
             punch_path = argv[++i];
             g_excl_mode = EXCL_PUNCH;
         }
-        else if (!strcmp(argv[i], "-h") || !strcmp(argv[i], "--help")) usage();
+        /* --help сюда не доходит: его перехватывает main() и печатает справку из
+         * таблицы вместе с этими же флагами. Ветка оставлена на случай прямого
+         * вызова aggregate_main() — например, из стенда. */
+        else if (!strcmp(argv[i], "-h") || !strcmp(argv[i], "--help")) {
+            fputs("использование: steer fit [ФАЙЛ] [флаги]\nфлаги:\n", stdout);
+            aggregate_usage_flags(stdout);
+            return 0;
+        }
         else if (argv[i][0] == '-' && argv[i][1]) usage();
         else in = argv[i];
     }

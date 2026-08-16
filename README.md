@@ -105,12 +105,29 @@ Defines routing policies. Evaluated in order (top to bottom). The first match wi
 
 ## Command Line Interface
 
+The binary is self-documenting: `steer help` lists every command grouped by purpose, and
+`steer help <command>` (or `steer <command> --help`) prints the synopsis, what the command
+actually does, and every flag it accepts. `steer --version` reports the version and whether
+this is the base or the extended build.
+
+Help goes to stdout and exits `0`; anything printed to stderr with exit `2` is an error.
+Unknown flags are refused rather than ignored — `steer apply --dryrun` fails instead of
+quietly applying the ruleset for real.
+
 - `steer apply [--dry-run]` — Compiles the JSON spec into active `nftables` rules and routing tables.
 - `steer status` — Outputs the current applied state in JSON format.
 - `steer diag` — Runs diagnostics and reports the health of the engine (exits with `1` if broken).
 - `steer explain <ip|domain>` — Explains exactly which channel and output a given address or domain will use.
+- `steer outputs [--kind K|--obfs]` — Lists output names, one per line.
+- `steer needs-dnsd` — Exits `0` when the spec has domain channels and the resolver is needed.
+- `steer dnsd` — The resolver that backs domain channels.
 - `steer fit --budget N <file>` — Aggregates and trims an IP list to fit within `N` memory elements.
 - `steer failover` — Checks output health and updates active interfaces based on priority.
+- `steer vless <output>` / `vless-nodes` / `vless-probe` — VLESS/Reality tunnel, subscription nodes, node latency check (`steer-extended` only).
+- `steer obfs <output>` / `steer obfs-server --listen PORT --forward HOST:PORT` — WireGuard over a fake TCP stream, client and server halves.
+
+Common flags: `--spec FILE` (default `/etc/steer/spec.json`) and `--state-dir DIR`
+(default `/var/lib/steer`) are accepted by every command that reads the spec.
 
 ### Log levels (journal contract)
 

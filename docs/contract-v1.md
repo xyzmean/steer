@@ -160,7 +160,35 @@ steer logs to the journal (stderr) with a fixed severity prefix on every line. T
 
 A subsystem label follows the prefix (e.g. `steer[warn] tunnel: ...`). Parse the prefix to decide severity.
 
-## 6. Architecture Invariants
+## 6. Command Line (Invocation Contract)
+
+The engine is invoked as `steer <command> [positional] [flags]`. Flags always follow the
+command; a flag in the command position is refused rather than guessed at.
+
+**Exit codes.** `0` — done; `1` — a command-specific negative answer (`diag` found a
+`fail` verdict, `needs-dnsd` says the resolver is not needed, `fit` could not fit the
+list); `2` — the engine refused: bad arguments, an unreadable or invalid spec, a missing
+output. A control plane must not treat `1` as a failure to run — the JSON on stdout is
+still valid.
+
+**Streams.** Requested help (`steer help`, `steer help <command>`, `steer <command>
+--help`, `steer --version`) goes to **stdout** and exits `0`. Everything the engine refuses
+goes to **stderr** and exits `2`. Machine-readable output (`status`, `diag`,
+`vless-nodes`, `vless-probe`, `outputs`, `fit`) is on stdout, unmixed with diagnostics.
+
+**Argument validation is strict.** An unknown flag, a flag the command does not accept, a
+flag whose value is missing or swallowed by the next flag, an extra positional argument,
+and a non-numeric value where a number is required are all errors. Nothing unrecognized is
+silently absorbed — a caller that mistypes `--dry-run` gets a refusal, not a real apply.
+
+**Common flags.** `--spec FILE` (default `/etc/steer/spec.json`) and `--state-dir DIR`
+(default `/var/lib/steer`) are accepted by every command that reads the spec.
+`vless-probe --node -1` means "the first working node", which is also the default.
+
+`steer help` lists the commands; `steer help <command>` documents one. The list is
+generated from the same table that validates the arguments, so the two cannot drift.
+
+## 7. Architecture Invariants
 - **First Match Wins**: Rules are evaluated top-to-bottom.
 - **File-Based Matching**: Matches rely strictly on external file paths to conserve memory.
 - **Stateless Configuration**: Dynamic changes (like failover) update the routing tables directly without modifying the core nftables ruleset.

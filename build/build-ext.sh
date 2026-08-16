@@ -14,6 +14,10 @@ set -eu
 TARGET="$1"
 MCPU="${2:-}"
 OUT="$3"
+# Версия приходит четвёртым аргументом, а не читается из VERSION: скрипт работает внутри
+# контейнера после cd в каталог mbedtls, и относительный путь к файлу оттуда не находится.
+# Умолчание нужно ради ручного запуска с тремя аргументами.
+VERSION="${4:-dev}"
 
 MBED_INC=/opt/mbedtls/include
 EXT_INC=/src/src/ext
@@ -61,10 +65,10 @@ fi
 # и бинарник разом вырастает с 540 КБ до 4,9 МБ. На overlay в 6,9 МБ это разница между
 # «пакет ставится» и «места нет», причём отладочная информация на роутере не нужна никому.
 zig cc -target "$TARGET" ${MCPU:+-mcpu=$MCPU} -static $OPT -s \
-    -I"$MBED_INC" -I"$EXT_INC" $CFG -DSTEER_EXTENDED \
+    -I"$MBED_INC" -I"$EXT_INC" $CFG -DSTEER_EXTENDED -DSTEER_VERSION="\"$VERSION\"" \
     -o "$OUT" \
     /src/src/steer.c /src/src/spec.c /src/src/dnsd.c /src/src/failover.c \
-    /src/src/aggregate.c /src/src/obfs.c \
+    /src/src/aggregate.c /src/src/obfs.c /src/src/cli.c \
     /src/src/ext/sub.c /src/src/ext/reality.c /src/src/ext/tls13.c \
     /src/src/ext/vless_proto.c /src/src/ext/vision.c /src/src/ext/client.c \
     /src/src/ext/tun.c /src/src/ext/tunnel.c /src/src/ext/h2.c /src/src/ext/rtx.c \

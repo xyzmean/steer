@@ -30,7 +30,7 @@ fi
 #
 # Собираются из ОДНИХ исходников: extended это те же файлы плюс src/ext и mbedtls.
 # Разные бинарники из разного набора файлов означали бы два места, где чинить одну ошибку.
-BASE_SRC="src/steer.c src/spec.c src/dnsd.c src/failover.c src/aggregate.c src/obfs.c"
+BASE_SRC="src/steer.c src/spec.c src/dnsd.c src/failover.c src/aggregate.c src/obfs.c src/cli.c"
 # Список файлов расширенной сборки живёт в build/build-ext.sh и только там: он запускается
 # отдельным процессом с тремя аргументами, ничего отсюда не наследует, и вторая копия списка
 # здесь молча расходилась бы с первой. Что списки не разошлись с самим каталогом src/ext,
@@ -54,6 +54,7 @@ for spec in $ISAS; do
     printf '  %-26s ' "$arch"
     if docker run --rm -v "$PWD:/src" -w /src "$IMAGE" \
             cc -target "$target" -mcpu="$mcpu" -static -Os -Wall -Wextra \
+               -DSTEER_VERSION="\"$VERSION\"" \
                -o "build/steer-$arch" $BASE_SRC \
                2>"build/$arch.err"; then
         echo "$(stat -c %s "build/steer-$arch") bytes"
@@ -71,6 +72,7 @@ for spec in $ISAS; do
     printf '  %-26s ' "$arch (extended)"
     if docker run --rm -v "$PWD:/src" -w /src --entrypoint sh "$IMAGE" \
             /src/build/build-ext.sh "$target" "$mcpu" "/src/build/steer-ext-$arch" \
+            "$VERSION" \
             2>"build/$arch-ext.err"; then
         echo "$(stat -c %s "build/steer-ext-$arch") bytes"
     else

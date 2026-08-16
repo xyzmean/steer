@@ -29,9 +29,14 @@
 
 #include "spec.h"
 #include "obfs.h"
+#include "cli.h"
 
 int dnsd_main(int argc, char **argv);
 int cmd_failover(const char *spec, int verbose);
+/* Свои флаги эти двое печатают сами — см. комментарии у объявлений. Справка по ним
+ * склеивается из таблицы (что команда делает) и этих строк (чем ей управляют). */
+void dnsd_usage_flags(FILE *out);
+void aggregate_usage_flags(FILE *out);
 /* Клиент VLESS есть только в расширенной сборке (steer-extended). В базовой команда
  * отвечает внятным отказом, а не отсутствует: «неизвестная команда» на steer vless
  * заставила бы искать опечатку вместо того, чтобы поставить нужный пакет. */
@@ -1671,93 +1676,109 @@ static int cmd_explain(const char *spec, const char *what) {
 }
 
 int main(int argc, char **argv) {
-    const char *spec = "/etc/steer/spec.json";
     if (argc < 2) {
-        fputs("usage: steer apply [--dry-run] [--spec FILE]\n"
-              "       steer dnsd  [--spec FILE]   (resolver for domain channels)\n"
-              "       steer failover [--spec FILE] [-v]   (pick a live device per output)\n"
-              "       steer fit --budget N [IN]   (подогнать список под память)\n"
-              "       steer vless OUTPUT          (поднять TUN для выхода kind=vless)\n"
-              "       steer vless-nodes OUTPUT    (узлы подписки, JSON)\n"
-              "       steer vless-probe OUTPUT [--node N] [--timeout S]\n"
-              "                                   (проверить узел и замерить задержку)\n"
-              "       steer obfs OUTPUT           (WireGuard поверх поддельного TCP)\n"
-              "       steer obfs-server --listen PORT --forward АДРЕС:ПОРТ\n"
-              "                                   (серверная половина, для VPS)\n"
-              "       steer outputs [--kind K|--obfs]  (перечислить выходы)\n"
-              "       steer needs-dnsd            (exit 0 if the spec has domain channels)\n"
-              "       steer status [--spec FILE]\n"
-              "       steer diag [--spec FILE]    (проверки состояния, JSON; код 1 при поломке)\n"
-              "       steer explain АДРЕС|ИМЯ [--spec FILE]\n", stderr);
+        cli_usage_short(stderr);
         return 2;
     }
-    const char *cmd = argv[1], *arg = NULL;
-    int dry = 0, verbose = 0;
-    /* Умолчание по узлу — «до первого рабочего»: то же решение, что принимает подъём
-     * выхода, поэтому проверка отвечает на вопрос «что будет, если применить». */
-    int node = -1, timeout = 5;
-    for (int i = 2; i < argc; i++) {
-        if (!strcmp(argv[i], "--spec") && i + 1 < argc) spec = argv[++i];
-        else if (!strcmp(argv[i], "--dry-run")) dry = 1;
-        else if (!strcmp(argv[i], "-v") || !strcmp(argv[i], "--verbose")) verbose = 1;
-        else if (!strcmp(argv[i], "--state-dir") && i + 1 < argc) g_state_dir = argv[++i];
-        else if (!strcmp(argv[i], "--node") && i + 1 < argc) node = atoi(argv[++i]);
-        else if (!strcmp(argv[i], "--timeout") && i + 1 < argc) timeout = atoi(argv[++i]);
-        /* Значения флагов разбираются ЗДЕСЬ, а не в ветке команды: общий цикл иначе
-         * принял бы «--node» и «3» за имя выхода, и последнее слово в строке молча
-         * становилось бы именем. Так уже случалось с fit, у которого свои аргументы. */
-        else arg = argv[i];
+    const char *cmd = argv[1];
+
+    /* Справка и версия — до поиска команды: это не команды движка, а вопросы к нему.
+     * Обе формы, и слово, и флаг: `steer --help` человек набирает не задумываясь, а
+     * раньше получал «unknown command: --help» с кодом 2. */
+    if (!strcmp(cmd, "help") || !strcmp(cmd, "--help") || !strcmp(cmd, "-h")) {
+        if (argc > 2) {
+            const struct cli_cmd *c = cli_lookup(argv[2]);
+            if (!c) cli_unknown(argv[2]);
+            cli_help(stdout, c);
+        } else {
+            cli_help(stdout, NULL);
+        }
+        return 0;
     }
-    if (timeout < 1) timeout = 1;
-    /* Does this spec need the resolver? Asked by the init script instead of guessing
-     * from the file's text — it used to grep for the literal `"domains_file"`, and when
-     * the spec gained the plural `domains_files` the match silently stopped working:
-     * the resolver never started while apply still installed the DNS redirect, so
-     * every LAN query went to a closed port and DNS died. The engine is the only thing
-     * that knows what it will generate, so it answers. */
+    if (!strcmp(cmd, "version") || !strcmp(cmd, "--version") || !strcmp(cmd, "-V")) {
+        cli_version(stdout);
+        return 0;
+    }
+    /* Флаг вместо команды. Отдельная строка, потому что «нет такой команды: --spec»
+     * не объясняет, что именно не так с порядком слов. */
+    if (cmd[0] == '-') {
+        fprintf(stderr, "steer: флаги идут после команды, а не до неё: %s\n", cmd);
+        fputs("       например: steer apply --spec /etc/steer/spec.json\n"
+              "       список команд: steer help\n", stderr);
+        return 2;
+    }
+
+    const struct cli_cmd *c = cli_lookup(cmd);
+    if (!c) cli_unknown(cmd);
+    /* Просьба о справке перехватывается ДО разбора, одинаково для всех команд —
+     * включая fit и dnsd, у которых свои парсеры аргументов. */
+    if (cli_wants_help(argc - 2, argv + 2)) {
+        cli_help(stdout, c);
+        /* У команд со своим разбором список флагов знает только их парсер, поэтому
+         * справка склеивается из двух половин. */
+        if (c->passthru) {
+            fputs("\nФлаги:\n", stdout);
+            if (!strcmp(cmd, "fit")) aggregate_usage_flags(stdout);
+            else dnsd_usage_flags(stdout);
+        }
+        return 0;
+    }
+
+    /* У fit и dnsd свои аргументы, и общий разбор молча съел бы, например, --budget.
+     * Такие команды помечены в таблице как passthru и получают argv как есть. */
+    if (c->passthru) {
+        if (!strcmp(cmd, "fit")) return aggregate_main(argc - 1, argv + 1);
+        return dnsd_main(argc - 2, argv + 2);
+    }
+
+    struct cli_args a;
+    cli_parse(c, argc, argv, 2, &a);
+    if (a.state_dir) g_state_dir = a.state_dir;
+    const char *spec = a.spec, *arg = a.npos ? a.pos[0] : NULL;
+
+    if (!strcmp(cmd, "apply")) return cmd_apply(spec, a.dry_run);
+    if (!strcmp(cmd, "status")) return cmd_status(spec);
+    if (!strcmp(cmd, "diag")) return cmd_diag(spec);
+    if (!strcmp(cmd, "failover")) return cmd_failover(spec, a.verbose);
+    if (!strcmp(cmd, "explain")) {
+        /* Адрес ИЛИ имя. Проверка формы обязательна для обоих: аргумент подставляется в
+         * вызов nft, и именно здесь однажды была дыра — адрес уходил в system(). */
+        if (!addr_ok(arg) && !looks_like_name(arg))
+            die("это не адрес и не имя: %s", arg);
+        return cmd_explain(spec, arg);
+    }
     /* Перечислить выходы заданного вида. Init-скрипту нужно знать, для каких выходов
      * поднимать процесс, и спрашивать об этом движок — то же правило, что с needs-dnsd:
      * grep по ключу в JSON ломается при первом же переименовании поля, причём молча. */
     if (!strcmp(cmd, "outputs")) {
-        const char *want = NULL;
-        int want_obfs = 0;
-        for (int i = 2; i < argc; i++) {
-            if (!strcmp(argv[i], "--kind") && i + 1 < argc) want = argv[i + 1];
-            /* Отдельный признак, а не вид: обфускация — свойство выхода, и
-             * init-скрипту нужен именно список тех, кому поднимать процесс. */
-            else if (!strcmp(argv[i], "--obfs")) want_obfs = 1;
-        }
         load_spec(spec);
         for (size_t i = 0; i < g_out_n; i++) {
             const char *k = g_out[i].kind == OUT_DIRECT ? "direct" :
                             g_out[i].kind == OUT_VLESS ? "vless" : "interface";
-            if (want && strcmp(want, k) != 0) continue;
-            if (want_obfs && !g_out[i].obfs.on) continue;
+            if (a.kind && strcmp(a.kind, k) != 0) continue;
+            /* --obfs — отдельный признак, а не вид: обфускация есть свойство выхода,
+             * и init-скрипту нужен именно список тех, кому поднимать процесс. */
+            if (a.obfs && !g_out[i].obfs.on) continue;
             printf("%s\n", g_out[i].name);
         }
         return 0;
     }
-    /* Серверная половина. Спека ей не нужна и не читается: сервер живёт на VPS, где
-     * ни выходов, ни каналов нет — есть порт, который слушать, и локальный WireGuard,
-     * которому пересылать. */
-    if (!strcmp(cmd, "obfs-server")) {
-        int lport = 0;
-        const char *fwd = NULL;
-        for (int i = 2; i < argc; i++) {
-            if (!strcmp(argv[i], "--listen") && i + 1 < argc) lport = atoi(argv[++i]);
-            else if (!strcmp(argv[i], "--forward") && i + 1 < argc) fwd = argv[++i];
-        }
-        if (lport < 1 || lport > 65535)
-            die("нужен --listen ПОРТ (порт поддельного TCP)", NULL);
-        if (!fwd) die("нужен --forward АДРЕС:ПОРТ (куда отдавать датаграммы)", NULL);
-        char host[80];
-        int fport = 0;
-        if (obfs_split_hostport(fwd, host, sizeof(host), &fport) != 0)
-            die("--forward должен быть вида адрес:порт, а не %s", fwd);
-        return obfs_server(lport, host, fport);
+    /* Нужен ли этой спеке резолвер. Спрашивают у движка, а не угадывают по тексту
+     * файла: init-скрипт когда-то искал в нём буквальное `"domains_file"`, спека
+     * обзавелась множественным `domains_files`, и совпадение молча перестало
+     * находиться — резолвер не поднимался, а apply при этом ставил перенаправление
+     * DNS, и каждый запрос из LAN уходил в закрытый порт. Что будет сгенерировано,
+     * знает только движок, поэтому отвечает он. */
+    if (!strcmp(cmd, "needs-dnsd")) {
+        load_spec(spec);
+        registry_assign();
+        build_groups();
+        return has_domains() ? 0 : 1;
     }
+    if (!strcmp(cmd, "vless")) return cmd_vless(spec, arg);
+    if (!strcmp(cmd, "vless-nodes")) return cmd_vless_nodes(spec, arg);
+    if (!strcmp(cmd, "vless-probe")) return cmd_vless_probe(spec, arg, a.node, a.timeout);
     if (!strcmp(cmd, "obfs")) {
-        if (!arg) die("нужно имя выхода: steer obfs <output>", NULL);
         load_spec(spec);
         struct output *o = out_by_name(arg);
         if (!o) die("нет такого выхода: %s", arg);
@@ -1765,41 +1786,21 @@ int main(int argc, char **argv) {
         return obfs_client(o->name, o->obfs.server, o->obfs.server_port,
                            o->obfs.listen, o->obfs.listen_port);
     }
-    if (!strcmp(cmd, "needs-dnsd")) {
-        load_spec(spec);
-        registry_assign();
-        build_groups();
-        return has_domains() ? 0 : 1;
+    /* Серверная половина. Спека ей не нужна и не читается: сервер живёт на VPS, где
+     * ни выходов, ни каналов нет — есть порт, который слушать, и локальный WireGuard,
+     * которому пересылать. */
+    if (!strcmp(cmd, "obfs-server")) {
+        if (!a.listen) die("нужен --listen ПОРТ (порт поддельного TCP)", NULL);
+        if (!a.forward) die("нужен --forward АДРЕС:ПОРТ (куда отдавать датаграммы)", NULL);
+        char host[80];
+        int fport = 0;
+        if (obfs_split_hostport(a.forward, host, sizeof(host), &fport) != 0)
+            die("--forward должен быть вида адрес:порт, а не %s", a.forward);
+        return obfs_server(a.listen, host, fport);
     }
-    /* Раньше остальных: у fit свои аргументы, и разбирать их общим циклом значило бы
-     * молча съесть, например, --budget. */
-    if (!strcmp(cmd, "fit")) return aggregate_main(argc - 1, argv + 1);
-    if (!strcmp(cmd, "vless")) {
-        if (!arg) die("нужно имя выхода: steer vless <output>", NULL);
-        return cmd_vless(spec, arg);
-    }
-    if (!strcmp(cmd, "vless-nodes")) {
-        if (!arg) die("нужно имя выхода: steer vless-nodes <output>", NULL);
-        return cmd_vless_nodes(spec, arg);
-    }
-    if (!strcmp(cmd, "vless-probe")) {
-        if (!arg) die("нужно имя выхода: steer vless-probe <output>", NULL);
-        return cmd_vless_probe(spec, arg, node, timeout);
-    }
-    if (!strcmp(cmd, "failover")) return cmd_failover(spec, verbose);
-    if (!strcmp(cmd, "dnsd")) return dnsd_main(argc - 2, argv + 2);
-    if (!strcmp(cmd, "apply")) return cmd_apply(spec, dry);
-    if (!strcmp(cmd, "status")) return cmd_status(spec);
-    if (!strcmp(cmd, "diag")) return cmd_diag(spec);
-    if (!strcmp(cmd, "explain")) {
-        if (!arg) die("explain needs an address or a name", NULL);
-        /* Адрес ИЛИ имя. Проверка формы обязательна для обоих: аргумент подставляется в
-         * вызов nft, и именно здесь однажды была дыра — адрес уходил в system(). */
-        if (!addr_ok(arg) && !looks_like_name(arg))
-            die("это не адрес и не имя: %s", arg);
-        return cmd_explain(spec, arg);
-    }
-    die("unknown command: %s", cmd);
+    /* Сюда попасть нельзя: имя нашлось в таблице, значит ветка для него есть. Если
+     * всё-таки попали — в таблицу добавили команду и забыли про диспетчер. */
+    die("команда %s объявлена, но не подключена — это ошибка в движке", cmd);
     return 2;
 }
 
