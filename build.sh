@@ -47,6 +47,69 @@ x86_64:x86_64-linux-musl:baseline
 
 mkdir -p "$OUT" build/pkg
 
+# ---- две упаковки одного пакета: apk и opkg ----------------------------------
+#
+# OpenWrt перешёл на apk в 24.10, но 23.05 и 22.03 живут на роутерах и будут жить: на
+# 4/32 их никто не обновит, а именно там движок и нужнее всего. Собирать пакет только в
+# новом формате значит отрезать половину устройств, ради которых он написан.
+#
+# Оба формата делаются из ОДНОГО дерева файлов ($root / $eroot), а не из двух: разные
+# деревья означали бы пакет, который на одном формате работает, а на другом нет, и
+# заметить это можно было бы только на роутере. Отличаются они только метаданными.
+#
+# ipkg-build — родной скрипт OpenWrt, тот же, что собирает пакеты в их SDK. Берётся из
+# сети один раз и кладётся в build/ (см. .gitignore): переписывать его своими руками
+# значило бы получить .ipk, который opkg принимает не везде, — ровно та ошибка, на
+# которой в splify обжигались с po2lmo.
+IPKG=build/ipkg-build
+if [ ! -x "$IPKG" ]; then
+    echo "качаю ipkg-build из OpenWrt"
+    # curl или wget: на машине сборщика бывает любой из двух, а требовать конкретный
+    # значит уронить сборку там, где всё для неё есть.
+    URL=https://raw.githubusercontent.com/openwrt/openwrt/master/scripts/ipkg-build
+    if command -v curl >/dev/null 2>&1; then
+        curl -fsSL "$URL" -o "$IPKG" || { echo "не удалось скачать ipkg-build"; exit 1; }
+    elif command -v wget >/dev/null 2>&1; then
+        wget -qO "$IPKG" "$URL" || { echo "не удалось скачать ipkg-build"; exit 1; }
+    else
+        echo "нужен curl или wget, чтобы взять ipkg-build"; exit 1
+    fi
+    chmod +x "$IPKG"
+fi
+
+# mk_ipk КОРЕНЬ ИМЯ АРХ ЗАВИСИМОСТИ ОПИСАНИЕ [ДОПОЛНИТЕЛЬНЫЕ ПОЛЯ CONTROL]
+#
+# Каталог CONTROL создаётся ВНУТРИ дерева пакета, поэтому зовётся строго ПОСЛЕ apk mkpkg
+# по тому же дереву: иначе служебные файлы уехали бы в полезную нагрузку apk.
+mk_ipk() {
+    ipk_root="$1"; ipk_name="$2"; ipk_arch="$3"; ipk_dep="$4"; ipk_desc="$5"; ipk_extra="${6:-}"
+    mkdir -p "$ipk_root/CONTROL"
+    {
+        echo "Package: $ipk_name"
+        echo "Version: $VERSION-1"
+        echo "Depends: $ipk_dep"
+        echo "Architecture: $ipk_arch"
+        echo "Maintainer: xyzmean"
+        echo "Section: net"
+        [ -n "$ipk_extra" ] && printf '%s\n' "$ipk_extra"
+        echo "Description: $ipk_desc"
+    } > "$ipk_root/CONTROL/control"
+    cp build/scripts/post-install "$ipk_root/CONTROL/postinst"
+    cp build/scripts/pre-deinstall "$ipk_root/CONTROL/prerm"
+    chmod 0755 "$ipk_root/CONTROL/postinst" "$ipk_root/CONTROL/prerm"
+    # Без -o/-g: нынешний ipkg-build их не понимает (они были в старых версиях), а
+    # молчаливый отказ здесь означал бы релиз без половины пакетов.
+    if "$PWD/$IPKG" "$ipk_root" "$PWD/$OUT" >/dev/null 2>&1; then
+        # ipkg-build называет файл через подчёркивания; приводим к тому же виду, что у
+        # apk, чтобы в релизе оба формата одного пакета лежали рядом и читались одинаково.
+        mv "$OUT/${ipk_name}_${VERSION}-1_${ipk_arch}.ipk" \
+           "$OUT/${ipk_name}-${VERSION}-1_${ipk_arch}.ipk" 2>/dev/null || true
+    else
+        echo "    (ipk packaging failed for $ipk_name $ipk_arch)"
+    fi
+    rm -rf "$ipk_root/CONTROL"
+}
+
 echo "steer $VERSION"
 for spec in $ISAS; do
     arch=${spec%%:*}; rest=${spec#*:}
@@ -109,9 +172,10 @@ exit 0
 EOF
     chmod +x build/scripts/post-install build/scripts/pre-deinstall
 
-    # Расширенный пакет: то же имя команды, поэтому provides/conflicts с базовым —
+    # Расширенный пакет: то же имя команды, поэтому объявляется заменой базового —
     # установленные вместе они спорили бы за /usr/sbin/steer, и какой победит зависело бы
-    # от порядка установки.
+    # от порядка установки. В apk это provides + replaces (третьего поля там нет), в opkg
+    # к ним добавляется Conflicts — см. mk_ipk.
     if [ -f "build/steer-ext-$arch" ]; then
         eroot="build/pkg/$arch-ext"
         rm -rf "$eroot"
@@ -129,6 +193,15 @@ EOF
                --script pre-deinstall:build/scripts/pre-deinstall \
                -F $eroot -o $OUT/steer-extended-$VERSION-1_$arch.apk" >/dev/null 2>&1 \
             || echo "    (упаковка extended для $arch не удалась)"
+        # Тот же пакет в формате opkg. Три поля сразу: в opkg это ровно тот набор,
+        # которым выражается «ставится ВМЕСТО», и без Conflicts два пакета уживались бы
+        # в базе, споря за /usr/sbin/steer. Отдельной переменной, а не строкой в вызове:
+        # многострочный литерал посреди аргументов читается плохо и его проверяет стенд.
+        EXT_FIELDS='Provides: steer
+Replaces: steer
+Conflicts: steer'
+        mk_ipk "$eroot" steer-extended "$arch" "nftables, ip-full, kmod-tun" \
+            "steer + клиент VLESS/Reality (как dnsmasq-full)" "$EXT_FIELDS"
     fi
 
     docker run --rm -v "$PWD":/w -w /w alpine:latest sh -c \
@@ -140,6 +213,48 @@ EOF
            --script pre-deinstall:build/scripts/pre-deinstall \
            -F $root -o $OUT/steer-$VERSION-1_$arch.apk" >/dev/null 2>&1 \
         || echo "    (apk packaging failed for $arch)"
+    mk_ipk "$root" steer "$arch" "nftables, ip-full" \
+        "policy routing engine: channels in, nftables out"
+done
+
+# ---- серверная половина обфускации: архив для VPS -----------------------------
+#
+# steer obfs-server живёт не на роутере, а на VPS рядом с WireGuard, и пакетом OpenWrt
+# туда не поставишь: там обычный Linux с systemd. До сих пор единственным путём была
+# сборка из исходников (server/install.sh), то есть на голой VPS установка начиналась с
+# apt install build-essential ради одного файла — и упиралась в него же на образах, где
+# компилятора нет и ставить его нельзя.
+#
+# Архив содержит ровно то, что нужно на той стороне: статический бинарник, установщик и
+# краткую справку. Бинарник тот же самый, что уезжает в пакет для роутера той же
+# архитектуры, — отдельной сборки для сервера нет и быть не должно: два бинарника из
+# разных сборок означали бы две обфускации, расходящиеся в мелочах на проводе.
+#
+# Архитектуры только те, на которых VPS реально бывают. Собирать архив под mips значило
+# бы предлагать людям то, чего не существует.
+echo "серверная половина:"
+for arch in x86_64 aarch64_generic; do
+    bin="build/steer-$arch"
+    if [ ! -f "$bin" ]; then
+        printf '  %-26s пропуск (движок не собрался)\n' "$arch"
+        continue
+    fi
+    # Имя внутри архива — привычное человеку, а не имя цели OpenWrt: на VPS про
+    # aarch64_generic никто не знает, там знают uname -m.
+    case "$arch" in
+        x86_64)           uarch=x86_64 ;;
+        aarch64_generic)  uarch=aarch64 ;;
+        *)                uarch=$arch ;;
+    esac
+    stage="build/obfs-$uarch"
+    rm -rf "$stage"
+    mkdir -p "$stage"
+    cp "$bin" "$stage/steer"
+    cp server/install.sh "$stage/install.sh"
+    [ -f server/README.md ] && cp server/README.md "$stage/README.md"
+    chmod 0755 "$stage/steer" "$stage/install.sh"
+    tar -C build -czf "$OUT/steer-obfs-$VERSION-$uarch.tar.gz" "obfs-$uarch"
+    printf '  %-26s %s bytes\n' "$uarch" "$(stat -c %s "$OUT/steer-obfs-$VERSION-$uarch.tar.gz")"
 done
 
 echo "packages:"

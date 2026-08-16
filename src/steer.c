@@ -31,6 +31,12 @@
 #include "obfs.h"
 #include "cli.h"
 
+/* Уровень в журнале — см. одноимённые макросы в failover.c и obfs.c. Метка подсистемы
+ * здесь «apply»: все строки ниже пишутся при компиляции и применении спеки. Отказы
+ * вызывающему (die и разбор аргументов) уровня НЕ несут и несут «steer: » — это ответ
+ * тому, кто позвал, а не запись в журнал; так и записано в контракте. */
+#define LOG_W "steer[warn] apply: "
+
 int dnsd_main(int argc, char **argv);
 int cmd_failover(const char *spec, int verbose);
 /* Свои флаги эти двое печатают сами — см. комментарии у объявлений. Справка по ним
@@ -45,6 +51,12 @@ int cmd_vless(const char *spec_path, const char *out_name);
 int cmd_vless_nodes(const char *spec_path, const char *out_name);
 int cmd_vless_probe(const char *spec_path, const char *out_name, int node, int timeout_s);
 #else
+/* ПОДСТРОКУ «steer-extended» ЗДЕСЬ ЧИТАЮТ СНАРУЖИ — это контракт, а не просто текст.
+ * splify2 определяет вид установленного пакета так:
+ *     out="$(steer vless '' 2>&1)"; case "$out" in *steer-extended*) vless=0 ;; esac
+ * и по результату решает, показывать ли вкладку VLESS целиком. Переформулировать отказ
+ * можно как угодно, но слово steer-extended обязано в нём остаться; закреплено стендом
+ * tests/climatch.sh («vless '' называет пакет»). */
 static int no_vless(void) {
     fprintf(stderr, "steer: клиент VLESS в этой сборке отсутствует — "
                     "нужен пакет steer-extended\n");
@@ -86,6 +98,9 @@ struct group {
     char name[64];              /* <output>_ip | <output>_dom, and the set name */
     const char *out;
     int domains;                /* addresses otherwise */
+    /* Группа «весь трафик»: набора у неё нет, правило безусловное. Признак входит в ключ
+     * слияния — см. build_groups, почему такую группу нельзя объединять со списочной. */
+    int all;
     int realip;
     const char (*from)[64];
     size_t from_n;
@@ -125,10 +140,18 @@ static void build_groups(void) {
          * «выключено» обязано значить «не действует», а не «действует тише». */
         if (c->disabled) continue;
         int domains = c->domains_n > 0;
+        /* Канал, забирающий ВЕСЬ трафик: у него нет набора вовсе. */
+        int all = c->any && !c->prefixes_n && !c->domains_n;
         size_t k = 0;
         for (; k < g_grp_n; k++) {
             struct group *g = &g_grp[k];
             if (strcmp(g->out, c->out) != 0) continue;
+            /* «Весь трафик» и «трафик из списка» — РАЗНЫЕ группы, даже когда выход и
+             * клиенты совпадают. Слияние их было молчаливой потерей: правило группы
+             * получало имя _ip и начинало проверять набор, то есть канал «весь трафик
+             * этой сети в туннель» превращался в «только адреса из списка», и об этом не
+             * сообщалось ни отказом, ни в status, ни в diag. */
+            if (g->all != all) continue;
             /* Вид больше НЕ разделяет группы: адресное и доменное правило одного сервиса,
              * ведущие в один outbound для одних клиентов, — это одно правило и один набор.
              * Разделение по виду было следствием запрета смешивать, а не требованием ядра. */
@@ -141,16 +164,15 @@ static void build_groups(void) {
             memset(g, 0, sizeof(*g));
             g->out = c->out;
             g->domains = 0;
+            g->all = all;
             g->realip = c->realip;
             g->from = c->from_n ? c->from : g_from_default;
             g->from_n = c->from_n ? c->from_n : g_from_default_n;
             /* Имя ставим предварительно, окончательное — ниже: домены могут прийти вторым
              * правилом, и тогда набор обязан называться _dom, иначе резолвер его не найдёт
-             * (он вычисляет имя сам, по тому же правилу). */
-            snprintf(g->name, sizeof(g->name), "%.24s_%s", c->out, domains ? "dom" : "ip");
-            /* An `any` channel has no set: it claims everything from those clients. */
-            if (c->any && !c->prefixes_n && !c->domains_n)
-                snprintf(g->name, sizeof(g->name), "%.24s_all", c->out);
+             * (он вычисляет имя сам, той же функцией group_set_name). */
+            group_set_name(g->name, sizeof(g->name), g->out, all ? "all" : domains ? "dom" : "ip",
+                           g->from, g->from_n, g->realip);
         }
         struct group *g = &g_grp[k];
         /* Домены только помечаем: их файлы читает резолвер. Режим берём у первого доменного
@@ -171,8 +193,19 @@ static void build_groups(void) {
     for (size_t i = 0; i < g_grp_n; i++) {
         struct group *g = &g_grp[i];
         if (!g->files_n && !g->domains) continue;
-        snprintf(g->name, sizeof(g->name), "%.24s_%s", g->out, g->domains ? "dom" : "ip");
+        group_set_name(g->name, sizeof(g->name), g->out, g->domains ? "dom" : "ip",
+                       g->from, g->from_n, g->realip);
     }
+    /* Страховка, а не проверка входа: имя обязано быть уникальным по построению, и если
+     * оно всё-таки повторилось — значит различитель не различил (например, два имени
+     * выхода совпали после обрезки до 18 символов). Молчать здесь нельзя: именно молчание
+     * и было прежней бедой — ядро сливает одноимённые наборы, и трафик уходит не туда без
+     * единой строки. Лучше громкий отказ применить спеку, чем тихая ошибка маршрутизации. */
+    for (size_t i = 0; i < g_grp_n; i++)
+        for (size_t k = i + 1; k < g_grp_n; k++)
+            if (!strcmp(g_grp[i].name, g_grp[k].name))
+                die("два разных набора каналов получили одно имя %s — "
+                    "укоротите или разведите имена выходов", g_grp[i].name);
 }
 
 static int has_domains(void) {
@@ -296,7 +329,7 @@ static void check_address_lists(void) {
             char sample[128];
             count_list(g->files[k], &total, &bad, sample, sizeof(sample), &bad_line);
             if (!total) {
-                fprintf(stderr, "steer: %s: список пуст — канал «%s» ничего не поймает\n",
+                fprintf(stderr, LOG_W "%s: список пуст — канал «%s» ничего не поймает\n",
                         g->files[k], g->members_n ? g->members[0] : g->name);
                 continue;
             }
@@ -324,7 +357,7 @@ static void check_address_lists(void) {
                 die("%s", msg);
             }
             if (bad)
-                fprintf(stderr, "steer: %s: строк не-адресов %zu из %zu, пропускаю их "
+                fprintf(stderr, LOG_W "%s: строк не-адресов %zu из %zu, пропускаю их "
                                 "(первая — %zu: «%s»)\n",
                         g->files[k], bad, total, bad_line, sample);
         }
@@ -745,7 +778,7 @@ static void report_traceroute_dep(void) {
     for (size_t i = 0; i < g_out_n; i++) {
         if (!out_has_device(&g_out[i])) continue;
         if (fw_check(g_out[i].device).masqueraded) {
-            fprintf(stderr, "steer: traceroute_hops cannot work for output %s: %s "
+            fprintf(stderr, LOG_W "traceroute_hops cannot work for output %s: %s "
                             "masquerades, so ICMP errors come addressed to the router "
                             "and only conntrack can route them to the client — "
                             "untracking them drops the hops entirely\n",
@@ -760,7 +793,7 @@ static void report_traceroute_dep(void) {
     while ((pos = dump_line(pos, line, sizeof(line))) != NULL)
         if (strstr(line, "untracked") && strstr(line, "accept")) ok = 1;
     if (!ok)
-        fprintf(stderr, "steer: traceroute_hops is on but no rule accepting untracked "
+        fprintf(stderr, LOG_W "traceroute_hops is on but no rule accepting untracked "
                         "packets was found — ICMP time-exceeded will be dropped by the "
                         "firewall and hops will show as asterisks. Needed once, in the "
                         "firewall (not here): accept ct state untracked icmp type "
@@ -772,7 +805,7 @@ static void report_output_deps(void) {
         if (!out_has_device(&g_out[i])) continue;
         struct fwcheck c = fw_check(g_out[i].device);
         if (!c.in_firewall)
-            fprintf(stderr, "steer: output %s: %s is not mentioned by the firewall at all — "
+            fprintf(stderr, LOG_W "output %s: %s is not mentioned by the firewall at all — "
                             "traffic steered there will not come back until it is in a zone\n",
                     g_out[i].name, g_out[i].device);
         /* Выходу vless NAT не нужен, и предупреждать о нём — значит посылать человека
@@ -786,7 +819,7 @@ static void report_output_deps(void) {
             /* нечего проверять */
         }
         else if (!c.masqueraded)
-            fprintf(stderr, "steer: output %s: no masquerade/snat rule found for %s — "
+            fprintf(stderr, LOG_W "output %s: no masquerade/snat rule found for %s — "
                             "if that path needs NAT, packets leave with LAN addresses and "
                             "the channel goes quiet while its counter still rises\n",
                     g_out[i].name, g_out[i].device);
@@ -888,7 +921,7 @@ static void apply_routing(void) {
         const char *route[] = { "ip", "route", "add", "default", "dev", g_out[i].device,
                                 "table", table, NULL };
         if (run(route) != 0) {
-            fprintf(stderr, "steer: output %s: cannot route via %s — is the device up?\n",
+            fprintf(stderr, LOG_W "output %s: cannot route via %s — is the device up?\n",
                     g_out[i].name, g_out[i].device);
             /* Пустая таблица — это не «нет маршрута», а «ищи дальше»: помеченный
              * пакет провалится в следующую таблицу и уйдёт напрямую, то есть ровно
@@ -899,7 +932,7 @@ static void apply_routing(void) {
                 const char *bh[] = { "ip", "route", "add", "blackhole", "default",
                                      "table", table, NULL };
                 run(bh);
-                fprintf(stderr, "steer: output %s: трафик остановлен до появления "
+                fprintf(stderr, LOG_W "output %s: трафик остановлен до появления "
                                 "рабочего устройства (on_fail=drop)\n", g_out[i].name);
             }
         }
@@ -950,7 +983,7 @@ static int cmd_apply(const char *spec, int dry) {
     const char *load[] = { "nft", "-f", tmp, NULL };
     int rc = run(load);
     if (rc != 0) {
-        fprintf(stderr, "steer: nft refused the ruleset (kept: %s)\n", tmp);
+        fprintf(stderr, LOG_W "nft refused the ruleset (kept: %s)\n", tmp);
         const char *check[] = { "nft", "-c", "-f", tmp, NULL };
         run(check);
         return 1;
@@ -1232,6 +1265,21 @@ static int parse_prefix(const char *s, uint32_t *net, uint32_t *mask) {
 static const char *list_finds_resolver(const char *path, char *found, size_t found_sz) {
     FILE *in = fopen(path, "r");
     if (!in) return NULL;                 /* про нечитаемый список говорит своя проверка */
+    /* Двенадцать адресов резолверов — константы времени компиляции, и разбирать их заново
+     * на КАЖДОЙ строке списка значило звать sscanf тринадцать раз вместо одного. На списке
+     * категории в семнадцать тысяч строк это двести тысяч лишних разборов одного и того же
+     * текста, а на национальном блок-листе — миллионы; diag человек нажимает и ждёт.
+     * Замер на 500 000 строк: 0,83 с против 0,09 с. */
+    static uint32_t r_addr[sizeof(RESOLVERS) / sizeof(RESOLVERS[0])];
+    static int r_ok[sizeof(RESOLVERS) / sizeof(RESOLVERS[0])];
+    static int r_ready;
+    if (!r_ready) {
+        for (size_t i = 0; i < sizeof(RESOLVERS) / sizeof(RESOLVERS[0]); i++) {
+            uint32_t m32;
+            r_ok[i] = parse_prefix(RESOLVERS[i].addr, &r_addr[i], &m32);
+        }
+        r_ready = 1;
+    }
     char line[512];
     const char *who = NULL;
     while (!who && fgets(line, sizeof(line), in)) {
@@ -1243,9 +1291,8 @@ static const char *list_finds_resolver(const char *path, char *found, size_t fou
         uint32_t net, mask;
         if (!parse_prefix(p, &net, &mask)) continue;
         for (size_t i = 0; i < sizeof(RESOLVERS) / sizeof(RESOLVERS[0]); i++) {
-            uint32_t addr, m32;
-            if (!parse_prefix(RESOLVERS[i].addr, &addr, &m32)) continue;
-            if ((addr & mask) == net) {
+            if (!r_ok[i]) continue;
+            if ((r_addr[i] & mask) == net) {
                 snprintf(found, found_sz, "%.40s", p);   /* префикс короче, точность — от -Wformat-truncation */
                 who = RESOLVERS[i].who;
                 break;
@@ -1751,6 +1798,13 @@ int main(int argc, char **argv) {
      * поднимать процесс, и спрашивать об этом движок — то же правило, что с needs-dnsd:
      * grep по ключу в JSON ломается при первом же переименовании поля, причём молча. */
     if (!strcmp(cmd, "outputs")) {
+        /* Вид проверяется по списку, а не сравнивается как есть: `--kind vles` (опечатка)
+         * давал пустой вывод и код 0, а по этому выводу init-скрипт решает, каким выходам
+         * поднимать процессы. Тишина вместо отказа означала бы не поднятый туннель без
+         * единой строки о причине. */
+        if (a.kind && strcmp(a.kind, "interface") && strcmp(a.kind, "vless") &&
+            strcmp(a.kind, "direct"))
+            die("--kind: нужен interface, vless или direct, а не %s", a.kind);
         load_spec(spec);
         for (size_t i = 0; i < g_out_n; i++) {
             const char *k = g_out[i].kind == OUT_DIRECT ? "direct" :

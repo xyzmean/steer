@@ -152,6 +152,7 @@ int h2_start(struct h2 *h, const struct h2_io *io, const char *authority,
     h->io = *io;
     h->send_win = 65535;                 /* до SETTINGS сервера — значение по умолчанию */
     h->send_win_conn = 65535;
+    h->peer_init_win = 65535;            /* то же умолчание, от него считается сдвиг */
 
     static __thread unsigned char buf[4096];
     struct wbuf b = { buf, 0, sizeof(buf) };
@@ -251,8 +252,16 @@ static int ctl_handle(struct h2 *h) {
                  * отправляем не больше 16384, и это законно при любых его настройках. */
                 if (id == 0x04) {
                     /* Окно ПОТОКА сдвигается на разницу; окно соединения настройками не
-                     * меняется вовсе — только кадром WINDOW_UPDATE. */
-                    h->send_win += (int32_t)v - 65535;
+                     * меняется вовсе — только кадром WINDOW_UPDATE.
+                     *
+                     * Разница считается с ПРЕДЫДУЩИМ значением, а не с 65535 (RFC 7540
+                     * §6.9.2): вторые такие же SETTINGS применяли сдвиг ещё раз, и окно
+                     * уезжало на величину, которой сервер не давал. */
+                    if (v > 0x7FFFFFFFu) return H2_ERESET;
+                    int64_t w = (int64_t)h->send_win + ((int64_t)v - h->peer_init_win);
+                    if (w > 0x7FFFFFFF || w < -0x7FFFFFFF) return H2_ERESET;
+                    h->send_win = (int32_t)w;
+                    h->peer_init_win = (int32_t)v;
                 }
             }
             return frame_out(h, FR_SETTINGS, FLAG_ACK, 0, NULL, 0);
@@ -266,8 +275,19 @@ static int ctl_handle(struct h2 *h) {
         case FR_WINDOW_UPDATE: {
             if (h->ctl_n < 4) return 0;
             int32_t inc = (int32_t)(get32(h->ctl) & 0x7FFFFFFF);
-            if (h->frame_ours) h->send_win += inc;
-            else h->send_win_conn += inc;
+            /* Предел 2^31-1 обязателен (RFC 7540 §6.9.1), и это не педантизм: прибавление
+             * без проверки — знаковое переполнение, то есть неопределённое поведение, а на
+             * практике окно уходит в МИНУС и больше не возвращается. Дальше h2_write
+             * навсегда отвечает H2_EWINDOW, и отправка наверх по этому соединению встаёт
+             * насмерть — от сервера для этого достаточно нескольких WINDOW_UPDATE,
+             * близких к 0x7FFFFFFF. Превышение предела RFC велит считать ошибкой потока,
+             * поэтому рвём соединение, а не подрезаем окно молча: подрезанное окно
+             * разошлось бы с тем, что считает сервер, и встало бы всё равно — но уже
+             * непонятно почему. */
+            int64_t w = (int64_t)(h->frame_ours ? h->send_win : h->send_win_conn) + inc;
+            if (w > 0x7FFFFFFF) return H2_ERESET;
+            if (h->frame_ours) h->send_win = (int32_t)w;
+            else h->send_win_conn = (int32_t)w;
             return 0;
         }
 

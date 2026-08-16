@@ -41,6 +41,117 @@ void die(const char *fmt, const char *a) {
     exit(2);
 }
 
+/* Состав идентификатора, пришедшего из спеки: имя выхода, имя устройства, имя канала,
+ * lan_device.
+ *
+ * Заслон стоит В ПАРСЕРЕ, а не у каждого вызова оболочки, и это принципиально. Имена
+ * отсюда подставляются в командные строки в четырёх разных местах — `ip -4 -o addr show
+ * %s` ниже, `pgrep -f 'steer obfs %s'` и `nft list chain … o_%s` в diag, имя набора в
+ * set_count, — и проверять их по месту значит проверять четыре раза и забыть в пятом.
+ * Забыли: спека с lan_device вида «x;id>/tmp/pwned;#» выполняла эту команду от root, и
+ * срабатывало это у ЛЮБОЙ команды, читающей спеку, потому что автоопределение подсети
+ * включается штатно — когда from_default не задан. Имя выхода с кавычкой давало то же
+ * самое через diag, а diag дёргает rpcd интерфейса.
+ *
+ * Проверенное однажды при загрузке имя безопасно везде и навсегда, включая места,
+ * которых ещё нет. Это то же решение, что с адресом в explain: там проверка формы стоит
+ * до подстановки, и по той же причине — подстановка непроверенной строки уже была дырой.
+ *
+ * Состав нарочно уже, чем позволяет ядро: буквы, цифры, `_`, `-`, `.`. Имена интерфейсов
+ * Linux этим и ограничены на практике, а имя выхода придумывает человек в интерфейсе —
+ * ему хватает. Пустое имя отвергается тоже: оно ломает и набор, и pgrep. */
+int name_ok(const char *s) {
+    if (!s || !*s) return 0;
+    for (const unsigned char *q = (const unsigned char *)s; *q; q++)
+        if (!((*q >= 'a' && *q <= 'z') || (*q >= 'A' && *q <= 'Z') ||
+              (*q >= '0' && *q <= '9') || *q == '_' || *q == '-' || *q == '.'))
+            return 0;
+    return 1;
+}
+
+/* Имя КАНАЛА — не идентификатор, а подпись, которую человек читает в интерфейсе, и
+ * требовать от неё латиницу нельзя: каналы в этом проекте называют по-русски, и стенд
+ * с «адресами»/«доменами» — ровно тот случай. В оболочку это имя не попадает никогда:
+ * комментарий в ruleset собирается из имени ГРУППЫ, а то выводится из имени выхода.
+ * Дойти оно может до JSON у status и до текста ruleset, поэтому запрещено ровно то, что
+ * ломает их разбор: кавычка, обратная косая и управляющие символы. Всё остальное, включая
+ * любой UTF-8, разрешено. */
+int label_ok(const char *s) {
+    if (!s || !*s) return 0;
+    for (const unsigned char *q = (const unsigned char *)s; *q; q++)
+        if (*q == '"' || *q == '\\' || *q < 0x20 || *q == 0x7F) return 0;
+    return 1;
+}
+
+/* ---- имя набора группы -----------------------------------------------------
+ *
+ * Живёт ЗДЕСЬ, а не в компиляторе, потому что имя вычисляют двое: steer.c, когда
+ * генерирует набор, и dnsd.c, когда решает, в какой набор класть адрес разрешённого
+ * домена. Разойдись они — резолвер наполнял бы набор, которого нет, и доменная
+ * маршрутизация молча переставала бы работать. Одна функция, два вызывающих.
+ *
+ * Почему у имени появился различитель. Раньше имя собиралось только из выхода и вида
+ * (`vpn_ip`, `vpn_dom`), а группы компилятор разделяет ещё и по списку клиентов (`from`)
+ * и по режиму резолвера. Две группы получали ОДНО имя, ядро сливало их наборы в один, и
+ * список, заведённый «только для телевизора», уезжал в туннель для всей сети. Никакого
+ * отказа при этом не было: nft принимает два объявления одного набора.
+ *
+ * Различитель — порядковый номер списка клиентов в спеке, а не хэш: номер точен, а хэш
+ * мог бы совпасть у двух разных списков и вернуть ту же беду тихо. Номер считается по
+ * g_ch в порядке спеки, поэтому оба вызывающих получают одно и то же число, не
+ * сговариваясь.
+ *
+ * Умолчания суффикса не получают: `vpn_ip` у обычной конфигурации остаётся `vpn_ip`, и
+ * на уже установленных роутерах имена наборов (а с ними и перенос счётчиков) не меняются.
+ */
+static int from_same(const char (*a)[64], size_t an, const char (*b)[64], size_t bn) {
+    if (an != bn) return 0;
+    for (size_t i = 0; i < an; i++) if (strcmp(a[i], b[i]) != 0) return 0;
+    return 1;
+}
+
+/* Действующий список клиентов канала: свой, а если его нет — общий по умолчанию. Правило
+ * то же, что у компилятора при сборке групп, и записано один раз здесь. */
+static const char (*chan_from(const struct channel *c, size_t *n))[64] {
+    if (c->from_n) { *n = c->from_n; return c->from; }
+    *n = g_from_default_n;
+    return g_from_default;
+}
+
+/* Номер списка клиентов среди РАЗЛИЧНЫХ списков, встреченных в спеке, в порядке первого
+ * появления. Список по умолчанию участвует в нумерации наравне с прочими: он всё равно
+ * попадает в ветку без суффикса, кроме случая realip. */
+static int from_disc(const char (*from)[64], size_t from_n) {
+    int idx = 0;
+    for (size_t i = 0; i < g_ch_n; i++) {
+        size_t cn;
+        const char (*cf)[64] = chan_from(&g_ch[i], &cn);
+        if (from_same(cf, cn, from, from_n)) return idx;
+        /* Считаем только первое появление каждого списка. */
+        int seen = 0;
+        for (size_t k = 0; k < i && !seen; k++) {
+            size_t kn;
+            const char (*kf)[64] = chan_from(&g_ch[k], &kn);
+            seen = from_same(kf, kn, cf, cn);
+        }
+        if (!seen) idx++;
+    }
+    return idx;
+}
+
+void group_set_name(char *dst, size_t n, const char *out, const char *kind,
+                    const char (*from)[64], size_t from_n, int realip) {
+    /* realip различает только доменные группы: у адресных резолвер не участвует. */
+    int rip = realip && !strcmp(kind, "dom");
+    if (!rip && from_same(from, from_n, g_from_default, g_from_default_n)) {
+        snprintf(dst, n, "%.24s_%s", out, kind);
+        return;
+    }
+    /* Выход обрезается сильнее, чтобы имя с суффиксом осталось коротким: у наборов
+     * nftables на старых ядрах предел длины 32 символа. */
+    snprintf(dst, n, "%.18s_%s_c%d%s", out, kind, from_disc(from, from_n), rip ? "r" : "");
+}
+
 /* ---- a JSON reader small enough to audit ---------------------------------- */
 /* Deliberately not a general parser: it walks the document the shape of the spec
  * demands and refuses anything else. A router config that compiles into firewall
@@ -232,6 +343,10 @@ static void parse_outputs(struct js *j) {
         struct output o = {0};
         o.node_index = -1;                  /* по умолчанию: первый рабочий узел */
         if (js_str(j, o.name, sizeof(o.name)) != 0) die("outputs: expected a name", NULL);
+        /* Состав имени — см. name_ok(). Оно уходит в командную строку через diag и в имя
+         * набора, поэтому проверяется здесь, один раз, а не у каждого вызова. */
+        if (!name_ok(o.name))
+            die("outputs.%s: в имени выхода можно только буквы, цифры, _ - и точку", o.name);
         if (js_lit(j, ':') != 0) die("outputs.%s: expected ':'", o.name);
         if (js_lit(j, '{') != 0) die("outputs.%s: expected an object", o.name);
         char kind[32] = "";
@@ -241,7 +356,11 @@ static void parse_outputs(struct js *j) {
             if (js_str(j, key, sizeof(key)) != 0) die("outputs.%s: bad key", o.name);
             js_lit(j, ':');
             if (!strcmp(key, "kind")) js_str(j, kind, sizeof(kind));
-            else if (!strcmp(key, "device")) js_str(j, o.device, sizeof(o.device));
+            else if (!strcmp(key, "device")) {
+                js_str(j, o.device, sizeof(o.device));
+                if (!name_ok(o.device))
+                    die("outputs.%s: имя устройства негодного состава", o.name);
+            }
             else if (!strcmp(key, "devices")) {
                 /* Кандидаты в порядке предпочтения. Единственное число остаётся
                  * сокращением для одного — прежние спеки не ломаются. */
@@ -252,6 +371,7 @@ static void parse_outputs(struct js *j) {
                         char t[32];
                         if (js_str(j, t, sizeof(t)) != 0) break;
                         if (o.devices_n >= MAX_DEVICES) die("outputs.%s: too many devices", o.name);
+                        if (!name_ok(t)) die("outputs.%s: имя устройства негодного состава", o.name);
                         snprintf(o.devices[o.devices_n++], 32, "%s", t);
                         js_ws(j);
                         if (*j->p == ',') {
@@ -347,8 +467,18 @@ static void parse_channels(struct js *j) {
                 js_ws(j);
                 while (*j->p != '}') {
                     char mk[32];
-                    js_str(j, mk, sizeof(mk));
-                    js_lit(j, ':');
+                    /* Возврат js_str проверяется, как во всех соседних циклах, и это не
+                     * педантизм. На недописанной спеке (питание пропало посреди записи
+                     * файла) js_str отказывал молча, js_lit тоже, а js_skip на '\0' не
+                     * продвигает указатель ни на байт — условие цикла оставалось истинным
+                     * вечно. `steer status` на таком файле уходил в бесконечный цикл со
+                     * 100% CPU, а его опрашивает rpcd каждые пять секунд: каждый опрос
+                     * плодил ещё один вечный процесс на единственном ядре роутера.
+                     * Контракт обещает громкий отказ на битой спеке — вот он. */
+                    if (js_str(j, mk, sizeof(mk)) != 0)
+                        die("channels.%s: match: expected a key", c.name);
+                    if (js_lit(j, ':') != 0)
+                        die("channels.%s: match: expected ':'", c.name);
                     /* Singular is shorthand for a one-element list, so a spec written
                      * before this stayed valid. */
                     if (!strcmp(mk, "prefixes_file")) {
@@ -379,6 +509,9 @@ static void parse_channels(struct js *j) {
         }
         j->p++;
         if (!c.name[0]) die("a channel has no name", NULL);
+        /* Подпись, а не идентификатор: по-русски — можно, кавычкой — нельзя (см. label_ok). */
+        if (!label_ok(c.name))
+            die("channel %s: в имени нельзя кавычку, обратную косую и управляющие символы", c.name);
         if (!c.out[0]) die("channel %s has no out", c.name);
         if (!c.prefixes_n && !c.domains_n && !c.any)
             die("channel %s matches nothing (want prefixes_files, domains_files or any)", c.name);
@@ -425,7 +558,13 @@ void load_spec(const char *path) {
         else if (!strcmp(key, "outputs")) parse_outputs(&j);
         else if (!strcmp(key, "channels")) parse_channels(&j);
         else if (!strcmp(key, "from_default")) str_array(&j, g_from_default, MAX_FROM, &g_from_default_n);
-        else if (!strcmp(key, "lan_device")) js_str(&j, g_lan_device, sizeof(g_lan_device));
+        else if (!strcmp(key, "lan_device")) {
+            js_str(&j, g_lan_device, sizeof(g_lan_device));
+            /* Самая дорогая из проверок этого набора: именно отсюда имя уходило в
+             * `ip -4 -o addr show %s` через popen, у любой команды, читающей спеку. */
+            if (!name_ok(g_lan_device))
+                die("lan_device: негодный состав имени (%s)", g_lan_device);
+        }
         else if (!strcmp(key, "traceroute_hops")) { js_ws(&j); g_traceroute_hops = (*j.p == 't'); js_skip(&j); }
         else js_skip(&j);
         js_ws(&j);

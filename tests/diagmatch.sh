@@ -45,18 +45,23 @@ PATH="$tmp/bin:$PATH"
 export PATH
 
 # spec NAME KIND — конфигурация с одним адресным каналом в выход указанного вида.
+#
+# Локальная переменная называется outdef, а НЕ out. Раньше здесь было `out`, то есть то же
+# имя, в котором ниже лежит отчёт diag: вызов `spec vless vless` затирал отчёт интерфейсного
+# выхода куском JSON, и две проверки после него сравнивали пустоту с пустотой, а «у vless
+# проверок больше» превращалось в «4 больше 0» — истинное при любом поведении движка.
 spec() {
     if [ "$2" = "vless" ]; then
-        out='"vpn": { "kind": "vless", "sub_file": "/etc/steer/sub.json", "on_fail": "drop" }'
+        outdef='"vpn": { "kind": "vless", "sub_file": "/etc/steer/sub.json", "on_fail": "drop" }'
     else
-        out='"vpn": { "kind": "interface", "devices": ["wg0"], "on_fail": "drop" }'
+        outdef='"vpn": { "kind": "interface", "devices": ["wg0"], "on_fail": "drop" }'
     fi
     cat > "$tmp/$1.json" <<EOF
 {
   "schema": 1,
   "lan_device": "br-lan",
   "from_default": ["192.168.1.0/24"],
-  "outputs": { $out, "direct": { "kind": "direct" } },
+  "outputs": { $outdef, "direct": { "kind": "direct" } },
   "channels": [
     { "name": "cloudflare", "match": { "prefixes_files": ["$tmp/cf.lst"] }, "out": "vpn" }
   ]
@@ -124,8 +129,17 @@ outrc="$($DIAG diag --spec "$tmp/vless-clean.json" 2>/dev/null)"
 check "список без резолверов: молчим" "" "$(printf '%s' "$outrc" | verdict resolver)"
 
 # ---- отчёт остаётся разбираемым --------------------------------------------
-check "проверок в отчёте с vless больше, чем без него" "1" \
-      "$([ "$(printf '%s' "$outv" | count)" -gt "$(printf '%s' "$out" | count)" ] && echo 1 || echo 0)"
+# Здесь стояло «проверок с vless больше, чем без него». Лишней у vless была ровно заметка
+# про UDP, и когда её убрали (I-026, см. выше), утверждение стало неверным — но заметить
+# это было нельзя: переменная с отчётом интерфейсного выхода затиралась вызовом spec(), и
+# сравнение вырождалось в «4 больше 0», истинное всегда.
+#
+# Проверяется то, что осталось правдой: отчёт разбираем для обоих видов выхода, и состав
+# проверок у них ОДИНАКОВ — то есть vless больше не порождает заметок про самого себя.
+check "отчёт с vless разбираем" "1" \
+      "$([ "$(printf '%s' "$outv" | count)" -gt 0 ] && echo 1 || echo 0)"
+check "vless не добавляет своих заметок" \
+      "$(printf '%s' "$out" | count)" "$(printf '%s' "$outv" | count)"
 
 printf '\n%d проверок пройдено' "$pass"
 if [ "$fail" -gt 0 ]; then printf ', %d ПРОВАЛЕНО\n' "$fail"; exit 1; fi

@@ -350,6 +350,59 @@ check "два правила одного сервиса — один набор
 check "и одно правило в цепочке метки" "1" \
     "$(printf '%s\n' "$twoout" | grep -c 'comment \"steer:')"
 
+# ---- группы с разными клиентами получают РАЗНЫЕ наборы -----------------------
+# Имя набора собиралось только из выхода и вида, а группы разделяются ещё и по `from` и по
+# режиму. Двум группам доставалось одно имя, ядро сливало наборы в один, и список,
+# заведённый «только для телевизора», уезжал в туннель для всей сети — без отказа, без
+# предупреждения, потому что nft принимает два объявления одного набора.
+cat > "$tmp/twofrom.json" <<EOF
+{ "schema": 1, "from_default": ["192.168.1.0/24"],
+  "outputs": { "vpn": { "kind": "interface", "device": "wg0" } },
+  "channels": [
+    { "name": "телевизор", "from": ["192.168.1.5"], "match": { "prefixes_files": ["$tmp/m1.lst"] }, "out": "vpn" },
+    { "name": "остальные", "match": { "prefixes_files": ["$tmp/m2.lst"] }, "out": "vpn" }
+  ] }
+EOF
+tfout="$("$BIN" apply --dry-run --spec "$tmp/twofrom.json" --state-dir "$tmp/state-tf" 2>&1)"
+check "разные клиенты — два РАЗНЫХ набора" "2" \
+    "$(printf '%s\n' "$tfout" | grep -c '^    set ')"
+check "и одноимённых наборов среди них нет" "2" \
+    "$(printf '%s\n' "$tfout" | sed -n 's/^    set \([a-z0-9_]*\) .*/\1/p' | sort -u | wc -l)"
+check "клиент по умолчанию сохраняет прежнее имя набора" "1" \
+    "$(printf '%s\n' "$tfout" | grep -c '^    set vpn_ip {')"
+
+# Доменные каналы: свой список клиентов и свой режим тоже обязаны давать свой набор,
+# иначе резолвер кладёт fake-IP и настоящие адреса в один набор.
+cat > "$tmp/threedom.json" <<EOF
+{ "schema": 1, "from_default": ["192.168.1.0/24"],
+  "outputs": { "vpn": { "kind": "interface", "device": "wg0" } },
+  "channels": [
+    { "name": "d1", "match": { "domains_files": ["$tmp/d.lst"] }, "out": "vpn" },
+    { "name": "d2", "match": { "domains_files": ["$tmp/d.lst"], "mode": "realip" }, "out": "vpn" },
+    { "name": "d3", "from": ["192.168.1.9"], "match": { "domains_files": ["$tmp/d.lst"] }, "out": "vpn" }
+  ] }
+EOF
+tdout="$("$BIN" apply --dry-run --spec "$tmp/threedom.json" --state-dir "$tmp/state-td" 2>&1)"
+check "fakeip, realip и свои клиенты — три разных набора" "3" \
+    "$(printf '%s\n' "$tdout" | sed -n 's/^    set \([a-z0-9_]*\) .*/\1/p' | sort -u | wc -l)"
+
+# Канал «весь трафик» рядом со списочным того же выхода: раньше они сливались в одну
+# группу, правило получало имя _ip и начинало проверять набор — то есть «весь трафик этой
+# сети в туннель» молча превращался в «только адреса из списка».
+cat > "$tmp/anymix.json" <<EOF
+{ "schema": 1, "from_default": ["192.168.1.0/24"],
+  "outputs": { "vpn": { "kind": "interface", "device": "wg0" } },
+  "channels": [
+    { "name": "список", "match": { "prefixes_files": ["$tmp/m1.lst"] }, "out": "vpn" },
+    { "name": "всё",    "match": { "any": true, "allow_all": true }, "out": "vpn" }
+  ] }
+EOF
+amout="$("$BIN" apply --dry-run --spec "$tmp/anymix.json" --state-dir "$tmp/state-am" 2>&1)"
+check "any рядом со списком остаётся отдельным правилом" "1" \
+    "$(printf '%s\n' "$amout" | grep -c 'comment \"steer:vpn_all\"')"
+check "и это правило безусловное — набор оно не проверяет" "0" \
+    "$(printf '%s\n' "$amout" | grep 'steer:vpn_all' | grep -c 'daddr @')"
+
 # ---- does the spec need the resolver ----------------------------------------
 # The init script asks the engine this. It used to grep the spec for the literal
 # `"domains_file"`, and when the plural `domains_files` arrived the match stopped
@@ -362,11 +415,26 @@ check "needs-dnsd: no for address channels only" "1" "$?"
 
 # And the shipped init script must ASK rather than guess, or the same trap returns
 # the next time a key is renamed.
-init=../files/etc/init.d/steer
+# Путь от КОРНЯ репозитория, откуда стенд и запускается (make test). Он был написан как
+# `../files/...`, то есть указывал наружу репозитория, файл не находился никогда, и обе
+# проверки молча не выполнялись — счётчик о них даже не знал. Поэтому существование файла
+# теперь само по себе проверка: если путь снова уедет, стенд об этом скажет.
+init=files/etc/init.d/steer
+check "init-скрипт найден" "1" "$([ -f "$init" ] && echo 1 || echo 0)"
 if [ -f "$init" ]; then
-    check "init script asks the engine" "1" "$(grep -c 'needs-dnsd' "$init")"
+    # Считается ВЫЗОВ, а не упоминание: слово needs-dnsd встречается ещё и в комментарии
+    # рядом, поэтому счёт по всему файлу давал 2 и проверка не прошла бы, даже когда всё
+    # в порядке. Проверить это раньше было нельзя — путь к файлу был неверен, и стенд
+    # молчал (см. выше).
+    check "init script asks the engine" "1" "$(grep -c '^[^#]*steer needs-dnsd' "$init")"
     check "init script does not grep the spec for keys" "0" \
         "$(grep -c "grep -q '\"domains" "$init")"
+    # Сторож устройств обязан открываться ДО вопроса про резолвер: тот выходит из
+    # функции, когда доменных каналов нет, и failover оставался незапущенным на самой
+    # обычной конфигурации — только адресные списки.
+    check "failover открывается раньше вопроса про резолвер" "1" \
+        "$([ "$(grep -n 'procd_open_instance failover' "$init" | cut -d: -f1)" \
+             -lt "$(grep -n 'needs-dnsd' "$init" | tail -1 | cut -d: -f1)" ] && echo 1 || echo 0)"
 fi
 
 # ---- пустая спека законна ----------------------------------------------------

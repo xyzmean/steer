@@ -153,23 +153,47 @@ Requested via `steer diag [--spec FILE]`. Runs a set of health checks and emits 
 
 ## 5. Log Prefixes (Journal Contract)
 
-steer logs to the journal (stderr) with a fixed severity prefix on every line. This prefix — not the prose wording — is the contract a control plane should classify by, because the wording may change between releases:
+steer logs to the journal (stderr) with a fixed severity prefix. This prefix — not the prose
+wording — is the contract a control plane should classify by, because the wording may change
+between releases:
 
 - `steer[warn]` — a real concern (something broken or mis-routed).
 - `steer[info]` — informational status, not an alarm.
 
-A subsystem label follows the prefix (e.g. `steer[warn] tunnel: ...`). Parse the prefix to decide severity.
+A subsystem label follows the prefix: `apply`, `failover`, `dnsd`, `obfs`, `tunnel`
+(e.g. `steer[warn] failover: ...`). Parse the prefix to decide severity.
+
+**What is deliberately not prefixed.** A refusal addressed to whoever invoked the engine —
+an invalid spec, a bad argument, a missing output, a command absent from this build — is
+printed as plain `steer: ...` and the process exits `2`. Those are answers to the caller,
+not journal lines: they arrive on the caller's stderr, and a control plane already knows
+something failed from the exit code. Everything the engine emits *while running* carries a
+severity prefix.
+
+This was previously overstated: the contract claimed every line carried a prefix while only
+the obfuscator and the extended build actually set one, so a control plane classifying by
+prefix labelled all current engine output as coming from an older version.
 
 ## 6. Command Line (Invocation Contract)
 
 The engine is invoked as `steer <command> [positional] [flags]`. Flags always follow the
 command; a flag in the command position is refused rather than guessed at.
 
-**Exit codes.** `0` — done; `1` — a command-specific negative answer (`diag` found a
-`fail` verdict, `needs-dnsd` says the resolver is not needed, `fit` could not fit the
-list); `2` — the engine refused: bad arguments, an unreadable or invalid spec, a missing
-output. A control plane must not treat `1` as a failure to run — the JSON on stdout is
-still valid.
+**Exit codes.** `0` — done; `2` — the engine refused: bad arguments, an unreadable or
+invalid spec, a missing output. `1` is command-specific and does **not** mean the same
+thing everywhere, so read it per command:
+
+| command | what `1` means | is it a failure to run? |
+|---|---|---|
+| `diag` | at least one check has verdict `fail` | no — the JSON on stdout is complete and valid |
+| `needs-dnsd` | the spec has no domain channels, the resolver is not needed | no — this is the answer |
+| `fit` | the list does not fit the budget | no — the list and the report are still emitted |
+| `apply` | `nft` rejected the ruleset; nothing was applied | **yes** |
+| `explain` | the resolver did not answer | **yes**, for that query |
+| `vless`, `obfs`, `obfs-server`, `dnsd` | the process exited | **yes** |
+
+Do not classify `1` generically. Treating `apply`'s `1` as "a negative answer" reports a
+failed apply as a success.
 
 **Streams.** Requested help (`steer help`, `steer help <command>`, `steer <command>
 --help`, `steer --version`) goes to **stdout** and exits `0`. Everything the engine refuses
@@ -185,8 +209,18 @@ silently absorbed — a caller that mistypes `--dry-run` gets a refusal, not a r
 (default `/var/lib/steer`) are accepted by every command that reads the spec.
 `vless-probe --node -1` means "the first working node", which is also the default.
 
-`steer help` lists the commands; `steer help <command>` documents one. The list is
-generated from the same table that validates the arguments, so the two cannot drift.
+`steer help` lists the commands; `steer help <command>` documents one. For every command
+except `fit` and `dnsd` the list is generated from the same table that validates the
+arguments, so the two cannot drift. Those two parse their own flags and print their own
+flag list, which `steer help` appends verbatim — one source per command, but two
+mechanisms.
+
+**Identifiers in the spec are restricted.** Output names, device names and `lan_device`
+must be `[A-Za-z0-9_.-]`, because they are substituted into shell command lines and into
+nftables set and chain names; the parser refuses anything else at load time. Channel names
+are labels, not identifiers: any UTF-8 is allowed (Russian names are normal), but the
+quote, the backslash and control characters are refused because they would break the JSON
+of `status` and the generated ruleset.
 
 ## 7. Architecture Invariants
 - **First Match Wins**: Rules are evaluated top-to-bottom.

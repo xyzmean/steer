@@ -148,6 +148,48 @@ int main(void) {
         check("DATA-кадр: тело не искажено", 0, memcmp(out, "abcd", 4));
     }
 
+    {
+        /* WINDOW_UPDATE близко к пределу: окно НЕ должно переполниться в минус.
+         *
+         * Прибавление без проверки — знаковое переполнение (неопределённое поведение), а
+         * наблюдаемо это тем, что окно уходит в минус НАВСЕГДА: дальше h2_write вечно
+         * отвечает H2_EWINDOW, и отправка по соединению встаёт насмерть. Сервер добивается
+         * этого двумя кадрами, каждый из которых сам по себе законен. RFC 7540 §6.9.1
+         * велит считать превышение 2^31-1 ошибкой, поэтому ждём разрыв, а не молчание. */
+        struct h2 h;
+        struct fake_io io;
+        unsigned char feed[64];
+        h2_open(&h, &io);
+        feed[0] = 0; feed[1] = 0; feed[2] = 4;
+        feed[3] = FR_WINDOW_UPDATE; feed[4] = 0;
+        put32(feed + 5, 1);              /* наш поток */
+        put32(feed + 9, 0x7FFFFFFF);
+        io.feed = feed; io.feed_n = 13; io.feed_pos = 0;
+
+        unsigned char out[H2_MIN_READ_CAP];
+        size_t got = 0;
+        int rc = h2_read(&h, out, sizeof(out), &got);
+        check("WINDOW_UPDATE за предел 2^31-1: соединение разорвано", H2_ERESET, rc);
+        check("и окно не ушло в минус", 1, h.send_win >= 0);
+    }
+    {
+        /* Одинаковые SETTINGS дважды: окно обязано остаться прежним. Сдвиг считался от
+         * 65535 всегда, поэтому вторые такие же настройки применяли разницу ещё раз, и
+         * окно уезжало на величину, которой сервер не давал (RFC 7540 §6.9.2). */
+        struct h2 h;
+        struct fake_io io;
+        unsigned char feed[64];
+        h2_open(&h, &io);
+        io.feed = feed; io.feed_n = settings_frame(feed, 0x0004, 1024); io.feed_pos = 0;
+        unsigned char out[H2_MIN_READ_CAP];
+        size_t got = 0;
+        h2_read(&h, out, sizeof(out), &got);
+        int after_first = h.send_win;
+        io.feed_n = settings_frame(feed, 0x0004, 1024); io.feed_pos = 0;
+        h2_read(&h, out, sizeof(out), &got);
+        check("те же SETTINGS дважды: окно не сдвинулось повторно", after_first, h.send_win);
+    }
+
     printf("\n%s\n", fails ? "ЕСТЬ ПРОВАЛЫ" : "все проверки прошли");
     return fails ? 1 : 0;
 }

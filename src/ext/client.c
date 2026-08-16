@@ -441,6 +441,7 @@ static int tcp_connect(const char *host, uint16_t port, int timeout_s) {
 int vless_connect(const struct vless_node *node, struct vless_conn *conn, int timeout_s) {
     memset(conn, 0, sizeof(*conn));
     conn->fd = -1;
+    int rc_h2;
 
     int fd = tcp_connect(node->host, node->port, timeout_s);
     if (fd < 0) return fd;
@@ -455,7 +456,13 @@ int vless_connect(const struct vless_node *node, struct vless_conn *conn, int ti
         conn->plain = 1;
         /* Без TLS согласовывать ALPN нечем, поэтому HTTP/2 начинаем сразу: голый h2 по
          * TCP («h2c») сервер либо примет, либо ответит мусором, и это увидит проверка. */
-        return conn->tr == VT_RAW ? 0 : h2_open(conn, node);
+        if (conn->tr == VT_RAW) return 0;
+        rc_h2 = h2_open(conn, node);
+        /* Единственная ветка отказа в этой функции, которая дескриптор НЕ закрывала —
+         * все соседние закрывают. Узел security=none с транспортом grpc/xhttp, который
+         * не отвечает по h2, за сутки опроса упирал процесс в RLIMIT_NOFILE. */
+        if (rc_h2) { close(fd); conn->fd = -1; }
+        return rc_h2;
     }
 
     struct reality_cfg cfg = {
@@ -501,12 +508,22 @@ int vless_connect(const struct vless_node *node, struct vless_conn *conn, int ti
          *
          * Поэтому ошибка остаётся только на противоречие: сервер назвал протокол, и это
          * не h2. Тогда мы точно знаем, что говорить по HTTP/2 бессмысленно. */
+        /* Отказы ПОСЛЕ удавшегося рукопожатия закрываются через vless_close, а не одним
+         * close(fd), и это не стилистика. К этому месту ключи уже развёрнуты, и контексты
+         * AES/GCM живут в КУЧЕ (tls13.c: mbedtls_gcm_setkey → mbedtls_cipher_setup →
+         * calloc). Дескриптор их не держит, вызывающие тоже не убирают: проверка узла
+         * возвращается сразу, пул запасных сессий лишь помечает слот пустым.
+         *
+         * Стреляет это на узле grpc/xhttp с security=reality, которого Reality не
+         * признал: маскировочный сайт выбирает ALPN http/1.1, ENOH2 приходит на КАЖДОЙ
+         * попытке, а пул пополняется на каждый SYN. Процесс живёт неделями — RSS растёт
+         * до OOM-killer, и в журнале при этом только «поток к узлу не открылся». */
         if (conn->tls.alpn[0] && strcmp(conn->tls.alpn, "h2") != 0) {
-            close(fd); conn->fd = -1;
+            vless_close(conn);
             return VLESS_CONN_ENOH2;
         }
         rc = h2_open(conn, node);
-        if (rc) { close(fd); conn->fd = -1; return rc; }
+        if (rc) { vless_close(conn); return rc; }
     }
     return 0;
 }

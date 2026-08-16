@@ -146,10 +146,16 @@ done
 # отвергнут разбором. Так уже ловилось `--node -1` — часовой «первый рабочий», который
 # диапазон «с нуля» отверг бы, и проверка выхода в интерфейсе молча перестала бы
 # работать.
+# Проверяется КОД ВОЗВРАТА, а не текст ошибки. Первая версия считала вхождения четырёх
+# русских фраз в stderr — то есть любая переформулировка сообщения в cli.c делала все
+# проверки границы вечнозелёными, а именно они и стерегут совместимость с splify2.
+# Разбор аргументов отвечает кодом 2; всё остальное (нет спеки, нет выхода, движок без
+# VLESS) — это уже работа команды, и такие коды здесь законны.
 accepted() { # ИМЯ -- команда...
     name="$1"; shift 2
-    "$@" >/dev/null 2>"$tmp/err"
-    check "$name" "0" "$(grep -c 'неизвестный флаг\|не понимает флаг\|не принимает аргументов\|нужно целое' "$tmp/err")"
+    "$@" >/dev/null 2>&1
+    rc=$?
+    check "$name" "принят" "$([ "$rc" = 2 ] && echo "ОТВЕРГНУТ разбором" || echo "принят")"
 }
 accepted "splify2: apply --dry-run --spec" -- "$BIN" apply --dry-run --spec "$tmp/spec.json"
 accepted "splify2: outputs --kind vless --spec" -- "$BIN" outputs --kind vless --spec "$tmp/spec.json"
@@ -157,15 +163,31 @@ accepted "splify2: outputs --obfs --spec" -- "$BIN" outputs --obfs --spec "$tmp/
 accepted "splify2: status --spec" -- "$BIN" status --spec "$tmp/spec.json"
 accepted "splify2: diag --spec" -- "$BIN" diag --spec "$tmp/spec.json"
 accepted "splify2: explain АДРЕС --spec" -- "$BIN" explain 1.2.3.4 --spec "$tmp/spec.json"
-accepted "splify2: vless-nodes ВЫХОД --spec" -- "$BIN" vless-nodes v --spec "$tmp/spec.json"
-accepted "splify2: vless-probe --node -1 --timeout 6" -- \
+# Команды VLESS в базовой сборке отвечают кодом 2 — «в этой сборке их нет», — и по коду
+# это не отличить от отказа разбора. Поэтому здесь проверяется маркер: базовая сборка
+# обязана дойти до отказа САМОЙ КОМАНДЫ и назвать нужный пакет. Заодно это единственное
+# место, где закреплена строка «steer-extended».
+#
+# Строка — контракт, а не текст. splify2 (rpcd/splify2) отличает базовую сборку от
+# расширенной так:  out="$(steer vless '' 2>&1)"; case "$out" in *steer-extended*) …
+# и по этому решает, показывать ли вкладку VLESS целиком. Переформулируйте отказ в
+# src/steer.c без оглядки сюда — и интерфейс объявит расширенную сборку базовой.
+ext_marker() { # ИМЯ -- команда...
+    name="$1"; shift 2
+    out="$("$@" 2>&1 >/dev/null)"
+    check "$name" "1" "$(printf '%s' "$out" | grep -c 'steer-extended')"
+}
+ext_marker "splify2: vless-nodes доходит до команды" -- \
+    "$BIN" vless-nodes v --spec "$tmp/spec.json"
+ext_marker "splify2: vless-probe --node -1 --timeout 6 доходит до команды" -- \
     "$BIN" vless-probe v --node -1 --timeout 6 --spec "$tmp/spec.json"
-accepted "splify2: vless-probe --node 0" -- \
+ext_marker "splify2: vless-probe --node 0 доходит до команды" -- \
     "$BIN" vless-probe v --node 0 --timeout 6 --spec "$tmp/spec.json"
-# Пустое имя выхода: rpcd зовёт `steer vless ''`, чтобы отличить базовую сборку от
-# расширенной по тексту отказа. Пустая строка обязана считаться позиционным аргументом,
-# а не пропущенным.
-accepted "splify2: vless с пустым именем выхода" -- "$BIN" vless ''
+# Пустое имя выхода: rpcd зовёт именно `steer vless ''`. Пустая строка обязана считаться
+# позиционным аргументом, а не пропущенным, — иначе разбор отвергнет вызов раньше, чем
+# движок успеет назвать пакет, и определение сборки сломается.
+ext_marker "splify2: vless '' называет пакет (по этому splify2 узнаёт сборку)" -- \
+    "$BIN" vless ''
 accepted "splify2: fit --budget --report ФАЙЛ" -- \
     "$BIN" fit --budget 100 --report "$tmp/rep.json" /dev/null
 

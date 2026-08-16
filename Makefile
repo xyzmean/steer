@@ -18,10 +18,11 @@ $(BUILD)/steer: src/steer.c src/spec.c src/dnsd.c src/failover.c src/aggregate.c
 	$(CC) $(CFLAGS) $(DEFS) -o $@ src/steer.c src/spec.c src/dnsd.c src/failover.c \
 	      src/aggregate.c src/obfs.c src/cli.c
 
-test: all ext-syntax $(BUILD)/dnsmatch $(BUILD)/specmatch $(BUILD)/failovermatch $(BUILD)/h2match $(BUILD)/submatch $(BUILD)/fwmatch $(BUILD)/obfsmatch $(BUILD)/diagsim
+test: all ext-syntax $(BUILD)/dnsmatch $(BUILD)/specmatch $(BUILD)/failovermatch $(BUILD)/h2match $(BUILD)/submatch $(BUILD)/fwmatch $(BUILD)/obfsmatch $(BUILD)/visionmatch $(BUILD)/diagsim
 	@sh tests/run.sh
 	@sh tests/gen.sh
 	@sh tests/climatch.sh
+	@sh tests/dnsproxy.sh
 	@sh tests/diagmatch.sh
 	@sh tests/buildmatch.sh
 	@$(BUILD)/dnsmatch
@@ -31,6 +32,7 @@ test: all ext-syntax $(BUILD)/dnsmatch $(BUILD)/specmatch $(BUILD)/failovermatch
 	@$(BUILD)/submatch
 	@$(BUILD)/fwmatch
 	@$(BUILD)/obfsmatch
+	@$(BUILD)/visionmatch
 
 # Движок, собранный как расширенный, но без самой расширенной части: нужен стенду
 # diagmatch, потому что спеку с `kind: vless` базовая сборка отвергает парсером, а
@@ -98,6 +100,13 @@ $(BUILD)/h2match: tests/h2match.c src/ext/h2.c src/ext/h2.h src/ext/tls13.h
 # Разбор подписки — единственное место, куда в движок попадает чужой текст из интернета.
 # Ни сети, ни mbedtls он не требует, поэтому стенд включает исходник напрямую и входит
 # в обычный make test, в отличие от остального src/ext (см. ext-syntax).
+# Разбор потока Vision — вторая точка, куда в движок попадают недоверенные байты от
+# сервера. Ни сети, ни mbedtls он не требует, поэтому входит в обычный make test, как и
+# разбор подписки; остальной src/ext доходит только до ext-syntax.
+$(BUILD)/visionmatch: tests/visionmatch.c src/ext/vision.c src/ext/vision.h
+	@mkdir -p $(BUILD)
+	$(CC) $(CFLAGS) -o $@ tests/visionmatch.c
+
 $(BUILD)/submatch: tests/submatch.c src/ext/sub.c src/ext/vless.h
 	@mkdir -p $(BUILD)
 	$(CC) $(CFLAGS) -o $@ tests/submatch.c
@@ -109,5 +118,6 @@ $(BUILD)/submatch: tests/submatch.c src/ext/sub.c src/ext/vless.h
 clean:
 	rm -rf $(BUILD)/steer $(BUILD)/steer-* $(BUILD)/dnsmatch $(BUILD)/specmatch \
 	       $(BUILD)/failovermatch $(BUILD)/h2match $(BUILD)/submatch $(BUILD)/fwmatch $(BUILD)/obfsmatch \
+	       $(BUILD)/visionmatch \
 	       $(BUILD)/diagsim $(BUILD)/libmbed-*.a \
 	       $(BUILD)/*.err $(BUILD)/pkg $(BUILD)/scripts out

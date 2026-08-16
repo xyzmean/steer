@@ -37,9 +37,14 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: Проверить формат версии
+        env:
+          INPUT_VERSION: ${{ inputs.version }}
         run: |
           set -eu
-          V='${{ inputs.version }}'
+          # Через env, а не подстановкой в текст скрипта: ${{ }} раскрывается ДО запуска
+          # оболочки, то есть проверка формата ниже стоит уже после того, как значение
+          # стало кодом. Кавычка во входных данных ломала бы разбор всего шага.
+          V="$INPUT_VERSION"
           # Строгая проверка здесь, а не «как-нибудь потом»: версия попадает и в имена
           # файлов, и в тег, и в ?v= бандлов у splify2. Опечатка расходится по всем трём.
           echo "$V" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+$' || {
@@ -50,6 +55,9 @@ jobs:
       - name: Собрать пакеты
         run: |
           set -eu
+          # pipefail обязателен: без него код шага — это код tee, и падение самого
+          # build.sh (нет docker, не собрался образ) шаг не заваливает вовсе.
+          set -o pipefail
           # build.sh сам поднимает образ сборщика из build/Dockerfile, если его нет.
           ./build.sh 2>&1 | tee /tmp/build.log
 
@@ -59,14 +67,39 @@ jobs:
           # build.sh печатает FAILED и ИДЁТ ДАЛЬШЕ — это верно для локальной работы, но в
           # релизе молча выложить пять пакетов из двенадцати нельзя: человек скачает свой
           # и не найдёт, а в логе давно никто не смотрит.
-          if grep -q FAILED /tmp/build.log; then
-            echo "::error::часть архитектур не собралась:"
-            grep FAILED /tmp/build.log
+          # Ловятся ОБА вида отказа. FAILED печатает только компиляция; упаковка
+          # сообщает о себе другими словами («не удалась», «packaging failed»), и барьер,
+          # искавший одно слово, пропускал ровно тот случай, ради которого стоит: apk
+          # mkpkg упал на трёх архитектурах, релиз опубликован с девятью пакетами.
+          if grep -qE 'FAILED|не удалась|packaging failed' /tmp/build.log; then
+            echo "::error::часть архитектур не собралась или не упаковалась:"
+            grep -E 'FAILED|не удалась|packaging failed' /tmp/build.log
             exit 1
           fi
-          n=$(ls out/*.apk 2>/dev/null | wc -l)
-          [ "$n" -gt 0 ] || { echo "::error::пакетов нет"; exit 1; }
-          echo "собрано пакетов: $n"
+          # Ожидаемое число считается из самого build.sh, а не вписано сюда числом:
+          # список архитектур меняется, и константа разошлась бы с ним молча. На каждую
+          # архитектуру два пакета — базовый и extended — и это в КАЖДОМ из двух форматов.
+          arch_n=$(sed -n '/^ISAS="/,/^"$/p' build.sh | grep -c '^[a-z0-9_.-]*:')
+          want=$((arch_n * 2))
+          for ext in apk ipk; do
+            n=$(ls out/*."$ext" 2>/dev/null | wc -l)
+            [ "$n" -eq "$want" ] || {
+              echo "::error::пакетов .$ext — $n, а ожидалось $want (архитектур $arch_n × 2)"
+              ls -la out/ 2>/dev/null
+              exit 1; }
+            echo "собрано .$ext: $n из $want ожидаемых"
+          done
+          # Серверная половина: по архиву на каждую VPS-архитектуру из build.sh. Список
+          # берётся оттуда же по той же причине — чтобы не разойтись молча.
+          vps_n=$(sed -n '/^for arch in .* do$/{/aarch64_generic/p}' build.sh | head -1 |
+                  sed 's/^for arch in //; s/; *do$//' | wc -w)
+          [ "$vps_n" -ge 1 ] || { echo "::error::не нашёл список VPS-архитектур в build.sh"; exit 1; }
+          t=$(ls out/steer-obfs-*.tar.gz 2>/dev/null | wc -l)
+          [ "$t" -eq "$vps_n" ] || {
+            echo "::error::архивов steer-obfs $t, а ожидалось $vps_n"
+            ls -la out/ 2>/dev/null
+            exit 1; }
+          echo "собрано архивов steer-obfs: $t из $vps_n ожидаемых"
           ls -la out/
 
       - name: Зафиксировать версию в репозитории
@@ -88,7 +121,10 @@ jobs:
           tag_name: v${{ env.VERSION }}
           name: steer ${{ env.VERSION }}
           prerelease: ${{ inputs.prerelease }}
-          files: out/*.apk
+          files: |
+            out/*.apk
+            out/*.ipk
+            out/*.tar.gz
           body: |
             Движок маршрутизации по политикам для OpenWrt.
 
@@ -104,6 +140,23 @@ jobs:
             Пакеты взаимозаменяемы и конфликтуют между собой: `steer-extended` объявляет
             `provides: steer`, поэтому ставится поверх без удаления настроек.
 
+            **Два формата.** `.apk` — для OpenWrt 24.10 и новее, `.ipk` — для 23.05, 22.03
+            и всего, что осталось на opkg. Содержимое одинаковое, отличаются только
+            метаданные пакета.
+
             ```sh
+            # OpenWrt 24.10+
             apk add --allow-untrusted ./steer-extended-${{ env.VERSION }}-1_<arch>.apk
+            # OpenWrt 23.05 и старше
+            opkg install ./steer-extended-${{ env.VERSION }}-1_<arch>.ipk
+            ```
+
+            **`steer-obfs-*.tar.gz` — серверная половина обфускации, для VPS.** Нужна
+            только выходу с `obfs`: она принимает поддельный TCP снаружи и отдаёт
+            датаграммы локальному WireGuard. Компилятор на сервере больше не нужен —
+            бинарник в архиве статический, тот же самый, что и в пакете для роутера.
+
+            ```sh
+            tar xzf steer-obfs-${{ env.VERSION }}-x86_64.tar.gz
+            cd obfs-x86_64 && sudo sh install.sh --port 4567 --forward 127.0.0.1:51820
             ```

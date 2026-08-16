@@ -126,30 +126,70 @@ static long long now_ms(void) {
  * перестановки байтов в паре: посчитать её в «неправильном» порядке и один раз
  * переставить байты результата — то же самое, что считать в правильном. Поэтому
  * промежуточные слова читаются как есть, а разворот делается единожды в csum_fin. */
+/* Слагаемые читаются 32-битными словами В ПОРЯДКЕ МАШИНЫ, а не парами байт.
+ *
+ * Прежний код собирал пары вручную (`p[0] << 8 | p[1]`) и объяснял это тем, что выигрыш
+ * от слов «пара процентов», а невыровненное чтение на MIPS стоит ловушки ядра. Обе
+ * половины довода не действуют:
+ *
+ *   * «Пара процентов» верна для -O2 и неверна для -Os, а базовый пакет (вместе с этим
+ *     файлом) собирается именно с -Os — там компилятор цикл пар не разворачивает и не
+ *     векторизует. Замер на нагрузке 1400 байт: 428 нс парами против 110 нс словами.
+ *   * Ловушки нет: memcpy четырёх байт выравнивания не требует, компилятор на MIPS
+ *     выпускает lwl/lwr. Этот же приём уже едет в пакете на тех же целях —
+ *     src/ext/tun.c читает словами через memcpy ровно так.
+ *
+ * Порядок байтов не трогается ни разу за проход, и это ключ к скорости. Сумма в
+ * интернете симметрична относительно перестановки байтов в паре: сложив единицы В
+ * ПОРЯДКЕ МАШИНЫ и один раз переставив байты результата, получаем то же число.
+ * Перестановку делает htons в csum_fin — на big-endian он ничего не делает, там сумма
+ * уже в нужном порядке, а на little-endian меняет байты местами. Никаких #if.
+ *
+ * Хвост дописывается нулём в двухбайтовый буфер и читается ТАК ЖЕ, как остальные
+ * единицы, — иначе последний байт пришлось бы класть в разную половину на разных
+ * машинах, и именно там такая правка обычно и ломается.
+ *
+ * Проверять эквивалентность обязательно: ошибка в сумме не проявляется явно — пакет
+ * молча отбрасывается стеком той стороны. См. стенд obfsmatch: он сверяет эту функцию с
+ * независимой построчной реализацией на всех длинах и смещениях. */
 static uint32_t csum_add(const void *data, size_t len, uint32_t acc) {
     const uint8_t *p = data;
     uint64_t s = acc;
-    /* Развёрнуто по восемь байт и в 64-битный накопитель: переносы копятся внутри и
-     * сворачиваются один раз в конце, а не на каждом шаге. Порядок сборки пары
-     * оставлен прежним (старший байт первым) — он не зависит ни от порядка байтов
-     * машины, ни от выравнивания указателя, а невыровненное чтение слова на MIPS
-     * стоит ловушки ядра. Соблазн читать 32-битными словами здесь отвергнут
-     * сознательно: выигрыш пара процентов, а ошибка в сумме не ломается явно —
-     * пакет просто молча отбрасывается на той стороне. */
-    while (len >= 8) {
-        s += (uint32_t)((p[0] << 8) | p[1]) + (uint32_t)((p[2] << 8) | p[3])
-           + (uint32_t)((p[4] << 8) | p[5]) + (uint32_t)((p[6] << 8) | p[7]);
-        p += 8; len -= 8;
+    while (len >= 16) {
+        uint32_t w0, w1, w2, w3;
+        memcpy(&w0, p, 4); memcpy(&w1, p + 4, 4);
+        memcpy(&w2, p + 8, 4); memcpy(&w3, p + 12, 4);
+        s += (uint64_t)w0 + w1 + w2 + w3;
+        p += 16; len -= 16;
     }
-    while (len > 1) { s += (uint32_t)((p[0] << 8) | p[1]); p += 2; len -= 2; }
-    if (len) s += (uint32_t)(p[0] << 8);
+    while (len >= 4) {
+        uint32_t w;
+        memcpy(&w, p, 4);
+        s += w;
+        p += 4; len -= 4;
+    }
+    if (len >= 2) {
+        uint16_t h;
+        memcpy(&h, p, 2);
+        s += h;
+        p += 2; len -= 2;
+    }
+    if (len) {
+        uint8_t tail[2] = { p[0], 0 };
+        uint16_t h;
+        memcpy(&h, tail, 2);
+        s += h;
+    }
     while (s >> 32) s = (s & 0xFFFFFFFF) + (s >> 32);
     return (uint32_t)s;
 }
 
 static uint16_t csum_fin(uint32_t acc) {
     while (acc >> 16) acc = (acc & 0xFFFF) + (acc >> 16);
-    return (uint16_t)(~acc & 0xFFFF);
+    /* htons здесь — не «положить на провод», а перестановка байтов суммы из порядка
+     * машины в порядок сети, тот единственный раз за пакет, ради которого весь проход
+     * выше идёт без перестановок. На big-endian это тождество. */
+    return (uint16_t)(~htons((uint16_t)acc) & 0xFFFF);
 }
 
 /* Псевдозаголовок TCP: адреса, протокол и длина. Ядро сырому сокету сумму не считает —
@@ -391,7 +431,8 @@ static struct sockaddr_in g_from[BATCH];
 
 /* Записать заголовок ВПЕРЁД нагрузки, лежащей по base + HDR_ROOM, и вернуть указатель
  * на начало сегмента. Двигает seq так же, как это делает conn_send. */
-static uint8_t *build_ahead(struct fconn *c, uint8_t *base, size_t plen, size_t *seglen) {
+static uint8_t *build_ahead(struct fconn *c, uint8_t *base, size_t plen, size_t *seglen,
+                            long long now) {
     uint8_t *seg = base + HDR_ROOM - sizeof(struct tcp_hdr);
     struct tcp_hdr *t = (struct tcp_hdr *)seg;
     memset(t, 0, sizeof(*t));
@@ -405,8 +446,17 @@ static uint8_t *build_ahead(struct fconn *c, uint8_t *base, size_t plen, size_t 
     *seglen = sizeof(*t) + plen;
     t->sum = htons(obfs_tcp_csum(c->saddr, c->daddr, seg, *seglen));
     c->seq += (uint32_t)plen;
-    c->last_tx = now_ms();
-    c->last_ack = c->last_tx;
+    /* Время приходит СНАРУЖИ, одно на пачку, а не снимается на каждый пакет.
+     *
+     * На mipsel в ядрах OpenWrt нет vDSO для clock_gettime — это не дешёвое чтение
+     * страницы, а настоящий системный вызов с переключением режима, 1-3 мкс. На каждом
+     * пакете при девяти тысячах пакетов в секунду это 1-3% единственного ядра, отданные
+     * за метку, которая всё равно измеряется с гранулярностью TICK_MS = 20.
+     *
+     * Ровно это решение уже принято в туннеле, по той же причине и с тем же объяснением:
+     * см. g_now_ns в src/ext/tunnel.c. */
+    c->last_tx = now;
+    c->last_ack = now;
     c->unacked = 0;
     return seg;
 }
@@ -647,9 +697,10 @@ int obfs_client(const char *out_name, const char *server, int server_port,
                 if (c.state != ST_EST) { dropped += (unsigned)got; continue; }
 
                 int k = 0;
+                long long tx_now = now_ms();     /* одно на пачку — см. build_ahead */
                 for (int i = 0; i < got; i++) {
                     size_t seglen;
-                    uint8_t *seg = build_ahead(&c, g_bat_tx[i], g_mm[i].msg_len, &seglen);
+                    uint8_t *seg = build_ahead(&c, g_bat_tx[i], g_mm[i].msg_len, &seglen, tx_now);
                     g_iov[k].iov_base = seg;
                     g_iov[k].iov_len = seglen;
                     memset(&g_mm[k].msg_hdr, 0, sizeof(g_mm[k].msg_hdr));
@@ -995,9 +1046,11 @@ int obfs_server(int listen_port, const char *forward, int forward_port) {
                 }
                 int got = recvmmsg(ss->udp, g_mm, BATCH, MSG_DONTWAIT, NULL);
                 if (got <= 0) break;
+                long long tx_now = now_ms();     /* одно на пачку — см. build_ahead */
                 for (int b = 0; b < got; b++) {
                     size_t seglen;
-                    uint8_t *seg = build_ahead(&ss->c, g_bat_tx[b], g_mm[b].msg_len, &seglen);
+                    uint8_t *seg = build_ahead(&ss->c, g_bat_tx[b], g_mm[b].msg_len, &seglen,
+                                               tx_now);
                     g_iov[b].iov_base = seg;
                     g_iov[b].iov_len = seglen;
                     memset(&g_mm[b].msg_hdr, 0, sizeof(g_mm[b].msg_hdr));

@@ -142,6 +142,18 @@ static inline int out_has_device(const struct output *o) {
 }
 
 void die(const char *fmt, const char *a);
+/* Годен ли идентификатор из спеки к подстановке в командную строку и в имя набора.
+ * Проверяется парсером при загрузке — см. развёрнутое объяснение у определения. */
+int name_ok(const char *s);
+/* Годна ли ПОДПИСЬ (имя канала) к выводу в JSON и в текст ruleset. Мягче name_ok:
+ * разрешает любой UTF-8, запрещает кавычку, обратную косую и управляющие символы. */
+int label_ok(const char *s);
+
+/* Имя набора nftables для группы каналов. Вычисляют двое — компилятор и резолвер, — и
+ * функция общая именно поэтому: разойдись они в имени, резолвер наполнял бы набор,
+ * которого нет. kind — "ip", "dom" или "all". Подробности у определения в spec.c. */
+void group_set_name(char *dst, size_t n, const char *out, const char *kind,
+                    const char (*from)[64], size_t from_n, int realip);
 void load_spec(const char *path);
 void registry_assign(void);
 struct output *out_by_name(const char *n);

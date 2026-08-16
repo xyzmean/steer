@@ -311,6 +311,21 @@ void aggregate_usage_flags(FILE *out) {
           "  --truncate               разрешить отрезать хвост, если иначе не влезает\n", out);
 }
 
+/* Число, а не «сколько получится». strtoul на «abc» молча даёт 0, а нуль здесь значит
+ * «бюджета нет» — то есть `--budget abc` уводил список НЕУЖАТЫМ, с отчётом "fits":true и
+ * кодом 0. Именно этот сценарий фиттер и должен был предотвращать: splify2 передаёт сюда
+ * бюджет из настроек, и испорченное значение означало бы список, не влезающий в память
+ * роутера, о чём никто не узнает. Контракт обещает отказ на не-числе — вот он. */
+static unsigned long num_arg(const char *flag, const char *s) {
+    char *end;
+    unsigned long v = strtoul(s, &end, 10);
+    if (!*s || *end) {
+        fprintf(stderr, "steer: fit: %s: нужно целое число, а не «%s»\n", flag, s);
+        exit(2);
+    }
+    return v;
+}
+
 static void usage(void) {
     fputs("steer: fit: непонятный флаг\n"
           "использование: steer fit [ФАЙЛ] [флаги]\n"
@@ -330,9 +345,9 @@ int aggregate_main(int argc, char **argv) {
     int do_truncate = 0;
 
     for (int i = 1; i < argc; i++) {
-        if (!strcmp(argv[i], "--budget") && i + 1 < argc) budget = strtoul(argv[++i], NULL, 10);
+        if (!strcmp(argv[i], "--budget") && i + 1 < argc) budget = num_arg("--budget", argv[++i]);
         else if (!strcmp(argv[i], "--exclude") && i + 1 < argc) excl_path = argv[++i];
-        else if (!strcmp(argv[i], "--min-count") && i + 1 < argc) min_count = strtoul(argv[++i], NULL, 10);
+        else if (!strcmp(argv[i], "--min-count") && i + 1 < argc) min_count = num_arg("--min-count", argv[++i]);
         else if (!strcmp(argv[i], "--report") && i + 1 < argc) report_path = argv[++i];
         else if (!strcmp(argv[i], "--levels") && i + 1 < argc) levels = argv[++i];
         else if (!strcmp(argv[i], "--truncate")) do_truncate = 1;

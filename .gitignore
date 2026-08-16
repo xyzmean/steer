@@ -25,6 +25,11 @@ build/h2match
 build/submatch
 build/fwmatch
 build/obfsmatch
+build/visionmatch
+# Родной скрипт OpenWrt, качается сборкой при первом запуске (см. build.sh).
+build/ipkg-build
+# Дерево архива серверной половины: собирается из build/steer-<арх> и server/.
+build/obfs-*
 build/diagsim
 build/crypto-vec
 build/bx-*

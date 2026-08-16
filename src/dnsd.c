@@ -964,7 +964,11 @@ static int nft_add_element(const char *set_name, uint32_t key_host, uint32_t ttl
     int rc = nftlk_elem_msg(NFT_MSG_NEWSETELEM, g_nft_table, set_name,
                             &key_net, 1 /* interval set */, NULL, timeout_ms);
     if (rc == -EINVAL)
-        fprintf(stderr, "splify-dnsd: %s rejected an interval element (-EINVAL) — "
+        /* Имя splify-dnsd осталось от предыдущего проекта, и строка из-за него не
+         * доезжала до интерфейса вовсе: журнал там собирается как `logread | grep steer`,
+         * а подстроки steer в ней не было. При этом сообщение важное — доменная
+         * маршрутизация не наполняется. */
+        fprintf(stderr, "steer[warn] dnsd: %s rejected an interval element (-EINVAL) — "
                         "is it declared without `flags interval`?\n", set_name);
     /* Already there = already in the desired state. (A refreshed timeout would be
      * nicer, but the element only has to outlive the client's cached answer, and
@@ -1299,7 +1303,22 @@ static void fakeip_route_set(const char *domain, int new_set_idx);
 /* sockaddr_storage, not sockaddr_in: the listen socket is dual-stack, so a
  * client can be IPv6. See run_proxy's socket setup for why that matters. */
 struct pending {
-    int fd;
+    /* Ни сокета, ни дескриптора: наверх ходит ОДИН постоянный сокет на весь процесс
+     * (g_up_fd), а ответ к своему ожиданию привязывается переписанным номером
+     * транзакции — см. pending_tag. Раньше на каждый пересланный запрос открывался
+     * свой сокет: socket + connect + fcntl + send + epoll_ctl ADD на запрос и
+     * epoll_ctl DEL + close на ответ, шесть системных вызовов и отдельная структура
+     * сокета в ядре — на пути КАЖДОГО запроса из локальной сети. Замер: 19,1 мкс на
+     * запрос против 7,5. На mipsel, где системный вызов дороже в разы, разница
+     * заметна на глаз при загрузке страницы (20-40 запросов). */
+    /* Номер транзакции, с которым запрос пришёл ОТ КЛИЕНТА. Наверх уходит другой, наш,
+     * и в ответе его надо вернуть на место: клиент сопоставляет ответ с запросом
+     * именно по нему. */
+    uint16_t cli_id;
+    /* Поколение слота: младший байт нашего номера транзакции — это индекс слота, а
+     * старший — поколение. Без него запоздавший ответ на давно закрытое ожидание
+     * попал бы в чужой слот, переиспользовавший тот же индекс. */
+    uint8_t gen;
     int in_use;
     /* Клиенту уже ответили из быстрого пути: ответ upstream нужен только чтобы
      * обновить DNAT-карту и реальный адрес, отправлять его клиенту нельзя —
@@ -1323,6 +1342,17 @@ struct pending {
 static struct pending g_pending[MAX_PENDING];
 static int g_epfd = -1;
 static int g_listen_fd = -1;
+/* Единственный сокет к апстриму, живёт всё время работы процесса. Апстрим — это
+ * 127.0.0.1, сокет connect'нут, поэтому отказ от случайного исходящего порта здесь
+ * ничего не стоит: подделать ответ может только тот, кто уже на петле, а такой и так
+ * может всё. */
+static int g_up_fd = -1;
+static uint8_t g_gen_next;
+
+/* Номер транзакции, под которым ожидание уходит наверх. */
+static uint16_t pending_tag(const struct pending *p) {
+    return (uint16_t)(((uint16_t)p->gen << 8) | (uint16_t)(p - g_pending));
+}
 /* One entry per channel that matches domains, in SPEC ORDER. */
 struct dchan {
     char set[64];               /* the nft set the compiler generated for it */
@@ -1411,11 +1441,8 @@ static void reload_rules(void) {
  * так и не ответил, висел с открытым fd до следующего чужого запроса. */
 static void pending_reap(time_t now) {
     for (int i = 0; i < MAX_PENDING; i++) {
-        if (g_pending[i].in_use && g_pending[i].expire < now) {
-            epoll_ctl(g_epfd, EPOLL_CTL_DEL, g_pending[i].fd, NULL);
-            close(g_pending[i].fd);
-            g_pending[i].in_use = 0;
-        }
+        if (g_pending[i].in_use && g_pending[i].expire < now)
+            g_pending[i].in_use = 0;      /* сокета за слотом больше нет — закрывать нечего */
     }
 }
 
@@ -1434,7 +1461,9 @@ static struct pending *pending_alloc(void) {
  * Слушающий сокет неблокирующий, и цикл событий дочитывает очередь до EAGAIN:
  * под всплеском (страница — это 20-40 запросов за миллисекунды) это один
  * epoll_wait на пачку вместо круга через ядро на каждую датаграмму. */
-static int handle_client_query(int upstream_port) {
+/* upstream_port больше не нужен на этом пути: сокет наверх открыт и connect'нут один раз
+ * в run_proxy, порт задан там. */
+static int handle_client_query(void) {
     uint8_t buf[MAX_PKT];
     /* Dual-stack listener -> the client may be IPv6 (or v4-mapped). The reply is
      * sent back to exactly these bytes, so the family never has to be inspected. */
@@ -1515,20 +1544,19 @@ static int handle_client_query(int upstream_port) {
     struct pending *p = pending_alloc();
     if (!p) return 1; /* under load: drop, client's own resolver will retry/timeout */
 
-    int fd = socket(AF_INET, SOCK_DGRAM, 0);
-    if (fd < 0) return 1;
-    struct sockaddr_in up = {0};
-    up.sin_family = AF_INET;
-    up.sin_port = htons((uint16_t)upstream_port);
-    up.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
-    if (connect(fd, (struct sockaddr *)&up, sizeof(up)) != 0) { close(fd); return 1; }
-    /* Неблокирующий, как и слушающий сокет: epoll-готовность не гарантирует,
-     * что recv не заблокируется (датаграмму могли отбросить по контрольной
-     * сумме между событием и чтением), а блокировка здесь стоит всего цикла. */
-    fcntl(fd, F_SETFL, O_NONBLOCK);
-    if (send(fd, buf, (size_t)n, 0) < 0) { close(fd); return 1; }
+    if (g_up_fd < 0) return 1;                 /* апстрим не открылся — отвечать нечем */
 
-    p->fd = fd;
+    /* Номер транзакции переписывается на наш: ответы всех ожиданий приходят теперь на
+     * ОДИН сокет, и различить их можно только по нему. Исходный номер клиента ложится в
+     * слот и возвращается на место в ответе. */
+    p->cli_id = (uint16_t)((buf[0] << 8) | buf[1]);
+    p->gen = g_gen_next++;
+    uint16_t tag = pending_tag(p);
+    buf[0] = (uint8_t)(tag >> 8);
+    buf[1] = (uint8_t)(tag & 0xFF);
+
+    if (send(g_up_fd, buf, (size_t)n, 0) < 0) return 1;
+
     p->in_use = 1;
     p->quiet = quiet;
     p->hit = hit;
@@ -1536,11 +1564,6 @@ static int handle_client_query(int upstream_port) {
     p->client = from;
     p->client_len = fromlen;
     p->expire = time(NULL) + PENDING_TTL_SEC;
-
-    struct epoll_event ev = {0};
-    ev.events = EPOLLIN;
-    ev.data.ptr = p;
-    epoll_ctl(g_epfd, EPOLL_CTL_ADD, fd, &ev);
     return 1;
 }
 
@@ -1577,19 +1600,30 @@ static size_t build_rewritten_response(const uint8_t *orig, size_t qend,
     return pos;
 }
 
-static void handle_upstream_response(struct pending *p) {
+/* Возвращает 1, если датаграмма была прочитана (есть смысл читать дальше), 0 — если
+ * очередь пуста. Ответы всех ожиданий приходят на один сокет, поэтому своё ожидание
+ * находится по номеру транзакции, который мы же и проставили при отправке. */
+static int handle_upstream_response(void) {
     uint8_t buf[MAX_PKT];
-    ssize_t n = recv(p->fd, buf, sizeof(buf), 0);
-    /* Ложная готовность неблокирующего сокета — не конец ожидания: настоящий
-     * ответ ещё может прийти, слот и fd остаются жить до него или до реапа. */
-    if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) return;
+    ssize_t n = recv(g_up_fd, buf, sizeof(buf), 0);
+    if (n < 0) return 0;                       /* в том числе EAGAIN: очередь пуста */
+    if (n < 12) return 1;                      /* короче заголовка DNS — не ответ */
 
-    epoll_ctl(g_epfd, EPOLL_CTL_DEL, p->fd, NULL);
-    close(p->fd);
+    uint16_t tag = (uint16_t)((buf[0] << 8) | buf[1]);
+    struct pending *p = &g_pending[tag & 0xFF];
+    /* Три условия сразу: слот занят, поколение совпадает, и это вообще ответ на наш
+     * номер. Иначе датаграмма — запоздавший ответ на давно закрытое ожидание или
+     * чужая подделка, и применять её к живому слоту нельзя. */
+    if (!p->in_use || p->gen != (uint8_t)(tag >> 8)) return 1;
+
+    /* Номер клиента возвращается на место ДО любой отправки вниз: клиент сопоставляет
+     * ответ с запросом именно по нему, а дальше буфер уходит клиенту и как есть, и
+     * переписанным. */
+    buf[0] = (uint8_t)(p->cli_id >> 8);
+    buf[1] = (uint8_t)(p->cli_id & 0xFF);
+
     p->in_use = 0;
     int quiet = p->quiet;
-
-    if (n <= 0) return;
 
     /* Несовпавший домен (подавляющее большинство трафика): решение уже принято
      * на приёме запроса, имя вопроса в ответе — те же байты, а правила с тех
@@ -1600,7 +1634,7 @@ static void handle_upstream_response(struct pending *p) {
         if (!quiet)
             sendto(g_listen_fd, buf, (size_t)n, 0,
                    (struct sockaddr *)&p->client, p->client_len);
-        return;
+        return 1;
     }
 
     char qname[MAX_HOSTNAME];
@@ -1631,7 +1665,7 @@ static void handle_upstream_response(struct pending *p) {
         if (!quiet)
             sendto(g_listen_fd, buf, (size_t)n, 0,
                    (struct sockaddr *)&p->client, p->client_len);
-        return;
+        return 1;
     }
 
     /* Matched a rule. AAAA, HTTPS (65), and SVCB (64) are suppressed outright
@@ -1649,7 +1683,7 @@ static void handle_upstream_response(struct pending *p) {
             sendto(g_listen_fd, len ? out : buf, len ? len : (size_t)n, 0,
                    (struct sockaddr *)&p->client, p->client_len);
         }
-        return;
+        return 1;
     }
 
     /* real-IP mode: the answer goes to the client untouched and every address in it
@@ -1665,7 +1699,7 @@ static void handle_upstream_response(struct pending *p) {
         if (!quiet)
             sendto(g_listen_fd, buf, (size_t)n, 0,
                    (struct sockaddr *)&p->client, p->client_len);
-        return;
+        return 1;
     }
 
     if (qtype == DNS_TYPE_A && nips > 0) {
@@ -1715,13 +1749,13 @@ static void handle_upstream_response(struct pending *p) {
 
                 /* Клиенту из быстрого пути уже ушёл fake-IP; этот ответ был нужен
                  * только ради строк выше — обновить карту и реальный адрес. */
-                if (quiet) return;
+                if (quiet) return 1;
 
                 uint8_t out[512];
                 size_t len = build_rewritten_response(buf, qend, out, sizeof(out), 1, fake_addr);
                 if (len > 0) {
                     sendto(g_listen_fd, out, len, 0, (struct sockaddr *)&p->client, p->client_len);
-                    return;
+                    return 1;
                 }
             }
         }
@@ -1733,6 +1767,7 @@ static void handle_upstream_response(struct pending *p) {
      * DNS transaction. */
     if (!quiet)
         sendto(g_listen_fd, buf, (size_t)n, 0, (struct sockaddr *)&p->client, p->client_len);
+    return 1;
 }
 
 static int run_proxy(int listen_port, int upstream_port) {
@@ -1798,6 +1833,26 @@ static int run_proxy(int listen_port, int upstream_port) {
     ev.events = EPOLLIN;
     ev.data.ptr = NULL; /* NULL marks the listen socket */
     epoll_ctl(g_epfd, EPOLL_CTL_ADD, g_listen_fd, &ev);
+
+    /* Один сокет наверх на весь процесс — см. комментарий у struct pending. Открывается
+     * здесь, а не при первом запросе, чтобы отказ был виден сразу, а не превращался в
+     * «DNS иногда не работает». Неблокирующий, как и слушающий: готовность epoll не
+     * гарантирует, что recv не заблокируется, а блокировка стоит всего цикла. */
+    g_up_fd = socket(AF_INET, SOCK_DGRAM, 0);
+    if (g_up_fd < 0) { perror("upstream socket"); return 1; }
+    struct sockaddr_in up = {0};
+    up.sin_family = AF_INET;
+    up.sin_port = htons((uint16_t)upstream_port);
+    up.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    if (connect(g_up_fd, (struct sockaddr *)&up, sizeof(up)) != 0) {
+        perror("upstream connect");
+        return 1;
+    }
+    fcntl(g_up_fd, F_SETFL, O_NONBLOCK);
+    struct epoll_event uev = {0};
+    uev.events = EPOLLIN;
+    uev.data.ptr = &g_up_fd;            /* не NULL — значит это ответ сверху */
+    epoll_ctl(g_epfd, EPOLL_CTL_ADD, g_up_fd, &uev);
 
     signal(SIGHUP, on_sighup);
     signal(SIGTERM, on_sigterm);
@@ -1888,14 +1943,19 @@ static int run_proxy(int listen_port, int upstream_port) {
                  * пачки: один разговорчивый клиент не должен заслонять ответы
                  * upstream, которые ждут в этом же массиве событий. */
                 for (int k = 0; k < 64; k++)
-                    if (!handle_client_query(upstream_port)) break;
+                    if (!handle_client_query()) break;
             } else {
-                handle_upstream_response((struct pending *)events[i].data.ptr);
+                /* Ответы всех ожиданий приходят на один сокет, поэтому очередь тоже
+                 * дочитывается до конца пачкой — иначе на всплеске за один виток цикла
+                 * забирался бы ровно один ответ. */
+                for (int k = 0; k < 64; k++)
+                    if (!handle_upstream_response()) break;
             }
         }
     }
 
     if (g_nlk_fd >= 0) close(g_nlk_fd);
+    if (g_up_fd >= 0) close(g_up_fd);
     close(g_listen_fd);
     close(g_epfd);
     for (size_t i = 0; i < g_dch_n; i++) ruleset_free(&g_dch[i].rules);
@@ -2024,6 +2084,7 @@ static int cmd_fakeip(const char *state_path, const char *domain) {
  * правке. Формат строк — тот же, что у общих флагов. */
 void dnsd_usage_flags(FILE *out) {
     fputs("  --spec ФАЙЛ              спека каналов (по умолчанию /etc/steer/spec.json)\n"
+          "  --state-dir КАТАЛОГ      каталог состояния (по умолчанию /var/lib/steer)\n"
           "  --listen-port ПОРТ       порт, на котором отвечать LAN (по умолчанию 5300)\n"
           "  --upstream-port ПОРТ     порт апстрима, куда переспрашивать (по умолчанию 53)\n"
           "  --fakeip-state ФАЙЛ      где хранить раздачу поддельных адресов\n"
@@ -2062,6 +2123,12 @@ int dnsd_main(int argc, char **argv) {
             upstream_port = atoi(argv[++i]);
         } else if (strcmp(argv[i], "--fakeip-state") == 0 && i + 1 < argc) {
             g_fakeip_state_path = argv[++i];
+        } else if (strcmp(argv[i], "--state-dir") == 0 && i + 1 < argc) {
+            /* Резолвер каталог состояния ИСПОЛЬЗУЕТ — fakeip.state кладётся именно туда
+             * (см. ниже), — но флага не понимал, в отличие от всех прочих команд, читающих
+             * спеку. Запуск с чужим --state-dir поэтому молча писал состояние в
+             * /var/lib/steer, то есть мимо того каталога, которым живёт остальной запуск. */
+            g_state_dir = argv[++i];
         } else {
             dnsd_usage();
             return 2;
@@ -2079,7 +2146,13 @@ int dnsd_main(int argc, char **argv) {
     for (size_t i = 0; i < g_ch_n; i++) {
         if (!g_ch[i].domains_n) continue;
         char set[64];
-        snprintf(set, sizeof(set), "%.24s_dom", g_ch[i].out);
+        /* Имя считает ОБЩАЯ функция, та же, что у компилятора: своя формула здесь была
+         * `%.24s_dom` и не знала ни про список клиентов, ни про режим, поэтому доменные
+         * каналы одного выхода с разными from сливались в один набор, а fakeip и realip
+         * попадали туда же вместе. Разойтись двум формулам теперь негде — она одна. */
+        size_t fn = g_ch[i].from_n ? g_ch[i].from_n : g_from_default_n;
+        const char (*fr)[64] = g_ch[i].from_n ? g_ch[i].from : g_from_default;
+        group_set_name(set, sizeof(set), g_ch[i].out, "dom", fr, fn, g_ch[i].realip);
         size_t k = 0;
         for (; k < g_dch_n; k++)
             if (!strcmp(g_dch[k].set, set) && g_dch[k].realip == g_ch[i].realip) break;

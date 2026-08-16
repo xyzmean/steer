@@ -32,6 +32,13 @@
 #include <signal.h>
 #include "spec.h"
 
+/* Уровень в журнале приписывается КАЖДОЙ строке — это контракт, по которому управляющий
+ * слой (splify2) раскрашивает журнал, и он разбирает именно префикс, а не текст. Базовый
+ * движок его не ставил вовсе, хотя контракт обещал: интерфейс из-за этого подписывал все
+ * свежие строки про переключение устройств как «от более старого движка». */
+#define LOG_W "steer[warn] failover: "
+#define LOG_I "steer[info] failover: "
+
 /* Таблица и приоритет правила для проб. Далеко от 300+, которые раздаёт реестр:
  * проба обязана быть невидимой для боевой маршрутизации. */
 #define PROBE_TABLE 299
@@ -227,7 +234,7 @@ static void apply_failed(struct output *o) {
         const char *bh[] = { "ip", "route", "add", "blackhole", "default",
                              "table", tbl, NULL };
         run_quiet(bh);
-        fprintf(stderr, "steer: выход %s: живых устройств нет, трафик остановлен "
+        fprintf(stderr, LOG_W "выход %s: живых устройств нет, трафик остановлен "
                         "(on_fail=drop)\n", o->name);
         return;
     }
@@ -237,10 +244,10 @@ static void apply_failed(struct output *o) {
     while (run_quiet(rd) == 0) ;
 
     if (o->on_fail == FAIL_ZAPRET && !zapret_running())
-        fprintf(stderr, "steer: выход %s: живых устройств нет, трафик пущен напрямую, "
+        fprintf(stderr, LOG_W "выход %s: живых устройств нет, трафик пущен напрямую, "
                         "но zapret не запущен — обхода DPI не будет\n", o->name);
     else
-        fprintf(stderr, "steer: выход %s: живых устройств нет, трафик пущен напрямую "
+        fprintf(stderr, LOG_W "выход %s: живых устройств нет, трафик пущен напрямую "
                         "(on_fail=%s)\n", o->name,
                 o->on_fail == FAIL_ZAPRET ? "zapret" : "direct");
 }
@@ -330,7 +337,7 @@ static int restart_allowed(const char *dev) {
 static int revive(const struct output *o, const char *dev, int verbose) {
     if (!restart_allowed(dev)) {
         if (verbose)
-            fprintf(stderr, "steer: %s: перезапуск был недавно, пропускаю\n", dev);
+            fprintf(stderr, LOG_I "%s: перезапуск был недавно, пропускаю\n", dev);
         return 0;
     }
 
@@ -341,7 +348,7 @@ static int revive(const struct output *o, const char *dev, int verbose) {
      * выбирает рабочий узел сам. У сторожа для vless одна задача: сообщить, что туннель
      * молчит, и подождать — кому именно ждать, тот поднимется сам. */
     if (o->kind == OUT_VLESS) {
-        fprintf(stderr, "steer: %s: не отвечает по TCP — VLESS-процесс должен подняться "
+        fprintf(stderr, LOG_W "%s: не отвечает по TCP — VLESS-процесс должен подняться "
                         "заново через procd; жду\n", dev);
         for (int i = 0; i < 10; i++) {
             sleep(1);
@@ -350,7 +357,7 @@ static int revive(const struct output *o, const char *dev, int verbose) {
         return 0;
     }
 
-    fprintf(stderr, "steer: %s: не отвечает — перезапускаю интерфейс\n", dev);
+    fprintf(stderr, LOG_W "%s: не отвечает — перезапускаю интерфейс\n", dev);
     /* Сначала обфускатор, потом интерфейс, и порядок здесь — не вкусовщина.
      *
      * У выхода с obfs датаграммы WireGuard идут не в сеть, а в свой процесс, и если
@@ -427,7 +434,7 @@ int cmd_failover(const char *spec, int verbose) {
         for (size_t k = 0; k < o->devices_n; k++) {
             if (device_healthy_for(o, o->devices[k])) { chosen = o->devices[k]; break; }
             if (verbose)
-                fprintf(stderr, "steer: %s: %s не отвечает\n", o->name, o->devices[k]);
+                fprintf(stderr, LOG_W "%s: %s не отвечает\n", o->name, o->devices[k]);
         }
 
         /* Ни одно не ответило — вот теперь можно тратить время на оживление. Порядок
@@ -444,7 +451,7 @@ int cmd_failover(const char *spec, int verbose) {
                        was[0] && strcmp(was, "-") ? " (переключение)" : "");
                 changed = 1;
             } else if (verbose) {
-                fprintf(stderr, "steer: %s: %s работает\n", o->name, chosen);
+                fprintf(stderr, LOG_I "%s: %s работает\n", o->name, chosen);
             }
         } else {
             o->device[0] = '\0';
@@ -455,6 +462,6 @@ int cmd_failover(const char *spec, int verbose) {
         }
     }
     active_save();
-    if (!changed && verbose) fprintf(stderr, "steer: изменений нет\n");
+    if (!changed && verbose) fprintf(stderr, LOG_I "изменений нет\n");
     return 0;
 }

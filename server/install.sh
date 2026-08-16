@@ -39,20 +39,42 @@ done
 # текущему каталогу: «сработало у меня» из-за cd — не то свойство, которое нужно установщику.
 here=$(cd "$(dirname "$0")" && pwd)
 root=$(dirname "$here")
-[ -f "$root/Makefile" ] || { echo "не нахожу исходники движка рядом с $here"; exit 1; }
 
-command -v cc >/dev/null 2>&1 || { echo "нужен компилятор: apt install build-essential"; exit 1; }
+# Два способа получить бинарник, и оба ведут к одному и тому же файлу.
+#
+# Рядом со скриптом лежит готовый steer — значит это распакованный архив из релиза
+# (steer-obfs-ВЕРСИЯ-АРХ.tar.gz). Он статический, собран тем же zig под musl, что и пакеты
+# для роутера, и потому не зависит ни от версии libc на VPS, ни от дистрибутива вовсе.
+# Компилятор в этом случае не нужен — а раньше был нужен всегда, и на голой VPS установка
+# начиналась с apt install build-essential ради одного файла.
+#
+# Готового нет — собираем из исходников рядом, как и прежде.
+if [ -x "$here/steer" ]; then
+    BIN="$here/steer"
+    echo "беру готовый бинарник: $BIN"
+else
+    [ -f "$root/Makefile" ] || {
+        echo "рядом нет ни готового бинарника steer, ни исходников движка."
+        echo "возьмите архив steer-obfs-*.tar.gz со страницы релизов либо клонируйте репозиторий."
+        exit 1
+    }
+    command -v cc >/dev/null 2>&1 || { echo "нужен компилятор: apt install build-essential"; exit 1; }
+    BIN="$root/build/steer"
+fi
+
 command -v nft >/dev/null 2>&1 || cat <<'EOF'
 внимание: nft не найден. Процесс не сможет поставить правило против RST, и ядро будет
 рвать сессии. Поставьте nftables либо добавьте правило вручную:
   iptables -I OUTPUT -p tcp --sport ПОРТ --tcp-flags RST RST -j DROP
 EOF
 
-echo "собираю движок…"
-make -C "$root" -s all
+if [ "$BIN" = "$root/build/steer" ]; then
+    echo "собираю движок…"
+    make -C "$root" -s all
+fi
 
 install -d "$PREFIX"
-install -m 0755 "$root/build/steer" "$PREFIX/steer"
+install -m 0755 "$BIN" "$PREFIX/steer"
 
 cat > "$ENVFILE" <<EOF
 # Настройки серверной половины обфускации. Меняются здесь, а не в юните:
