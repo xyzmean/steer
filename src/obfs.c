@@ -239,6 +239,74 @@ uint32_t obfs_next_ack(uint32_t have, uint32_t seq, size_t plen) {
     return ((int32_t)(want - have) > 0) ? want : have;
 }
 
+/* ---- отбор пакетов в ядре --------------------------------------------------
+ *
+ * Сырой сокет получает КОПИЮ каждого TCP-пакета, доставляемого локально, — и это не
+ * мелочь, а главная цена конструкции. На сервере обфускации локально доставляется в том
+ * числе всё, что несёт сам туннель: пакет приходит к нам поддельным TCP, мы отдаём его
+ * WireGuard, тот расшифровывает — и расшифрованный TCP снова доставляется локально,
+ * снова попадая в очередь нашего сокета. Чем быстрее идёт туннель, тем больше мусора мы
+ * копируем в userspace, тем чаще переполняется очередь, тем больше НАСТОЯЩИХ сегментов
+ * теряется. Обратная связь с положительным знаком: скорость падала на глазах, а
+ * /proc/net/raw показывал сотни тысяч drops на сокете, из которого никто не читает.
+ *
+ * Отбор поэтому делает ядро. Фильтр классический (cBPF), потому что он нужен на сокете
+ * и должен работать на musl-роутере без libbpf и без прав на bpf(2).
+ *
+ * Смещения: у сырого сокета AF_INET данные начинаются с IP-заголовка, поэтому 12 — это
+ * адрес источника, а длина заголовка берётся из младшего полубайта нулевого байта
+ * (идиома `ldxb 4*([0]&0xf)`), после чего порты лежат по X+0 и X+2. Проверено не по
+ * документации, а стендом: при неверном смещении не приходит вообще ничего.
+ */
+#include <linux/filter.h>
+
+static void raw_filter(int fd, struct sock_filter *code, unsigned short n) {
+    struct sock_fprog p;
+    p.len = n;
+    p.filter = code;
+    /* Отказ не смертелен: без фильтра всё работает, просто дороже. Ругаться здесь
+     * значило бы пугать там, где деградация измерима и не фатальна. */
+    setsockopt(fd, SOL_SOCKET, SO_ATTACH_FILTER, &p, sizeof(p));
+}
+
+/* Клиент: только наша четвёрка. */
+static void filter_client(int fd, uint32_t server_be, uint16_t sport, uint16_t dport) {
+    struct sock_filter code[] = {
+        BPF_STMT(BPF_LD  | BPF_W   | BPF_ABS, 12),                  /* ip saddr */
+        BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, ntohl(server_be), 0, 5),
+        BPF_STMT(BPF_LDX | BPF_B   | BPF_MSH, 0),                   /* X = ihl */
+        BPF_STMT(BPF_LD  | BPF_H   | BPF_IND, 0),                   /* tcp sport */
+        BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, sport, 0, 3),
+        BPF_STMT(BPF_LD  | BPF_H   | BPF_IND, 2),                   /* tcp dport */
+        BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, dport, 0, 1),
+        BPF_STMT(BPF_RET | BPF_K, 0xFFFFFFFF),
+        BPF_STMT(BPF_RET | BPF_K, 0),
+    };
+    raw_filter(fd, code, sizeof(code) / sizeof(code[0]));
+}
+
+/* Сервер: всё, что адресовано порту обфускации. Клиенты заранее неизвестны, поэтому
+ * четвёрку здесь не проверить — но порт отсекает ровно тот мусор, ради которого фильтр
+ * и заводится. */
+static void filter_server(int fd, uint16_t port) {
+    struct sock_filter code[] = {
+        BPF_STMT(BPF_LDX | BPF_B   | BPF_MSH, 0),
+        BPF_STMT(BPF_LD  | BPF_H   | BPF_IND, 2),                   /* tcp dport */
+        BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, port, 0, 1),
+        BPF_STMT(BPF_RET | BPF_K, 0xFFFFFFFF),
+        BPF_STMT(BPF_RET | BPF_K, 0),
+    };
+    raw_filter(fd, code, sizeof(code) / sizeof(code[0]));
+}
+
+/* Сокеты, которые только отправляют: не принимать ничего. Без этого connect()'нутый
+ * сокет сессии копил очередь на мегабайт и складывал туда весь встречный поток —
+ * именно он и дал 146 тысяч drops на первом же замере под нагрузкой. */
+static void filter_none(int fd) {
+    struct sock_filter code[] = { BPF_STMT(BPF_RET | BPF_K, 0) };
+    raw_filter(fd, code, 1);
+}
+
 /* ---- сырой сокет ----------------------------------------------------------- */
 /* connect() на сыром сокете ничего не шлёт: он фиксирует получателя и заставляет ядро
  * выбрать маршрут, а с ним и адрес источника — тот самый, который нужен контрольной
@@ -327,7 +395,17 @@ static void guard_sig(int sig) {
  * что первую же сессию оборвёт собственное ядро — поэтому вызывающий говорит об этом
  * громко, а не молча продолжает. */
 static int guard_up(const char *label, const char *peer_addr, int port, int is_server) {
-    chain_name(label, g_chain, sizeof(g_chain));
+    /* Имя цепочки обязано быть РАЗНЫМ у разных экземпляров, и это не аккуратность.
+     * Серверные экземпляры звались одинаково («server»), поэтому второй сервер,
+     * поднятый на другом порту, при выходе снимал цепочку первого — и тот оставался
+     * работать без правила против RST. Снаружи это выглядело как «туннель отвалился
+     * сам по себе»: ядро начинало отвечать RST на каждое рукопожатие, клиент рвал
+     * сессию, пробовал с нового порта и так по кругу. Проверено на живом сервере,
+     * ценой упавшего туннеля. Порт в имени делает экземпляры независимыми. */
+    char label_buf[64];
+    if (is_server) snprintf(label_buf, sizeof(label_buf), "srv%d", port);
+    else snprintf(label_buf, sizeof(label_buf), "%.40s", label);
+    chain_name(label_buf, g_chain, sizeof(g_chain));
     char portbuf[16];
     snprintf(portbuf, sizeof(portbuf), "%d", port);
 
@@ -343,13 +421,27 @@ static int guard_up(const char *label, const char *peer_addr, int port, int is_s
     if (run_quiet(addc) != 0) return -1;
 
     /* Клиент: RST, адресованный серверу обфускации. Сервер: RST, уходящий с нашего
-     * порта кому угодно — клиентов много и заранее они неизвестны. */
+     * порта кому угодно — клиентов много и заранее они неизвестны.
+     *
+     * Маска `& rst == rst` вместо голого `flags rst` — потому что ядро отвечает на SYN
+     * закрытого порта не чистым RST, а RST+ACK, и запись без маски в части версий nft
+     * читается как сравнение поля флагов ЦЕЛИКОМ. Тогда правило ловит RST на данные и
+     * пропускает ровно тот, который рвёт рукопожатие. Здешний nft вёл себя правильно и
+     * без маски, но зависеть от версии в правиле, от которого зависит связь, незачем.
+     *
+     * `tcp window 0` отделяет RST ЯДРА от НАШЕГО. Ядро шлёт RST на несуществующее
+     * соединение всегда с нулевым окном, а мы объявляем 65535 — и нам этот RST нужен:
+     * им сервер сообщает клиенту, что сессии больше нет (например, после перезапуска).
+     * Без такого различения клиент узнавал бы об этом только по тишине, то есть через
+     * минуту, и перезапуск сервера стоил бы минуты простоя туннеля. */
     const char *rule_c[] = { "nft", "add", "rule", "inet", "steer_obfs", g_chain,
                              "ip", "daddr", peer_addr, "tcp", "dport", portbuf,
-                             "tcp", "flags", "rst", "counter", "drop", NULL };
+                             "tcp", "flags", "&", "rst", "==", "rst",
+                             "tcp", "window", "0", "counter", "drop", NULL };
     const char *rule_s[] = { "nft", "add", "rule", "inet", "steer_obfs", g_chain,
                              "tcp", "sport", portbuf,
-                             "tcp", "flags", "rst", "counter", "drop", NULL };
+                             "tcp", "flags", "&", "rst", "==", "rst",
+                             "tcp", "window", "0", "counter", "drop", NULL };
     if (run_quiet(is_server ? rule_s : rule_c) != 0) return -1;
 
     g_chain_up = 1;
@@ -388,6 +480,9 @@ static int client_connect(struct fconn *c, int *raw_fd, uint32_t daddr, int dpor
         fprintf(stderr, LOG_W "сырой сокет недоступен: %s\n", strerror(errno));
         return -1;
     }
+    /* Фильтр ставится ДО первого SYN: между socket() и настройкой очередь успевает
+     * набрать чужого, и на нагруженном роутере это тысячи пакетов. */
+    filter_client(*raw_fd, daddr, c->dport, c->sport);
     if (conn_send(*raw_fd, c, TH_SYN, NULL, 0, 1) != 0) return -1;
     c->state = ST_SYN_SENT;
     c->syn_tries = 1;
@@ -602,6 +697,7 @@ static struct sess *sess_alloc(uint32_t caddr, uint16_t cport, uint16_t our_port
 
     slot->tx = raw_open(caddr, &slot->c.saddr);
     if (slot->tx < 0) return NULL;
+    filter_none(slot->tx);
 
     slot->udp = socket(AF_INET, SOCK_DGRAM, 0);
     if (slot->udp < 0) { sess_free(slot); return NULL; }
@@ -642,6 +738,17 @@ int obfs_server(int listen_port, const char *forward, int forward_port) {
     fcntl(rx, F_SETFL, fl | O_NONBLOCK);
     int rcvbuf = 1 << 20;
     setsockopt(rx, SOL_SOCKET, SO_RCVBUF, &rcvbuf, sizeof(rcvbuf));
+    filter_server(rx, (uint16_t)listen_port);
+
+    /* Отдельный сокет без connect: им отвечают тем, чьей сессии нет. Заводится один
+     * раз, а не на каждый такой пакет, иначе поток чужих сегментов означал бы поток
+     * системных вызовов socket/close. Принимать ему нечего. */
+    int tx0 = socket(AF_INET, SOCK_RAW, IPPROTO_TCP);
+    if (tx0 >= 0) {
+        int md = IP_PMTUDISC_DONT;
+        setsockopt(tx0, IPPROTO_IP, IP_MTU_DISCOVER, &md, sizeof(md));
+        filter_none(tx0);
+    }
 
     if (guard_up("server", NULL, listen_port, 1) != 0)
         fprintf(stderr, LOG_W "правило против RST не встало: если порт %d не закрыт "
@@ -692,7 +799,29 @@ int obfs_server(int listen_port, const char *forward, int forward_port) {
                     conn_send(ss->tx, &ss->c, TH_SYN | TH_ACK, NULL, 0, 1);
                     continue;
                 }
-                if (!ss) continue;
+                if (!ss) {
+                    /* Данные по сессии, которой у нас нет: клиент пережил наш
+                     * перезапуск и продолжает слать в пустоту. Молчание здесь стоит
+                     * дорого — он узнает о беде только по тишине, то есть через минуту
+                     * (DEAD_MS), и всё это время туннель стоит. RST говорит об этом
+                     * сразу, и клиент переподключается за миллисекунды.
+                     *
+                     * Окно 65535, а не ноль: именно этим наш RST отличается от RST ядра,
+                     * который гасит наше же правило (см. guard_up). */
+                    if (tx0 >= 0 && !(s.flags & TH_RST)) {
+                        uint8_t rst[60];
+                        size_t rn = obfs_build(rst, s.daddr, s.saddr,
+                                               (uint16_t)listen_port, s.sport,
+                                               s.ack, s.seq + (uint32_t)s.plen,
+                                               TH_RST | TH_ACK, 0, NULL, 0);
+                        struct sockaddr_in to;
+                        memset(&to, 0, sizeof(to));
+                        to.sin_family = AF_INET;
+                        to.sin_addr.s_addr = s.saddr;
+                        sendto(tx0, rst, rn, 0, (struct sockaddr *)&to, sizeof(to));
+                    }
+                    continue;
+                }
                 ss->c.last_rx = now_ms();
                 if (s.flags & TH_RST) { sess_free(ss); continue; }
                 if (ss->c.state == ST_SYN_RCVD && (s.flags & TH_ACK)) ss->c.state = ST_EST;
