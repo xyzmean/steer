@@ -144,6 +144,44 @@ for pat in 'out/*.apk' 'out/*.ipk' 'out/*.tar.gz'; do
     check "релиз выкладывает $pat" "1" "$(grep -cF "$pat" "$wf")"
 done
 
+# ---- документация не разошлась с кодом ----------------------------------------
+# docs/contract-v1.md — то, на что опирается управляющий слой, и разойтись с кодом он может
+# только молча: документ не исполняется. Самое живое место — список идентификаторов проверок
+# diag: он может и расти, и сокращаться (проверка `udp` однажды исчезла), а потребитель
+# читает документ.
+API=docs/contract-v1.md
+code_ids="$(grep -o 'diag("[a-z_]*"' src/steer.c | sed 's/diag("//;s/"//' | sort -u | tr '\n' ' ')"
+doc_ids="$(sed -n '/Идентификаторы проверок/,/^$/p' "$API" |
+           grep -o '`[a-z_]*`' | tr -d '`' | sort -u | tr '\n' ' ')"
+check "идентификаторы проверок diag совпадают с кодом" "$code_ids" "$doc_ids"
+
+# Документация на русском — проект для русскоязычных пользователей. Проверяется наличие
+# кириллицы, а не отсутствие латиницы: имена команд, полей и флагов остаются как есть.
+for d in README.md docs/contract-v1.md docs/vless.md server/README.md; do
+    check "$d написан по-русски" "yes" \
+        "$(grep -qP '[А-Яа-я]' "$d" && echo yes || echo no)"
+done
+
+# Номер версии в документации устаревает молча к следующему же релизу: примеры команд
+# обязаны быть с подстановкой, а не с числом.
+stale=""
+for d in README.md docs/contract-v1.md docs/vless.md server/README.md; do
+    grep -qE 'steer(-extended|-obfs)?-[0-9]+\.[0-9]+\.[0-9]+' "$d" && stale="$stale$d "
+done
+check "в документации нет зашитых номеров версии" "" "$stale"
+
+# Команды, обещанные в README, обязаны существовать в движке: README читают раньше, чем
+# `steer help`, и несуществующая команда там — это отказ на первом же шаге.
+if [ -x ./build/steer ]; then
+    bad_cmd=""
+    for c in apply status diag explain outputs needs-dnsd dnsd failover fit vless \
+             vless-nodes vless-probe obfs obfs-server; do
+        grep -q "\`$c" README.md || continue
+        ./build/steer help "$c" >/dev/null 2>&1 || bad_cmd="$bad_cmd$c "
+    done
+    check "все команды из README существуют" "" "$bad_cmd"
+fi
+
 # ---- workflow вообще пригоден к запуску ---------------------------------------
 # Разбор вынесен в tests/wfcheck.py — там же объяснено, почему это нельзя проверить
 # глазами. Коротко: GitHub раскрывает выражения и внутри комментариев оболочки, и

@@ -1,89 +1,200 @@
-# VLESS/Reality Client Architecture
+# Клиент VLESS/Reality
 
-This document describes the VLESS/Reality client implementation available exclusively in the `steer-extended` package.
+Этот документ описывает встроенный клиент VLESS/Reality, который есть только в пакете
+`steer-extended`.
 
-## Overview
-The embedded VLESS client is designed to operate within extreme resource constraints (under 500 KB including the TLS stack), making it viable for low-end routers where standard implementations (like Xray or sing-box, which consume 20-40 MB) cannot fit. 
+## Зачем он вообще
 
-It handles routing, native TUN interface creation, and cryptographic handshakes directly via `mbedtls`.
+Готовые клиенты — Xray, sing-box — занимают 20-40 МБ и на роутер с overlay-разделом в 6-7 МБ не
+встают. Здесь клиент вместе с TLS-стеком весит меньше 500 КБ, потому что написан под то же
+ограничение, что и весь движок: работать на нижней границе домашних роутеров.
 
-## Supported Protocols
-- **Transports**: `tcp`, `grpc`, `xhttp` (implemented via minimal embedded HTTP/2).
-- **Security**: `reality`, `none`.
-- **Flow**: `xtls-rprx-vision`, or none.
-- **Traffic**: TCP and UDP over TUN — see [UDP and QUIC](#udp-and-quic).
+Клиент сам создаёт TUN-устройство, сам делает криптографическое рукопожатие через `mbedtls` и сам
+несёт трафик. Дальше это устройство ничем не отличается от `wg0` для остальной части движка: метки,
+таблицы, каналы и failover работают с ним ровно так же.
 
-*Note: ICMP is still not forwarded. Emulating ping through a proxy is misleading — a successful ping would not mean a working path — so anything that is neither TCP nor UDP is answered with ICMP "Port Unreachable".*
+## Что поддерживается
 
-## Reality Implementation Details
+- **Транспорты**: `tcp`, `grpc`, `xhttp` (два последних — через встроенный минимальный HTTP/2).
+- **Безопасность**: `reality`, `none`.
+- **Поток**: `xtls-rprx-vision` или без него.
+- **Трафик**: TCP и UDP через TUN — см. [UDP и QUIC](#udp-и-quic).
 
-The Reality protocol authenticates the client using a modified TLS 1.3 handshake:
-1. The server possesses a constant X25519 keypair, with the public key (`pbk`) known to the client.
-2. The client generates an ephemeral keypair and places its public half in the `key_share` of the `ClientHello`.
-3. A shared secret is computed from the client's ephemeral private key and the server's constant `pbk`. This secret derives an authenticator embedded in the `session_id`.
-4. If the server validates the authenticator, it acts as a VLESS proxy. Otherwise, it transparently proxies the decoy site.
+**ICMP не пересылается.** Успешный `ping` через прокси не означал бы работающий путь — это
+вводило бы в заблуждение, — поэтому всё, что не TCP и не UDP, получает ICMP «порт недостижим».
 
-**Crucial Invariant**: The `ClientHello` must perfectly mimic a standard browser (e.g., Chrome). Any deviation in extension order, cipher suites, or GREASE values can be used to fingerprint the client. 
+## Как работает Reality
 
-## Vision Flow
+Reality аутентифицирует клиента внутри изменённого рукопожатия TLS 1.3:
 
-The `xtls-rprx-vision` flow obscures TLS-in-TLS characteristics by injecting randomized padding frames.
-- Padding frames conceal the length of adjacent data records.
-- VLESS headers are injected into the stream prior to the first Vision frame.
-- Protocol symmetry dictates that the server's initial response also includes the UUID header.
+1. У сервера есть постоянная пара ключей X25519, публичная половина (`pbk`) известна клиенту.
+2. Клиент генерирует эфемерную пару и кладёт свою публичную половину в `key_share` внутри
+   `ClientHello`.
+3. Из эфемерного приватного ключа клиента и постоянного `pbk` сервера считается общий секрет. Из него
+   выводится аутентификатор, который прячется в `session_id`.
+4. Признал аутентификатор — сервер работает как прокси VLESS. Не признал — прозрачно проксирует
+   маскировочный сайт, и клиент не может отличить это от обычного сайта.
 
-## TUN Device and TCP Handling
+**Ключевой инвариант.** `ClientHello` обязан быть неотличим от браузерного (Chrome) — вплоть до
+порядка расширений, набора шифров и значений GREASE. Любое отклонение становится признаком, по
+которому клиента опознают. Именно поэтому здесь свой сборщик Hello, а не то, что предлагает
+библиотека: библиотечный Hello узнаваем.
 
-Since `steer` processes raw IP packets but the VLESS server expects TCP streams, a lightweight TCP state machine is implemented.
-- **Retransmissions**: A configurable ring buffer tracks unacknowledged bytes. Retransmissions are triggered by timeout or duplicate ACKs (RFC 5681).
-- **No Reordering Buffer**: Out-of-order packets from the client are dropped and left for the client's OS to retransmit, saving router memory.
-- **Multi-Threading**: Uses `IFF_MULTI_QUEUE` to allocate queues per CPU core (up to 4). Symmetric hashing ensures both halves of a TCP connection map to the same thread, eliminating the need for locks in the data path.
-- **Memory Scaling**: Memory is allocated dynamically per connection (max 64 concurrent connections by default) to prevent OOM kills on memory-constrained routers.
+Аппаратный AES используется, когда он есть; на MIPS и ARM без него выбирается ChaCha20 — разница
+измеримая, 11,6 против 1,7 МБ/с на MIPS 24Kc, и на таком железе именно шифрование задаёт потолок
+скорости.
 
-## UDP and QUIC
+## Поток Vision
 
-UDP travels as VLESS command 2: the request header names one destination, and the stream that follows is a sequence of datagrams, each prefixed with its length as two big-endian bytes. Both directions use the same framing. This is what carries QUIC (HTTP/3), WireGuard/WARP, game traffic and plain DNS.
+`xtls-rprx-vision` скрывает признаки «TLS внутри TLS», подмешивая кадры набивки случайной длины.
 
-- **One node session per flow.** The destination lives in the *request header*, so it is fixed for the life of a stream: a session per `src:port → dst:port` pair is what the protocol shape dictates. Xray's XUDP (Mux.Cool for UDP) can multiplex several destinations over one stream, and it pays off exactly where there are many destinations with one datagram each — DNS. For what UDP is actually needed for here (QUIC, WireGuard, games) there is one destination and the flow lives for minutes, so XUDP would add its own framing and nothing else.
-- **Vision is not used for UDP**, and the request carries no `flow` addon. Vision replaces stream copying after the handshake, which has no meaning for datagrams; Xray agrees — an account with `flow=xtls-rprx-vision` may send UDP requests with an empty flow, and that is how Xray's own client behaves. Sending the flow here gets the stream closed with no useful diagnosis.
-- **Handshake cost is hidden.** The first datagram waits in the early-data buffer while the node handshake runs, and the spare-session pool usually hands over a ready stream immediately (see below). Without that work each new QUIC connection would pay 100-400 ms.
-- **Datagrams up to 4096 bytes.** Reassembling a partially received datagram needs a buffer *per flow*, and 64 KB × 320 flows is memory a router does not have. 4 KB covers everything in practice: QUIC and game traffic stay inside the MTU by themselves, and the largest legitimate case is a DNS answer with EDNS0, where clients advertise 4096. A larger datagram is skipped by its exact length — losing stream synchronisation would kill the flow, not just the datagram.
-- **Fragmentation, both ways.** A datagram larger than the MTU arrives from the client already split by its own stack; the tunnel reassembles it (one slot per worker thread, in-order fragments only) before handing it to the node. In the other direction a datagram larger than the MTU is cut into IP fragments and reassembled by the client's stack — without this, a large DNS answer would be silently dropped.
-- **Idle timeout is the same 120 s as TCP**, matching conntrack. Shorter would change the source port *on the node side* for the next datagram, and a QUIC peer would have to re-validate the path.
-- **Loss is loss.** If a datagram cannot be handed to the node at that moment (HTTP/2 window closed on grpc/xhttp), it is dropped rather than queued: every protocol over UDP survives a lost datagram, but none survives reordering. `STEER_TUN_STATS=1` reports these as `потеряно датаграмм`.
+- Кадры набивки скрывают длину соседних записей с данными.
+- Заголовок VLESS вставляется в поток перед первым кадром Vision.
+- Протокол симметричен: первый ответ сервера тоже начинается с UUID.
 
-## Connection Setup Latency
+Разбор идёт потоком: кадр не обязан приехать целиком за одну запись TLS, и границы записи и кадра
+совпадать не должны. Начало потока и заголовок кадра копятся между вызовами — иначе запись,
+обрывающаяся на середине заголовка, теряла бы синхронизацию, и дальше клиенту как данные уезжали бы
+служебные байты.
 
-The node handshake (TCP + TLS/Reality + optional HTTP/2) costs 100-400 ms. That cost used to sit on the critical path of every new connection, because the client's `SYN-ACK` was withheld until the upstream stream was ready — a client starts its own TLS only after the handshake completes, so the delay was paid in full, per connection, on top of everything else. Plain `nftables` routing has no such step, which is exactly where the difference was felt.
+## TUN и обработка TCP
 
-Three mechanisms remove it:
+Движок работает с сырыми IP-пакетами, а сервер VLESS ждёт поток TCP, поэтому внутри есть небольшая
+машина состояний TCP.
 
-- **Immediate `SYN-ACK`**: the handshake to the client completes on a local round trip, before the node stream exists. The VLESS destination address travels in the *request header* rather than at connection time, so nothing about the upstream needs to be known yet. If the stream later fails to open, the client gets an `RST` — the same outcome as before, just later.
-- **Early-data buffer**: because the client is now answered immediately, its first bytes (the `ClientHello`, one to two KB) arrive while the node handshake is still running. They are held per connection, up to 8 KB, and handed to the node as soon as the stream is ready. Beyond that cap the data is simply not acknowledged, so the client retransmits it later — the same back-pressure the closed-window path already uses. Stream order is never traded for speed: fresh client data waits until the buffered tail has been delivered.
-- **Spare sessions**: a small pool of pre-established node sessions (default 4, `STEER_TUN_SPARES=0` disables, max 8). The pool is refilled **only when a `SYN` arrives**, so an idle router performs no background handshakes at all; a browser opening connections in bursts finds them ready. Spares expire after 2.5 s — Xray drops a session that has not sent a VLESS request within its handshake timeout (4 s by default) — and expired ones are closed by a once-per-second sweep so an idle pool does not hold sockets or TLS buffers indefinitely.
+- **Ретрансмиссии.** Кольцевой буфер хранит неподтверждённые байты. Повтор запускается по таймауту
+  или по дублирующим ACK (RFC 5681).
+- **Буфера переупорядочивания нет.** Пакеты клиента, пришедшие не по порядку, отбрасываются — их
+  перешлёт ОС клиента. Это экономит память роутера, а платит за это только тот клиент, у которого и
+  так теряются пакеты.
+- **Многопоточность.** `IFF_MULTI_QUEUE` даёт по очереди на ядро (до четырёх). Симметричное
+  хэширование кладёт обе половины одного соединения TCP в один поток, поэтому на пути данных не
+  нужны блокировки.
+- **Память по факту.** Выделяется на соединение, до 320 одновременных; горячая часть состояния
+  соединения умещается в две кэш-линии, холодная лежит отдельно и берётся страницами по обращению.
 
-Measured on a MediaTek Filogic router against a real Reality node, fetching `www.youtube.com` through the tunnel (median of 6 fresh connections):
+## UDP и QUIC
 
-| | TCP connect | TTFB |
+UDP едет как команда VLESS 2: заголовок запроса называет один адресат, а дальше поток — это
+последовательность датаграмм, каждая с двухбайтовой длиной в начале. Обе стороны используют одну
+рамку. Именно это несёт QUIC (HTTP/3), WireGuard/WARP, игровой трафик и обычный DNS.
+
+- **Одна сессия к узлу на поток.** Адресат живёт в *заголовке запроса*, то есть фиксирован на всё
+  время потока: сессия на пару `источник:порт → адресат:порт` — это то, что диктует форма
+  протокола. XUDP (Mux.Cool для UDP) у Xray умеет мультиплексировать несколько адресатов в один
+  поток, и выигрывает это ровно там, где адресатов много, а датаграмм на каждого одна — то есть на
+  DNS. Для того, ради чего UDP здесь нужен (QUIC, WireGuard, игры), адресат один, а поток живёт
+  минутами, поэтому XUDP добавил бы свою рамку и ничего больше.
+- **Vision для UDP не используется**, и `flow` в запросе не объявляется. Vision заменяет копирование
+  потока после рукопожатия, для датаграмм это лишено смысла. Xray согласен: учётная запись с
+  `flow=xtls-rprx-vision` вправе отправлять запросы UDP с пустым flow, и собственный клиент Xray так
+  и делает. Отправить flow здесь — значит получить закрытый поток без внятной причины.
+- **Стоимость рукопожатия спрятана.** Первая датаграмма ждёт в буфере ранних данных, пока идёт
+  рукопожатие к узлу, а пул запасных сессий обычно отдаёт готовый поток сразу. Без этого каждое новое
+  соединение QUIC платило бы 100-400 мс.
+- **Датаграммы до 4096 байт.** Сборка частично полученной датаграммы требует буфера *на поток*, а
+  64 КБ × 320 потоков — это память, которой у роутера нет. Четырёх килобайт хватает на практике: QUIC
+  и игровой трафик сами держатся внутри MTU, а самый крупный законный случай — ответ DNS с EDNS0, где
+  клиенты объявляют 4096. Датаграмма больше пропускается по её точной длине: потеря синхронизации
+  потока убила бы весь поток, а не одну датаграмму.
+- **Фрагментация в обе стороны.** Датаграмма больше MTU приходит от клиента уже разрезанной его
+  собственным стеком, и туннель собирает её (один слот на рабочий поток, только фрагменты по порядку)
+  прежде чем отдать узлу. В обратную сторону датаграмма больше MTU режется на IP-фрагменты и
+  собирается стеком клиента — без этого крупный ответ DNS молча пропадал бы.
+- **Срок простоя — те же 120 с, что у TCP**, как у conntrack. Меньше означало бы смену исходящего
+  порта *на стороне узла* для следующей датаграммы, и партнёр QUIC был бы вынужден заново
+  подтверждать путь.
+- **Потеря есть потеря.** Если датаграмму нельзя отдать узлу прямо сейчас (закрылось окно HTTP/2 на
+  grpc/xhttp), она отбрасывается, а не встаёт в очередь: любой протокол поверх UDP переживает
+  потерянную датаграмму, но ни один не переживает переупорядочивания. `STEER_TUN_STATS=1` показывает
+  их как `потеряно датаграмм`.
+
+## Задержка установления соединения
+
+Рукопожатие к узлу (TCP + TLS/Reality + при необходимости HTTP/2) стоит 100-400 мс. Раньше эта
+стоимость лежала на критическом пути каждого нового соединения: `SYN-ACK` клиенту задерживался, пока
+не готов поток наверх, а клиент начинает свой TLS только после завершения рукопожатия — то есть
+задержка платилась целиком, на каждое соединение, поверх всего остального. У обычной маршрутизации
+через `nftables` такого шага нет, и разница чувствовалась именно здесь.
+
+Убирают её три механизма:
+
+- **Немедленный `SYN-ACK`.** Рукопожатие с клиентом завершается за локальный круг, ещё до
+  существования потока к узлу. Адрес назначения VLESS едет в *заголовке запроса*, а не в момент
+  соединения, поэтому знать про верхнюю сторону пока ничего не нужно. Если поток потом не откроется,
+  клиент получит `RST` — тот же исход, что и раньше, только позже.
+- **Буфер ранних данных.** Раз клиенту ответили сразу, его первые байты (`ClientHello`, один-два КБ)
+  приходят, пока рукопожатие к узлу ещё идёт. Они держатся на соединение, до 8 КБ, и отдаются узлу
+  как только поток готов. Сверх этого предела данные просто не подтверждаются, и клиент перешлёт их
+  позже — то же обратное давление, которым уже пользуется путь с закрытым окном. Порядок потока
+  никогда не обменивается на скорость: свежие данные клиента ждут, пока не доставлен накопленный
+  хвост.
+- **Запасные сессии.** Небольшой пул заранее установленных сессий к узлу (по умолчанию 4,
+  `STEER_TUN_SPARES=0` отключает, максимум 8). Пул пополняется **только когда пришёл `SYN`**,
+  поэтому простаивающий роутер не делает никаких фоновых рукопожатий; браузер, открывающий
+  соединения пачками, находит их готовыми. Запасные живут 2,5 с — Xray снимает сессию, не отправившую
+  запрос VLESS в пределах своего таймаута рукопожатия (по умолчанию 4 с), — и просроченные
+  закрываются проходом раз в секунду, чтобы простаивающий пул не держал сокеты и буферы TLS
+  бесконечно.
+
+Замерено на роутере MediaTek Filogic против настоящего узла Reality, загрузка `www.youtube.com`
+через туннель (медиана шести свежих соединений):
+
+| | Соединение TCP | TTFB |
 |---|---|---|
-| before | 147 ms | 370 ms |
-| after | 0 ms | 242 ms |
-| burst of 6, before | 183 ms | 410 ms |
-| burst of 6, after | 1 ms | 252 ms |
+| до | 147 мс | 370 мс |
+| после | 0 мс | 242 мс |
+| пачка из 6, до | 183 мс | 410 мс |
+| пачка из 6, после | 1 мс | 252 мс |
 
-Throughput and CPU per megabyte are unchanged (1.0 ms/MB on the local rig before and after); this work targets latency only.
+Пропускная способность и процессор на мегабайт не изменились (1,0 мс/МБ на локальном стенде до и
+после): эта работа была только про задержку.
 
-## Exit Codes
+## Переменные окружения
 
-`steer vless <output>` always exits with a **non-zero code (`1`)** when the tunnel process returns at all, and emits a single reason line to the journal (`steer[warn]` prefix). The exit code is `1` on every terminating path — a clean `0` would be a lie here, because the process only ends when the tunnel is no longer carrying traffic. procd / the control plane should treat non-zero as "tunnel is down" and read the reason line for the cause.
+Для разбора неполадок, не для повседневной настройки.
 
-Previous versions returned `-40` / `-41` from `tun_open`, which `main` truncated to bytes `216` / `215` — numbers meaningless to both humans and the control plane. These are now unified to `1` with a named reason.
+| Переменная | Что делает |
+|---|---|
+| `STEER_TUN_STATS=1` | Печатать статистику туннеля: пакеты, датаграммы, потери |
+| `STEER_TUN_SPARES=N` | Размер пула запасных сессий (0 отключает, максимум 8) |
+| `STEER_TUN_THREADS=N` | Число рабочих очередей TUN |
+| `STEER_TUN_TRACE=1` | Подробная трассировка пути пакета |
+| `STEER_TUN_NOGSO=1` | Отключить разгрузку GSO на TUN |
+| `STEER_CIPHER=...` | Принудительно выбрать шифр вместо автовыбора по наличию AES |
+| `STEER_EXPLAIN_TRACE=1` | Трассировка в `steer explain` |
 
-| Exit | Reason (journal line) | Cause |
-|------|-----------------------|-------|
-| `1`  | `steer[warn] tunnel: нет /dev/net/tun (...) — не установлен kmod-tun` | `/dev/net/tun` missing — the `kmod-tun` package is not installed. |
-| `1`  | `steer[warn] tunnel: устройство <dev> не создалось: ... (отказал TUNSETIFF)` | The TUN device could not be created (`TUNSETIFF` failed, or `/dev/net/tun` would not open). |
-| `1`  | `steer[warn] tunnel: <dev> не поднялся ни одной очередью из <N>` | No worker queue was ever established before the process ended. |
-| `1`  | `steer[warn] tunnel: <dev> больше не несёт трафик — все очереди (<N>) завершились` | The tunnel ran, but all queues have now drained/ended, so the tunnel is no longer serving traffic. |
+## Коды возврата
 
-A control plane restarting the tunnel on non-zero exit should distinguish the `kmod-tun` / device-creation failures (infrastructure problem, restart won't help) from the "queues ended" case (transient, restart may recover).
+`steer vless <выход>` завершается **ненулевым кодом (`1`)** всегда, когда процесс туннеля вообще
+возвращается, и печатает в журнал одну строку причины с префиксом `steer[warn]`. Ноль был бы здесь
+неправдой: процесс заканчивается только тогда, когда туннель больше не несёт трафик. procd и
+управляющий слой должны трактовать ненулевой код как «туннель упал» и читать строку причины.
+
+Прежние версии возвращали `-40` / `-41` из `tun_open`, а `main` обрезал их до байтов `216` / `215` —
+числа, не значащие ничего ни для человека, ни для управляющего слоя.
+
+Отказы **до** запуска туннеля отвечают кодом `2` — это отказ вызывающему, а не падение туннеля:
+
+| Код | Строка причины | Что случилось |
+|---|---|---|
+| `2` | `steer[warn]: выхода <имя> нет в спеке` | В спеке нет такого выхода |
+| `2` | `steer[warn]: выход <имя> не vless (kind другой)` | Выход есть, но он не `kind: vless` |
+| `2` | `steer[warn]: <файл> не читается` | Не читается файл подписки |
+
+Отказы **при подъёме и работе** туннеля отвечают кодом `1`:
+
+| Код | Строка причины | Что случилось |
+|---|---|---|
+| `1` | `steer[warn]: в подписке нет пригодных узлов ...` | Подписка разобрана, но ни один узел не годится |
+| `1` | `steer[warn]: узла N нет (всего M)` | Задан `node`, которого в подписке нет |
+| `1` | `steer[warn]: ни один узел подписки не отвечает` | Все узлы проверены, ни один не ответил |
+| `1` | `steer[warn] tunnel: нет /dev/net/tun (...) — не установлен kmod-tun` | Нет `/dev/net/tun`: не стоит пакет `kmod-tun` |
+| `1` | `steer[warn] tunnel: устройство <dev> не создалось: ... (отказал TUNSETIFF)` | Устройство TUN не создалось |
+| `1` | `steer[warn] tunnel: <dev> не поднялся ни одной очередью из <N>` | Ни одна рабочая очередь не встала |
+| `1` | `steer[warn] tunnel: <dev> больше не несёт трафик — все очереди (<N>) завершились` | Туннель работал, но все очереди закончились |
+
+Управляющий слой, перезапускающий туннель на ненулевом коде, должен различать случаи: отсутствие
+`kmod-tun` и отказ создания устройства — это проблема инфраструктуры, перезапуск не поможет;
+«очереди закончились» — состояние временное, перезапуск может помочь; код `2` означает ошибку в
+спеке, и перезапускать бессмысленно до её правки.

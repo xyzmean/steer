@@ -1,38 +1,66 @@
-# Steer: Policy-Based Routing Engine for OpenWrt
+# steer — движок маршрутизации по правилам для OpenWrt
 
-Steer is a high-performance, declarative policy-based routing engine designed specifically for OpenWrt. It translates declarative JSON specifications into `nftables` rules, routing tables, and IP sets atomically.
+steer решает, какой трафик уходит в туннель, а какой идёт напрямую. Правила описываются одним
+файлом JSON, движок превращает его в правила `nftables`, таблицы маршрутизации и наборы адресов —
+одной атомарной транзакцией.
 
-Steer is built with strict resource constraints in mind, optimized for the lower bounds of home routers (single core, limited memory). It acts purely as a routing engine: it does not download lists or provide a Web UI. For a complete solution with a UI and automatic list updates, see [splify2](https://github.com/xyzmean/splify2).
+Написан под нижнюю границу домашних роутеров: одно ядро, десятки мегабайт памяти, overlay-раздел
+на 6-7 МБ. Это движок и только движок: он не скачивает списки и не имеет веб-интерфейса. Если
+нужен интерфейс с готовым каталогом сервисов и автообновлением списков — смотрите
+[splify2](https://github.com/xyzmean/splify2), он управляет этим движком.
 
 [![Telegram](https://img.shields.io/badge/Telegram-chat-2CA5E0?style=flat&logo=telegram)](https://t.me/ssplify)
-[![Support Project](https://img.shields.io/badge/Support-project-f5365c?style=flat)](https://www.donationalerts.com/r/yo1nkxxd)
+[![Поддержать проект](https://img.shields.io/badge/%D0%9F%D0%BE%D0%B4%D0%B4%D0%B5%D1%80%D0%B6%D0%B0%D1%82%D1%8C-%D0%BF%D1%80%D0%BE%D0%B5%D0%BA%D1%82-f5365c?style=flat)](https://www.donationalerts.com/r/yo1nkxxd)
 
-## Features
-- **Declarative Configuration:** Define exactly what traffic goes where using a simple JSON file.
-- **Resource Efficiency:** Designed to run on weak hardware. Uses `nftables` sets loaded in a single transaction.
-- **Advanced DNS Handling:** Built-in `dnsd` resolver for domain-based routing with `fake-ip` (default) and `real-ip` modes.
-- **Failover:** Automatic fallback between multiple interfaces (e.g., VPN tunnels) with priority support.
-- **VLESS/Reality Support:** First-class support for VLESS/Reality via the `steer-extended` package, with native TUN integration. Carries both TCP and UDP, so QUIC/HTTP-3, WireGuard/WARP and game traffic work through a VLESS output.
-- **Memory Fitter:** Automatically fits large IP lists (like national blocklists) into router memory using density-based aggregation (`steer fit`).
+## Что он умеет
 
-## Installation
+- **Правила, а не «весь трафик в VPN».** Канал описывает, какой трафик и от каких клиентов уходит
+  в какой выход. Каналы проверяются сверху вниз, побеждает первый совпавший.
+- **Маршрутизация по доменам, а не только по адресам.** Встроенный резолвер `dnsd` подменяет ответ
+  на служебный адрес из диапазона `198.18.0.0/15`, а ядро возвращает настоящий через DNAT. Это
+  точнее списков адресов: один адрес CDN обслуживает сотни сайтов, и по адресу их не различить.
+- **Экономия памяти.** Национальный блок-лист в сотни тысяч префиксов не влезает в роутер как есть.
+  `steer fit` ужимает его до заданного числа элементов набора, объединяя соседние префиксы по
+  плотности, и честно сообщает, чего это стоило.
+- **Отказоустойчивость.** У выхода может быть список устройств в порядке предпочтения; сторож
+  проверяет их и переключает трафик на первое живое. Когда не работает ни одно — поведение задаётся
+  вами, а по умолчанию трафик останавливается, а не уходит в открытый интернет.
+- **Свой клиент VLESS/Reality** (в пакете `steer-extended`) с транспортами `tcp`, `grpc`, `xhttp`,
+  потоком Vision и собственным TUN. Несёт и TCP, и UDP, поэтому через такой выход работают QUIC
+  (HTTP/3), WireGuard/WARP и игровой трафик. Весит вместе с TLS-стеком меньше 500 КБ — Xray или
+  sing-box занимают 20-40 МБ и на такой роутер не встают.
+- **WireGuard поверх поддельного TCP** для сетей, где UDP режут или пропускают по белому списку
+  протоколов. Серверная половина ставится на VPS, см. [server/](server/README.md).
 
-Download the pre-compiled `.apk` packages for your architecture from the [Releases](https://github.com/xyzmean/steer/releases) page. The architecture in the filename matches `DISTRIB_ARCH` from `/etc/openwrt_release`.
+## Установка
+
+Возьмите пакет своей архитектуры со страницы [релизов](https://github.com/xyzmean/steer/releases).
+Архитектура в имени файла — та же, что показывает `DISTRIB_ARCH` в `/etc/openwrt_release`.
 
 ```sh
-# For basic routing
-apk add --allow-untrusted ./steer-<version>-1_<arch>.apk
+# OpenWrt 24.10 и новее (менеджер пакетов apk)
+apk add --allow-untrusted ./steer-extended-<версия>-1_<арх>.apk
 
-# Or for VLESS/Reality support
-apk add --allow-untrusted ./steer-extended-<version>-1_<arch>.apk
+# OpenWrt 23.05, 22.03 и старше (менеджер пакетов opkg)
+opkg install ./steer-extended-<версия>-1_<арх>.ipk
 ```
-*Note: `steer-extended` acts as a drop-in replacement and provides all base features plus VLESS/Reality support.*
 
-## Configuration (spec.json)
+Какой из двух пакетов брать:
 
-Steer is configured via a JSON specification file (typically `/etc/steer/spec.json`). The engine reads this file to determine traffic channels and output interfaces. 
+| Пакет | Когда нужен |
+|---|---|
+| `steer` | Туннель уже работает — WireGuard, AmneziaWG, что угодно. Движку остаётся только маршрутизировать. |
+| `steer-extended` | Туннель должен поднимать сам движок: есть ссылка подписки VLESS/Reality или отдельные ссылки `vless://`. Умеет всё то же, что базовый, плюс клиент. |
 
-### Example Configuration
+Пакеты взаимозаменяемы: `steer-extended` объявляет себя заменой базового, поэтому ставится поверх
+без удаления настроек. Одновременно они стоять не могут — оба владеют `/usr/sbin/steer`.
+
+Расширенному пакету нужен `kmod-tun`: без него туннель не поднимется, и движок скажет об этом прямо.
+
+## Быстрый старт
+
+Спека лежит в `/etc/steer/spec.json`. Минимальная конфигурация — «список адресов в туннель, всё
+остальное напрямую»:
 
 ```json
 {
@@ -40,119 +68,272 @@ Steer is configured via a JSON specification file (typically `/etc/steer/spec.js
   "lan_device": "br-lan",
   "from_default": ["192.168.1.0/24"],
   "outputs": {
-    "vpn": {
-      "kind": "interface",
-      "devices": ["awg0", "wg0"],
-      "on_fail": "drop"
-    },
-    "vless_out": {
-      "kind": "vless",
-      "sub_file": "/etc/steer/sub.txt",
-      "on_fail": "zapret"
-    },
-    "direct": {
-      "kind": "direct"
-    }
+    "vpn":    { "kind": "interface", "device": "wg0", "on_fail": "drop" },
+    "direct": { "kind": "direct" }
   },
   "channels": [
-    {
-      "name": "geoblock",
-      "match": { "domains_files": ["/etc/steer/lists/geo.lst"] },
-      "out": "vpn"
-    },
-    {
-      "name": "blocked_ips",
-      "match": { "prefixes_files": ["/etc/steer/lists/ipsum.lst"] },
-      "out": "vless_out"
-    },
-    {
-      "name": "smart_tv",
-      "from": ["192.168.1.50"],
-      "match": { "any": true, "allow_all": true },
-      "out": "direct"
-    }
+    { "name": "блоклист",
+      "match": { "prefixes_files": ["/etc/steer/lists/blocked.lst"] },
+      "out": "vpn" }
   ]
 }
 ```
 
-### JSON Fields Explained
-
-- **`schema`**: Configuration schema version (must be `1`).
-- **`lan_device`**: The local network interface (e.g., `br-lan`).
-- **`from_default`**: The default source subnet(s) to apply rules to if a channel doesn't specify one.
-
-#### `outputs`
-Defines the destination routing interfaces.
-- **`kind`**: Type of output (`interface`, `vless`, or `direct`).
-- **`devices` / `device`**: Network interface names (e.g., `wg0`, `tun0`). If an array is provided, it acts as a priority list for failover.
-- **`on_fail`**: Action to take if all devices in the output are down.
-  - `drop` (default): Block traffic (blackhole) to prevent leaks.
-  - `direct`: Route traffic directly without VPN.
-  - `zapret`: Route directly, but verify that a DPI bypass (zapret) is running.
-- **`sub_file`**: (VLESS only) Path to the subscription file.
-
-#### `channels`
-Defines routing policies. Evaluated in order (top to bottom). The first match wins.
-- **`name`**: Channel identifier.
-- **`from`**: (Optional) Source IP or MAC addresses. All entries must be the **same type** — a `from` array may contain IPs **or** MACs, but mixing the two is rejected (e.g., `["192.168.1.50", "192.168.1.51"]` or `["00:11:22:33:44:55"]`). To route both a host and a MAC, define two channels.
-- **`enabled`**: (Optional, default `true`) Set to `false` to keep a channel in the spec without installing any rules — it generates no nft set and no chain entry, and is skipped by sanity checks. Handy for temporarily disabling a broken rule without deleting it.
-- **`out`**: The name of the output (defined in `outputs`) where matched traffic should go.
-- **`match`**: Conditions for the traffic:
-  - **`domains_files`**: Array of file paths containing domains to match. Uses the built-in `dnsd` resolver.
-  - **`prefixes_files`**: Array of file paths containing IP subnets (CIDR) to match.
-  - **`mode`**: DNS resolution mode for domain lists. `fakeip` (default, highly accurate) or `realip`.
-  - **`any`** / **`allow_all`**: Use `true` to match all traffic from the specified source.
-
-## Command Line Interface
-
-The binary is self-documenting: `steer help` lists every command grouped by purpose, and
-`steer help <command>` (or `steer <command> --help`) prints the synopsis, what the command
-actually does, and every flag it accepts. `steer --version` reports the version and whether
-this is the base or the extended build.
-
-Help goes to stdout and exits `0`; anything printed to stderr with exit `2` is an error.
-Unknown flags are refused rather than ignored — `steer apply --dryrun` fails instead of
-quietly applying the ruleset for real.
-
-- `steer apply [--dry-run]` — Compiles the JSON spec into active `nftables` rules and routing tables.
-- `steer status` — Outputs the current applied state in JSON format.
-- `steer diag` — Runs diagnostics and reports the health of the engine (exits with `1` if broken).
-- `steer explain <ip|domain>` — Explains exactly which channel and output a given address or domain will use.
-- `steer outputs [--kind K|--obfs]` — Lists output names, one per line.
-- `steer needs-dnsd` — Exits `0` when the spec has domain channels and the resolver is needed.
-- `steer dnsd` — The resolver that backs domain channels.
-- `steer fit --budget N <file>` — Aggregates and trims an IP list to fit within `N` memory elements.
-- `steer failover` — Checks output health and updates active interfaces based on priority.
-- `steer vless <output>` / `vless-nodes` / `vless-probe` — VLESS/Reality tunnel, subscription nodes, node latency check (`steer-extended` only).
-- `steer obfs <output>` / `steer obfs-server --listen PORT --forward HOST:PORT` — WireGuard over a fake TCP stream, client and server halves.
-
-Common flags: `--spec FILE` (default `/etc/steer/spec.json`) and `--state-dir DIR`
-(default `/var/lib/steer`) are accepted by every command that reads the spec.
-
-### Log levels (journal contract)
-
-steer writes diagnostics to the system journal (stderr). Each line carries a stable prefix that names its severity — this prefix is the parseable contract, since the prose wording may change between releases:
-
-- `steer[warn]` — a real concern: something is broken or routing traffic the wrong way.
-- `steer[info]` — informational status, not an alarm.
-
-A control plane (e.g., splify2) should classify a line by this prefix rather than by its text. The prefix appears before a subsystem label (for example, `steer[warn] tunnel: ...`).
-
-## Building from Source
-
-Steer is written in C and uses Zig as a cross-compiler to build static musl binaries for all architectures.
-
 ```sh
-make                      # Native build for development
-make test                 # Run offline unit tests
-./build.sh                # Build static binaries and APKs for all architectures using Docker
+steer apply --dry-run          # посмотреть, что получится, ничего не применяя
+steer apply                    # применить
+steer status                   # что стоит сейчас
+steer diag                     # проверки состояния: что сломано и почему
+steer explain example.org      # какой канал и выход достанутся этому имени
 ```
 
-## Documentation
+Списки — обычные текстовые файлы, по записи на строку. Адресные: `10.0.0.0/8`, `1.2.3.4` (это то
+же, что `/32`), диапазон `10.0.0.1-10.0.0.9`. Доменные: `example.org`, `*.example.org`,
+`=exact.example.org` (только это имя), `re:` с регулярным выражением. Пустые строки и строки,
+начинающиеся с `#` или `;`, пропускаются.
 
-For deep technical details on the Steer architecture:
-- [contract-v1.md](docs/contract-v1.md): Specification format, state format, invariants.
-- [vless.md](docs/vless.md): Architecture of the integrated VLESS/Reality client.
+Движок списки **не скачивает**: он читает то, что ему положили. Это сознательное разделение —
+скачивание, расписания и выбор источника принадлежат управляющему слою.
+
+## Настройка: spec.json
+
+Полное описание формата, ограничений и инвариантов — [docs/contract-v1.md](docs/contract-v1.md).
+Здесь — то, что нужно в первую очередь.
+
+### Верхний уровень
+
+| Поле | Значение |
+|---|---|
+| `schema` | Версия формата. Сейчас `1`, обязательно. |
+| `lan_device` | Локальный мост, обычно `br-lan`. Нужен для перенаправления DNS по IPv6: префикс там меняется, и правило цепляется за устройство, а не за адрес. |
+| `from_default` | Подсети клиентов по умолчанию — для каналов, где `from` не задан. Если поле не задано вовсе, движок определяет подсеть сам по адресу `lan_device`. |
+| `outputs` | Выходы: куда можно направить трафик. |
+| `channels` | Правила: какой трафик куда идёт. Порядок значим. |
+| `traceroute_hops` | Необязательно. Делает узлы в `traceroute` осмысленными; требует правила в чужом firewall, поэтому по умолчанию выключено — движок скажет, чего не хватает. |
+
+Имена выходов и устройств могут состоять только из латиницы, цифр, `_`, `-` и точки: они
+подставляются в командные строки и в имена наборов `nftables`, и парсер отвергает всё остальное при
+загрузке. Имена каналов — подписи для человека, в них можно писать по-русски; нельзя только
+кавычку, обратную косую и управляющие символы.
+
+### Выходы
+
+```json
+"outputs": {
+  "vpn":      { "kind": "interface", "devices": ["awg0", "wg0"], "on_fail": "drop" },
+  "vless_out":{ "kind": "vless", "sub_file": "/etc/steer/sub.txt", "on_fail": "zapret" },
+  "direct":   { "kind": "direct" }
+}
+```
+
+- `kind` — `interface` (уже существующее устройство), `vless` (движок поднимает туннель сам) или
+  `direct` (без туннеля).
+- `device` / `devices` — имя устройства или список в порядке предпочтения. Список — это приоритет:
+  сторож берёт первое живое. Задан один — второе выводится, так что дальше по коду путь один.
+- `on_fail` — что делать, когда не работает ни одно устройство выхода:
+
+  | Значение | Поведение |
+  |---|---|
+  | `drop` (по умолчанию) | Трафик останавливается. Канал заводят именно для того, чтобы трафик НЕ шёл напрямую; молча вернуть его на открытый путь в момент поломки — значит нарушить единственное обещание выхода ровно тогда, когда это опаснее всего. |
+  | `direct` | Трафик идёт напрямую. |
+  | `zapret` | Напрямую, но движок проверяет, что обход DPI действительно запущен. |
+
+- `sub_file` — только для `kind: vless`: файл с узлами подписки.
+- `node` — номер узла подписки. `-1` (по умолчанию) означает «первый рабочий»: выбор делает
+  проверка при подъёме, а не человек, угадывающий номер.
+- `obfs` — WireGuard поверх поддельного TCP, только для `kind: interface`. Поля: `server`,
+  `server_port`, `listen`, `listen_port`.
+
+### Каналы
+
+```json
+{ "name": "телевизор",
+  "from": ["192.168.1.50"],
+  "match": { "domains_files": ["/etc/steer/lists/tv.lst"], "mode": "fakeip" },
+  "out": "vpn" }
+```
+
+- `name` — подпись. Она же уходит в `status`, чтобы у счётчика было имя.
+- `from` — адреса или MAC-адреса клиентов. **Либо адреса, либо MAC — смешивать нельзя**: адрес
+  меняется, MAC живёт, и для ядра это два разных условия. Чтобы охватить и хост, и MAC, заведите два
+  канала.
+- `enabled` — `false` выключает правило целиком: ни набора, ни правила в цепочке, и проверки его
+  пропускают. Удобно, чтобы отключить правило на вечер, не удаляя его вместе с выбранными списками.
+- `out` — имя выхода.
+- `match` — условия:
+  - `prefixes_files` — файлы со списками адресов;
+  - `domains_files` — файлы со списками доменов (работает через `dnsd`);
+  - `mode` — режим резолвера для доменов, `fakeip` (по умолчанию) или `realip`, см. ниже;
+  - `any` вместе с `allow_all` — забрать **весь** трафик указанных клиентов. Оба поля обязательны:
+    один `any` отвергается, потому что это почти всегда описка, а её последствие — клиенты теряют и
+    роутер, и DNS, то есть чинить придётся с провода.
+
+Адреса и домены в одном канале — можно: набор один, просто заполняется с двух сторон.
+
+### fakeip или realip
+
+| | `fakeip` (по умолчанию) | `realip` |
+|---|---|---|
+| Как работает | Резолвер выдаёт клиенту служебный адрес из `198.18.0.0/15`, ядро подменяет его на настоящий через DNAT | Резолвер отдаёт настоящий ответ апстрима и кладёт этот адрес в набор канала |
+| Точность | Пер-домен, максимальная | Теряется там, где два домена живут на одном адресе |
+| `traceroute` | Все узлы показывают поддельный адрес: ядро переписывает ICMP-ошибки так, будто они пришли с того адреса, к которому обращался клиент | Узлы читаются нормально |
+
+Берите `fakeip`, пока не понадобится читаемый `traceroute`.
+
+## Команды
+
+Движок сам себя документирует:
+
+```sh
+steer help                 # список команд по разделам
+steer help apply           # что делает команда и какие у неё флаги
+steer apply --help         # то же самое
+steer --version            # версия и вариант сборки: базовая или расширенная
+```
+
+| Команда | Что делает |
+|---|---|
+| `apply [--dry-run]` | Скомпилировать спеку в правила. `--dry-run` печатает готовый ruleset и ничего не применяет. |
+| `status` | Применённое состояние: выходы, выбранные устройства, каналы, счётчики. JSON. |
+| `diag` | Проверки состояния: таблица, наборы, устройства, резолвер, маскарад, обфускация. JSON. |
+| `explain <адрес\|имя>` | Какой канал поймает адрес и в какой выход он уйдёт. Отвечает на вопрос «почему этот сайт идёт не туда». |
+| `outputs [--kind K] [--obfs]` | Перечислить выходы. Нужно init-скрипту, чтобы знать, для каких выходов поднимать процессы. |
+| `needs-dnsd` | Кодом возврата: нужен ли резолвер этой спеке. |
+| `dnsd` | Сам резолвер. Работает на переднем плане, процессом управляет procd. |
+| `failover` | Выбрать живое устройство для каждого выхода. Запускается по кругу из init-скрипта. |
+| `fit [файл]` | Подогнать список префиксов под память. |
+| `vless <выход>` | Поднять TUN и клиент VLESS/Reality. Только `steer-extended`. |
+| `vless-nodes <выход>` | Узлы подписки, JSON. |
+| `vless-probe <выход>` | Проверить узел и замерить задержку. |
+| `obfs <выход>` | WireGuard поверх поддельного TCP, клиентская половина. |
+| `obfs-server --listen ПОРТ --forward АДРЕС:ПОРТ` | Серверная половина, для VPS. |
+
+Общие флаги: `--spec ФАЙЛ` (по умолчанию `/etc/steer/spec.json`) и `--state-dir КАТАЛОГ` (по
+умолчанию `/var/lib/steer`) принимает каждая команда, читающая спеку.
+
+Разбор аргументов строгий: неизвестный флаг, флаг, которого команда не понимает, потерянное
+значение и не-число там, где ждали число, — это отказ с кодом 2, а не молчание. Опечатка в
+`--dry-run` не применит правила по-настоящему.
+
+Коды возврата и разделение потоков описаны в [docs/contract-v1.md](docs/contract-v1.md) §6. Коротко:
+`0` — сделано, `2` — движок отказался, а `1` зависит от команды и означает «отрицательный ответ» у
+`diag`, `needs-dnsd` и `fit`, но настоящий провал у `apply`.
+
+## Подгонка списков под память
+
+```sh
+steer fit --budget 20000 --report /tmp/fit.json < ru.lst > ru-fitted.lst
+```
+
+Фиттер объединяет соседние префиксы по плотности: если внутри `/24` лежат хотя бы два адреса из
+списка, вся сеть заменяется одним элементом. Отчёт говорит, сколько адресов при этом добавилось
+лишних (`waste_addresses`) и влезло ли вообще (`fits`).
+
+Если не влезает — по умолчанию список выходит **целиком** с пометкой `fits:false`, а не обрезается:
+тихая дыра над одним адресом хуже честного отказа. Обрезать хвост разрешает `--truncate`.
+
+`--exclude` принимает список адресов, которые не должны попасть в результат. `--punch-out` вместо
+отказа от объединения выписывает пересечения в отдельный файл — их держат отдельным каналом с более
+высоким приоритетом. На национальном блок-листе против исключения в 44 тысячи префиксов это разница
+между 14 665 элементами (не влезает) и 10 225 плюс 443 исключения.
+
+## Диагностика
+
+`steer diag` отвечает JSON со списком проверок и вердиктами `ok`, `note`, `warn`, `fail`. Код
+возврата 1 означает, что хотя бы одна проверка — `fail`; JSON при этом полный и валидный.
+
+`steer explain <адрес|имя>` называет канал и выход. Это первое, что стоит спросить, когда сайт идёт
+не туда.
+
+Движок пишет в журнал с префиксом уровня — `steer[warn]` или `steer[info]`, — и классифицировать
+строки следует по префиксу, а не по тексту: формулировки меняются между версиями. За префиксом идёт
+метка подсистемы: `apply`, `failover`, `dnsd`, `obfs`, `tunnel`. Отказы тому, кто позвал движок
+(негодная спека, плохой аргумент), уровня не несут: это ответ вызывающему, а не запись в журнал.
+
+### Что случается чаще всего
+
+**Домены не маршрутизируются, а адресные списки работают.** Резолвер не запущен или не перечитал
+спеку. `steer diag` назовёт это; `needs-dnsd` отвечает, нужен ли он вообще.
+
+**Публичный резолвер внутри списка канала.** Списки по номеру автономной системы забирают всё, что
+живёт в той же AS, поэтому `8.8.8.0/24` приезжает в категорию «Google», а `1.1.1.0/24` — в
+Cloudflare. Такой адрес уводит в туннель DNS клиентов, которые ходят напрямую к публичному
+резолверу. `diag` находит это и называет и резолвер, и файл.
+
+**Трафик уходит в туннель и не возвращается.** У выхода нет NAT. `diag` проверяет наличие
+маскарада для устройства и говорит об этом отдельной строкой — само правило движок не ставит, это
+чужая конфигурация.
+
+**Через туннель работает всё, кроме больших пакетов.** MTU. Особенно при обфускации, см.
+[server/README.md](server/README.md).
+
+**Канал заведён, а трафик им не идёт.** Проверьте порядок: побеждает первый совпавший канал. И
+посмотрите `from` — если клиента там нет, правило его не касается.
+
+## Обфускация: WireGuard поверх TCP
+
+Для сетей, где UDP режут. Клиентская половина — в движке, серверная ставится на VPS из архива
+`steer-obfs-<версия>-<арх>.tar.gz` со страницы релизов:
+
+```sh
+tar xzf steer-obfs-<версия>-x86_64.tar.gz
+cd obfs-x86_64 && sudo sh install.sh --port 4567 --forward 127.0.0.1:51820
+```
+
+Бинарник в архиве статический и тот же, что в пакете для роутера, — компилятор на сервере не нужен.
+Подробности, требования к firewall и расчёт MTU — [server/README.md](server/README.md).
+
+Формат на проводе совместим с [phantun](https://github.com/dndx/phantun): с той стороны может
+стоять `phantun_server`.
+
+Этот слой **не шифрует** (это делает WireGuard) и не защищает от целенаправленного зондирования:
+поток без ретрансмиссий отличим от настоящего TCP при анализе. Задача — пройти там, где UDP режут,
+а не спрятаться от исследователя.
+
+## Сборка из исходников
+
+```sh
+make                      # нативная сборка для разработки
+make test                 # весь набор стендов, офлайн: без роутера, без сети, без nft
+./build.sh                # статические бинарники и пакеты всех архитектур (нужен Docker)
+```
+
+Роутерные сборки — статические musl через кросс-тулчейн zig, по бинарнику на архитектуру. Статика
+означает, что не нужно подбирать версию libc под конкретный релиз OpenWrt: одна сборка обслуживает
+все релизы для своей архитектуры.
+
+`./build.sh` кладёт в `out/` четыре вида артефактов: `.apk` и `.ipk` для каждой архитектуры (по два
+пакета — базовый и расширенный) и архивы `steer-obfs` для x86_64 и aarch64.
+
+`make test` обязателен перед правкой: почти каждый стенд там стоит на конкретной поломке, которая
+однажды случилась, и в его комментарии написано, на какой именно.
+
+## Документация
+
+- [docs/contract-v1.md](docs/contract-v1.md) — формат спеки, формат состояния, ограничения ввода,
+  контракт командной строки и журнала, инварианты. Это то, на что опирается управляющий слой.
+- [docs/vless.md](docs/vless.md) — устройство встроенного клиента VLESS/Reality: транспорты,
+  Reality, Vision, UDP и QUIC, задержка установления соединения, коды возврата.
+- [server/README.md](server/README.md) — серверная половина обфускации.
+
+## Известные ограничения
+
+- **Настройки не попадают в резервную копию OpenWrt.** `/etc/steer/spec.json` и
+  `/etc/steer/sub.txt` не объявлены файлами конфигурации пакета, поэтому `sysupgrade` и «Создать
+  архив» в LuCI их не берут. После обновления прошивки «с сохранением настроек» подписка выглядит
+  настроенной, а правил, выходов и узлов нет. Сохраняйте руками:
+
+  ```sh
+  tar czf /tmp/steer-backup.tar.gz /etc/steer/spec.json /etc/steer/sub.txt
+  ```
+
+  Списки в `/etc/steer/lists` восстанавливать не обязательно: отсутствующий список не мешает
+  применению, а управляющий слой скачает их по расписанию.
+- **ICMP через туннель VLESS не идёт.** Успешный `ping` через прокси не означал бы работающий
+  путь, поэтому всё, что не TCP и не UDP, получает ICMP «порт недостижим».
+- **Только IPv4 в правилах.** Каналы работают по адресам IPv4; для IPv6 движок ставит
+  перенаправление DNS, но маршрутизации по правилам там нет.
 
 ---
-*If you need a complete UI and automated lists, consider using [splify2](https://github.com/xyzmean/splify2).*
+*Нужен готовый интерфейс с каталогом сервисов и автообновлением списков —
+[splify2](https://github.com/xyzmean/splify2).*

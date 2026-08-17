@@ -1,12 +1,17 @@
-# Steer Contract (Schema 1)
+# Контракт steer (схема 1)
 
-This document describes the interface between the control plane (e.g., [splify2](https://github.com/xyzmean/splify2)) and the steer routing engine. 
+Это интерфейс между управляющим слоем (например, [splify2](https://github.com/xyzmean/splify2)) и
+движком маршрутизации steer. Всё, что здесь описано, — обещание движка наружу; всё, чего здесь нет,
+может измениться между версиями без предупреждения.
 
-The configuration format is JSON. JSON was chosen because it is natively supported by OpenWrt (`jsonfilter`, `blobmsg`, LuCI) and preserves array ordering, which is semantically significant for steer channels. Unknown keys in the specification are silently ignored to ensure forward compatibility.
+Формат настройки — JSON. Выбран потому, что в OpenWrt он поддержан из коробки (`jsonfilter`,
+`blobmsg`, LuCI) и сохраняет порядок массивов, а для каналов steer порядок значим. Незнакомые ключи
+движок молча пропускает — это запас на совместимость вперёд: спека, написанная более новым
+интерфейсом, не должна ронять маршрутизацию на не обновлённом роутере.
 
-## 1. Specification (Input)
+## 1. Спека (вход)
 
-The specification file is typically located at `/etc/steer/spec.json`.
+Обычно лежит в `/etc/steer/spec.json`.
 
 ```json
 {
@@ -23,21 +28,37 @@ The specification file is typically located at `/etc/steer/spec.json`.
 }
 ```
 
-### Global Configuration
-- **`schema`**: Must be `1`.
-- **`lan_device`**: The internal network interface (e.g., `br-lan`). Needed for DNS redirection.
-- **`from_default`**: Subnets applied to channels that do not explicitly specify a `from` array.
+### Верхний уровень
 
-### Outputs
-Defines the destination routing interfaces.
-- **`kind`**: Type of output (`interface`, `vless`, or `direct`).
-- **`devices` / `device`**: Interface name(s). If an array is used, it defines the failover priority order.
-- **`on_fail`**: Action if all interfaces fail. Options: `drop` (default, blackhole to prevent leaks), `direct`, `zapret`.
-- **`obfs`**: (Optional, `kind: interface` only.) Carries the tunnel's UDP transport inside a fake
-  TCP stream — WireGuard over TCP, wire-compatible with phantun. Adds 12 bytes of overhead
-  (a 20-byte TCP header instead of an 8-byte UDP one) and keeps datagram semantics: no
-  retransmission, no flow control, one datagram per segment. Present on both the base and the
-  extended package.
+- **`schema`** — обязательно `1`.
+- **`lan_device`** — локальный мост (например, `br-lan`). Нужен для перенаправления DNS: у локального
+  префикса IPv6 нет стабильного адреса (ULA плюс делегированный глобальный, который меняется),
+  поэтому правило цепляется за устройство, а не за адрес.
+- **`from_default`** — подсети клиентов для каналов, где `from` не задан. Если поля нет вовсе, движок
+  определяет подсеть сам, читая адрес `lan_device`, — так же, как это делает uci в OpenWrt. Без
+  этого правило DNS-перенаправления не генерировалось бы, клиенты уходили бы к dnsmasq напрямую, и
+  fake-IP молча не работал бы: «с роутера работает, с устройств нет», причём цепочка синтаксически
+  цела, просто в ней нет правила.
+- **`traceroute_hops`** — необязательно. Делает узлы в `traceroute` осмысленными. Требует правила в
+  чужом firewall, которым движок не владеет, поэтому по умолчанию выключено: читаемые, но неверные
+  узлы хуже отсутствующих. Движок предупреждает, чего именно не хватает.
+
+### Выходы (`outputs`)
+
+- **`kind`** — `interface`, `vless` или `direct`.
+- **`devices` / `device`** — имя устройства или список. Список задаёт порядок предпочтения для
+  failover. Задан один — второй выводится, чтобы дальше по коду не было двух путей.
+- **`on_fail`** — что делать, когда не работает ни одно устройство: `drop` (по умолчанию — блокировка,
+  чтобы трафик не утёк в открытый интернет), `direct`, `zapret`.
+- **`node`** — только для `kind: vless`: номер узла подписки. `-1` (по умолчанию) — «первый рабочий»:
+  выбор делает проверка при подъёме, а не человек, угадывающий номер.
+- **`sub_file`** — только для `kind: vless`: файл с узлами подписки.
+- **`obfs`** — необязательно, только для `kind: interface`. Несёт UDP-транспорт туннеля внутри
+  поддельного потока TCP (WireGuard поверх TCP, совместимо на проводе с phantun). Добавляет 12 байт
+  накладных (заголовок TCP 20 байт вместо UDP 8) и сохраняет семантику датаграмм: без
+  ретрансмиссий, без управления потоком, одна датаграмма на сегмент. Есть и в базовом, и в
+  расширенном пакете.
+
   ```json
   "vpn": {
     "kind": "interface", "device": "wg0", "on_fail": "drop",
@@ -46,82 +67,145 @@ Defines the destination routing interfaces.
               "listen": "127.0.0.1:51820" }
   }
   ```
-  - **`mode`**: (Optional.) Only `wg-over-tcp` exists today; an absent value means it. An unknown
-    value is rejected rather than assumed.
-  - **`server`**: Address and port of the obfuscation server (`steer obfs-server` or upstream
-    `phantun_server`). Must be a literal IPv4 address, not a hostname: resolving a name would
-    mean asking DNS, which may itself be routed through the tunnel this server is bringing up.
-    The control plane resolves it and writes the address.
-  - **`listen`**: Local address and port the obfuscator listens on. It must equal the peer's
-    `Endpoint` in `/etc/config/network` — this is the one place where two configurations must
-    agree, and the engine cannot derive one from the other because WireGuard keys and peers are
-    not its property. A mismatch is silent: WireGuard sends into nowhere.
-  - **MTU**: the tunnel interface MTU must not exceed `link_mtu − 72` (outer IP 20 + fake TCP 20 +
-    WireGuard 32) — 1428 on a 1500-byte link, 1420 on PPPoE. Both ends of the tunnel must use the
-    same MTU. `steer diag` computes the limit from the actual egress device and warns with the
-    exact number.
-  - Enumerated by `steer outputs --obfs`; run by `steer obfs <output>` (a procd instance named
-    `obfs_<output>`). The process installs one nft rule of its own, in table `inet steer_obfs`,
-    which drops the kernel's RST for its own flow — without it the router's own stack tears down
-    the session. The rule lives outside `inet steer` because `apply` rebuilds that table whole.
 
-### Channels
-Defines routing rules. The array order dictates the priority (first match wins).
-- **`name`**: Identifier for the channel.
-- **`enabled`**: (Optional, default `true`). When `false`, the channel stays in the spec but installs no nft set and no chain rule, and is skipped by the sanity checks. Use this to keep a rule on file while disabling it.
-- **`from`**: Array of source IP **or** MAC addresses. All entries in one array must be the same type — mixing IP and MAC addresses in a single `from` array is rejected with an error, because nft cannot express "IP or MAC" inside one rule. To match both a host and a MAC, define separate channels.
-- **`match`**: Object containing conditions:
-  - **`domains_files`** / **`domains_file`**: Paths to domain lists. A channel may combine `domains_files` and `prefixes_files` (address + domain matching in one channel is supported).
-  - **`prefixes_files`** / **`prefixes_file`**: Paths to IP lists.
-  - **`mode`**: DNS mode for domain channels. `fakeip` (issues addresses from `198.18.0.0/15`, default) or `realip`.
-  - **`any`** & **`allow_all`**: Must both be `true` to match all traffic from the specified sources.
-- **`out`**: The target output name.
+  - **`mode`** — необязательно. Сегодня существует только `wg-over-tcp`, и отсутствие значения
+    означает его. Незнакомое значение отвергается, а не додумывается.
+  - **`server`** — адрес и порт сервера обфускации (`steer obfs-server` или апстримный
+    `phantun_server`). Обязательно литерал IPv4, не имя: разрешение имени означало бы обращение к
+    DNS, а он сам может быть направлен в туннель, который этот сервер и поднимает. Разрешает имя
+    управляющий слой и записывает адрес.
+  - **`listen`** — локальный адрес и порт, которые слушает обфускатор. Обязан совпадать с
+    `Endpoint` пира в `/etc/config/network`. Это единственное место, где две настройки должны
+    сойтись, и вывести одну из другой движок не может: ключи и пиры WireGuard — не его
+    собственность. Расхождение молчаливо: WireGuard отправляет в никуда.
+  - **MTU** — MTU интерфейса туннеля не должен превышать `MTU канала − 72` (внешний IP 20 +
+    поддельный TCP 20 + WireGuard 32): 1428 при обычных 1500, 1420 на PPPoE. На обеих сторонах
+    туннеля MTU обязан совпадать. `steer diag` считает предел от настоящего исходящего устройства и
+    предупреждает точным числом.
+  - Перечисляются `steer outputs --obfs`, запускаются `steer obfs <выход>` (экземпляр procd с
+    именем `obfs_<выход>`). Процесс ставит одно своё правило nft в таблице `inet steer_obfs`,
+    которое отбрасывает RST собственного ядра для своего потока: без него стек роутера сам рвёт
+    сессию. Правило живёт вне `inet steer` потому, что `apply` пересобирает ту таблицу целиком.
 
-## 2. State (Output)
+### Каналы (`channels`)
 
-Requested via `steer status`. Returns the currently applied configuration and live states.
+Порядок массива задаёт приоритет: побеждает первый совпавший.
+
+- **`name`** — подпись канала. Уходит в `status`, чтобы у счётчика было имя.
+- **`enabled`** — необязательно, по умолчанию `true`. При `false` канал остаётся в спеке, но не
+  создаёт ни набора nft, ни правила в цепочке, и проверки его пропускают. «Выключено» значит «не
+  действует», а не «действует тише».
+- **`from`** — массив адресов **или** MAC-адресов источника. Все записи одного массива обязаны быть
+  одного типа: смешивание отвергается с ошибкой, потому что nft не выражает «IP или MAC» внутри
+  одного правила. Чтобы охватить и хост, и MAC, заведите отдельные каналы.
+- **`out`** — имя выхода.
+- **`match`** — условия:
+  - **`domains_files`** / **`domains_file`** — пути к доменным спискам. Единственное число —
+    сокращение для списка из одного элемента, обе формы равноправны.
+  - **`prefixes_files`** / **`prefixes_file`** — пути к адресным спискам. Канал может совмещать
+    адреса и домены: набор один, просто заполняется с двух сторон.
+  - **`mode`** — режим резолвера для доменных каналов: `fakeip` (выдаёт адреса из `198.18.0.0/15`,
+    по умолчанию) или `realip`.
+  - **`any`** и **`allow_all`** — оба обязательно `true`, чтобы забрать весь трафик указанных
+    источников. Один `any` отвергается: это почти всегда описка, а её последствие — клиенты теряют
+    и роутер, и DNS, то есть чинить придётся с провода.
+
+### Формы записей в списках
+
+Файлы списков — обычный текст, по записи на строку. Пустые строки и начинающиеся с `#` или `;`
+пропускаются.
+
+Адресные списки:
+
+| Форма | Пример |
+|---|---|
+| Хост | `1.2.3.4` (равно `/32`) |
+| Префикс | `10.0.0.0/8` |
+| Диапазон | `10.0.9.0-10.0.9.5` |
+
+Диапазон принимается наравне с префиксом, и это существенно: `steer fit` сам выдаёт диапазоны — два
+соседних адреса, не складывающихся в выровненный префикс, объединяются именно так. Набор объявлен с
+`flags interval` и `auto-merge`, поэтому nft принимает такой элемент как обычный.
+
+Доменные списки:
+
+| Форма | Смысл |
+|---|---|
+| `example.org` | Имя и все его поддомены |
+| `*.example.org`, `foo?.example.org` | Шаблон (`*` и `?`) |
+| `=example.org` | Только это имя, без поддоменов |
+| `re:^.*\.example\.org$` | Регулярное выражение (POSIX extended, регистр не важен) |
+
+Регистр букв не важен нигде. Негодное регулярное выражение пропускается как одна строка, а не роняет
+резолвер.
+
+## 2. Состояние (выход)
+
+Запрашивается `steer status`. Отдаёт применённую конфигурацию и живое состояние.
 
 ```json
 {
   "schema": 1,
   "outputs": {
-    "vpn": { "kind": "interface", "device": "awg0", "up": true, "mark": "0x00100000", "table": 300, "in_firewall": true, "nat": true }
+    "vpn": { "kind": "interface", "device": "awg0", "up": true, "mark": "0x00100000",
+             "table": 300, "in_firewall": true, "nat": true }
   },
   "channels": [
-    { "name": "vpn_dom", "out": "vpn", "kind": "domains", "live": true, "packets": 5009, "bytes": 1799237, "down_packets": 4120, "down_bytes": 5981023, "lists": 2, "channels": ["youtube", "google"] }
+    { "name": "vpn_dom", "out": "vpn", "kind": "domains", "live": true,
+      "packets": 5009, "bytes": 1799237, "down_packets": 4120, "down_bytes": 5981023,
+      "lists": 2, "channels": ["youtube", "google"] }
   ]
 }
 ```
-- **`channels`**: In the output, these represent merged groups (channels sharing the same output and matching criteria), not the original 1-to-1 spec channels.
-- **`live`**: `false` means the rule is missing from the kernel.
-- **`packets` / `bytes`**: Outbound (upload) counters — packets leaving the router toward the output. `bytes` deliberately keeps this "outbound" meaning for backward compatibility with installed control planes.
-- **`down_packets` / `down_bytes`**: Inbound (download) counters, counted on the `postrouting_down` chain. Emitted only when the channel carries download traffic. Do not repurpose `bytes` for download — existing UIs read it as upload.
-- **`lists`**: Number of source list files backing this merged group.
-- **`in_firewall` / `nat`**: Diagnostic flags indicating if the tunnel is correctly configured in the OpenWrt firewall.
-- **`obfs`**: Present only when the output carries its transport over fake TCP. Mirrors the spec —
-  `{ "mode": "wg-over-tcp", "server": "203.0.113.10:4567", "listen": "127.0.0.1:51820" }`. It
-  deliberately carries **no liveness flag**: `status` is polled every few seconds and checking a
-  process means spawning one. The verdict on whether the obfuscator is running belongs to `diag`,
-  which is asked on demand.
 
-## 3. Input Limits and Validation
+- **`channels`** в выводе — это **объединённые группы**, а не исходные каналы спеки один к одному.
+  Каналы, совпадающие по выходу, виду списка, клиентам и режиму резолвера, сливаются в одну группу с
+  одним набором и одним правилом. Имена исходных каналов группы приходят в поле `channels` — это то,
+  что стоит показывать человеку, а не имя набора.
+- **`name`** — имя набора nft. Формируется из выхода и вида: `vpn_ip`, `vpn_dom`. Когда группа
+  отличается от умолчаний (свой список клиентов или `realip`), к имени добавляется различитель:
+  `vpn_ip_c1`, `vpn_dom_c0r`. Разбирать это имя не нужно и не следует — оно служебное.
+- **`live`** — `false` означает, что правила нет в ядре.
+- **`packets` / `bytes`** — счётчики ИСХОДЯЩЕГО (upload): пакеты, уходящие от роутера к выходу.
+  Значение «исходящий» у `bytes` сохранено намеренно, ради совместимости с установленными
+  управляющими слоями.
+- **`down_packets` / `down_bytes`** — счётчики ВХОДЯЩЕГО (download), считаются в цепочке
+  `postrouting_down`. Печатаются только когда по каналу шло скачивание. Не переиспользуйте `bytes`
+  под download: существующие интерфейсы читают его как upload.
+- **`lists`** — сколько файлов списков стоит за этой группой.
+- **`devices` / `on_fail`** — список кандидатов и поведение при отказе, как в спеке.
+- **`in_firewall` / `nat`** — диагностические признаки: виден ли туннель firewall'у OpenWrt и есть ли
+  для него NAT.
+- **`obfs`** — только у выхода, который несёт транспорт поверх поддельного TCP. Повторяет спеку.
+  Признака живости здесь **нет намеренно**: `status` опрашивают раз в несколько секунд, а проверка
+  процесса — это запуск процесса. Приговор о живости даёт `diag`, который спрашивают по нажатию.
 
-The specification is strict JSON. Inputs that violate these rules cause `steer` to refuse the spec (exit non-zero) rather than proceed with a silently broken state.
+## 3. Ограничения ввода и проверки
 
-- **Strict JSON, no trailing comma**: arrays like `[...,]` are rejected. Use standard JSON. (Previously a trailing comma could hang the parser; it now fails loudly.)
-- **File size**: the spec file must be **≤ 256 KiB**. A larger file is rejected (`spec too large (max 256 KiB)`) rather than silently truncated.
-- **Array sizes** (overflow is rejected, not silently dropped):
-  - `domains_files` / `prefixes_files`: ≤ 16 entries each.
-  - `from` / `from_default`: ≤ 16 entries.
-  - `outputs.*.devices`: ≤ 8 entries.
-  - `outputs`: ≤ 16. `channels`: ≤ 64.
-- **String length**: each `from`/`devices` entry is capped at its documented width (256 / 64 / 32 bytes respectively).
+Спека — строгий JSON. Нарушение перечисленного означает отказ движка (ненулевой код), а не работу с
+тихо испорченным состоянием.
 
-These caps exist to fit the fixed memory budget of low-end routers. A control plane assembling large specs should keep within them.
+- **Строгий JSON, без висящей запятой.** Массивы вида `[...,]` отвергаются. Раньше висящая запятая
+  могла подвесить парсер; теперь это громкий отказ.
+- **Размер файла** — не больше **256 КиБ**. Больший отвергается (`spec too large`), а не обрезается.
+- **Размеры массивов** (переполнение отвергается, а не отбрасывается молча):
+  - `domains_files` / `prefixes_files` — не больше 16 каждый;
+  - `from` / `from_default` — не больше 16;
+  - `outputs.*.devices` — не больше 8;
+  - `outputs` — не больше 16; `channels` — не больше 64.
+- **Длина строк** — каждая запись `from`/`devices`/пути обрезается по своей ширине (64 / 32 / 256
+  байт). Это обрезание, а не отказ.
+- **Незавершённая спека отвергается громко.** Файл, записанный не до конца (например, пропало
+  питание посреди записи), даёт `channels.<имя>: match: expected a key` и код 2. Раньше такой файл
+  уводил парсер в бесконечный цикл, и `status`, опрашиваемый раз в пять секунд, плодил вечные
+  процессы.
 
-## 4. Diagnostics (Output)
+Ограничения существуют ради фиксированного бюджета памяти слабых роутеров. Управляющий слой,
+собирающий большие спеки, должен держаться внутри них.
 
-Requested via `steer diag [--spec FILE]`. Runs a set of health checks and emits JSON:
+## 4. Диагностика (выход)
+
+Запрашивается `steer diag [--spec ФАЙЛ]`.
 
 ```json
 {
@@ -134,96 +218,134 @@ Requested via `steer diag [--spec FILE]`. Runs a set of health checks and emits 
 }
 ```
 
-- Each check object has `id`, `verdict`, `what`, `why`.
-- **Verdicts** are one of four values:
-  - `ok` — checked and good.
-  - `note` — advice, not a finding: it works and will keep working, but is worth knowing. **`note` is deliberately excluded from the `warn`/`fail` counters** and must not be treated as "not ok". (Without this, always-true advice — e.g. a browser with DoH bypassing the router's DNS — would permanently paint a healthy router red.)
-  - `warn` — it works, but there is something that explains a likely future complaint.
-  - `fail` — broken; traffic is going the wrong way.
-- **Check `id`s** currently emitted: `table`, `down_chain`, `set`, `dns_redirect`, `dnsd`, `doh`, `ipv6`, `resolver`, `output`, `obfs`. The set may grow *and shrink* between releases; consumers must tolerate unknown ids and must not require any particular id to be present.
-  - `udp` — **no longer emitted.** It used to be a `note` saying the VLESS tunnel carries TCP only. The tunnel now carries UDP (VLESS command 2), so QUIC, WireGuard and game traffic work through a `kind: vless` output. A consumer that treated the absence of this note as "old version" must instead read the version.
-  - `obfs` — emitted per output that has an `obfs` block, up to four times: the obfuscator process
-    is running (`fail` if not); its anti-RST rule is installed (`warn` if not — without it the
-    router's own kernel tears the session down); the route to the obfuscation server does **not**
-    go through the tunnel that server brings up (`fail` — that loop cannot be broken from inside);
-    and the tunnel MTU fits inside the fake TCP envelope (`warn`, with the exact number to set).
-  - `resolver` — emitted as a `note` when a `kind: vless` channel's address list contains a public resolver (for example `8.8.8.0/24` inside a Google or YouTube category). Such DNS queries do reach the resolver through the tunnel, but each query is a fresh UDP flow and therefore a fresh handshake to the node: names resolve, only slower. Never a `warn` — nothing is broken.
-- **Exit code**: `steer diag` exits `1` only when at least one check is `fail`; `note` and `warn` never cause a non-zero exit.
-- **Top-level counters**: `warn` = number of `warn` verdicts; `fail` = number of `fail` verdicts. There is no `note` counter.
+У каждой проверки есть `id`, `verdict`, `what`, `why`.
 
-## 5. Log Prefixes (Journal Contract)
+**Вердикты** — одно из четырёх значений:
 
-steer logs to the journal (stderr) with a fixed severity prefix. This prefix — not the prose
-wording — is the contract a control plane should classify by, because the wording may change
-between releases:
+| Вердикт | Смысл |
+|---|---|
+| `ok` | Проверено, всё хорошо. |
+| `note` | Совет, а не находка: работает и будет работать, но знать полезно. **`note` намеренно исключён из счётчиков `warn`/`fail`** и не должен трактоваться как «не ок». Иначе вечно верный совет — например, про браузер с DoH, обходящий DNS роутера, — навсегда красил бы здоровый роутер красным. |
+| `warn` | Работает, но есть то, что объясняет вероятную будущую жалобу. |
+| `fail` | Сломано, трафик идёт не туда. |
 
-- `steer[warn]` — a real concern (something broken or mis-routed).
-- `steer[info]` — informational status, not an alarm.
+**Идентификаторы проверок**, которые печатаются сейчас: `table`, `down_chain`, `set`,
+`dns_redirect`, `dnsd`, `doh`, `ipv6`, `resolver`, `output`, `obfs`. Набор может **и расти, и
+сокращаться** между версиями; потребитель обязан терпеть незнакомые id и не должен требовать наличия
+какого-либо конкретного.
 
-A subsystem label follows the prefix: `apply`, `failover`, `dnsd`, `obfs`, `tunnel`
-(e.g. `steer[warn] failover: ...`). Parse the prefix to decide severity.
+- `udp` — **больше не печатается.** Это была заметка «выход VLESS несёт только TCP». Туннель теперь
+  несёт UDP (команда VLESS 2), поэтому QUIC, WireGuard и игровой трафик через `kind: vless`
+  работают. Потребитель, трактовавший отсутствие этой заметки как «старая версия», должен читать
+  версию.
+- `obfs` — печатается на каждый выход с блоком `obfs`, до четырёх раз: процесс обфускатора работает
+  (`fail`, если нет); его правило против RST установлено (`warn`, если нет — без него ядро роутера
+  само рвёт сессию); маршрут к серверу обфускации **не** идёт через туннель, который этот сервер
+  поднимает (`fail` — такую петлю нельзя разорвать изнутри); MTU туннеля влезает в поддельный
+  конверт TCP (`warn`, с точным числом).
+- `resolver` — печатается как `note`, когда в адресном списке канала с `kind: vless` найден адрес
+  публичного резолвера (например, `8.8.8.0/24` внутри категории Google или YouTube). Такие запросы
+  DNS до резолвера доходят, но каждый запрос — отдельный поток UDP и, значит, отдельное рукопожатие
+  к узлу: имена разрешаются, просто медленнее. Никогда не `warn` — ничего не сломано.
 
-**What is deliberately not prefixed.** A refusal addressed to whoever invoked the engine —
-an invalid spec, a bad argument, a missing output, a command absent from this build — is
-printed as plain `steer: ...` and the process exits `2`. Those are answers to the caller,
-not journal lines: they arrive on the caller's stderr, and a control plane already knows
-something failed from the exit code. Everything the engine emits *while running* carries a
-severity prefix.
+**Код возврата.** `steer diag` отвечает `1` только когда хотя бы одна проверка — `fail`; `note` и
+`warn` ненулевого кода не дают. JSON при этом полный и валидный.
 
-This was previously overstated: the contract claimed every line carried a prefix while only
-the obfuscator and the extended build actually set one, so a control plane classifying by
-prefix labelled all current engine output as coming from an older version.
+**Счётчики верхнего уровня.** `warn` — число вердиктов `warn`, `fail` — число `fail`. Счётчика для
+`note` нет.
 
-## 6. Command Line (Invocation Contract)
+## 5. Префиксы журнала
 
-The engine is invoked as `steer <command> [positional] [flags]`. Flags always follow the
-command; a flag in the command position is refused rather than guessed at.
+Движок пишет в журнал (stderr) с постоянным префиксом уровня. Классифицировать строки следует по
+**префиксу, а не по тексту**: формулировки меняются между версиями.
 
-**Exit codes.** `0` — done; `2` — the engine refused: bad arguments, an unreadable or
-invalid spec, a missing output. `1` is command-specific and does **not** mean the same
-thing everywhere, so read it per command:
+- `steer[warn]` — настоящая забота: что-то сломано или трафик идёт не туда.
+- `steer[info]` — информационное состояние, не тревога.
 
-| command | what `1` means | is it a failure to run? |
+За префиксом идёт метка подсистемы: `apply`, `failover`, `dnsd`, `obfs`, `tunnel` — например,
+`steer[warn] failover: ...`.
+
+**Что уровня не несёт намеренно.** Отказ, адресованный тому, кто позвал движок — негодная спека,
+плохой аргумент, отсутствующий выход, команда, которой нет в этой сборке, — печатается как обычное
+`steer: ...` и завершается кодом 2. Это ответ вызывающему, а не запись в журнал: он приходит на
+stderr вызывающего, и управляющий слой уже знает об отказе по коду возврата. Всё, что движок пишет
+**во время работы**, префикс уровня несёт.
+
+Раньше это обещание было шире, чем правда: контракт утверждал, что префикс есть на каждой строке, а
+ставили его только обфускатор и расширенная сборка. Управляющий слой, классифицирующий по префиксу,
+из-за этого подписывал весь свежий вывод движка как пришедший от более старой версии.
+
+## 6. Командная строка
+
+Движок зовут как `steer <команда> [аргументы] [флаги]`. Флаги всегда идут после команды; флаг на
+месте команды отвергается, а не додумывается.
+
+**Коды возврата.** `0` — сделано; `2` — движок отказался: плохие аргументы, нечитаемая или негодная
+спека, отсутствующий выход. `1` зависит от команды и **не означает одно и то же везде**:
+
+| Команда | Что означает `1` | Это провал выполнения? |
 |---|---|---|
-| `diag` | at least one check has verdict `fail` | no — the JSON on stdout is complete and valid |
-| `needs-dnsd` | the spec has no domain channels, the resolver is not needed | no — this is the answer |
-| `fit` | the list does not fit the budget | no — the list and the report are still emitted |
-| `apply` | `nft` rejected the ruleset; nothing was applied | **yes** |
-| `explain` | the resolver did not answer | **yes**, for that query |
-| `vless`, `obfs`, `obfs-server`, `dnsd` | the process exited | **yes** |
+| `diag` | Хотя бы одна проверка — `fail` | Нет: JSON на stdout полный и валидный |
+| `needs-dnsd` | В спеке нет доменных каналов, резолвер не нужен | Нет: это и есть ответ |
+| `fit` | Список не влез в бюджет | Нет: список и отчёт всё равно напечатаны |
+| `apply` | `nft` отверг набор правил; ничего не применилось | **Да** |
+| `explain` | Резолвер не ответил | **Да**, для этого запроса |
+| `vless`, `obfs`, `obfs-server`, `dnsd` | Процесс завершился | **Да** |
 
-Do not classify `1` generically. Treating `apply`'s `1` as "a negative answer" reports a
-failed apply as a success.
+Не классифицируйте `1` обобщённо. Трактовка `1` у `apply` как «отрицательного ответа» превращает
+неудавшееся применение в успех.
 
-**Streams.** Requested help (`steer help`, `steer help <command>`, `steer <command>
---help`, `steer --version`) goes to **stdout** and exits `0`. Everything the engine refuses
-goes to **stderr** and exits `2`. Machine-readable output (`status`, `diag`,
-`vless-nodes`, `vless-probe`, `outputs`, `fit`) is on stdout, unmixed with diagnostics.
+**Потоки.** Запрошенная справка (`steer help`, `steer help <команда>`, `steer <команда> --help`,
+`steer --version`) идёт в **stdout** и завершается нулём. Всё, от чего движок отказывается, идёт в
+**stderr** с кодом 2. Машиночитаемый вывод (`status`, `diag`, `vless-nodes`, `vless-probe`,
+`outputs`, `fit`) — на stdout, не перемешанный с диагностикой.
 
-**Argument validation is strict.** An unknown flag, a flag the command does not accept, a
-flag whose value is missing or swallowed by the next flag, an extra positional argument,
-and a non-numeric value where a number is required are all errors. Nothing unrecognized is
-silently absorbed — a caller that mistypes `--dry-run` gets a refusal, not a real apply.
+**Разбор аргументов строгий.** Неизвестный флаг, флаг, которого команда не понимает, флаг с
+потерянным или съеденным следующим флагом значением, лишний позиционный аргумент и не-число там, где
+требуется число, — всё это ошибки. Нераспознанное не поглощается молча: вызывающий, ошибшийся в
+`--dry-run`, получит отказ, а не настоящее применение правил.
 
-**Common flags.** `--spec FILE` (default `/etc/steer/spec.json`) and `--state-dir DIR`
-(default `/var/lib/steer`) are accepted by every command that reads the spec.
-`vless-probe --node -1` means "the first working node", which is also the default.
+**Общие флаги.** `--spec ФАЙЛ` (по умолчанию `/etc/steer/spec.json`) и `--state-dir КАТАЛОГ` (по
+умолчанию `/var/lib/steer`) принимает каждая команда, читающая спеку. `vless-probe --node -1`
+означает «первый рабочий узел», это же и умолчание.
 
-`steer help` lists the commands; `steer help <command>` documents one. For every command
-except `fit` and `dnsd` the list is generated from the same table that validates the
-arguments, so the two cannot drift. Those two parse their own flags and print their own
-flag list, which `steer help` appends verbatim — one source per command, but two
-mechanisms.
+`steer help` перечисляет команды, `steer help <команда>` документирует одну. Для всех команд, кроме
+`fit` и `dnsd`, список порождается из той же таблицы, которая проверяет аргументы, поэтому разойтись
+им негде. Эти две разбирают свои флаги сами и печатают свой список, который `steer help` дописывает
+дословно: один источник на команду, но два механизма.
 
-**Identifiers in the spec are restricted.** Output names, device names and `lan_device`
-must be `[A-Za-z0-9_.-]`, because they are substituted into shell command lines and into
-nftables set and chain names; the parser refuses anything else at load time. Channel names
-are labels, not identifiers: any UTF-8 is allowed (Russian names are normal), but the
-quote, the backslash and control characters are refused because they would break the JSON
-of `status` and the generated ruleset.
+**Определение сборки.** `steer --version` печатает версию и вариант: «базовая сборка» или
+«расширенная сборка, VLESS/Reality». Отдельно: команды VLESS в базовой сборке отвечают отказом,
+содержащим подстроку **`steer-extended`** — по ней управляющий слой отличает варианты пакета, и эта
+подстрока является частью контракта.
 
-## 7. Architecture Invariants
-- **First Match Wins**: Rules are evaluated top-to-bottom.
-- **File-Based Matching**: Matches rely strictly on external file paths to conserve memory.
-- **Stateless Configuration**: Dynamic changes (like failover) update the routing tables directly without modifying the core nftables ruleset.
-- **Marking Strategy**: Packet marks are applied in `prerouting mangle` before routing decisions are finalized.
+**Состав идентификаторов в спеке ограничен.** Имена выходов, имена устройств и `lan_device` обязаны
+состоять из `[A-Za-z0-9_.-]`: они подставляются в командные строки и в имена наборов и цепочек
+nftables, и парсер отвергает всё остальное при загрузке. Имена каналов — подписи, не идентификаторы:
+в них разрешён любой UTF-8 (русские имена — норма), запрещены кавычка, обратная косая и управляющие
+символы, потому что они ломают JSON у `status` и текст генерируемого набора правил.
+
+## 7. Архитектурные инварианты
+
+- **Побеждает первое совпадение.** Каналы проверяются сверху вниз. Внутри своей цепочки это
+  выражено `return`, а не проверкой «метка ещё нулевая»: первое совпавшее правило побеждает по
+  построению.
+- **Своя таблица, а не include в fw4.** Перезагрузка fw4 ЗАМЕНЯЕТ `table inet fw4` и вымывает
+  каждый набор, живущий внутри неё; отдельная `table inet steer` это просто переживает. Один
+  `nft -f` атомарен: применяется либо весь набор каналов, либо ничего. Удаление сводится к
+  `nft delete table inet steer`, и ничем нашим нельзя испортить чужой firewall.
+- **Совпадение по файлам.** Условия ссылаются на внешние файлы, а не держат списки в спеке, — ради
+  памяти и ради того, чтобы обновление списка не было правкой настройки.
+- **Статичный набор правил.** Динамические изменения (failover) правят таблицы маршрутизации, не
+  трогая набор правил nftables.
+- **Метки в prerouting mangle**, до того как решение о маршруте принято окончательно.
+- **Состояние минимально, но не отсутствует.** Спека статична, а вот резолвер держит явное
+  постоянное состояние — таблицу fake-IP (`fakeip.state`), переживающую перезапуск, — и `apply`
+  хранит реестр меток и таблиц между перезагрузками (`/var/lib/steer/registry`). Это не кэш, а
+  контракт: клиентский кэш fake-IP обязан остаться верным после перезапуска демона, а неустойчивая
+  метка молча уводила бы трафик чужим путём через устаревшее `ip rule`.
+- **Fail-open в DNS.** Резолвер никогда не блокирует транзакцию DNS: при ошибке или исчерпании пула
+  fake-IP наверх уходит настоящий ответ. Сломанный резолвер не должен означать «интернета нет».
+- **Имя набора считает одна функция.** Компилятор и резолвер вычисляют его одной и той же функцией:
+  разойдись они, резолвер наполнял бы набор, которого нет, и доменная маршрутизация молча
+  перестала бы работать.
