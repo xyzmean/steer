@@ -52,7 +52,13 @@
 static int b64url_decode(const char *in, unsigned char *out, size_t out_n) {
     static const char *A = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
     size_t o = 0;
-    int acc = 0, bits = 0;
+    /* БЕЗ ЗНАКА и с маской. Накопитель здесь копит все прочитанные шестёрки битов подряд,
+     * и при знаковом int сдвиг влево переполняет его после нескольких символов — это
+     * неопределённое поведение, найденное санитайзером на стенде xsloop. Практического
+     * вреда не приносило (нужны только младшие биты), но неопределённое поведение в
+     * разборе ключа — это то, что компилятор вправе оптимизировать во что угодно. */
+    unsigned acc = 0;
+    int bits = 0;
     for (const char *p = in; *p; p++) {
         const char *q = strchr(A, *p);
         if (!q) {
@@ -62,7 +68,7 @@ static int b64url_decode(const char *in, unsigned char *out, size_t out_n) {
             else if (*p == '/') q = A + 63;
             else return -1;
         }
-        acc = (acc << 6) | (int)(q - A);
+        acc = ((acc << 6) | (unsigned)(q - A)) & 0x3FFFFFu;   /* хватает на 22 бита */
         bits += 6;
         if (bits >= 8) {
             bits -= 8;
@@ -222,6 +228,10 @@ struct buf {
 
 static void put(struct buf *b, const void *d, size_t n) {
     if (b->len + n > b->cap) { b->len = b->cap + 1; return; }   /* переполнение видно снаружи */
+    /* Пустое расширение приходит как (NULL, 0) — так описаны extended_master_secret и
+     * session_ticket в таблице ниже. memcpy с NULL формально неопределён даже при нулевой
+     * длине (санитайзер это и сообщает), поэтому выходим раньше. */
+    if (!n) return;
     memcpy(b->p + b->len, d, n);
     b->len += n;
 }
@@ -241,15 +251,28 @@ static void ext(struct buf *b, unsigned type, const void *body, size_t n) {
  *
  * Вернуть придётся вместе с точным отпечатком Chrome, где GREASE обязателен. */
 
+/* Обёртка ради неизменности внешнего вызова: клиент VLESS зовёт её и ничего не знает про
+ * носителя. Байты при этом те же, что были до его появления (tests/hellofreeze.c). */
 int reality_build_hello(const struct reality_cfg *cfg, struct reality_state *st,
                         unsigned char *out, size_t out_n, size_t *out_len) {
+    return reality_build_hello_carry(cfg, st, NULL, out, out_n, out_len);
+}
+
+int reality_build_hello_carry(const struct reality_cfg *cfg, struct reality_state *st,
+                              const struct reality_carrier *car,
+                              unsigned char *out, size_t out_n, size_t *out_len) {
     unsigned char pbk[32], sid[16];
     int pbk_n = b64url_decode(cfg->pbk, pbk, sizeof(pbk));
     if (pbk_n != 32) return REALITY_EBADKEY;
     int sid_n = cfg->sid[0] ? hex_decode(cfg->sid, sid, sizeof(sid)) : 0;
     if (sid_n < 0) return REALITY_EBADKEY;
 
-    if (x25519_keypair(st->priv, st->pub) != 0) return REALITY_ECRYPTO;
+    if (car && car->priv) {
+        /* Пара пришла снаружи: xsteer выводит из неё общий секрет ещё до сборки Hello,
+         * потому что этим секретом запечатывается статический ключ в набивке ECH. */
+        memcpy(st->priv, car->priv, 32);
+        memcpy(st->pub, car->pub, 32);
+    } else if (x25519_keypair(st->priv, st->pub) != 0) return REALITY_ECRYPTO;
     if (x25519_shared(st->priv, pbk, st->shared) != 0) return REALITY_ECRYPTO;
 
     /* Аутентификатор считается ПОСЛЕ сборки Hello — см. ниже, где он вписывается на
@@ -427,6 +450,13 @@ int reality_build_hello(const struct reality_cfg *cfg, struct reality_state *st,
     {
         unsigned char noise[209];
         if (fill_random(noise, sizeof(noise)) != 0) return REALITY_ECRYPTO;
+        /* Носитель заполняет ровно те 176 байт, которые уедут полезной нагрузкой ECH.
+         * Заполняется ЗДЕСЬ, а не после сборки, по двум причинам: набивка входит в байты,
+         * которые потом подписывает session_id, и указатель `noise + 33` — это буквально
+         * будущая нагрузка, а не смещение, посчитанное вручную по раскладке расширения. */
+        if (car && car->fill_ech &&
+            car->fill_ech(car->ctx, noise + 33, 176, st->shared) != 0)
+            return REALITY_ECRYPTO;
         struct buf eb = { b_ech, 0, sizeof(b_ech) };
         put8(&eb, 0x00);
         put16(&eb, 0x0001);
@@ -579,6 +609,16 @@ int reality_build_hello(const struct reality_cfg *cfg, struct reality_state *st,
         memcpy(aad, raw, aad_n);
         memset(aad + (4 + 2 + 32 + 1), 0, 32);
 
+        /* Носитель подписывает то же самое своим способом. Ему отдаются ровно те байты, с
+         * которыми он же сверится на другой стороне: сообщение рукопожатия с обнулённым
+         * session_id. Дальше аутентификатор Reality не считается вовсе — его место занято. */
+        if (car && car->fill_sid) {
+            if (car->fill_sid(car->ctx, sid_at, aad, aad_n, st->shared) != 0)
+                return REALITY_ECRYPTO;
+            memcpy(st->session_id, sid_at, 32);
+            return 0;
+        }
+
         unsigned char authkey[32];
         const mbedtls_md_info_t *md = mbedtls_md_info_from_type(MBEDTLS_MD_SHA256);
         if (!md) return REALITY_ECRYPTO;
@@ -609,4 +649,42 @@ int reality_build_hello(const struct reality_cfg *cfg, struct reality_state *st,
 int x25519_shared_ext(const unsigned char priv[32], const unsigned char peer[32],
                       unsigned char out[32]) {
     return x25519_shared(priv, peer, out);
+}
+
+/* ---- примитивы наружу, для xsteer ------------------------------------------
+ *
+ * Три обёртки над статикой этого файла. Тем же приёмом, которым здесь уже живёт
+ * x25519_shared_ext, и по той же причине: xsteer нужны ровно эти три вещи, а копия каждой
+ * означала бы второе место, где живёт решение. У cpu_has_aes это особенно важно: от него
+ * зависит порядок наборов шифров в Hello, то есть облик, и расхождение между «что мы
+ * объявили» и «чем мы шифруем» стоило бы туннелю шестикратной потери скорости на MIPS. */
+int xc_random(unsigned char *out, size_t n) { return fill_random(out, n); }
+int xc_cpu_has_aes(void) { return cpu_has_aes(); }
+int xc_x25519_keypair(unsigned char priv[32], unsigned char pub[32]) {
+    return x25519_keypair(priv, pub);
+}
+
+/* Публичная половина ДАННОГО приватного ключа. Нужна xsteer: статический ключ пира лежит в
+ * конфигурации приватной половиной (как у wg), а публичная выводится, а не переписывается
+ * руками — два значения, выведенных одно из другого, обязаны считаться. */
+int xc_x25519_public(const unsigned char priv[32], unsigned char pub[32]) {
+    mbedtls_ecp_group grp;
+    mbedtls_mpi d;
+    mbedtls_ecp_point Q;
+    mbedtls_ecp_group_init(&grp);
+    mbedtls_mpi_init(&d);
+    mbedtls_ecp_point_init(&Q);
+    int rc = -1;
+    if (mbedtls_ecp_group_load(&grp, MBEDTLS_ECP_DP_CURVE25519) != 0) goto out;
+    unsigned char be[32];
+    for (int i = 0; i < 32; i++) be[i] = priv[31 - i];
+    if (mbedtls_mpi_read_binary(&d, be, 32) != 0) goto out;
+    if (mbedtls_ecp_mul(&grp, &Q, &d, &grp.G, rng_cb, NULL) != 0) goto out;
+    if (mbedtls_mpi_write_binary_le(&Q.MBEDTLS_PRIVATE(X), pub, 32) != 0) goto out;
+    rc = 0;
+out:
+    mbedtls_ecp_group_free(&grp);
+    mbedtls_mpi_free(&d);
+    mbedtls_ecp_point_free(&Q);
+    return rc;
 }

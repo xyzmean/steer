@@ -1,5 +1,17 @@
 #!/bin/sh
-# Собирает расширенный бинарник (движок + клиент VLESS/Reality) под одну архитектуру.
+# Собирает расширенный бинарник под одну архитектуру — в одной из двух РОЛЕЙ.
+#
+# Роли появились вместе со звездой xsteer, и не ради удобства. Хабу нужна криптография, то
+# есть mbedtls, то есть расширенная сборка; а на роутере хабу делать нечего — подкоманды,
+# поднимающей слушателя на публичном порту, там быть не должно. Отсюда две роли:
+#
+#   router (по умолчанию) — движок, клиент VLESS/Reality и клиент xsteer. Едет в пакет.
+#   server                — движок, хаб xsteer. Едет в архив для VPS.
+#
+# Гейт стоит на СПИСКАХ ФАЙЛОВ, а не внутри их тел, и это важно: цель ext-syntax в Makefile
+# гоняет -fsyntax-only по маске src/ext/*.c, и файл, целиком спрятанный под #ifdef, проходил
+# бы проверку «пустым» — то есть ровно тот откат, ради которого ext-syntax и появилась.
+# Поэтому цикл спицы живёт в xsclient.c, цикл хаба в xshub.c, а различаются только списки.
 #
 # Вынесено из build.sh отдельным файлом, а не оставлено строкой в `docker run -c`: там всё
 # это жило внутри двойных кавычек с экранированием, и флаги -I терялись при подстановке —
@@ -18,6 +30,9 @@ OUT="$3"
 # контейнера после cd в каталог mbedtls, и относительный путь к файлу оттуда не находится.
 # Умолчание нужно ради ручного запуска с тремя аргументами.
 VERSION="${4:-dev}"
+# Роль: router (умолчание) или server. Пятым аргументом, чтобы прежние вызовы с четырьмя
+# аргументами продолжали значить то же, что значили.
+ROLE="${5:-router}"
 
 MBED_INC=/opt/mbedtls/include
 EXT_INC=/src/src/ext
@@ -64,12 +79,33 @@ fi
 # -s обязателен: zig cc при -Os убирает отладочную информацию сам, при -O2 — оставляет,
 # и бинарник разом вырастает с 540 КБ до 4,9 МБ. На overlay в 6,9 МБ это разница между
 # «пакет ставится» и «места нет», причём отладочная информация на роутере не нужна никому.
+# Общее для обеих ролей: формат кадра, конфигурация, маршрутизация, рукопожатие, соединение
+# и то, на чём они стоят (TLS-записи, примитивы Reality, TUN). Расходиться на проводе этим
+# половинам негде — кода формата ровно один экземпляр, и это ровно та гарантия, которая
+# заменила прежнюю «один бинарник на две стороны» (см. server/README.md).
+XS_COMMON="/src/src/ext/xswire.c /src/src/ext/xsconf.c /src/src/ext/xsroute.c \
+           /src/src/ext/chello.c /src/src/ext/xshake.c /src/src/ext/xsconn.c \
+           /src/src/ext/tls13.c /src/src/ext/reality.c /src/src/ext/tun.c /src/src/ext/h2.c \\
+           /src/src/ext/xsadmin.c"
+EXT_ROUTER="/src/src/ext/sub.c /src/src/ext/vless_proto.c /src/src/ext/vision.c \
+            /src/src/ext/client.c /src/src/ext/tunnel.c /src/src/ext/rtx.c \
+            /src/src/ext/xsclient.c"
+EXT_SERVER="/src/src/ext/xshub.c"
+
+case "$ROLE" in
+  router) EXT="$XS_COMMON $EXT_ROUTER"; ROLEDEF="-DSTEER_EXTENDED" ;;
+  # У серверной сборки STEER_EXTENDED НЕ определён нарочно: на VPS нет ни спеки, ни выходов,
+  # ни каналов, и клиентские подкоманды там обязаны отказывать штатной заглушкой, а не
+  # ссылаться на код, которого в этой сборке нет.
+  server) EXT="$XS_COMMON $EXT_SERVER"; ROLEDEF="-DSTEER_SERVER" ;;
+  *) echo "неизвестная роль: $ROLE (router|server)" >&2; exit 2 ;;
+esac
+
+# shellcheck disable=SC2086
 zig cc -target "$TARGET" ${MCPU:+-mcpu=$MCPU} -static $OPT -s \
-    -I"$MBED_INC" -I"$EXT_INC" $CFG -DSTEER_EXTENDED -DSTEER_VERSION="\"$VERSION\"" \
+    -I"$MBED_INC" -I"$EXT_INC" $CFG $ROLEDEF -DSTEER_VERSION="\"$VERSION\"" \
     -o "$OUT" \
     /src/src/steer.c /src/src/spec.c /src/src/dnsd.c /src/src/failover.c \
     /src/src/aggregate.c /src/src/obfs.c /src/src/cli.c \
-    /src/src/ext/sub.c /src/src/ext/reality.c /src/src/ext/tls13.c \
-    /src/src/ext/vless_proto.c /src/src/ext/vision.c /src/src/ext/client.c \
-    /src/src/ext/tun.c /src/src/ext/tunnel.c /src/src/ext/h2.c /src/src/ext/rtx.c \
+    $EXT \
     "$WORK"/*.o

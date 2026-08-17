@@ -18,7 +18,7 @@ $(BUILD)/steer: src/steer.c src/spec.c src/dnsd.c src/failover.c src/aggregate.c
 	$(CC) $(CFLAGS) $(DEFS) -o $@ src/steer.c src/spec.c src/dnsd.c src/failover.c \
 	      src/aggregate.c src/obfs.c src/cli.c
 
-test: all ext-syntax $(BUILD)/dnsmatch $(BUILD)/specmatch $(BUILD)/failovermatch $(BUILD)/h2match $(BUILD)/submatch $(BUILD)/fwmatch $(BUILD)/obfsmatch $(BUILD)/visionmatch $(BUILD)/diagsim
+test: all ext-syntax $(BUILD)/dnsmatch $(BUILD)/specmatch $(BUILD)/specmatch-ext $(BUILD)/xswirematch $(BUILD)/xsconfmatch $(BUILD)/xsroutematch $(BUILD)/chellomatch $(BUILD)/failovermatch $(BUILD)/h2match $(BUILD)/submatch $(BUILD)/fwmatch $(BUILD)/obfsmatch $(BUILD)/visionmatch $(BUILD)/diagsim
 	@sh tests/run.sh
 	@sh tests/gen.sh
 	@sh tests/climatch.sh
@@ -27,12 +27,17 @@ test: all ext-syntax $(BUILD)/dnsmatch $(BUILD)/specmatch $(BUILD)/failovermatch
 	@sh tests/buildmatch.sh
 	@$(BUILD)/dnsmatch
 	@$(BUILD)/specmatch
+	@$(BUILD)/specmatch-ext
 	@$(BUILD)/failovermatch
 	@$(BUILD)/h2match
 	@$(BUILD)/submatch
 	@$(BUILD)/fwmatch
 	@$(BUILD)/obfsmatch
 	@$(BUILD)/visionmatch
+	@$(BUILD)/xswirematch
+	@$(BUILD)/xsconfmatch
+	@$(BUILD)/xsroutematch
+	@$(BUILD)/chellomatch
 
 # Движок, собранный как расширенный, но без самой расширенной части: нужен стенду
 # diagmatch, потому что спеку с `kind: vless` базовая сборка отвергает парсером, а
@@ -69,6 +74,16 @@ $(BUILD)/dnsmatch: tests/dnsmatch.c src/dnsd.c src/spec.c src/spec.h
 $(BUILD)/specmatch: tests/specmatch.c src/spec.c src/spec.h
 	@mkdir -p $(BUILD)
 	$(CC) $(CFLAGS) -o $@ tests/specmatch.c
+
+# Тот же исходник, собранный КАК РАСШИРЕННЫЙ. Нужен потому, что виды выходов vless и
+# xsteer в базовой сборке отвергаются парсером (и обязаны отвергаться — см. spec.c), а
+# значит их положительные случаи в build/specmatch недостижимы: до появления этого
+# бинарника kind=vless не проверялся здесь ни одной строкой, только комментарием.
+# Прецедент тот же, что у build/diagsim: один исходник, два бинарника, ветки внутри под
+# #ifdef — так «базовая отказывает» и «расширенная разбирает» проверяются одним файлом.
+$(BUILD)/specmatch-ext: tests/specmatch.c src/spec.c src/spec.h
+	@mkdir -p $(BUILD)
+	$(CC) $(CFLAGS) -DSTEER_EXTENDED -o $@ tests/specmatch.c
 
 # Поддельный TCP проверяется в памяти: сборка и разбор сегмента, контрольные суммы и
 # арифметика номеров — чистые функции без сокетов, поэтому стенд не требует ни сети, ни
@@ -111,13 +126,49 @@ $(BUILD)/submatch: tests/submatch.c src/ext/sub.c src/ext/vless.h
 	@mkdir -p $(BUILD)
 	$(CC) $(CFLAGS) -o $@ tests/submatch.c
 
+# Арифметика провода xsteer: заголовок записи, вывод nonce, окно приёма, пределы
+# соединения. Всё, что она считает, ломается МОЛЧА — пакет отбрасывается стеком той
+# стороны, или не расшифровывается, или отвергается как повтор, и ни одного сообщения об
+# этом нет. Ни сети, ни mbedtls стенд не требует (xswire.c намеренно без библиотеки),
+# поэтому он входит в обычный make test, как submatch и visionmatch.
+$(BUILD)/xswirematch: tests/xswirematch.c src/ext/xswire.c src/ext/xswire.h
+	@mkdir -p $(BUILD)
+	$(CC) $(CFLAGS) -o $@ tests/xswirematch.c
+
+# Разбор конфигурации xsteer — единственное место, куда в движок попадает текст, который
+# человек написал руками, поэтому разбор строгий, а стенд перечисляет каждый отказ.
+# Отдельно проверяется, что приватный ключ не попадает в вывод: обещание держится на том,
+# что печатающая функция не имеет к нему доступа по построению. Без mbedtls — это же
+# требуется для build/diagsim, который линкует этот файл ради проверок diag.
+$(BUILD)/xsconfmatch: tests/xsconfmatch.c src/ext/xsconf.c src/ext/xsconf.h src/ext/xswire.h
+	@mkdir -p $(BUILD)
+	$(CC) $(CFLAGS) -o $@ tests/xsconfmatch.c
+
+# Куда отдать пакет. Ошибка здесь не видна снаружи: канал работает, счётчик растёт, а
+# пакеты приходят не тому пиру. Три утверждения, без которых звезда небезопасна, стоят
+# именно тут — самое длинное совпадение, «нет пира — отбросить» (а не «отдать первому»,
+# что было бы утечкой между спицами) и запрет отправлять от чужого имени.
+$(BUILD)/xsroutematch: tests/xsroutematch.c src/ext/xsroute.c src/ext/xsroute.h src/ext/xsconf.h
+	@mkdir -p $(BUILD)
+	$(CC) $(CFLAGS) -o $@ tests/xsroutematch.c
+
+# Разбор ClientHello — граница доверия хаба: это первый код, который смотрит на байты от
+# кого угодно из интернета, и ошибка здесь означает чтение за буфером по длине, которой
+# доверились. Разбирается НАСТОЯЩИЙ Hello из заморозки (tests/chello-frozen.h), поэтому
+# mbedtls не нужен. Байтовую неизменность самого сборщика проверяет tests/hellofreeze.c,
+# которому библиотека нужна и который поэтому в make test не входит.
+$(BUILD)/chellomatch: tests/chellomatch.c tests/chello-frozen.h src/ext/chello.c src/ext/chello.h
+	@mkdir -p $(BUILD)
+	$(CC) $(CFLAGS) -o $@ tests/chellomatch.c
+
 # НЕ rm -rf $(BUILD): в build/ живут отслеживаемые Dockerfile, build-ext.sh и
 # лабораторные исходники, без которых ./build.sh из свежего клона не работает —
 # .gitignore об этом прямо предупреждает, а clean их сносил (I-023). Удаляются
 # только артефакты: то, что здесь же и собирается, плюс упаковка из build.sh.
 clean:
-	rm -rf $(BUILD)/steer $(BUILD)/steer-* $(BUILD)/dnsmatch $(BUILD)/specmatch \
+	rm -rf $(BUILD)/steer $(BUILD)/steer-* $(BUILD)/dnsmatch $(BUILD)/specmatch $(BUILD)/specmatch-ext \
 	       $(BUILD)/failovermatch $(BUILD)/h2match $(BUILD)/submatch $(BUILD)/fwmatch $(BUILD)/obfsmatch \
-	       $(BUILD)/visionmatch \
+	       $(BUILD)/visionmatch $(BUILD)/xswirematch $(BUILD)/xsconfmatch $(BUILD)/xsroutematch $(BUILD)/chellomatch $(BUILD)/hellofreeze $(BUILD)/xsloop $(BUILD)/xsbench \
+	       $(BUILD)/steer-hub $(BUILD)/steer-ext \
 	       $(BUILD)/diagsim $(BUILD)/libmbed-*.a \
 	       $(BUILD)/*.err $(BUILD)/pkg $(BUILD)/scripts out

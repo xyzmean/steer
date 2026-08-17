@@ -335,6 +335,32 @@ static void parse_obfs(struct js *j, struct output *o) {
     o->obfs.on = 1;
 }
 
+/* Виды выходов ОДНИМ списком: из него и печать (out_kind_name), и проверка флага
+ * --kind (out_kind_known), и разбор поля kind ниже. Три места, читающие одну таблицу,
+ * вместо трёх списков, которые расходятся молча — см. объяснение у объявлений в spec.h. */
+static const struct { const char *name; enum out_kind kind; } KINDS[] = {
+    { "direct",    OUT_DIRECT },
+    { "interface", OUT_INTERFACE },
+    { "vless",     OUT_VLESS },
+    { "xsteer",    OUT_XSTEER },
+};
+#define KINDS_N (sizeof(KINDS) / sizeof(KINDS[0]))
+
+const char *out_kind_name(enum out_kind k) {
+    for (size_t i = 0; i < KINDS_N; i++)
+        if (KINDS[i].kind == k) return KINDS[i].name;
+    /* Недостижимо: вид приходит из этой же таблицы. Но возвращать здесь «interface»
+     * значило бы напечатать неправду про вид, которого мы не знаем, — а именно это уже
+     * делал тернарник, который эта функция заменила. */
+    return "?";
+}
+
+int out_kind_known(const char *s) {
+    for (size_t i = 0; i < KINDS_N; i++)
+        if (!strcmp(KINDS[i].name, s)) return 1;
+    return 0;
+}
+
 static void parse_outputs(struct js *j) {
     if (js_lit(j, '{') != 0) die("outputs: expected an object", NULL);
     js_ws(j);
@@ -389,6 +415,7 @@ static void parse_outputs(struct js *j) {
             }
             else if (!strcmp(key, "obfs")) parse_obfs(j, &o);
             else if (!strcmp(key, "sub_file")) js_str(j, o.sub_file, sizeof(o.sub_file));
+            else if (!strcmp(key, "conf")) js_str(j, o.xs_conf, sizeof(o.xs_conf));
             else if (!strcmp(key, "node")) o.node_index = (int)js_num(j);
             else if (!strcmp(key, "on_fail")) {
                 char m[16];
@@ -420,6 +447,29 @@ static void parse_outputs(struct js *j) {
             if (!o.device[0]) snprintf(o.device, sizeof(o.device), "%.15s", o.name);
             if (!o.devices_n) snprintf(o.devices[o.devices_n++], 32, "%s", o.device);
         }
+        else if (!strcmp(kind, "xsteer")) {
+#ifndef STEER_EXTENDED
+            /* Отказываем СРАЗУ и по той же причине, что у vless выше: иначе спека
+             * применяется, правила и метки встают, а устройства не создаст никто —
+             * человек видит рабочую конфигурацию, из которой не выходит ни один пакет.
+             * Подстроку «steer-extended» здесь читают снаружи (см. src/steer.c). */
+            die("outputs.%s: kind xsteer требует пакет steer-extended", o.name);
+#endif
+            o.kind = OUT_XSTEER;
+            /* Имя устройства и путь к конфигурации выводятся из имени выхода — тот же
+             * довод, что у vless: два имени, которым позволено разойтись, пользы не
+             * приносят. Имя выхода уже проверено name_ok выше, поэтому путь собирается
+             * из проверенного. */
+            if (!o.device[0]) snprintf(o.device, sizeof(o.device), "%.15s", o.name);
+            if (!o.devices_n) snprintf(o.devices[o.devices_n++], 32, "%s", o.device);
+            if (!o.xs_conf[0])
+                snprintf(o.xs_conf, sizeof(o.xs_conf), "/etc/steer/xsteer/%.200s.conf", o.name);
+            /* Абсолютный путь: процесс запускает procd со своим рабочим каталогом, а не
+             * наша оболочка, — относительный «работал бы из шелла» и не работал у
+             * сервиса. Годность к JSON: путь печатается в status, diag и xsteer-peers. */
+            else if (o.xs_conf[0] != '/' || !label_ok(o.xs_conf))
+                die("outputs.%s: conf должен быть абсолютным путём без кавычек", o.name);
+        }
         else if (!strcmp(kind, "interface")) {
             o.kind = OUT_INTERFACE;
             /* device и devices описывают одно и то же с разных сторон: device — что
@@ -428,11 +478,13 @@ static void parse_outputs(struct js *j) {
             if (!o.devices_n && o.device[0]) snprintf(o.devices[o.devices_n++], 32, "%s", o.device);
             if (!o.device[0] && o.devices_n) snprintf(o.device, sizeof(o.device), "%s", o.devices[0]);
             if (!o.device[0]) die("outputs.%s: kind interface needs a device", o.name);
-        } else die("outputs.%s: неизвестный kind (нужен direct, interface или vless)", o.name);
+        } else die("outputs.%s: неизвестный kind "
+                   "(нужен direct, interface, vless или xsteer)", o.name);
         /* Обфускация осмысленна только там, где транспорт — чужой UDP, до которого
          * движку не дотянуться иначе. У vless свой транспорт внутри движка (и свои
-         * средства маскировки — Reality), у direct транспорта нет вовсе. Принять поле
-         * молча значило бы сказать «настроено», не настроив ничего. */
+         * средства маскировки — Reality), у xsteer он свой и поддельный TCP уже внутри
+         * него, у direct транспорта нет вовсе. Принять поле молча значило бы сказать
+         * «настроено», не настроив ничего. */
         if (o.obfs.on && o.kind != OUT_INTERFACE)
             die("outputs.%s: obfs есть только у kind=interface", o.name);
         if (g_out_n >= MAX_OUTPUTS) die("too many outputs", NULL);

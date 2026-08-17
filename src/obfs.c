@@ -30,6 +30,27 @@
  * живёт в отдельной таблице `steer_obfs`, а не в `inet steer`: последнюю `apply`
  * пересобирает целиком, и правило исчезало бы при каждом сохранении настроек.
  *
+ * И ЦЕНА ЭТА НЕ ТОЛЬКО В ПРАВИЛЕ, а в том, что RST ядро всё равно СОБИРАЕТ на каждый
+ * принятый сегмент — правило гасит его уже готовым. Плюс на приёме ядро клонирует skb для
+ * КАЖДОГО сырого сокета, и только потом фильтр отбрасывает лишние копии: значит цена растёт
+ * с числом воркеров.
+ *
+ * СКОЛЬКО ЭТО СТОИТ И ЧТО БЫЛО БЫ С TUN — измерено, стенд tests/transportcost.sh. На отправке
+ * разницы нет: сырой сокет пачкой sendmmsg по 16 даёт 3,1 мкс на пакет, TUN с вызовом на
+ * пакет — 3,2 (сама пачка стоит 22%: по одному пакету — 4,0). На приёме, наоборот, TUN
+ * дешевле сырого сокета (10,2 против 11,5 мкс процессора системы на пакет), и вся разница
+ * именно в том RST, которого при перенаправлении в TUN не возникает вовсе.
+ *
+ * НО ВЫВОД ИЗ ЭТОГО НЕ «НАДО TUN». Тот же выигрыш даёт приём через AF_PACKET: он получает
+ * пакет ДО netfilter, значит нашему порту можно прямо запретить доходить до стека ядра — и
+ * RST не собирается; а PACKET_FANOUT отдаёт пакет ровно одному сокету группы, значит клон не
+ * умножается на воркеров. Измерено там же: 10,5 мкс одним сокетом и 8,6 четырьмя против 11,5
+ * у сырого сокета. При этом не нужны ни ip_forward, ни NAT, ни зона firewall, и не нужно,
+ * чтобы conntrack признал наш поддельный поток действительным (у варианта с TUN правило DNAT
+ * к недействительному потоку не применяется, и пакеты молча уходят не туда — это первое, на
+ * чём стенд и споткнулся). Отправка при любом раскладе остаётся на сыром сокете: у AF_PACKET
+ * пришлось бы самим собирать канальный заголовок, а на PPPoE это не Ethernet.
+ *
  * ЧЕГО ЗДЕСЬ НЕТ И ПОЧЕМУ. Шифрования нет: его делает WireGuard, второй слой добавил бы
  * только вес. Повторов нет — см. про лавину. Фрагментации нет, но, в отличие от
  * апстрима, DF мы и не ставим: при ошибке в MTU ядро фрагментирует, и настройка
@@ -255,6 +276,15 @@ size_t obfs_build(uint8_t *buf, uint32_t saddr, uint32_t daddr,
         buf[hlen++] = (uint8_t)((1500 - 40) >> 8);
         buf[hlen++] = (uint8_t)((1500 - 40) & 0xFF);
     }
+    /* Масштаб окна — только по просьбе (OBFS_OPT_SCALE) и только в SYN. Зачем он нужен и
+     * что без него измерено на живом роутере — в obfs.h. Раскладка: NOP, затем опция 3
+     * длиной 3 со множителем; NOP впереди выравнивает опции на четыре байта, как это делают
+     * настоящие стеки. */
+    if (with_mss >= OBFS_OPT_SCALE) {
+        buf[hlen++] = 1;                       /* NOP */
+        buf[hlen++] = 3; buf[hlen++] = 3;
+        buf[hlen++] = OBFS_WSCALE;
+    }
     t->off = (uint8_t)((hlen / 4) << 4);
 
     if (plen) memcpy(buf + hlen, payload, plen);
@@ -334,7 +364,7 @@ static void raw_filter(int fd, struct sock_filter *code, unsigned short n) {
 }
 
 /* Клиент: только наша четвёрка. */
-static void filter_client(int fd, uint32_t server_be, uint16_t sport, uint16_t dport) {
+void obfs_filter_quad(int fd, uint32_t server_be, uint16_t sport, uint16_t dport) {
     struct sock_filter code[] = {
         BPF_STMT(BPF_LD  | BPF_W   | BPF_ABS, 12),                  /* ip saddr */
         BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, ntohl(server_be), 0, 5),
@@ -352,7 +382,7 @@ static void filter_client(int fd, uint32_t server_be, uint16_t sport, uint16_t d
 /* Сервер: всё, что адресовано порту обфускации. Клиенты заранее неизвестны, поэтому
  * четвёрку здесь не проверить — но порт отсекает ровно тот мусор, ради которого фильтр
  * и заводится. */
-static void filter_server(int fd, uint16_t port) {
+void obfs_filter_port(int fd, uint16_t port) {
     struct sock_filter code[] = {
         BPF_STMT(BPF_LDX | BPF_B   | BPF_MSH, 0),
         BPF_STMT(BPF_LD  | BPF_H   | BPF_IND, 2),                   /* tcp dport */
@@ -363,10 +393,37 @@ static void filter_server(int fd, uint16_t port) {
     raw_filter(fd, code, sizeof(code) / sizeof(code[0]));
 }
 
+/* То же, но с раскладкой по воркерам: сокету достаются только сегменты, у которых младшие
+ * биты ПОРТА ИСТОЧНИКА равны id. Так каждый поток получает свою долю соединений, и ни одно
+ * соединение не приходит двум потокам — а значит окно приёма, ключи и счётчик nonce остаются
+ * личной собственностью потока и не требуют ни одного замка на горячем пути (тот же довод, что
+ * записан про очереди TUN в tun.h).
+ *
+ * Раскладка ИМЕННО по порту источника, а не по адресу: за одним NAT может сидеть вся звезда,
+ * и по адресу все соединения достались бы одному потоку. Маска обязана быть степенью двойки
+ * минус один: у cBPF нет деления, а «и» с маской — одна инструкция.
+ *
+ * Порядок проверок — сначала порт назначения (он отбивает основную массу чужого), потом
+ * раскладка: ядро исполняет фильтр на каждый локально доставляемый TCP-сегмент, и лишняя
+ * работа здесь платится на всём трафике машины, а не только на нашем. */
+void obfs_filter_port_shard(int fd, uint16_t port, uint16_t mask, uint16_t id) {
+    struct sock_filter code[] = {
+        BPF_STMT(BPF_LDX | BPF_B   | BPF_MSH, 0),
+        BPF_STMT(BPF_LD  | BPF_H   | BPF_IND, 2),                   /* tcp dport */
+        BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, port, 0, 4),
+        BPF_STMT(BPF_LD  | BPF_H   | BPF_IND, 0),                   /* tcp sport */
+        BPF_STMT(BPF_ALU | BPF_AND | BPF_K, mask),
+        BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, id, 0, 1),
+        BPF_STMT(BPF_RET | BPF_K, 0xFFFFFFFF),
+        BPF_STMT(BPF_RET | BPF_K, 0),
+    };
+    raw_filter(fd, code, sizeof(code) / sizeof(code[0]));
+}
+
 /* Сокеты, которые только отправляют: не принимать ничего. Без этого connect()'нутый
  * сокет сессии копил очередь на мегабайт и складывал туда весь встречный поток —
  * именно он и дал 146 тысяч drops на первом же замере под нагрузкой. */
-static void filter_none(int fd) {
+void obfs_filter_none(int fd) {
     struct sock_filter code[] = { BPF_STMT(BPF_RET | BPF_K, 0) };
     raw_filter(fd, code, 1);
 }
@@ -376,7 +433,7 @@ static void filter_none(int fd) {
  * выбрать маршрут, а с ним и адрес источника — тот самый, который нужен контрольной
  * сумме. Спрашивать адрес у интерфейса нельзя: их несколько, и правильный знает только
  * таблица маршрутизации. */
-static int raw_open(uint32_t daddr, uint32_t *saddr_out) {
+int obfs_raw_open(uint32_t daddr, uint32_t *saddr_out) {
     int fd = socket(AF_INET, SOCK_RAW, IPPROTO_TCP);
     if (fd < 0) return -1;
 
@@ -487,9 +544,14 @@ static int conn_send(int fd, struct fconn *c, uint8_t flags,
 static char g_chain[64];
 static int g_chain_up;
 
-static void chain_name(const char *out, char *dst, size_t n) {
+/* Вид в имени цепочки ('o' — обфускатор, 'x' — xsteer): у них одна таблица, но свои
+ * цепочки, иначе выход из одного процесса снимал бы правило другого. Таблица общая
+ * НАРОЧНО — вторая означала бы вторую строку уборки в init-скрипте, вторую запись в
+ * контракте и второй способ забыть одну из них. Имя таблицы историческое: «steer_obfs»
+ * теперь про поддельный TCP вообще, а не только про обфускацию WireGuard. */
+static void chain_name(char kind, const char *out, char *dst, size_t n) {
     size_t k = 0;
-    dst[k++] = 'o'; dst[k++] = '_';
+    dst[k++] = kind; dst[k++] = '_';
     for (size_t i = 0; out[i] && k + 1 < n; i++) {
         char c = out[i];
         int ok = (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
@@ -499,7 +561,7 @@ static void chain_name(const char *out, char *dst, size_t n) {
     dst[k] = '\0';
 }
 
-static void guard_down(void) {
+void obfs_guard_down(void) {
     if (!g_chain_up) return;
     const char *del[] = { "nft", "delete", "chain", "inet", "steer_obfs", g_chain, NULL };
     run_quiet(del);
@@ -507,7 +569,7 @@ static void guard_down(void) {
 }
 
 static void guard_sig(int sig) {
-    guard_down();
+    obfs_guard_down();
     _exit(128 + sig);
 }
 
@@ -515,7 +577,8 @@ static void guard_sig(int sig) {
  * закрыт политикой firewall (тогда RST не порождается вовсе), но на клиенте означает,
  * что первую же сессию оборвёт собственное ядро — поэтому вызывающий говорит об этом
  * громко, а не молча продолжает. */
-static int guard_up(const char *label, const char *peer_addr, int port, int is_server) {
+int obfs_guard_up(char kind, const char *label, const char *peer_addr, int port,
+                  int is_server) {
     /* Имя цепочки обязано быть РАЗНЫМ у разных экземпляров, и это не аккуратность.
      * Серверные экземпляры звались одинаково («server»), поэтому второй сервер,
      * поднятый на другом порту, при выходе снимал цепочку первого — и тот оставался
@@ -526,7 +589,7 @@ static int guard_up(const char *label, const char *peer_addr, int port, int is_s
     char label_buf[64];
     if (is_server) snprintf(label_buf, sizeof(label_buf), "srv%d", port);
     else snprintf(label_buf, sizeof(label_buf), "%.40s", label);
-    chain_name(label_buf, g_chain, sizeof(g_chain));
+    chain_name(kind, label_buf, g_chain, sizeof(g_chain));
     char portbuf[16];
     snprintf(portbuf, sizeof(portbuf), "%d", port);
 
@@ -578,7 +641,7 @@ static int guard_up(const char *label, const char *peer_addr, int port, int is_s
     if (run_quiet(is_server ? rule_s : rule_c) != 0) return -1;
 
     g_chain_up = 1;
-    atexit(guard_down);
+    atexit(obfs_guard_down);
     signal(SIGTERM, guard_sig);
     signal(SIGINT, guard_sig);
     return 0;
@@ -605,18 +668,28 @@ static void client_reset(struct fconn *c, uint32_t daddr, int dport) {
     c->state = ST_CLOSED;
 }
 
+/* Масштаб окна в SYN появился здесь ПОЗЖЕ обфускатора, и вот почему он важен и ему.
+ *
+ * Замер на живом роутере (канал 176 Мбит вверх, задержка 50 мс): туннель через обфускатор
+ * отдавал 2,15 Мбит/с и на восьмисекундном тесте растягивался на сорок секунд. Тот же путь,
+ * то же железо, но с масштабом окна — 63 Мбит/с. Причина не в шифре и не в процессоре:
+ * conntrack по дороге верит объявленному окну 65535 и метит недействительным всё, что
+ * выходит за 64 КиБ в полёте, а правило fw4 против утечек NAT такие пакеты отбрасывает.
+ *
+ * С phantun на другой стороне выигрыша не будет: масштаб действует, только если его прислали
+ * ОБА, а он опций не посылает. Но и вреда нет — опцию он игнорирует, как и раньше. */
 static int client_connect(struct fconn *c, int *raw_fd, uint32_t daddr, int dport) {
     if (*raw_fd >= 0) close(*raw_fd);
     client_reset(c, daddr, dport);
-    *raw_fd = raw_open(daddr, &c->saddr);
+    *raw_fd = obfs_raw_open(daddr, &c->saddr);
     if (*raw_fd < 0) {
         fprintf(stderr, LOG_W "сырой сокет недоступен: %s\n", strerror(errno));
         return -1;
     }
     /* Фильтр ставится ДО первого SYN: между socket() и настройкой очередь успевает
      * набрать чужого, и на нагруженном роутере это тысячи пакетов. */
-    filter_client(*raw_fd, daddr, c->dport, c->sport);
-    if (conn_send(*raw_fd, c, TH_SYN, NULL, 0, 1) != 0) return -1;
+    obfs_filter_quad(*raw_fd, daddr, c->dport, c->sport);
+    if (conn_send(*raw_fd, c, TH_SYN, NULL, 0, OBFS_OPT_SCALE) != 0) return -1;
     c->state = ST_SYN_SENT;
     c->syn_tries = 1;
     c->last_rx = now_ms();
@@ -648,7 +721,7 @@ int obfs_client(const char *out_name, const char *server, int server_port,
     int fl = fcntl(udp, F_GETFL, 0);
     fcntl(udp, F_SETFL, fl | O_NONBLOCK);
 
-    if (guard_up(out_name, server, server_port, 0) != 0)
+    if (obfs_guard_up('o', out_name, server, server_port, 0) != 0)
         fprintf(stderr, LOG_W "%s: правило против RST не встало — сессию может оборвать "
                               "собственное ядро (нет nft?)\n", out_name);
 
@@ -834,7 +907,7 @@ int obfs_client(const char *out_name, const char *server, int server_port,
             if (client_connect(&c, &raw, sa.s_addr, server_port) != 0) return 1;
         }
     }
-    guard_down();
+    obfs_guard_down();
     return 1;
 }
 
@@ -884,9 +957,9 @@ static struct sess *sess_alloc(uint32_t caddr, uint16_t cport, uint16_t our_port
     memset(slot, 0, sizeof(*slot));
     slot->udp = slot->tx = -1;
 
-    slot->tx = raw_open(caddr, &slot->c.saddr);
+    slot->tx = obfs_raw_open(caddr, &slot->c.saddr);
     if (slot->tx < 0) return NULL;
-    filter_none(slot->tx);
+    obfs_filter_none(slot->tx);
 
     slot->udp = socket(AF_INET, SOCK_DGRAM, 0);
     if (slot->udp < 0) { sess_free(slot); return NULL; }
@@ -927,7 +1000,7 @@ int obfs_server(int listen_port, const char *forward, int forward_port) {
     fcntl(rx, F_SETFL, fl | O_NONBLOCK);
     int rcvbuf = 1 << 20;
     setsockopt(rx, SOL_SOCKET, SO_RCVBUF, &rcvbuf, sizeof(rcvbuf));
-    filter_server(rx, (uint16_t)listen_port);
+    obfs_filter_port(rx, (uint16_t)listen_port);
 
     /* Отдельный сокет без connect: им отвечают тем, чьей сессии нет. Заводится один
      * раз, а не на каждый такой пакет, иначе поток чужих сегментов означал бы поток
@@ -936,10 +1009,10 @@ int obfs_server(int listen_port, const char *forward, int forward_port) {
     if (tx0 >= 0) {
         int md = IP_PMTUDISC_DONT;
         setsockopt(tx0, IPPROTO_IP, IP_MTU_DISCOVER, &md, sizeof(md));
-        filter_none(tx0);
+        obfs_filter_none(tx0);
     }
 
-    if (guard_up("server", NULL, listen_port, 1) != 0)
+    if (obfs_guard_up('o', "server", NULL, listen_port, 1) != 0)
         fprintf(stderr, LOG_W "правило против RST не встало: если порт %d не закрыт "
                               "политикой firewall, ядро будет рвать сессии\n", listen_port);
 
@@ -992,7 +1065,7 @@ int obfs_server(int listen_port, const char *forward, int forward_port) {
                     ss->c.ack = s.seq + 1;
                     ss->c.state = ST_SYN_RCVD;
                     ss->c.last_rx = now_ms();
-                    conn_send(ss->tx, &ss->c, TH_SYN | TH_ACK, NULL, 0, 1);
+                    conn_send(ss->tx, &ss->c, TH_SYN | TH_ACK, NULL, 0, OBFS_OPT_SCALE);
                     continue;
                 }
                 if (!ss) {
@@ -1073,6 +1146,6 @@ int obfs_server(int listen_port, const char *forward, int forward_port) {
                 conn_send(g_sess[i].tx, &g_sess[i].c, TH_ACK, NULL, 0, 0);
         }
     }
-    guard_down();
+    obfs_guard_down();
     return 1;
 }

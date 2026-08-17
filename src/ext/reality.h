@@ -34,4 +34,52 @@ struct reality_state {
 int reality_build_hello(const struct reality_cfg *cfg, struct reality_state *st,
                         unsigned char *out, size_t out_n, size_t *out_len);
 
+/* Носитель чужого рукопожатия внутри того же ClientHello.
+ *
+ * ЗАЧЕМ ЭТО ЗДЕСЬ, А НЕ ОТДЕЛЬНЫМ СБОРЩИКОМ. Протоколу xsteer (см. xshake.c) нужен Hello
+ * с обликом Chrome, но со своей полезной нагрузкой в двух полях: свой эфемерный ключ в
+ * key_share, свой аутентификатор в session_id и запечатанный статический ключ в набивке
+ * фальшивого ECH. Скопировать для этого сборщик Hello значило бы завести ВТОРОЕ место, где
+ * живёт отпечаток браузера, — и однажды они разъедутся, причём симптомом будет не ошибка, а
+ * сервер Reality, молча отвечающий маскировочным сайтом. Поэтому сборщик один, а различия
+ * выражены тремя необязательными полями.
+ *
+ * Байты Hello при car == NULL не меняются ни на бит: это закреплено стендом
+ * tests/hellofreeze.c, который сверяет их с заморозкой, снятой ДО появления носителя.
+ *
+ * Порядок вызова обратных функций не случаен и важен для обеих сторон: сначала fill_ech
+ * (набивка входит в подписываемые байты), потом fill_sid (подписывает весь Hello с
+ * обнулённым session_id). Тот же порядок повторяет хаб, разбирая полученное. */
+struct reality_carrier {
+    /* Готовая эфемерная пара вместо сгенерированной. Нужна потому, что xsteer выводит из
+     * неё общий секрет ЕЩЁ ДО сборки Hello — чтобы было чем запечатать статический ключ. */
+    const unsigned char *priv;      /* 32 байта, или NULL */
+    const unsigned char *pub;       /* 32 байта, обязателен вместе с priv */
+    /* Заполнить набивку ECH (176 байт). NULL — оставить случайный шум, как у браузера без
+     * настроенного ECH. */
+    int (*fill_ech)(void *ctx, unsigned char *ech, size_t ech_n,
+                    const unsigned char shared[32]);
+    /* Заполнить 32 байта session_id вместо аутентификатора Reality. hs — сообщение
+     * рукопожатия с УЖЕ ОБНУЛЁННЫМ session_id, то есть ровно те байты, которые вторая
+     * сторона сможет восстановить у себя. */
+    int (*fill_sid)(void *ctx, unsigned char sid[32],
+                    const unsigned char *hs, size_t hs_n,
+                    const unsigned char shared[32]);
+    void *ctx;
+};
+
+int reality_build_hello_carry(const struct reality_cfg *cfg, struct reality_state *st,
+                              const struct reality_carrier *car,
+                              unsigned char *out, size_t out_n, size_t *out_len);
+
+/* Примитивы этого файла наружу — для xsteer (src/ext/xshake.c). Объяснение, почему обёртки,
+ * а не копии, стоит у их определений в reality.c. */
+int xc_random(unsigned char *out, size_t n);
+int xc_cpu_has_aes(void);
+int xc_x25519_keypair(unsigned char priv[32], unsigned char pub[32]);
+int xc_x25519_public(const unsigned char priv[32], unsigned char pub[32]);
+/* Общий секрет X25519. Живёт здесь же и уже объявлена в tls13.c, но xsteer зовёт её тоже. */
+int x25519_shared_ext(const unsigned char priv[32], const unsigned char peer[32],
+                      unsigned char out[32]);
+
 #endif

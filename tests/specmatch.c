@@ -447,6 +447,102 @@ int main(void) {
         check("без obfs: признак выключен", 0, g_out[0].obfs.on);
     }
 
+    /* ---- виды выходов, существующие только в расширенной сборке ------------------
+     *
+     * Этот же файл собирается ДВАЖДЫ: build/specmatch без STEER_EXTENDED и
+     * build/specmatch-ext с ним. Иначе положительные случаи kind=vless и kind=xsteer
+     * недостижимы вовсе — базовая сборка отвергает такую спеку парсером, — и до
+     * появления второго бинарника vless не был проверен здесь ни одной строкой.
+     * Прецедент тот же, что у build/diagsim: один исходник, два бинарника. */
+    {
+        const char *s = SPEC(
+            "\"outputs\":{\"vpn\":{\"kind\":\"xsteer\"}},"
+            "\"channels\":[]}");
+#ifdef STEER_EXTENDED
+        check("xsteer: спека принята", 0, load_from_str(s));
+        check("xsteer: вид OUT_XSTEER", OUT_XSTEER, g_out[0].kind);
+        /* Устройство и путь к конфигурации выводятся из имени выхода: держать их
+         * отдельными полями значило бы позволить двум именам разойтись. */
+        check_str("xsteer: устройство из имени выхода", "vpn", g_out[0].device);
+        check("xsteer: один кандидат в devices", 1, (int)g_out[0].devices_n);
+        check_str("xsteer: conf по умолчанию", "/etc/steer/xsteer/vpn.conf", g_out[0].xs_conf);
+        check("xsteer: считается выходом с устройством", 1, out_has_device(&g_out[0]));
+        check("xsteer: устройство создаёт наш процесс", 1, out_engine_managed(&g_out[0]));
+        check("xsteer: masquerade не нужен", 1, out_self_natting(&g_out[0]));
+#else
+        /* Базовая сборка обязана отказать ПАРСЕРОМ, а не при подъёме: иначе правила и
+         * метки встают, устройства не создаёт никто, и человек видит рабочую с виду
+         * конфигурацию, из которой не выходит ни один пакет. */
+        check("xsteer: базовая сборка отвергает вид", 2, load_from_str(s));
+#endif
+    }
+    {
+        /* То же обещание для vless — до второго бинарника оно не проверялось нигде. */
+        const char *s = SPEC(
+            "\"outputs\":{\"vpn\":{\"kind\":\"vless\",\"sub_file\":\"/tmp/sub.txt\"}},"
+            "\"channels\":[]}");
+#ifdef STEER_EXTENDED
+        check("vless: спека принята", 0, load_from_str(s));
+        check("vless: вид OUT_VLESS", OUT_VLESS, g_out[0].kind);
+        check("vless: устройство создаёт наш процесс", 1, out_engine_managed(&g_out[0]));
+#else
+        check("vless: базовая сборка отвергает вид", 2, load_from_str(s));
+#endif
+    }
+#ifdef STEER_EXTENDED
+    {
+        /* Явный conf побеждает умолчание, но обязан быть абсолютным: процесс запускает
+         * procd со своим рабочим каталогом, и относительный путь «работал бы из шелла». */
+        const char *s = SPEC(
+            "\"outputs\":{\"vpn\":{\"kind\":\"xsteer\",\"conf\":\"/etc/hub.conf\"}},"
+            "\"channels\":[]}");
+        check("xsteer: явный conf принят", 0, load_from_str(s));
+        check_str("xsteer: явный conf сохранён", "/etc/hub.conf", g_out[0].xs_conf);
+    }
+    {
+        const char *s = SPEC(
+            "\"outputs\":{\"vpn\":{\"kind\":\"xsteer\",\"conf\":\"hub.conf\"}},"
+            "\"channels\":[]}");
+        check("xsteer: относительный conf — отказ", 2, load_from_str(s));
+    }
+    {
+        /* У xsteer свой транспорт и своя маскировка внутри движка: obfs здесь означал бы
+         * обфускацию поверх обфускации, то есть «настроено», не настроив ничего. */
+        const char *s = SPEC(
+            "\"outputs\":{\"vpn\":{\"kind\":\"xsteer\","
+            "\"obfs\":{\"server\":\"203.0.113.10:4567\",\"listen\":\"127.0.0.1:51820\"}}},"
+            "\"channels\":[]}");
+        check("xsteer: obfs — отказ", 2, load_from_str(s));
+    }
+    {
+        /* Проверки, знавшие про один вид выхода с устройством, молча пропускали второй.
+         * Эти две — ровно они: выход в локальный мост и any без allow_all. */
+        const char *s = SPEC(
+            "\"lan_device\":\"br-lan\","
+            "\"outputs\":{\"vpn\":{\"kind\":\"xsteer\",\"device\":\"br-lan\"}},"
+            "\"channels\":[]}");
+        check("xsteer: устройство = lan_device — отказ", 2, load_from_str(s));
+    }
+    {
+        const char *s = SPEC(
+            "\"outputs\":{\"vpn\":{\"kind\":\"xsteer\"}},"
+            "\"channels\":[{\"name\":\"всё\",\"out\":\"vpn\",\"match\":{\"any\":true}}]}");
+        check("xsteer: any без allow_all — отказ", 2, load_from_str(s));
+    }
+#endif
+    {
+        /* Неизвестный вид отвергается целиком — и это желаемое поведение, а не цена:
+         * спека, записанная более новым интерфейсом, не должна применяться наполовину. */
+        const char *s = SPEC(
+            "\"outputs\":{\"vpn\":{\"kind\":\"xsteerr\"}},"
+            "\"channels\":[]}");
+        check("неизвестный kind — отказ", 2, load_from_str(s));
+        check("out_kind_known: xsteer известен", 1, out_kind_known("xsteer"));
+        check("out_kind_known: опечатка неизвестна", 0, out_kind_known("xsteerr"));
+        check_str("out_kind_name: xsteer", "xsteer", out_kind_name(OUT_XSTEER));
+        check_str("out_kind_name: interface", "interface", out_kind_name(OUT_INTERFACE));
+    }
+
     printf("\n%s\n", fails ? "ЕСТЬ ПРОВАЛЫ" : "все проверки прошли");
     return fails ? 1 : 0;
 }

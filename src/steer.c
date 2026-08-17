@@ -76,6 +76,61 @@ static int cmd_vless_probe(const char *spec_path, const char *out_name,
     return no_vless();
 }
 #endif
+
+/* Клиент и хаб xsteer. Клиент — расширенная сборка, хаб — серверная: на роутере хабу делать
+ * нечего, и подкоманды, поднимающей слушателя на публичном порту, там быть не должно. */
+/* Клиент — только расширенная сборка. А вот проверка конфигурации и генерация ключей нужны и
+ * серверной: без них оператор хаба не смог бы ни ключ сделать, ни файл проверить. */
+#if defined(STEER_EXTENDED) || defined(STEER_SERVER)
+int cmd_xsteer_key(void);
+int cmd_xsteer_check(const char *conf);
+#else
+static int no_xsteer_admin(void) {
+    fprintf(stderr, "steer: служебные команды xsteer в этой сборке отсутствуют — "
+                    "нужен пакет steer-extended\n");
+    return 2;
+}
+static int cmd_xsteer_key(void) { return no_xsteer_admin(); }
+static int cmd_xsteer_check(const char *conf) { (void)conf; return no_xsteer_admin(); }
+#endif
+
+#ifdef STEER_EXTENDED
+int cmd_xsteer(const char *spec_path, const char *out_name, const char *conf,
+               const char *device);
+int cmd_xsteer_peers(const char *spec_path, const char *out_name, const char *conf);
+#else
+static int no_xsteer(void) {
+    /* Та же контрактная подстрока «steer-extended», что у VLESS, и по той же причине:
+     * splify2 определяет вид пакета пробой `steer xsteer ''`. */
+    fprintf(stderr, "steer: клиент xsteer в этой сборке отсутствует — "
+                    "нужен пакет steer-extended\n");
+    return 2;
+}
+static int cmd_xsteer(const char *spec_path, const char *out_name, const char *conf,
+                      const char *device) {
+    (void)spec_path; (void)out_name; (void)conf; (void)device;
+    return no_xsteer();
+}
+static int cmd_xsteer_peers(const char *spec_path, const char *out_name, const char *conf) {
+    (void)spec_path; (void)out_name; (void)conf;
+    return no_xsteer();
+}
+#endif
+
+#ifdef STEER_SERVER
+int cmd_xsteer_hub(const char *conf);
+#else
+static int cmd_xsteer_hub(const char *conf) {
+    (void)conf;
+    /* ВТОРАЯ контрактная подстрока — «steer-hub». Она отличает «нужен другой пакет для
+     * роутера» от «нужен артефакт для сервера», и без этого различия человека посылали бы
+     * ставить steer-extended туда, где хаба всё равно не будет. */
+    fprintf(stderr, "steer: хаб xsteer в этой сборке отсутствует — "
+                    "он ставится на VPS из архива steer-hub\n");
+    return 2;
+}
+#endif
+
 int aggregate_main(int argc, char **argv);
 
 /* ---- coalescing: one interface, at most two sets ---------------------------
@@ -839,8 +894,14 @@ static void report_output_deps(void) {
          * вовсе. Предупреждение «нет masquerade» здесь было ложной тревогой, а ложная
          * тревога дороже отсутствующей: по ней настраивают лишнее и перестают верить
          * настоящим. Про зону предупреждать всё равно надо — без неё fw4 не пропускает
-         * транзит, и это проверено с настоящего клиента. */
-        else if (g_out[i].kind == OUT_VLESS) {
+         * транзит, и это проверено с настоящего клиента.
+         *
+         * У xsteer тот же итог по другой причине: адреса клиентов границу переходят, но
+         * переходят к хабу внутри туннеля, где транслировать их нечем. Там NAT не просто
+         * не нужен, а вреден — он скрывает, от какой пира пришёл пакет, и ломает
+         * обратный поиск по AllowedIPs. Условие поэтому одно (out_self_natting), а
+         * объяснения в diag разные: см. ветку про masquerade в cmd_diag. */
+        else if (out_self_natting(&g_out[i])) {
             /* нечего проверять */
         }
         else if (!c.masqueraded)
@@ -1044,8 +1105,7 @@ static int cmd_status(const char *spec) {
             }
         }
         printf("%s\"%s\":{\"kind\":\"%s\"", i ? "," : "", g_out[i].name,
-               g_out[i].kind == OUT_DIRECT ? "direct" :
-               g_out[i].kind == OUT_VLESS ? "vless" : "interface");
+               out_kind_name(g_out[i].kind));
         if (out_has_device(&g_out[i])) {
             struct fwcheck c = fw_check(g_out[i].device);
             printf(",\"device\":\"%s\",\"up\":%s,\"mark\":\"0x%08x\",\"table\":%d"
@@ -1442,7 +1502,13 @@ static int cmd_diag(const char *spec) {
      *
      *    Приговор note в обоих случаях, а не warn: имена РАЗРЕШАЮТСЯ, поломки нет. Разница
      *    лишь в том, кого это касается — при доменных правилах клиентов из from_default
-     *    прикрывает перенаправление DNS на свой резолвер, и цену платят только остальные. */
+     *    прикрывает перенаправление DNS на свой резолвер, и цену платят только остальные.
+     *
+     *    ТОЛЬКО vless, и на xsteer это НЕ распространяется, хотя оба вида — наши туннели.
+     *    Причина заметки в том, что у VLESS поток к узлу свой на каждую пару адрес-порт;
+     *    xsteer несёт сырой IP, как wireguard, никаких потоков к узлу у него нет, и цены
+     *    тоже нет. Скопировать заметку на xsteer значило бы напечатать постоянную заметку
+     *    без причины — ровно то, из-за чего была убрана проверка `udp`. */
     for (size_t i = 0; i < g_grp_n; i++) {
         struct output *o = out_by_name(g_grp[i].out);
         if (!o || o->kind != OUT_VLESS) continue;
@@ -1485,8 +1551,8 @@ static int cmd_diag(const char *spec) {
             snprintf(what, sizeof(what), "выход %.40s: устройства %.24s нет",
                      g_out[i].name, g_out[i].device);
             snprintf(why, sizeof(why), "туннель не поднят — %s",
-                     g_out[i].kind == OUT_VLESS ? "смотрите журнал движка"
-                                                : "проверьте настройку интерфейса");
+                     out_engine_managed(&g_out[i]) ? "смотрите журнал движка"
+                                                   : "проверьте настройку интерфейса");
             diag("output", "fail", what, why);
             continue;
         }
@@ -1496,7 +1562,7 @@ static int cmd_diag(const char *spec) {
                      g_out[i].name, g_out[i].device);
             diag("output", "fail", what,
                  "фаервол отбросит ответы — добавьте устройство в зону");
-        } else if (!c.masqueraded && g_out[i].kind != OUT_VLESS) {
+        } else if (!c.masqueraded && !out_self_natting(&g_out[i])) {
             /* Только для kind=interface. Выходу vless masquerade не нужен: он завершает TCP
              * сам и наружу идёт от своего имени, адреса клиентов границу не переходят. Жалоба
              * на исправной системе — это постоянная жёлтая метка, которая учит не смотреть на
@@ -1511,13 +1577,22 @@ static int cmd_diag(const char *spec) {
                      g_out[i].name, g_out[i].device);
             diag("output", "ok", what, "");
         } else {
-            /* Сюда попадает только vless без masquerade — для него это норма. Сказать
-             * «NAT есть» было бы прямой неправдой: его нет, он просто не нужен. */
+            /* Сюда попадает выход без masquerade, которому он и не нужен (vless, xsteer)
+             * — для него это норма. Сказать «NAT есть» было бы прямой неправдой: его нет,
+             * он просто не нужен.
+             *
+             * Тексты РАЗНЫЕ, и это не оформление. Формулировка vless («туннель завершает
+             * TCP сам, адреса клиентов наружу не уходят») для xsteer неверна: адреса
+             * уходят, к хабу. Расширить условие через ||, оставив прежнее объяснение,
+             * значило бы записать в диагностику неправду — а по ней настраивают. */
             snprintf(what, sizeof(what), "выход %.40s: устройство %.24s в зоне",
                      g_out[i].name, g_out[i].device);
             diag("output", "ok", what,
-                 "masquerade не нужен: туннель завершает TCP сам, адреса клиентов наружу "
-                 "не уходят");
+                 g_out[i].kind == OUT_XSTEER
+                     ? "masquerade не нужен и вреден: адреса клиентов уходят к хабу, а NAT "
+                       "скрыл бы, от какой пира пришёл пакет"
+                     : "masquerade не нужен: туннель завершает TCP сам, адреса клиентов "
+                       "наружу не уходят");
         }
     }
 
@@ -1827,13 +1902,11 @@ int main(int argc, char **argv) {
          * давал пустой вывод и код 0, а по этому выводу init-скрипт решает, каким выходам
          * поднимать процессы. Тишина вместо отказа означала бы не поднятый туннель без
          * единой строки о причине. */
-        if (a.kind && strcmp(a.kind, "interface") && strcmp(a.kind, "vless") &&
-            strcmp(a.kind, "direct"))
-            die("--kind: нужен interface, vless или direct, а не %s", a.kind);
+        if (a.kind && !out_kind_known(a.kind))
+            die("--kind: нужен interface, vless, xsteer или direct, а не %s", a.kind);
         load_spec(spec);
         for (size_t i = 0; i < g_out_n; i++) {
-            const char *k = g_out[i].kind == OUT_DIRECT ? "direct" :
-                            g_out[i].kind == OUT_VLESS ? "vless" : "interface";
+            const char *k = out_kind_name(g_out[i].kind);
             if (a.kind && strcmp(a.kind, k) != 0) continue;
             /* --obfs — отдельный признак, а не вид: обфускация есть свойство выхода,
              * и init-скрипту нужен именно список тех, кому поднимать процесс. */
@@ -1868,6 +1941,13 @@ int main(int argc, char **argv) {
     /* Серверная половина. Спека ей не нужна и не читается: сервер живёт на VPS, где
      * ни выходов, ни каналов нет — есть порт, который слушать, и локальный WireGuard,
      * которому пересылать. */
+    if (!strcmp(cmd, "xsteer")) return cmd_xsteer(spec, arg, a.config, a.device);
+    if (!strcmp(cmd, "xsteer-peers")) return cmd_xsteer_peers(spec, arg, a.config);
+    if (!strcmp(cmd, "xsteer-key")) return cmd_xsteer_key();
+    if (!strcmp(cmd, "xsteer-check")) return cmd_xsteer_check(a.config);
+    /* Хаб живёт на VPS: спека ему не нужна и не читается — там ни выходов, ни каналов, а
+     * есть конфигурация звезды и порт. Прецедент тот же, что у obfs-server. */
+    if (!strcmp(cmd, "xsteer-hub")) return cmd_xsteer_hub(a.config);
     if (!strcmp(cmd, "obfs-server")) {
         if (!a.listen) die("нужен --listen ПОРТ (порт поддельного TCP)", NULL);
         if (!a.forward) die("нужен --forward АДРЕС:ПОРТ (куда отдавать датаграммы)", NULL);

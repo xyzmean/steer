@@ -214,7 +214,7 @@ static void aead_nonce(const unsigned char iv[12], uint64_t seq, unsigned char o
 
 /* Развернуть ключ в контекст шифра. Вызывается один раз на направление, когда ключи
  * трафика готовы; дальше каждая запись пользуется готовым контекстом. */
-static int keys_setup(struct tls13_keys *k) {
+int tls13_keys_setup(struct tls13_keys *k) {
     if (k->ctx_ready) return 0;
     if (k->aead == TLS13_AEAD_CHACHA) {
         mbedtls_chachapoly_init(&k->chacha);
@@ -229,7 +229,7 @@ static int keys_setup(struct tls13_keys *k) {
     return 0;
 }
 
-static void keys_free(struct tls13_keys *k) {
+void tls13_keys_free(struct tls13_keys *k) {
     if (!k->ctx_ready) return;
     if (k->aead == TLS13_AEAD_CHACHA) mbedtls_chachapoly_free(&k->chacha);
     else mbedtls_gcm_free(&k->gcm);
@@ -237,14 +237,14 @@ static void keys_free(struct tls13_keys *k) {
 }
 
 void tls13_free(struct tls13 *t) {
-    keys_free(&t->rd);
-    keys_free(&t->wr);
+    tls13_keys_free(&t->rd);
+    tls13_keys_free(&t->wr);
     mbedtls_sha256_free(&t->tr);
     mbedtls_sha512_free(&t->tr384);
     t->ready = 0;
 }
 
-static int aead_open(struct tls13_keys *k, uint64_t seq,
+int tls13_aead_open(struct tls13_keys *k, uint64_t seq,
                      const unsigned char *aad, size_t aad_n,
                      unsigned char *buf, size_t n) {
     if (n < 16) return TLS13_EBADREC;
@@ -267,7 +267,7 @@ static int aead_open(struct tls13_keys *k, uint64_t seq,
     return rc == 0 ? 0 : TLS13_EAUTH;
 }
 
-static int aead_seal(struct tls13_keys *k, uint64_t seq,
+int tls13_aead_seal(struct tls13_keys *k, uint64_t seq,
                      const unsigned char *aad, size_t aad_n,
                      unsigned char *buf, size_t n, unsigned char *tag) {
     if (!k->ctx_ready) return TLS13_ESTATE;
@@ -292,9 +292,9 @@ static int aead_open_once(const struct tls13_keys *src, uint64_t seq,
                           unsigned char *buf, size_t n) {
     struct tls13_keys k = *src;
     k.ctx_ready = 0;
-    int rc = keys_setup(&k);
-    if (rc == 0) rc = aead_open(&k, seq, aad, aad_n, buf, n);
-    keys_free(&k);
+    int rc = tls13_keys_setup(&k);
+    if (rc == 0) rc = tls13_aead_open(&k, seq, aad, aad_n, buf, n);
+    tls13_keys_free(&k);
     return rc;
 }
 
@@ -303,9 +303,9 @@ static int aead_seal_once(const struct tls13_keys *src, uint64_t seq,
                           unsigned char *buf, size_t n, unsigned char *tag) {
     struct tls13_keys k = *src;
     k.ctx_ready = 0;
-    int rc = keys_setup(&k);
-    if (rc == 0) rc = aead_seal(&k, seq, aad, aad_n, buf, n, tag);
-    keys_free(&k);
+    int rc = tls13_keys_setup(&k);
+    if (rc == 0) rc = tls13_aead_seal(&k, seq, aad, aad_n, buf, n, tag);
+    tls13_keys_free(&k);
     return rc;
 }
 
@@ -581,7 +581,7 @@ int tls13_handshake(struct tls13 *t, int fd,
     if (expand_label(md, s_ap, H, "iv", NULL, 0, t->rd.iv, 12) != 0) return TLS13_ECRYPTO;
     /* Ключи трафика больше не меняются — разворачиваем их в контексты шифров здесь, и
      * дальше поток идёт без единого setkey. */
-    if (keys_setup(&t->wr) != 0 || keys_setup(&t->rd) != 0) return TLS13_ECRYPTO;
+    if (tls13_keys_setup(&t->wr) != 0 || tls13_keys_setup(&t->rd) != 0) return TLS13_ECRYPTO;
     t->wr_seq = t->rd_seq = 0;
     t->ready = 1;
     return 0;
@@ -619,7 +619,7 @@ int tls13_write(struct tls13 *t, const unsigned char *data, size_t n) {
         out[3] = (unsigned char)(total >> 8); out[4] = (unsigned char)total;
         memcpy(out + 5, data, chunk);
         out[5 + chunk] = 0x17;                  /* inner type: application_data */
-        if (aead_seal(&t->wr, t->wr_seq++, out, 5, out + 5, chunk + 1,
+        if (tls13_aead_seal(&t->wr, t->wr_seq++, out, 5, out + 5, chunk + 1,
                       out + 5 + chunk + 1) != 0)
             return TLS13_ECRYPTO;
         size_t want = 5 + total, sent = 0;
@@ -675,7 +675,7 @@ static int read_one(struct tls13 *t, const unsigned char **body, size_t *body_n)
 
     unsigned char aad[5] = { 0x17, 0x03, 0x03,
                              (unsigned char)(n >> 8), (unsigned char)n };
-    rc = aead_open(&t->rd, t->rd_seq++, aad, 5, rec, n);
+    rc = tls13_aead_open(&t->rd, t->rd_seq++, aad, 5, rec, n);
     if (rc) return rc;
     size_t pt = n - 16;
     while (pt > 0 && rec[pt - 1] == 0) pt--;

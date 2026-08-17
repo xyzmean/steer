@@ -26,6 +26,17 @@ build/submatch
 build/fwmatch
 build/obfsmatch
 build/visionmatch
+build/specmatch-ext
+build/xswirematch
+build/xsconfmatch
+build/xsroutematch
+build/chellomatch
+build/hellofreeze
+build/xsloop
+build/xsbench
+build/steer-hub
+build/steer-ext
+build/transportcost
 # Родной скрипт OpenWrt, качается сборкой при первом запуске (см. build.sh).
 build/ipkg-build
 # Дерево архива серверной половины: собирается из build/steer-<арх> и server/.
