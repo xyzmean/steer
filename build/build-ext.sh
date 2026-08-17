@@ -85,7 +85,7 @@ fi
 # заменила прежнюю «один бинарник на две стороны» (см. server/README.md).
 XS_COMMON="/src/src/ext/xswire.c /src/src/ext/xsconf.c /src/src/ext/xsroute.c \
            /src/src/ext/chello.c /src/src/ext/xshake.c /src/src/ext/xsconn.c \
-           /src/src/ext/tls13.c /src/src/ext/reality.c /src/src/ext/tun.c /src/src/ext/h2.c \\
+           /src/src/ext/tls13.c /src/src/ext/reality.c /src/src/ext/tun.c /src/src/ext/h2.c \
            /src/src/ext/xsadmin.c"
 EXT_ROUTER="/src/src/ext/sub.c /src/src/ext/vless_proto.c /src/src/ext/vision.c \
             /src/src/ext/client.c /src/src/ext/tunnel.c /src/src/ext/rtx.c \
