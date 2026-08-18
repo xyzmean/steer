@@ -214,6 +214,15 @@ check "в xs_install.sh нет прямых read вне помощников" "2
 check "барьер релиза считает apk и ipk" "1" "$(grep -c 'for ext in apk ipk' "$wf")"
 check "барьер релиза считает архивы steer-obfs" "1" \
     "$(grep -c 'out/steer-obfs-\*.tar.gz' "$wf")"
+# Хаб xsteer — отдельный артефакт со своей ролью сборки; забыть его так же легко, как формат
+# пакета, и так же тихо: установщик просто не найдёт архив. Поэтому build.sh обязан его
+# собирать, а барьер релиза — считать.
+check "build.sh собирает архив steer-hub" "1" \
+    "$(grep -c 'czf ".*OUT/steer-hub' build.sh)"
+check "build.sh зовёт роль server для хаба" "1" \
+    "$(grep -c 'VERSION" server' build.sh)"
+check "барьер релиза считает архивы steer-hub" "1" \
+    "$(grep -c 'out/steer-hub-\*.tar.gz' "$wf")"
 for pat in 'out/*.apk' 'out/*.ipk' 'out/*.tar.gz'; do
     check "релиз выкладывает $pat" "1" "$(grep -cF "$pat" "$wf")"
 done

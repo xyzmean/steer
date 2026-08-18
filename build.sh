@@ -257,5 +257,59 @@ for arch in x86_64 aarch64_generic; do
     printf '  %-26s %s bytes\n' "$uarch" "$(stat -c %s "$OUT/steer-obfs-$VERSION-$uarch.tar.gz")"
 done
 
+# ---- хаб xsteer: архив для VPS -----------------------------------------------
+#
+# Клиент xsteer живёт на роутере (роль router, уже собран выше в extended), а хаб звезды —
+# на VPS. Хабу нужна подкоманда xsteer-hub, поднимающая слушателя на публичном порту, и
+# ради безопасности её нет в сборке для роутера: это отдельная РОЛЬ server сборки ext
+# (см. build/build-ext.sh — там объяснено, почему гейт стоит на списках файлов).
+#
+# Отсюда отдельный бинарник steer-hub и отдельный архив: смешивать его с обфускацией из
+# steer-obfs нельзя — там другая половина и другой протокол. Архитектуры те же, что у VPS
+# вообще (см. серверную половину выше): собирать хаб под mips значило бы предлагать
+# несуществующее.
+#
+# Имя архива БЕЗ версии — steer-hub-$uarch.tar.gz: установщик server/xs_install.sh тянет его
+# по фиксированному пути releases/latest/download/steer-hub-$arch.tar.gz, где имя не должно
+# зависеть от версии. Внутри — бинарник, установщик и справка: распаковал и запустил, даже
+# без сети (xs_install.sh берёт steer-hub рядом с собой, если он есть).
+echo "хаб xsteer:"
+for arch in x86_64 aarch64_generic; do
+    # Цель и mcpu берём из того же ISAS, что и основную сборку: одна таблица архитектур,
+    # чтобы хаб и движок не разошлись в флагах компилятора.
+    spec=""
+    for s in $ISAS; do [ "${s%%:*}" = "$arch" ] && spec="$s" && break; done
+    if [ -z "$spec" ]; then
+        printf '  %-26s пропуск (нет в ISAS)\n' "$arch"
+        continue
+    fi
+    rest=${spec#*:}; target=${rest%%:*}; mcpu=${rest#*:}
+    case "$arch" in
+        x86_64)           uarch=x86_64 ;;
+        aarch64_generic)  uarch=aarch64 ;;
+        *)                uarch=$arch ;;
+    esac
+    printf '  %-26s ' "$uarch"
+    if docker run --rm -v "$PWD:/src" -w /src --entrypoint sh "$IMAGE" \
+            /src/build/build-ext.sh "$target" "$mcpu" "/src/build/steer-hub-$arch" \
+            "$VERSION" server \
+            2>"build/$arch-hub.err"; then
+        :
+    else
+        rm -f "build/steer-hub-$arch"
+        echo "FAILED — $(grep -m1 error "build/$arch-hub.err" || head -1 "build/$arch-hub.err")"
+        continue
+    fi
+    stage="build/hub-$uarch"
+    rm -rf "$stage"
+    mkdir -p "$stage"
+    cp "build/steer-hub-$arch" "$stage/steer-hub"
+    cp server/xs_install.sh "$stage/xs_install.sh"
+    [ -f server/README.md ] && cp server/README.md "$stage/README.md"
+    chmod 0755 "$stage/steer-hub" "$stage/xs_install.sh"
+    tar -C "$stage" -czf "$OUT/steer-hub-$uarch.tar.gz" .
+    printf '%s bytes\n' "$(stat -c %s "$OUT/steer-hub-$uarch.tar.gz")"
+done
+
 echo "packages:"
 ls -1 "$OUT" 2>/dev/null | sed 's/^/  /'
