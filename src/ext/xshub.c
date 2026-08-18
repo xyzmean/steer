@@ -127,6 +127,10 @@ static struct sess g_sess[XSH_MAX_SESS];
 static struct xs_router g_router;
 static struct xs_conf g_conf;
 static struct xs_secrets g_sec;
+/* Имя устройства TUN. Умолчание xshub0, но конфигурация может задать своё через Device —
+ * тогда на одной машине уживаются два хаба, не столкнувшись за имя устройства. Разрешается
+ * один раз при старте (cmd_xsteer_hub) и дальше только читается. */
+static char g_dev[32] = "xshub0";
 /* Последняя метка времени от каждого пира: защита от воспроизведения записанного msg1.
  * Держится в памяти, а не на диске: перезапуск хаба и так требует нового рукопожатия. */
 static uint64_t g_last_stamp[XS_PEERS_MAX];
@@ -286,7 +290,7 @@ static void hub_retune_mtu(void) {
     if (!best || applied == best) { pthread_mutex_unlock(&g_ctl); return; }
     char val[8];
     snprintf(val, sizeof(val), "%d", best);
-    const char *a[] = { "ip", "link", "set", "dev", "xshub0", "mtu", val, NULL };
+    const char *a[] = { "ip", "link", "set", "dev", g_dev, "mtu", val, NULL };
     if (run_quiet(a) == 0) {
         fprintf(stderr, LOG_I "MTU устройства: %d (минимум среди пиров)\n", best);
         applied = best;
@@ -883,6 +887,8 @@ int cmd_xsteer_hub(const char *conf_path) {
         fprintf(stderr, LOG_W "%s\n", err);
         return 2;
     }
+    if (g_conf.device[0])
+        snprintf(g_dev, sizeof(g_dev), "%s", g_conf.device);
     for (int i = 0; i < XS_PEERS_MAX; i++)
         for (int c = 0; c < XS_CONNS_MAX; c++) g_peer_sess[i][c] = -1;
     for (int i = 0; i < XSH_MAX_SESS; i++) {
@@ -934,7 +940,7 @@ int cmd_xsteer_hub(const char *conf_path) {
      * одну очередь. Меньше очередей, чем воркеров, не беда: лишние воркеры возьмут очередь по
      * кругу, просто будут делить её с соседом. */
     struct tun_dev tq[XSH_WORKERS_MAX];
-    const char *dev = "xshub0";
+    const char *dev = g_dev;
     int nq = tun_open(tq, n, dev);
     if (nq < 0) {
         fprintf(stderr, LOG_W "нет /dev/net/tun (на LXC и OpenVZ его часто нет вовсе) — "

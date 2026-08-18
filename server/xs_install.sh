@@ -189,6 +189,18 @@ function installQuestions() {
 	HUB_PLEN="${HUB_SUBNET#*/}"
 	HUB_ADDR="${HUB_BASE}.1"
 
+	# Имя устройства TUN. По умолчанию xshub0, но если оно уже занято (например, рядом работает
+	# отдельный хаб режима потока), берём следующее свободное. Без этого второй хаб не поднимется:
+	# ip не создаст устройство с уже существующим именем, а ошибку это даёт невнятную.
+	HUB_DEV=xshub0
+	if ip link show "$HUB_DEV" >/dev/null 2>&1; then
+		local i=1
+		while ip link show "xshub${i}" >/dev/null 2>&1; do i=$((i + 1)); done
+		HUB_DEV="xshub${i}"
+		echo ""
+		echo "Устройство xshub0 занято — этот хаб возьмёт ${HUB_DEV}."
+	fi
+
 	echo ""
 	echo "Пиры могут ходить через хаб в интернет — тогда нужен masquerade на внешнем"
 	echo "интерфейсе. Правило ставится в ОТДЕЛЬНУЮ таблицу nft (steer_xsteer_nat), чужих"
@@ -212,6 +224,7 @@ HUB_SUBNET=${HUB_SUBNET}
 HUB_BASE=${HUB_BASE}
 HUB_PLEN=${HUB_PLEN}
 HUB_ADDR=${HUB_ADDR}
+HUB_DEV=${HUB_DEV}
 HUB_PUB_KEY=${HUB_PUB_KEY}
 HUB_NAT=${HUB_NAT}
 EOF
@@ -239,6 +252,7 @@ function installHub() {
 PrivateKey = $priv
 Address = ${HUB_ADDR}/${HUB_PLEN}
 ListenPort = ${HUB_PORT}
+Device = ${HUB_DEV}
 EOF
 	)
 	# ПРОВЕРЯТЬ КОНФИГУРАЦИЮ ЗДЕСЬ НЕЛЬЗЯ, и это не мелочь порядка: хабу нужен хотя бы один

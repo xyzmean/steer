@@ -208,14 +208,26 @@ int main(void) {
         char t[1024];
         snprintf(t, sizeof(t),
                  "[Interface]\nPrivateKey=%s\nAddress=10.77.0.1/24\nListenPort=443\n"
+                 "Device=xshubc0\n"
                  "[Peer]\nPublicKey=%s\nAllowedIPs=10.77.0.2/32, 192.168.88.0/24\n"
                  "[Peer]\nPublicKey=%s\nAllowedIPs=10.77.0.3/32, 192.168.99.0/24\n",
                  KEY_A, KEY_B, KEY_C);
         check("хаб: файл принят", 0, parse(t, XS_ROLE_HUB));
         check("хаб: два пира", 2, (long)g_c.peer_n);
         check("хаб: слушает", 443, g_c.listen_port);
+        check_str("хаб: имя устройства из Device", "xshubc0", g_c.device);
         check("хаб: у пиров нет endpoint", 0, g_c.peer[0].endpoint_port);
         check("хаб: keepalive не подставляется", 0, g_c.peer[0].keepalive);
+        check("хаб: неизвестных ключей нет", 0, g_c.unknown_n);
+    }
+    {
+        /* Device без значения по умолчанию пуст — хаб возьмёт xshub0. И мусорное имя отвергается
+         * здесь, а не на подъёме `ip link`, где ошибку видно хуже. */
+        char t[1024];
+        snprintf(t, sizeof(t),
+                 "[Interface]\nPrivateKey=%s\nAddress=10.77.0.1/24\nListenPort=443\nDevice=bad name\n"
+                 "[Peer]\nPublicKey=%s\nAllowedIPs=10.77.0.2/32\n", KEY_A, KEY_B);
+        refuses("отказ: Device с пробелом", t, XS_ROLE_HUB);
     }
 
     /* ---- отказы ------------------------------------------------------------- */

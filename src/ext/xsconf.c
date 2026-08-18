@@ -119,7 +119,7 @@ static const struct { const char *key; const char *why; } REFUSED[] = {
 /* Известные ключи — для подсказки при опечатке. Тот же приём, что у «возможно, вы имели в
  * виду» в cli.c: опечатка в имени ключа не должна требовать чтения документации. */
 static const char *KNOWN[] = {
-    "PrivateKey", "Address", "MTU", "ListenPort", "SNI",
+    "PrivateKey", "Address", "MTU", "ListenPort", "SNI", "Device",
     "PublicKey", "AllowedIPs", "Endpoint", "PersistentKeepalive",
 };
 #define KNOWN_N (sizeof(KNOWN) / sizeof(KNOWN[0]))
@@ -278,6 +278,17 @@ int xs_conf_parse(const char *text, size_t n, enum xs_role role,
                 if (strlen(val) >= sizeof(c->sni))
                     FAIL("строка %d: SNI длиннее %zu", line_no, sizeof(c->sni) - 1);
                 snprintf(c->sni, sizeof(c->sni), "%s", val);
+            } else if (ieq(key, "Device")) {
+                /* Имя устройства ядра: те же ограничения, что у ip link — буквы, цифры и
+                 * несколько знаков, короче IFNAMSIZ. Иначе `ip` откажет уже на подъёме, а
+                 * там ошибку видно хуже, чем здесь с номером строки. */
+                if (strlen(val) >= sizeof(c->device))
+                    FAIL("строка %d: Device длиннее %zu", line_no, sizeof(c->device) - 1);
+                for (const char *p = val; *p; p++)
+                    if (!((*p >= 'a' && *p <= 'z') || (*p >= 'A' && *p <= 'Z') ||
+                          (*p >= '0' && *p <= '9') || *p == '-' || *p == '_' || *p == '.'))
+                        FAIL("строка %d: Device: недопустимый символ %c", line_no, *p);
+                snprintf(c->device, sizeof(c->device), "%s", val);
             } else {
                 const char *hint = did_you_mean(key);
                 c->unknown_n++;
