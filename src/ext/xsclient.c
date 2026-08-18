@@ -50,6 +50,13 @@ int run_quiet(const char *const argv[]);
  * obfs.c, и по той же причине — пачка больше упирается уже не в вызовы, а в задержку. */
 #define XSC_BATCH 16
 
+/* Обратная связь по сборке разрезанных записей. Десять секунд везём по одному кадру после жалобы
+ * той стороны — достаточно, чтобы всплеск потерь прошёл, и мало, чтобы надолго терять выигрыш
+ * пачек; сообщаем не чаще раза в две секунды; наращиваем обратно раз в три. */
+#define XSC_REASM_COOL_MS   10000
+#define XSC_REASM_REPORT_MS 2000
+#define XSC_REASM_GROW_MS   3000
+
 /* Буферы приёма и отправки лежат В СТРУКТУРЕ ВОРКЕРА, а не рядом с файлом: соединений у пира
  * несколько, каждое обслуживает свой поток, и общий буфер означал бы, что два потока пишут в
  * одну строку. Цена — около 50 КБ на воркера; на роутере с 128 МБ это ничто по сравнению с
@@ -113,11 +120,33 @@ struct spoke {
     const char *out_name;
     const char *dev;
     int managed;
+    /* ---- пачки и сборка разрезанных записей (см. xswire.h) ----
+     *
+     * rb — буфер ОДНОЙ записи вместе с местом под заголовок TCP впереди: кадры читаются из TUN
+     * прямо в него, на свои места, поэтому пачка собирается без единой лишней копии. hdrs, siov и
+     * smm — заголовки сегментов и векторы для sendmmsg: сегмент собирается из двух кусков (свой
+     * заголовок и часть записи), и копировать нагрузку не приходится вовсе. */
+    uint8_t rb[20 + XS_REC_HDR + XS_MAX_RECORD + XS_TAG];
+    uint8_t hdrs[XS_BATCH_FRAMES_MAX + 8][20];
+    struct iovec siov[2 * (XS_BATCH_FRAMES_MAX + 8)];
+    struct mmsghdr smm[XS_BATCH_FRAMES_MAX + 8];
+    struct xs_reasm reasm;
+    unsigned long long last_drops;
+    /* batch_max — сколько кадров класть в одну запись СЕЙЧАС. Не постоянная величина: разрезанная
+     * запись гибнет целиком при потере любого сегмента, поэтому на рваном пути пачка обязана
+     * схлопываться до одного кадра. Растёт по чистой обратной связи, падает мгновенно. */
+    int batch_max;
+    long long cool_until, last_report, last_grow, keep_next;
+
     /* Приём и отправка: свои у каждого воркера (см. выше). */
     uint8_t rx_buf[XSC_BATCH][XS_ROW];
     struct mmsghdr mm[XSC_BATCH];
     struct iovec iov[XSC_BATCH];
-    uint8_t txb[XS_ROW];
+    /* Буфер отправки одиночного кадра И сборки Hello. Больше строки пакета намеренно: с
+     * постквантовым обменом ClientHello занимает около 1760 байт (столько же, сколько браузерный),
+     * и в XS_ROW он не влезает — первая версия получала на этом XS_ESMALL с сообщением
+     * «рукопожатие не собралось», не называя причину. */
+    uint8_t txb[2560];
     uint8_t tb[XSC_BATCH][XS_ROW];
     struct mmsghdr tmm[XSC_BATCH];
     struct iovec tiov[XSC_BATCH];
@@ -253,7 +282,18 @@ static int do_handshake(struct spoke *s) {
                                s->mtu_limit ? s->mtu_limit : s->mtu, s->conn_id,
                                s->txb, sizeof(s->txb), &hn);
     if (rc != 0) { fprintf(stderr, LOG_W "рукопожатие не собралось: %d\n", rc); return rc; }
-    if (xs_conn_send(&s->conn, 0x18 /* PSH|ACK */, s->txb, hn, 0) != 0) return -1;
+    /* Hello уезжает ПО СЕГМЕНТАМ, как у браузера: с постквантовым обменом он больше одного
+     * сегмента по построению (1759 байт против 537 без него — столько же, сколько у настоящего
+     * Chrome). Отправлять его одним куском нельзя: такой пакет либо не дойдёт, либо приедет
+     * фрагментированным, и то и другое видно на проводе сразу. */
+    {
+        size_t max_seg = (size_t)XS_MTU_DEF + XS_OVERHEAD - 40;
+        for (size_t off = 0; off < hn; off += max_seg) {
+            size_t part = hn - off;
+            if (part > max_seg) part = max_seg;
+            if (xs_conn_send(&s->conn, 0x18 /* PSH|ACK */, s->txb + off, part, 0) != 0) return -1;
+        }
+    }
 
     long long deadline = xs_now_ms() + 5000;
     uint8_t in[XS_ROW * 2];
@@ -309,6 +349,12 @@ static int do_handshake(struct spoke *s) {
             s->mtu_limit ? s->mtu_limit : XS_MTU_DEF, peer_mtu,
             s->mtu_cap ? ", в настройках задан предел" : "");
     xs_win_reset(&s->win);
+    xs_reasm_reset(&s->reasm);
+    /* Пачка начинается с двух кадров и растёт по чистой обратной связи: начинать с восьми значило
+     * бы платить на рваном пути с первой же секунды. */
+    s->batch_max = 2;
+    s->cool_until = 0;
+    s->last_drops = s->reasm.dropped;
     s->up = 1;
     s->handshake_at = xs_now_ms();
     fprintf(stderr, LOG_I "рукопожатие с %s:%d прошло, порт %u, шифр %s\n",
@@ -623,6 +669,54 @@ static int spoke_run(struct spoke *s, const char *dev, const char *chain_label, 
     return (int)(intptr_t)worker_main(&g_sp[0]);
 }
 
+/* ---- один кадр открытого текста -------------------------------------------
+ *
+ * Вынесено в функцию, потому что кадр теперь приходит двумя путями: одиночной записью и внутри
+ * пачки, которую разбор отдаёт по одному через обратный вызов. Две копии этой обработки означали бы
+ * два места, где можно по-разному ошибиться в том, что делать с внутренним пакетом. */
+static void spoke_frame(struct spoke *s, const uint8_t *pt, size_t pn, const char *dev,
+                        long long now) {
+    enum xs_kind kind = xs_frame_kind(pt, pn);
+    if (kind == XS_IPV4 || kind == XS_IPV6) {
+        xs_mss_clamp((uint8_t *)(uintptr_t)pt, pn, s->mtu);
+        tun_write_ctl(&s->tun, pt, pn);
+        s->down_pkts++;
+        s->down_bytes += pn;
+        return;
+    }
+    if (kind != XS_CTL) return;
+    int acked = xs_pack_size(pt, pn);
+    if (acked > 0) {
+        if (s->probing && acked == s->p_cur) {
+            /* Размер вернулся эхом — путь его несёт. Двигаем нижнюю границу и спрашиваем, есть ли
+             * смысл проверять дальше. */
+            s->p_lo = acked;
+            s->p_tries = 0;
+            s->p_verify = 0;
+            s->p_cur = xs_mtu_next(s->p_lo, s->p_hi, s->mtu_agreed);
+            if (!s->p_cur || ++s->p_steps > XS_MTU_TRIES_MAX) probe_done(s, dev, now);
+            else s->probe_sent = 0;
+        }
+        return;
+    }
+    int lost = xs_loss_value(pt, pn);
+    if (lost > 0) {
+        /* Хаб не собирает наши записи: путь рвёт сегменты. Схлопываем пачку немедленно — на рваном
+         * пути она делает хуже, а не лучше, а восстанавливать потерянное мы не будем (это
+         * UDP-туннель под видом TCP). */
+        s->batch_max = 1;
+        s->cool_until = now + XSC_REASM_COOL_MS;
+        fprintf(stderr, LOG_W "хаб не собрал %d записей — везу по одному кадру\n", lost);
+    }
+}
+
+struct spoke_fctx { struct spoke *s; const char *dev; long long now; };
+
+static void spoke_frame_cb(void *ctx, const uint8_t *f, size_t n) {
+    struct spoke_fctx *c = ctx;
+    spoke_frame(c->s, f, n, c->dev, c->now);
+}
+
 /* Цикл одного соединения. */
 static void *worker_main(void *arg) {
     struct spoke *s = arg;
@@ -726,75 +820,92 @@ static void *worker_main(void *arg) {
         long long now = xs_now_ms();
         if (n < 0 && errno != EINTR) break;
 
-        /* ---- наружу: TUN → поддельный TCP ---------------------------------- */
+        /* ---- наружу: TUN → поддельный TCP ----------------------------------
+         *
+         * Кадры читаются ПРЯМО в буфер записи, на свои места в контейнере пачки: так пачка
+         * собирается без единой лишней копии. Ждать ради неё нечего — берётся только то, что уже
+         * лежит в очереди устройства, поэтому при потоковой загрузке кадры набираются сами, а при
+         * интерактивном трафике в пачке один кадр, и он едет без контейнера, как раньше.
+         *
+         * Зачем это всё и чем оплачено — в xswire.h. Коротко: у настоящего TLS запись не кончается
+         * на границе сегмента, а у нас кончалась всегда. */
         if (n > 0 && (fds[0].revents & POLLIN)) {
-            int k = 0;
+            int max = s->batch_max;
+            if (now < s->cool_until) max = 1;
+            if (max < 1) max = 1;
+            if (max > XS_BATCH_FRAMES_MAX) max = XS_BATCH_FRAMES_MAX;
+            uint8_t *rec = s->rb + 20;
+            uint8_t *pay = rec + XS_REC_HDR;
+            size_t off = XS_BATCH_HDR;
+            int frames = 0;
             unsigned long long payload = 0;
-            for (int i = 0; i < XSC_BATCH; i++) {
-                /* Чтение TUN пачкой возможно только по одному вызову на пакет: это
-                 * символьное устройство, recvmmsg к нему не применим. Зато отправка —
-                 * одна на всю пачку. */
-                ssize_t r = tun_read_packet(&s->tun, s->tb[k] + XS_HDR_ROOM, (size_t)s->mtu);
+            while (frames < max) {
+                /* Проверка ДО чтения: прочитанный кадр девать некуда, если он не влезет, а
+                 * откладывать его до следующего круга значило бы менять порядок пакетов. */
+                if (frames > 0 && off + 2 + (size_t)s->mtu + XS_TAG > XS_MAX_RECORD) break;
+                ssize_t r = tun_read_packet(&s->tun, pay + off + 2, (size_t)s->mtu);
                 if (r <= 0) break;
-                /* Подрезка MSS в ОБОИХ направлениях, и это не перестраховка: сюда приходят
-                 * SYN от узлов локальной сети, а из туннеля — SYN-ACK от узлов интернета,
-                 * которые объявляют MSS по СВОЕМУ каналу и ничего не знают про наш. Не
-                 * подрезав встречный, мы получили бы ровно тот отказ, от которого защищаемся:
-                 * рукопожатие проходит, а первая же полная страница данных пропадает. */
-                xs_mss_clamp(s->tb[k] + XS_HDR_ROOM, (size_t)r, s->mtu);
-                uint32_t rel = xs_conn_rel_next(&s->conn);
-                uint8_t *rec = s->tb[k] + XS_HDR_ROOM - XS_REC_HDR;
-                if (xs_rec_build(rec, (size_t)r + XS_TAG) != 0) { s->dropped++; continue; }
-                if (tls13_aead_seal(&s->tx, rel, rec, XS_REC_HDR, s->tb[k] + XS_HDR_ROOM,
-                                    (size_t)r, s->tb[k] + XS_HDR_ROOM + r) != 0) {
-                    s->dropped++;
-                    continue;
-                }
-                size_t seglen = 0;
-                uint8_t *seg = xs_conn_ahead(&s->conn, s->tb[k], XS_REC_HDR + (size_t)r + XS_TAG,
-                                             &seglen, now);
-                s->tiov[k].iov_base = seg;
-                s->tiov[k].iov_len = seglen;
-                memset(&s->tmm[k].msg_hdr, 0, sizeof(s->tmm[k].msg_hdr));
-                s->tmm[k].msg_hdr.msg_iov = &s->tiov[k];
-                s->tmm[k].msg_hdr.msg_iovlen = 1;
+                /* Подрезка MSS в ОБОИХ направлениях, и это не перестраховка: сюда приходят SYN от
+                 * узлов локальной сети, а из туннеля — SYN-ACK от узлов интернета, которые
+                 * объявляют MSS по СВОЕМУ каналу и ничего не знают про наш. */
+                xs_mss_clamp(pay + off + 2, (size_t)r, s->mtu);
+                pay[off] = (uint8_t)((size_t)r >> 8);
+                pay[off + 1] = (uint8_t)((size_t)r & 0xFF);
+                off += 2 + (size_t)r;
                 payload += (unsigned long long)r;
-                k++;
-                /* Ретайр: смещение подошло к пределу или соединение старое. Замолчать
-                 * ОБЯЗАНЫ — иначе повтор nonce. */
-                if (xs_retire_due(xs_conn_rel_next(&s->conn), now - s->conn.born)) break;
+                frames++;
             }
-            if (k > 0) {
-                /* ЧАСТИЧНАЯ ОТПРАВКА ДОСЫЛАЕТСЯ, А НЕ СЧИТАЕТСЯ ПОТЕРЕЙ.
-                 *
-                 * sendmmsg отправляет СКОЛЬКО СМОГ и возвращает это число: очередь сокета
-                 * заполняется, и на скорости это происходит постоянно. Первая версия молча
-                 * записывала остаток в потери — и вот что это стоило на живом роутере: канал
-                 * 200 Мбит, процессор занят на 10%, а iperf показывал 0,25 Мбит/с при сотнях
-                 * потерь за шесть секунд. Потому что у нас нет повторной передачи: каждая
-                 * недосланная датаграмма — это дырка во внутреннем TCP, а одна дырка на
-                 * шестнадцать пакетов обрушивает окно до нуля.
-                 *
-                 * Поэтому досылаем хвост, а «нет прогресса дважды подряд» считаем настоящей
-                 * потерей — иначе один неотправляемый пакет (например, слишком большой)
-                 * заклинил бы цикл навсегда. */
-                int off = 0, stuck = 0;
-                while (off < k) {
-                    int sent = sendmmsg(s->conn.fd, &s->tmm[off], (unsigned)(k - off), 0);
-                    if (sent > 0) { off += sent; stuck = 0; continue; }
-                    if (++stuck >= 3) break;
-                    if (errno != EAGAIN && errno != ENOBUFS && errno != EINTR) break;
+            if (frames > 0) {
+                size_t pn;
+                if (frames == 1) {
+                    /* Одиночный кадр едет БЕЗ контейнера: он дешевле на три байта, и таких записей
+                     * большинство. Сдвиг на месте стоит одной копии на кадр и только тогда, когда
+                     * пачка не собралась. */
+                    pn = off - XS_BATCH_HDR - 2;
+                    memmove(pay, pay + XS_BATCH_HDR + 2, pn);
+                } else {
+                    pay[0] = XS_CTL_BATCH;
+                    pn = off;
                 }
-                s->up_pkts += (unsigned long long)off;
-                s->up_bytes += payload;
-                if (off < k) {
-                    s->dropped += (unsigned long long)(k - off);
-                    /* Причину называем, но не чаще раза в секунду: поток сообщений об одной
-                     * и той же беде не помогает, а мешает — тот же приём, что у обфускатора. */
-                    if (now - s->last_drop_warn >= 1000) {
-                        fprintf(stderr, LOG_W "отправка не прошла (%s): потеряно %d из %d "
-                                              "пакетов пачки\n", strerror(errno), k - off, k);
-                        s->last_drop_warn = now;
+                uint32_t rel = xs_conn_rel_next(&s->conn);
+                int segs = -1;
+                if (xs_rec_build(rec, pn + XS_TAG) == 0 &&
+                    tls13_aead_seal(&s->tx, rel, rec, XS_REC_HDR, pay, pn, pay + pn) == 0) {
+                    size_t max_seg = (size_t)s->mtu + XS_OVERHEAD - 40;
+                    segs = xs_conn_split_mm(&s->conn, rec, XS_REC_HDR + pn + XS_TAG, max_seg,
+                                            s->hdrs, s->siov, s->smm,
+                                            sizeof(s->hdrs) / sizeof(s->hdrs[0]), now);
+                }
+                if (segs <= 0) {
+                    s->dropped += (unsigned long long)frames;
+                } else {
+                    /* ЧАСТИЧНАЯ ОТПРАВКА ДОСЫЛАЕТСЯ, А НЕ СЧИТАЕТСЯ ПОТЕРЕЙ.
+                     *
+                     * sendmmsg отправляет сколько смог и возвращает это число: очередь сокета
+                     * заполняется, и на скорости это происходит постоянно. Первая версия молча
+                     * записывала остаток в потери — и это стоило 0,25 Мбит/с при канале 200 на
+                     * живом роутере: у нас нет повторной передачи, каждая недосланная датаграмма
+                     * это дырка во внутреннем TCP, а теперь ещё и половина разрезанной записи.
+                     * «Нет прогресса дважды подряд» считаем настоящей потерей — иначе один
+                     * неотправляемый сегмент заклинил бы цикл навсегда. */
+                    int sent_off = 0, stuck = 0;
+                    while (sent_off < segs) {
+                        int sent = sendmmsg(s->conn.fd, &s->smm[sent_off],
+                                            (unsigned)(segs - sent_off), 0);
+                        if (sent > 0) { sent_off += sent; stuck = 0; continue; }
+                        if (++stuck >= 3) break;
+                        if (errno != EAGAIN && errno != ENOBUFS && errno != EINTR) break;
+                    }
+                    if (sent_off < segs) {
+                        s->dropped += (unsigned long long)frames;
+                        if (now - s->last_drop_warn >= 1000) {
+                            fprintf(stderr, LOG_W "отправка не прошла (%s): %d из %d сегментов "
+                                                  "записи\n", strerror(errno), segs - sent_off, segs);
+                            s->last_drop_warn = now;
+                        }
+                    } else {
+                        s->up_pkts += (unsigned long long)frames;
+                        s->up_bytes += payload;
                     }
                 }
             }
@@ -823,39 +934,30 @@ static void *worker_main(void *arg) {
                     int what = xs_conn_on_seg(&s->conn, &seg, now);
                     if (what < 0) { session_down(s); break; }
                     if (what != 1) continue;
-                    /* Предфильтр до всякой криптографии: три сравнения отбивают чужое. */
-                    const uint8_t *body;
+                    /* Сборка записи, которая могла быть разрезана между сегментами. Она же
+                     * предфильтр: сегмент, не начинающийся с заголовка записи и не продолжающий
+                     * начатую, отбрасывается до всякой криптографии. */
+                    const uint8_t *body, *hdr;
                     size_t body_n;
-                    if (xs_rec_parse(seg.payload, seg.plen, &body, &body_n) != 0) continue;
-                    uint32_t rel = xs_conn_rel_of(&s->conn, seg.seq);
+                    uint32_t rel;
+                    if (!xs_reasm_feed(&s->reasm, seg.seq, s->conn.isn_rx, seg.payload, seg.plen,
+                                       &body, &body_n, &hdr, &rel))
+                        continue;
                     if (xs_win_check(&s->win, rel) != 0) continue;
                     uint8_t *ct = (uint8_t *)(uintptr_t)body;
-                    if (tls13_aead_open(&s->rx, rel, seg.payload, XS_REC_HDR, ct, body_n) != 0)
+                    /* AAD — заголовок записи, и у разрезанной это байты ПЕРВОГО сегмента: возьми мы
+                     * его из последнего, тег не сошёлся бы при верной криптографии. */
+                    if (tls13_aead_open(&s->rx, rel, hdr, XS_REC_HDR, ct, body_n) != 0)
                         continue;
                     /* Коммит окна ТОЛЬКО после сошедшегося тега: иначе подделанный пакет с
                      * далёким смещением выбил бы из окна весь честный поток. */
                     xs_win_commit(&s->win, rel);
                     size_t pn = body_n - XS_TAG;
-                    enum xs_kind kind = xs_frame_kind(ct, pn);
-                    if (kind == XS_IPV4 || kind == XS_IPV6) {
-                        xs_mss_clamp(ct, pn, s->mtu);
-                        tun_write_ctl(&s->tun, ct, pn);
-                        s->down_pkts++;
-                        s->down_bytes += pn;
-                    } else if (kind == XS_CTL) {
-                        int acked = xs_pack_size(ct, pn);
-                        if (acked > 0 && s->probing && acked == s->p_cur) {
-                            /* Размер вернулся эхом — путь его несёт. Двигаем нижнюю границу и
-                             * спрашиваем, есть ли смысл проверять дальше. */
-                            s->p_lo = acked;
-                            s->p_tries = 0;
-                            s->p_verify = 0;      /* прежнее значение подтверждено — растём */
-                            s->p_cur = xs_mtu_next(s->p_lo, s->p_hi, s->mtu_agreed);
-                            if (!s->p_cur || ++s->p_steps > XS_MTU_TRIES_MAX)
-                                probe_done(s, dev, now);
-                            else
-                                s->probe_sent = 0;
-                        }
+                    struct spoke_fctx fc = { s, dev, now };
+                    if (pn && ct[0] == XS_CTL_BATCH) {
+                        if (xs_batch_iter(ct, pn, spoke_frame_cb, &fc) != 0) s->dropped++;
+                    } else {
+                        spoke_frame(s, ct, pn, dev, now);
                     }
                     /* keepalive молча учтён: он уже обновил last_rx. */
                 }
@@ -926,9 +1028,33 @@ static void *worker_main(void *arg) {
             session_down(s);
             continue;
         }
+        /* Обратная связь по сборке: если у НАС не собираются записи, сказать об этом обязаны мы —
+         * уменьшить пачку может только та сторона. Молча терпеть значило бы, что на рваном пути
+         * пачки делают хуже, а не лучше, и никто об этом не узнает. */
+        if (s->reasm.dropped > s->last_drops && now - s->last_report >= XSC_REASM_REPORT_MS) {
+            uint8_t lf[8];
+            size_t ln = xs_loss_build(lf, sizeof(lf), (int)(s->reasm.dropped - s->last_drops));
+            if (ln && send_frame(s, lf, ln, now) == 0) {
+                s->last_drops = s->reasm.dropped;
+                s->last_report = now;
+            }
+        }
+        /* Рост пачки на чистом пути: медленно вверх, мгновенно вниз (см. spoke_frame). */
+        if (now >= s->cool_until && now - s->last_grow >= XSC_REASM_GROW_MS &&
+            s->batch_max < XS_BATCH_FRAMES_MAX) {
+            s->batch_max *= 2;
+            if (s->batch_max > XS_BATCH_FRAMES_MAX) s->batch_max = XS_BATCH_FRAMES_MAX;
+            s->last_grow = now;
+        }
+
         /* Keepalive: пустая запись. Пир за NAT обязана поддерживать отображение живым,
-         * потому что дозвониться до неё хаб не может. */
-        if (keepalive_ms && now - s->conn.last_tx >= keepalive_ms) {
+         * потому что дозвониться до неё хаб не может.
+         *
+         * ИНТЕРВАЛ С РАЗБРОСОМ, а не ровный: пакет одного и того же размера ровно каждые
+         * keepalive секунд не встречается ни в одном браузерном соединении и находится подсчётом
+         * пауз между мелкими пакетами. Разброс ±20% не стоит ничего. */
+        if (keepalive_ms && !s->keep_next) s->keep_next = keepalive_ms;
+        if (keepalive_ms && now - s->conn.last_tx >= s->keep_next) {
             uint32_t rel = xs_conn_rel_next(&s->conn);
             uint8_t *rec = s->txb + XS_HDR_ROOM - XS_REC_HDR;
             if (xs_rec_build(rec, XS_TAG) == 0 &&
@@ -938,6 +1064,9 @@ static void *worker_main(void *arg) {
                 uint8_t *seg = xs_conn_ahead(&s->conn, s->txb, XS_REC_HDR + XS_TAG, &seglen, now);
                 (void)!send(s->conn.fd, seg, seglen, MSG_NOSIGNAL);
             }
+            uint32_t j = 0;
+            xc_random((unsigned char *)&j, sizeof(j));
+            s->keep_next = keepalive_ms * 8 / 10 + (long long)(j % (uint32_t)(keepalive_ms * 4 / 10 + 1));
         }
         if (!s->conn_id && now - last_state >= 2000) { state_write(s); last_state = now; }
         (void)last_keep;

@@ -400,8 +400,17 @@ int reality_build_hello_carry(const struct reality_cfg *cfg, struct reality_stat
     struct pend px[20];
     size_t pn = 0;
 
+    /* Буфер постквантового ключа лежит здесь же, рядом с остальными телами расширений: он большой
+     * (1216 байт), и на стеке в этой функции ему место — она не рекурсивная и вызывается раз на
+     * рукопожатие. */
+    static __thread unsigned char b_pq[REALITY_MLKEM_SHARE];
     unsigned char b_sni[300], b_alpn[16], b_cc[4], b_ech[220], b_alps[8], b_reneg[1];
-    unsigned char b_ocsp[5], b_vers[8], b_sigs[20], b_ks[64], b_grp[12], b_pskm[2];
+    unsigned char b_ocsp[5], b_vers[8], b_sigs[20], b_grp[12], b_pskm[2];
+    /* key_share вырос: с постквантовым обменом его тело — больше килобайта, и на стеке в этой
+     * функции ему уже не место (она вызывается из потоков-соединителей, у которых стек скромный).
+     * __thread, а не общий static: рукопожатия идут параллельно, и общий буфер один перетирал бы
+     * другому — ровно та ошибка, что уже была здесь с буфером AAD. */
+    static __thread unsigned char b_ks[64 + REALITY_MLKEM_SHARE];
     unsigned char b_ecpf[2], b_last[1];
 
     /* Первым — GREASE, пустой. */
@@ -504,18 +513,36 @@ int reality_build_hello_carry(const struct reality_cfg *cfg, struct reality_stat
       for (size_t i = 0; i < sizeof(sigs) / sizeof(sigs[0]); i++) put16(&sb, sigs[i]);
       px[pn].type = 0x000D; px[pn].body = b_sigs; px[pn].n = sb.len; pn++; }
 
-    /* key_share: GREASE-группа с одним нулевым байтом, затем наша половина X25519.
-     * Номер GREASE-группы тот же, что в supported_groups — так делает браузер. */
+    /* key_share: GREASE-группа с одним нулевым байтом, затем — у современного Chrome —
+     * постквантовый ключ, и только потом наша половина X25519. Номер GREASE-группы тот же, что в
+     * supported_groups: так делает браузер.
+     *
+     * Постквантовая половина заполняется СЛУЧАЙНЫМИ байтами: обмена по ней мы не ведём, а
+     * отвечающая сторона её игнорирует. Для наблюдателя это неотличимо от настоящего ключа (тот
+     * тоже выглядит шумом), и именно она делает Hello браузерного размера — см. поле pq в
+     * reality.h. */
     { struct buf kb = { b_ks, 0, sizeof(b_ks) };
-      put16(&kb, 41);
+      int want_pq = car && car->pq;
+      unsigned body = 2 + 2 + 1;                       /* GREASE */
+      if (want_pq) body += 2 + 2 + REALITY_MLKEM_SHARE;
+      body += 2 + 2 + 32;                              /* x25519 */
+      put16(&kb, body);
       put16(&kb, g_group); put16(&kb, 1); put8(&kb, 0);
+      if (want_pq) {
+          if (fill_random(b_pq, REALITY_MLKEM_SHARE) != 0) return REALITY_ECRYPTO;
+          put16(&kb, REALITY_GROUP_MLKEM); put16(&kb, REALITY_MLKEM_SHARE);
+          put(&kb, b_pq, REALITY_MLKEM_SHARE);
+      }
       put16(&kb, 0x001D); put16(&kb, 32); put(&kb, st->pub, 32);
       px[pn].type = 0x0033; px[pn].body = b_ks; px[pn].n = kb.len; pn++; }
 
-    /* supported_groups: GREASE, X25519, secp256r1, secp384r1 — ровно набор Chrome.
-     * Прежние FFDHE 0x0100..0x0104 браузер не предлагает вовсе. */
+    /* supported_groups: GREASE, постквантовая (если предлагаем), X25519, secp256r1, secp384r1 —
+     * ровно набор Chrome. Прежние FFDHE 0x0100..0x0104 браузер не предлагает вовсе. */
     { struct buf gb = { b_grp, 0, sizeof(b_grp) };
-      put16(&gb, 8); put16(&gb, g_group);
+      int want_pq = car && car->pq;
+      put16(&gb, want_pq ? 10 : 8);
+      put16(&gb, g_group);
+      if (want_pq) put16(&gb, REALITY_GROUP_MLKEM);
       put16(&gb, 0x001D); put16(&gb, 0x0017); put16(&gb, 0x0018);
       px[pn].type = 0x000A; px[pn].body = b_grp; px[pn].n = gb.len; pn++; }
 

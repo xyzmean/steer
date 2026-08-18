@@ -307,7 +307,11 @@ static int xs_hs_client_hello_impl(struct xs_hs *hs, const struct xs_secrets *se
     b64url(hub_pub, pbk);
     struct reality_cfg cfg = { .sni = sni && sni[0] ? sni : "www.microsoft.com",
                                .pbk = pbk, .sid = "", .fp = "chrome", .alpn = "h2" };
-    struct reality_carrier car = { .priv = hs->e_priv, .pub = hs->e_pub,
+    /* Постквантовый обмен включаем ТОЛЬКО здесь, у xsteer: без него ClientHello занимает 537 байт
+     * против 1759 у настоящего Chrome и уезжает одним сегментом вместо двух — и то и другое
+     * считается наблюдателем даром (см. поле pq в reality.h). Клиенту VLESS этого не нужно: его
+     * Hello заморожен побайтово и сверен с живыми узлами. */
+    struct reality_carrier car = { .priv = hs->e_priv, .pub = hs->e_pub, .pq = 1,
                                    .fill_ech = carry_ech, .fill_sid = carry_sid, .ctx = &cc };
     struct reality_state st;
     size_t n = 0;

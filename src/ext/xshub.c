@@ -87,6 +87,10 @@
  * обрывом. Ровно это и показал живой стенд. Так же устроен WireGuard: keepalive посылает
  * ПРИНИМАЮЩАЯ сторона, и по той же причине. Десять секунд — его же интервал. */
 #define XSH_KEEPALIVE_MS 10000
+/* Обратная связь по сборке разрезанных записей — те же числа, что у пира, и по тем же причинам. */
+#define XSH_REASM_COOL_MS   10000
+#define XSH_REASM_REPORT_MS 2000
+#define XSH_REASM_GROW_MS   3000
 
 int run_quiet(const char *const argv[]);
 
@@ -98,6 +102,17 @@ struct sess {
     struct tls13_keys tx, rx;
     struct xs_win win;
     int      phase;
+    /* Накопленные байты ClientHello: он приходит НЕСКОЛЬКИМИ сегментами, потому что браузерный
+     * Hello больше сегмента (около 1760 байт из-за постквантового ключа), и наш такой же. Предел
+     * обязателен: сюда пишет кто угодно из интернета, и «копим, пока не разберётся» без предела —
+     * это способ съесть память хаба чужими байтами. */
+    uint8_t  hs_buf[4096];
+    size_t   hs_len;
+    /* Сборка разрезанных записей и обратная связь по ней (см. xswire.h). */
+    struct xs_reasm reasm;
+    unsigned long long last_drops;
+    int      batch_max;
+    long long cool_until, last_report, last_grow, keep_next;
     int16_t  peer;                 /* индекс пира или -1, пока не опознан */
     int8_t   conn_id;              /* номер соединения этой пира (0..XS_CONNS_MAX-1) */
     /* MTU, о котором договорились с этой пиром. Ноль — ещё не договорились. Хранится на
@@ -147,7 +162,14 @@ struct worker {
     uint8_t rx_buf[XSH_BATCH][XS_ROW];
     struct mmsghdr mm[XSH_BATCH];
     struct iovec iov[XSH_BATCH];
-    uint8_t row[XS_ROW];
+    /* Строка под ОДНУ запись целиком: с пачкой она больше сегмента по построению. Раскладка та же,
+     * что была (нагрузка по XS_HDR_ROOM), просто длиннее. */
+    uint8_t row[20 + XS_REC_HDR + XS_MAX_RECORD + XS_TAG];
+    /* Заголовки сегментов и векторы для sendmmsg: сегмент собирается из двух кусков — своего
+     * заголовка и части записи, — поэтому нагрузка не копируется вовсе. */
+    uint8_t hdrs[XS_BATCH_FRAMES_MAX + 8][20];
+    struct iovec siov[2 * (XS_BATCH_FRAMES_MAX + 8)];
+    struct mmsghdr smm[XS_BATCH_FRAMES_MAX + 8];
     /* Отдельный буфер под ответ рукопожатия. Строка пакета для него мала: ответ — это
      * ServerHello, фальшивый ChangeCipherSpec, запись формы «сертификат» со случайной набивкой
      * и подтверждение, то есть до ~1300 байт, и он обязан влезть в ОДИН сегмент (см. xshake.c).
@@ -282,7 +304,7 @@ static void hub_retune_mtu(void) {
  *
  * Проверка phase == PH_EST стоит ПОСЛЕ взятия замка: пока мы ждали, владелец мог освободить
  * сессию (sess_free берёт тот же замок), и тогда отправлять уже некуда. */
-static int send_to(struct sess *d, uint8_t *row, size_t plen, long long now) {
+static int send_to(struct worker *w, struct sess *d, uint8_t *row, size_t plen, long long now) {
     pthread_mutex_t *lk = &g_tx_lock[d - g_sess];
     pthread_mutex_lock(lk);
     if (d->phase != PH_EST) { pthread_mutex_unlock(lk); return -1; }
@@ -293,11 +315,27 @@ static int send_to(struct sess *d, uint8_t *row, size_t plen, long long now) {
     if (xs_rec_build(rec, plen + XS_TAG) == 0 &&
         tls13_aead_seal(&d->tx, rel, rec, XS_REC_HDR, row + XS_HDR_ROOM, plen,
                         row + XS_HDR_ROOM + plen) == 0) {
-        size_t seglen = 0;
-        uint8_t *seg = xs_conn_ahead(&d->conn, row, XS_REC_HDR + plen + XS_TAG, &seglen, now);
-        if (send(d->conn.fd, seg, seglen, MSG_NOSIGNAL) >= 0) {
-            d->down_pkts++;
-            rc = 0;
+        /* Запись режется на сегменты по MTU ЭТОЙ сессии: у пиров он свой у каждого, и превышать
+         * согласованный пробами размер нельзя. Пачка больше сегмента по построению, поэтому путь
+         * через xs_conn_split_mm теперь общий и для одиночных записей — при одном сегменте он
+         * ровно эквивалентен прежнему xs_conn_ahead. */
+        int mtu = d->mtu > 0 ? d->mtu : XS_MTU_DEF;
+        size_t max_seg = (size_t)mtu + XS_OVERHEAD - 40;
+        int segs = xs_conn_split_mm(&d->conn, rec, XS_REC_HDR + plen + XS_TAG, max_seg,
+                                    w->hdrs, w->siov, w->smm,
+                                    sizeof(w->hdrs) / sizeof(w->hdrs[0]), now);
+        if (segs > 0) {
+            int off = 0, stuck = 0;
+            while (off < segs) {
+                int sent = sendmmsg(d->conn.fd, &w->smm[off], (unsigned)(segs - off), 0);
+                if (sent > 0) { off += sent; stuck = 0; continue; }
+                if (++stuck >= 3) break;
+                if (errno != EAGAIN && errno != ENOBUFS && errno != EINTR) break;
+            }
+            if (off == segs) {
+                d->down_pkts++;
+                rc = 0;
+            }
         }
     }
     pthread_mutex_unlock(lk);
@@ -318,7 +356,38 @@ static void hs_step(struct worker *w, struct sess *s, const struct obfs_seg *seg
                     int listen_port, long long now) {
     (void)listen_port;
     uint8_t peer_static[32];
-    int rc = xs_hs_server_read(&s->hs, &g_sec, seg->payload, seg->plen, peer_static);
+    /* СОБИРАЕМ HELLO ИЗ СЕГМЕНТОВ. Браузерный ClientHello больше одного сегмента (около 1760 байт
+     * из-за постквантового ключа), и наш такой же — иначе размер Hello сам по себе признак.
+     * Значит первый сегмент почти всегда неполон, и разбирать его сразу нельзя. */
+    if (s->hs_len + seg->plen > sizeof(s->hs_buf)) {
+        uint8_t alert[16];
+        size_t an = xs_hs_alert(alert, sizeof(alert));
+        if (an) xs_conn_send(&s->conn, 0x18, alert, an, 0);
+        sess_free(w, s);
+        return;
+    }
+    memcpy(s->hs_buf + s->hs_len, seg->payload, seg->plen);
+    s->hs_len += seg->plen;
+    /* НЕ ПОХОЖЕ НА РУКОПОЖАТИЕ TLS ВООБЩЕ — отвечаем сразу, не дожидаясь продолжения.
+     *
+     * Это про зондирование, а не про аккуратность: прибор первым делом присылает не только
+     * настоящий ClientHello, но и «GET / HTTP/1.1», и просто мусор. Копить такие байты до предела
+     * значит молчать в ответ на запрос HTTP — чего настоящий сервер не делает никогда, и что
+     * отличимо не хуже молчания на Hello. */
+    if (s->hs_len >= 2 && (s->hs_buf[0] != 0x16 || s->hs_buf[1] != 0x03)) {
+        uint8_t alert[16];
+        size_t an = xs_hs_alert(alert, sizeof(alert));
+        if (an) xs_conn_send(&s->conn, 0x18, alert, an, 0);
+        sess_free(w, s);
+        return;
+    }
+    if (s->hs_len < 5) return;
+    {
+        size_t want = 5 + ((size_t)s->hs_buf[3] << 8) + s->hs_buf[4];
+        if (s->hs_len < want) return;
+    }
+    int rc = xs_hs_server_read(&s->hs, &g_sec, s->hs_buf, s->hs_len, peer_static);
+    s->hs_len = 0;
     if (rc != 0) {
         /* Отказ имеет форму настоящего фатального оповещения TLS. Молчание было бы отличимо
          * ещё сильнее — но от целенаправленного зондирования это всё равно не спасает, о чём
@@ -411,6 +480,12 @@ static void hs_confirm(struct worker *w, struct sess *s, const struct obfs_seg *
     s->conn_id = (int8_t)conn_id;
     xs_hs_wipe(&s->hs);
     xs_win_reset(&s->win);
+    xs_reasm_reset(&s->reasm);
+    /* Пачка начинается с двух кадров и растёт по чистой обратной связи: начинать с восьми значило
+     * бы платить на рваном пути с первой же секунды. */
+    s->batch_max = 2;
+    s->cool_until = 0;
+    s->last_drops = s->reasm.dropped;
     s->phase = PH_EST;
     s->handshake_at = now;
     /* Одна сессия на пира: новая заменяет прежнюю. Это и есть переподключение пира — он
@@ -484,12 +559,103 @@ static void route_packet(struct worker *w, struct sess *from, uint8_t *pt, size_
          * и путь между ними — узкое место из двух. Кроме хаба это посчитать некому: пира
          * друг о друге ничего не знают. */
         if (d->mtu > 0) xs_mss_clamp(pt, pn, d->mtu);
-        send_to(d, w->row, pn, now);
+        send_to(w, d, w->row, pn, now);
         return;
     }
     /* Свой адрес или выход наружу — отдаём ядру, в СВОЮ очередь устройства: писать можно в
      * любую, и своя не требует ни выбора, ни согласования с другими потоками. */
     tun_write_ctl(&w->tun, pt, pn);
+}
+
+/* Увезти набранные кадры ОДНОЙ записью: один кадр — как есть, несколько — в контейнере.
+ *
+ * pay указывает на нагрузку записи, off — сколько в ней занято вместе с местом под тип
+ * контейнера. Одиночный кадр едет БЕЗ контейнера: он дешевле на три байта, и таких записей
+ * большинство. */
+static void hub_send_frames(struct worker *w, struct sess *d, uint8_t *pay, size_t off,
+                            int frames) {
+    size_t pn;
+    if (frames == 1) {
+        pn = off - XS_BATCH_HDR - 2;
+        memmove(pay, pay + XS_BATCH_HDR + 2, pn);
+    } else {
+        pay[0] = XS_CTL_BATCH;
+        pn = off;
+    }
+    send_to(w, d, w->row, pn, xs_now_ms());
+}
+
+/* ---- один кадр открытого текста от пира ------------------------------------
+ *
+ * Вынесено в функцию, потому что кадр приходит двумя путями: одиночной записью и внутри пачки,
+ * которую разбор отдаёт по одному через обратный вызов. Две копии этой обработки означали бы два
+ * места, где можно по-разному ошибиться в том, что делать с чужим пакетом. */
+static void hub_frame(struct worker *w, struct sess *s, const uint8_t *pt, size_t pn,
+                      long long now) {
+    s->up_pkts++;
+    enum xs_kind kind = xs_frame_kind(pt, pn);
+    if (kind == XS_CTL) {
+        /* Проба пути: отвечаем эхом с ДОШЕДШИМ размером. Эхо крохотное (три байта), поэтому оно
+         * проходит всегда — иначе пир не смог бы отличить «большой кадр не дошёл» от «не дошёл
+         * ответ». */
+        int psz = xs_probe_size(pt, pn);
+        if (psz > 0) {
+            uint8_t ack[8];
+            size_t an2 = xs_pack_build(ack, sizeof(ack), psz);
+            if (an2) {
+                memcpy(w->row + XS_HDR_ROOM, ack, an2);
+                send_to(w, s, w->row, an2, now);
+            }
+            return;
+        }
+        /* Пир не собирает наши записи: путь рвёт сегменты. Схлопываем пачку немедленно — на
+         * рваном пути она делает хуже, а не лучше. */
+        int lost = xs_loss_value(pt, pn);
+        if (lost > 0) {
+            s->batch_max = 1;
+            s->cool_until = now + XSH_REASM_COOL_MS;
+            unsigned long long held = 0;
+            if (xs_ratelog(&w->rl_stamp, now, XS_LOG_EVERY_MS, &held)) {
+                char tail[64];
+                fprintf(stderr, LOG_I "пир не собрал %d записей — везу по одному кадру%s\n",
+                        lost, xs_held_str(held, tail, sizeof(tail)));
+            }
+            return;
+        }
+        /* Итог согласования: пир проверил путь и называет рабочий размер. Берём минимум со своим
+         * пределом — больше него мы всё равно не отправим. */
+        int mv = xs_mtu_value(pt, pn);
+        if (mv > 0) {
+            int own = g_conf.mtu ? g_conf.mtu : XS_MTU_DEF;
+            int was = s->mtu;
+            s->mtu = mv < own ? mv : own;
+            /* Печатаем только ИЗМЕНЕНИЕ: кадр приходит после каждого пробоя пира, то есть раз в
+             * две минуты на каждого, и строка «согласован тот же MTU» через год работы звезды из
+             * тридцати пиров — это четверть миллиона строк ни о чём. */
+            if (s->mtu != was) {
+                char fp2[12];
+                xs_key_fp(g_conf.peer[s->peer >= 0 ? s->peer : 0].pub, fp2);
+                fprintf(stderr, LOG_I "пир %s: согласован MTU %d\n", fp2, s->mtu);
+            }
+            hub_retune_mtu();
+        }
+        return;
+    }
+    if (kind != XS_IPV4 && kind != XS_IPV6) return;
+    /* Пакет поедет дальше из строки с местом под заголовки впереди, а пришёл он либо в приёмном
+     * буфере, либо в буфере сборки — переносим, если он не там. */
+    if (pt != w->row + XS_HDR_ROOM) {
+        if (pn > XS_MTU_DEF) return;
+        memmove(w->row + XS_HDR_ROOM, pt, pn);
+    }
+    route_packet(w, s, w->row + XS_HDR_ROOM, pn, now);
+}
+
+struct hub_fctx { struct worker *w; struct sess *s; long long now; };
+
+static void hub_frame_cb(void *ctx, const uint8_t *f, size_t n) {
+    struct hub_fctx *c = ctx;
+    hub_frame(c->w, c->s, f, n, c->now);
 }
 
 /* Цикл одного воркера. Всё, что он трогает, — либо его личное (буферы, индекс, свой отрезок
@@ -556,7 +722,13 @@ static void *worker_loop(void *arg) {
                     }
                     continue;
                 }
+                /* Замок берётся вокруг УЧЁТА принятого, потому что он теперь может отправить:
+                 * голое подтверждение уходит прямо из xs_conn_on_seg (по таймеру их выходило
+                 * пятьдесят в секунду там, где нужно тысячи). Отправка двигает номер, а в эту же
+                 * сессию может писать другой воркер — пакет пир→пир или пакет из TUN. */
+                pthread_mutex_lock(&g_tx_lock[s - g_sess]);
                 int what = xs_conn_on_seg(&s->conn, &seg, now);
+                pthread_mutex_unlock(&g_tx_lock[s - g_sess]);
                 if (what < 0) { sess_free(w, s); continue; }
                 if (what != 1) continue;
 
@@ -564,82 +736,79 @@ static void *worker_loop(void *arg) {
                 if (s->phase == PH_HS) { w->d_hs++; hs_confirm(w, s, &seg, now); continue; }
                 w->d_data++;
 
-                const uint8_t *body;
+                /* Сборка записи, которая могла быть разрезана между сегментами. Она же
+                 * предфильтр: сегмент, не начинающийся с заголовка записи и не продолжающий
+                 * начатую, отбрасывается до всякой криптографии. */
+                const uint8_t *body, *hdr;
                 size_t body_n;
-                if (xs_rec_parse(seg.payload, seg.plen, &body, &body_n) != 0) continue;
-                uint32_t rel = xs_conn_rel_of(&s->conn, seg.seq);
+                uint32_t rel;
+                if (!xs_reasm_feed(&s->reasm, seg.seq, s->conn.isn_rx, seg.payload, seg.plen,
+                                   &body, &body_n, &hdr, &rel))
+                    continue;
                 if (xs_win_check(&s->win, rel) != 0) continue;
-                /* Расшифровка НА МЕСТЕ, в приёмной строке: открытый текст оказывается на том
-                 * же смещении XS_HDR_ROOM, с которого пойдёт исходящий пакет, — поэтому
-                 * пересылка другой пиру не требует копии. */
+                /* Расшифровка НА МЕСТЕ: у целой записи — прямо в приёмной строке, у собранной —
+                 * в буфере сборки. Пересылку другому пиру это не удорожает: копия туда всё равно
+                 * нужна, и делается она ниже одним memmove на кадр. */
                 uint8_t *ct = (uint8_t *)(uintptr_t)body;
-                if (tls13_aead_open(&s->rx, rel, seg.payload, XS_REC_HDR, ct, body_n) != 0)
+                if (tls13_aead_open(&s->rx, rel, hdr, XS_REC_HDR, ct, body_n) != 0)
                     continue;
                 xs_win_commit(&s->win, rel);
                 size_t pn = body_n - XS_TAG;
-                s->up_pkts++;
-                enum xs_kind kind = xs_frame_kind(ct, pn);
-                if (kind == XS_CTL) {
-                    /* Проба пути: отвечаем эхом с ДОШЕДШИМ размером. Эхо крохотное (три
-                     * байта), поэтому оно проходит всегда — иначе пир не смогла бы отличить
-                     * «большой кадр не дошёл» от «не дошёл ответ». */
-                    int psz = xs_probe_size(ct, pn);
-                    if (psz > 0) {
-                        uint8_t ack[8];
-                        size_t an2 = xs_pack_build(ack, sizeof(ack), psz);
-                        if (an2) {
-                            memcpy(w->row + XS_HDR_ROOM, ack, an2);
-                            send_to(s, w->row, an2, now);
-                        }
-                        continue;
-                    }
-                    /* Итог согласования: пир проверил путь и называет рабочий размер.
-                     * Берём минимум со своим пределом — больше него мы всё равно не отправим. */
-                    int mv = xs_mtu_value(ct, pn);
-                    if (mv > 0) {
-                        int own = g_conf.mtu ? g_conf.mtu : XS_MTU_DEF;
-                        int was = s->mtu;
-                        s->mtu = mv < own ? mv : own;
-                        /* Печатаем только ИЗМЕНЕНИЕ: кадр приходит после каждого пробоя
-                         * пира, то есть раз в две минуты на каждую, и строка «согласован тот
-                         * же MTU» через год работы звезды из тридцати пиров — это четверть
-                         * миллиона строк ни о чём. */
-                        if (s->mtu != was) {
-                            char fp2[12];
-                            xs_key_fp(g_conf.peer[s->peer >= 0 ? s->peer : 0].pub, fp2);
-                            fprintf(stderr, LOG_I "пир %s: согласован MTU %d\n", fp2, s->mtu);
-                        }
-                        hub_retune_mtu();
-                    }
-                    continue;
+                struct hub_fctx fc = { w, s, now };
+                if (pn && ct[0] == XS_CTL_BATCH) {
+                    if (xs_batch_iter(ct, pn, hub_frame_cb, &fc) != 0) w->d_bad++;
+                } else {
+                    hub_frame(w, s, ct, pn, now);
                 }
-                if (kind != XS_IPV4 && kind != XS_IPV6) continue;
-                /* Если открытый текст лежит не на нашем смещении (у сегмента были опции),
-                 * переносим — это редкий случай, и обрабатывается явно. */
-                if (ct != w->row + XS_HDR_ROOM) {
-                    if (pn > XS_MTU_DEF) continue;
-                    memmove(w->row + XS_HDR_ROOM, ct, pn);
-                }
-                route_packet(w, s, w->row + XS_HDR_ROOM, pn, now);
             }
             if (got < XSH_BATCH) break;
           }
         }
 
-        /* ---- из ядра (интернет и локальные ответы) -------------------------- */
+        /* ---- из ядра (интернет и локальные ответы) --------------------------
+         *
+         * Это ГЛАВНОЕ направление загрузки, и именно здесь пачка окупается: подряд идущие пакеты
+         * одному и тому же пиру уезжают одной записью, которая больше сегмента и потому режется
+         * между ними — ровно так ведёт себя настоящий TLS (см. xswire.h). Ждать ради пачки нечего:
+         * берётся только то, что уже прочитано.
+         *
+         * Пачка собирается на ОДНОГО получателя: у каждой сессии свои ключи и свой номер
+         * последовательности, и «одна запись двум пирам» бессмысленна. */
         if (n > 0 && (fds[1].revents & POLLIN)) {
-            for (int i = 0; i < XSH_BATCH; i++) {
-                ssize_t r = tun_read_packet(&w->tun, w->row + XS_HDR_ROOM, XS_MTU_DEF);
+            struct sess *dst = NULL;
+            uint8_t *pay = w->row + XS_HDR_ROOM;
+            size_t off = XS_BATCH_HDR;
+            int frames = 0;
+            for (int i = 0; i < XSH_BATCH * XS_BATCH_FRAMES_MAX; i++) {
+                int max = dst ? dst->batch_max : XS_BATCH_FRAMES_MAX;
+                if (dst && now < dst->cool_until) max = 1;
+                if (frames >= max) break;
+                if (frames > 0 && off + 2 + XS_MTU_DEF + XS_TAG > XS_MAX_RECORD) break;
+                ssize_t r = tun_read_packet(&w->tun, pay + off + 2, XS_MTU_DEF);
                 if (r <= 20) break;
-                uint32_t dst;
-                memcpy(&dst, w->row + XS_HDR_ROOM + 16, 4);
-                int to = xs_route(&g_router, ntohl(dst));
-                int16_t di = to >= 0 ? peer_pick(to, w->row + XS_HDR_ROOM, (size_t)r) : -1;
+                uint32_t dip;
+                memcpy(&dip, pay + off + 2 + 16, 4);
+                int to = xs_route(&g_router, ntohl(dip));
+                int16_t di = to >= 0 ? peer_pick(to, pay + off + 2, (size_t)r) : -1;
                 if (di < 0) continue;                          /* нет пира — отбросить */
                 struct sess *d = &g_sess[di];
-                if (d->mtu > 0) xs_mss_clamp(w->row + XS_HDR_ROOM, (size_t)r, d->mtu);
-                send_to(d, w->row, (size_t)r, now);
+                if (d->mtu > 0) xs_mss_clamp(pay + off + 2, (size_t)r, d->mtu);
+                if (dst && d != dst) {
+                    /* Пакет другому пиру закрывает набор. Его самого переносим в начало и делаем
+                     * первым кадром следующей записи: откладывать его до следующего круга значило
+                     * бы менять порядок пакетов в потоке. */
+                    hub_send_frames(w, dst, pay, off, frames);
+                    memmove(pay + XS_BATCH_HDR + 2, pay + off + 2, (size_t)r);
+                    off = XS_BATCH_HDR;
+                    frames = 0;
+                }
+                dst = d;
+                pay[off] = (uint8_t)((size_t)r >> 8);
+                pay[off + 1] = (uint8_t)((size_t)r & 0xFF);
+                off += 2 + (size_t)r;
+                frames++;
             }
+            if (frames > 0 && dst) hub_send_frames(w, dst, pay, off, frames);
         }
 
         if (w->debug && now - d_last >= 1000) {
@@ -661,11 +830,39 @@ static void *worker_loop(void *arg) {
                 int16_t cur = g_peer_sess[s->peer][s->conn_id];
                 if (cur >= 0 && cur != (int16_t)i) { sess_free(w, s); continue; }
             }
+            /* Обратная связь по сборке: если у НАС не собираются записи пира, сказать об этом
+             * обязаны мы — уменьшить пачку может только он. */
+            if (s->phase == PH_EST && s->reasm.dropped > s->last_drops &&
+                now - s->last_report >= XSH_REASM_REPORT_MS) {
+                size_t ln = xs_loss_build(w->row + XS_HDR_ROOM, 8,
+                                          (int)(s->reasm.dropped - s->last_drops));
+                if (ln && send_to(w, s, w->row, ln, now) == 0) {
+                    s->last_drops = s->reasm.dropped;
+                    s->last_report = now;
+                }
+            }
+            /* Рост пачки на чистом пути: медленно вверх, мгновенно вниз (см. hub_frame). */
+            if (s->phase == PH_EST && now >= s->cool_until &&
+                now - s->last_grow >= XSH_REASM_GROW_MS && s->batch_max < XS_BATCH_FRAMES_MAX) {
+                s->batch_max *= 2;
+                if (s->batch_max > XS_BATCH_FRAMES_MAX) s->batch_max = XS_BATCH_FRAMES_MAX;
+                s->last_grow = now;
+            }
             /* Пустая запись и есть keepalive: длина нагрузки ноль, тип кадра пир опознаёт по
-             * пустоте (xs_frame_kind). Отдельного вида кадра для этого не нужно. */
+             * пустоте (xs_frame_kind). Отдельного вида кадра для этого не нужно.
+             *
+             * ИНТЕРВАЛ С РАЗБРОСОМ, а не ровный: пакет одного размера ровно каждые десять секунд не
+             * встречается ни в одном браузерном соединении и находится подсчётом пауз между мелкими
+             * пакетами. Разброс ±20% не стоит ничего. */
+            if (s->phase == PH_EST && !s->keep_next) s->keep_next = XSH_KEEPALIVE_MS;
             if (s->phase == PH_EST && s->conn.last_rx > s->conn.last_tx &&
-                now - s->conn.last_tx >= XSH_KEEPALIVE_MS)
-                send_to(s, w->row, 0, now);
+                now - s->conn.last_tx >= s->keep_next) {
+                send_to(w, s, w->row, 0, now);
+                uint32_t j = 0;
+                xc_random((unsigned char *)&j, sizeof(j));
+                s->keep_next = XSH_KEEPALIVE_MS * 8 / 10 +
+                               (long long)(j % (uint32_t)(XSH_KEEPALIVE_MS * 4 / 10 + 1));
+            }
             sess_tick_locked(s, now);
         }
     }

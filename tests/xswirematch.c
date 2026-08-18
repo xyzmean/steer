@@ -19,6 +19,17 @@
 
 static int fails;
 
+/* Приёмник кадров пачки: обратный вызов, потому что разбор отдаёт кадры по одному и не
+ * выделяет памяти. */
+static int got_n;
+static size_t got_bytes;
+static void collect(void *ctx, const uint8_t *frame, size_t flen) {
+    (void)ctx;
+    (void)frame;
+    got_n++;
+    got_bytes += flen;
+}
+
 static void check(const char *what, long want, long got) {
     printf("%-62s %s\n", what, want == got ? "ok" : "ПРОВАЛ");
     if (want != got) {
@@ -390,6 +401,101 @@ int main(void) {
         held = 0;
         check("ограничитель: печать в нулевое время учтена", 1, xs_ratelog(&z, 0, 5000, &held));
         check("ограничитель: следующая в нулевое время подавлена", 0, xs_ratelog(&z, 0, 5000, &held));
+    }
+
+
+    /* ---- пачка кадров в одной записи ---------------------------------------
+     *
+     * Зачем она нужна и чем оплачена — в xswire.h. Здесь проверяется то, на чём эта затея
+     * стоит: круг сборки и разбора, отказ от контейнера для одиночного кадра, отвержение
+     * битого контейнера ЦЕЛИКОМ и — главное — что пачка дешевле тех же кадров поодиночке. */
+    {
+        static uint8_t f1[40], f2[1439], f3[1];
+        memset(f1, 0x45, sizeof(f1));
+        memset(f2, 0x46, sizeof(f2));
+        f3[0] = 0x47;
+        struct xs_frame fr[3] = { { f1, sizeof(f1) }, { f2, sizeof(f2) }, { f3, sizeof(f3) } };
+        static uint8_t dst[XS_MAX_RECORD];
+        size_t n = xs_batch_build(dst, sizeof(dst), fr, 3);
+        check("пачка: собрана", 1, n > 0);
+        check("пачка: контейнер опознаётся как служебный кадр", XS_CTL, xs_frame_kind(dst, n));
+        got_n = 0;
+        got_bytes = 0;
+        check("пачка: разобрана", 0, xs_batch_iter(dst, n, collect, NULL));
+        check("пачка: кадров вышло столько же", 3, got_n);
+        check("пачка: байтов вышло столько же", (long)(sizeof(f1) + sizeof(f2) + sizeof(f3)),
+              (long)got_bytes);
+
+        /* Смысл всей затеи числом: три кадра одной записью обязаны стоить меньше, чем те же
+         * три поодиночке. Станет наоборот — пачка потеряет смысл, и стенд скажет об этом. */
+        long alone = 0;
+        for (int i = 0; i < 3; i++) alone += XS_OVERHEAD + (long)fr[i].n;
+        size_t segs = (n + XS_TAG + (size_t)XS_MTU_DEF - 1) / (size_t)XS_MTU_DEF;
+        long batched = (long)(segs * (XS_IP_HDR + XS_TCP_HDR)) + XS_REC_HDR + XS_TAG + (long)n;
+        check("пачка: дешевле одиночных записей", 1, batched < alone);
+
+        check("пачка: один кадр в контейнер не кладётся", 0, (long)xs_batch_build(dst, sizeof(dst), fr, 1));
+
+        /* Битый контейнер отвергается целиком: доставить половину пачки неизвестного
+         * происхождения хуже, чем не доставить ничего. */
+        static uint8_t bad[XS_MAX_RECORD];
+        memcpy(bad, dst, n);
+        bad[1] = 0xFF;
+        got_n = 0;
+        check("пачка: завышенная длина кадра отвергнута", -1, xs_batch_iter(bad, n, collect, NULL));
+        check("пачка: обрезок контейнера отвергнут", -1, xs_batch_iter(dst, 2, collect, NULL));
+
+        /* Обратная связь по сборке. */
+        uint8_t lf[8];
+        check("обратная связь: три байта", 3, (long)xs_loss_build(lf, sizeof(lf), 7));
+        check("обратная связь: значение читается обратно", 7, xs_loss_value(lf, 3));
+        check("обратная связь: проба за неё не выдаётся", -1, xs_loss_value((const uint8_t *)"\x03\x00\x07", 3));
+    }
+
+    /* ---- сборка записи, разрезанной между сегментами ------------------------ */
+    {
+        static uint8_t rec[XS_REC_HDR + 3000];
+        check("сборка: заголовок собран", 0, xs_rec_build(rec, 3000));
+        memset(rec + XS_REC_HDR, 0xAB, 3000);
+        struct xs_reasm r;
+        memset(&r, 0, sizeof(r));
+
+        const uint8_t *body = NULL, *hdr = NULL;
+        size_t body_n = 0;
+        uint32_t rel = 0;
+        uint32_t isn = 1000, seq = isn + 1;
+        size_t parts[3] = { 1400, 1400, XS_REC_HDR + 3000 - 2800 };
+        size_t off = 0;
+        int done = 0;
+        for (int i = 0; i < 3; i++) {
+            done = xs_reasm_feed(&r, seq, isn, rec + off, parts[i], &body, &body_n, &hdr, &rel);
+            if (i < 2) check("сборка: раньше времени не собралась", 0, done);
+            off += parts[i];
+            seq += (uint32_t)parts[i];
+        }
+        check("сборка: собралась на последнем сегменте", 1, done);
+        check("сборка: длина нагрузки та самая", 3000, (long)body_n);
+        check("сборка: байты не испортились", 0, memcmp(body, rec + XS_REC_HDR, 3000));
+        /* Смещение — от ПЕРВОГО сегмента: им зашифрована вся запись. Возьми вызывающий его из
+         * последнего — тег не сошёлся бы при полностью верной криптографии. */
+        check("сборка: смещение от первого сегмента", 1, (long)rel);
+        check("сборка: заголовок отдан как AAD", 0, memcmp(hdr, rec, XS_REC_HDR));
+
+        /* Пропавший средний сегмент: запись обязана быть выброшена и посчитана, а не склеена
+         * из несмежных байтов. */
+        memset(&r, 0, sizeof(r));
+        xs_reasm_feed(&r, 1, 0, rec, 1400, &body, &body_n, &hdr, &rel);
+        check("сборка: несмежные сегменты не склеиваются", 0,
+              xs_reasm_feed(&r, 1400 + 1000, 0, rec + 2800, 205, &body, &body_n, &hdr, &rel));
+        check("сборка: выброшенная посчитана", 1, (long)(r.dropped > 0));
+
+        /* Целая запись в одном сегменте по-прежнему разбирается сразу и без копии. */
+        memset(&r, 0, sizeof(r));
+        static uint8_t one[XS_REC_HDR + XS_TAG + 10];
+        xs_rec_build(one, XS_TAG + 10);
+        check("сборка: целая запись в одном сегменте", 1,
+              xs_reasm_feed(&r, 5, 0, one, sizeof(one), &body, &body_n, &hdr, &rel));
+        check("сборка: она отдана без копии", 1, body == one + XS_REC_HDR);
     }
 
     printf("\n%s\n", fails ? "ЕСТЬ ПРОВАЛЫ" : "все проверки прошли");

@@ -7,10 +7,6 @@
  * такие потоки; настоящая версия согласуется расширением внутри рукопожатия. Поставить
  * здесь 0x0304 значило бы отличаться от всякого настоящего TLS 1.3 на проводе первым же
  * байтом каждой записи. */
-#define XS_REC_TYPE 0x17
-#define XS_REC_V0   0x03
-#define XS_REC_V1   0x03
-
 int xs_rec_build(uint8_t *hdr, size_t body_n) {
     if (body_n < XS_TAG || body_n > 0xFFFF) return -1;
     hdr[0] = XS_REC_TYPE;
@@ -139,4 +135,111 @@ const char *xs_held_str(unsigned long long held, char *buf, size_t cap) {
     if (!held) return "";
     snprintf(buf, cap, " (и ещё %llu таких же за последние %d с)", held, XS_LOG_EVERY_MS / 1000);
     return buf;
+}
+
+/* ---- пачка кадров и сборка разрезанной записи -------------------------------
+ * Зачем это всё нужно и чем оплачено — в xswire.h. */
+
+size_t xs_batch_build(uint8_t *dst, size_t cap, const struct xs_frame *fr, size_t n) {
+    if (n < 2) return 0;                       /* одиночный кадр едет без контейнера */
+    size_t need = XS_BATCH_HDR;
+    for (size_t i = 0; i < n; i++) need += 2 + fr[i].n;
+    if (need > cap || need > XS_MAX_RECORD) return 0;
+    dst[0] = XS_CTL_BATCH;
+    size_t o = XS_BATCH_HDR;
+    for (size_t i = 0; i < n; i++) {
+        dst[o] = (uint8_t)(fr[i].n >> 8);
+        dst[o + 1] = (uint8_t)(fr[i].n & 0xFF);
+        memcpy(dst + o + 2, fr[i].p, fr[i].n);
+        o += 2 + fr[i].n;
+    }
+    return o;
+}
+
+int xs_batch_iter(const uint8_t *pt, size_t n,
+                  void (*fn)(void *ctx, const uint8_t *frame, size_t flen), void *ctx) {
+    if (n < XS_BATCH_HDR || pt[0] != XS_CTL_BATCH) return -1;
+    size_t o = XS_BATCH_HDR;
+    while (o < n) {
+        if (o + 2 > n) return -1;
+        size_t f = ((size_t)pt[o] << 8) | pt[o + 1];
+        o += 2;
+        if (!f || o + f > n) return -1;
+        fn(ctx, pt + o, f);
+        o += f;
+    }
+    return 0;
+}
+
+size_t xs_loss_build(uint8_t *pt, size_t cap, int n) {
+    if (cap < 3) return 0;
+    if (n > 0xFFFF) n = 0xFFFF;
+    pt[0] = XS_CTL_RLOSS;
+    pt[1] = (uint8_t)(n >> 8);
+    pt[2] = (uint8_t)(n & 0xFF);
+    return 3;
+}
+
+int xs_loss_value(const uint8_t *pt, size_t n) {
+    if (n < 3 || pt[0] != XS_CTL_RLOSS) return -1;
+    return (pt[1] << 8) | pt[2];
+}
+
+int xs_reasm_feed(struct xs_reasm *r, uint32_t seq, uint32_t isn_rx,
+                  const uint8_t *pl, size_t n,
+                  const uint8_t **body, size_t *body_n, const uint8_t **hdr, uint32_t *rel) {
+    if (r->active && seq == r->next_seq) {
+        if (r->len + n > sizeof(r->buf)) {      /* больше заявленного — не наш поток */
+            r->active = 0;
+            r->dropped++;
+            return 0;
+        }
+        memcpy(r->buf + r->len, pl, n);
+        r->len += n;
+        if (r->len < XS_REC_HDR + r->need) {
+            r->next_seq = seq + (uint32_t)n;
+            return 0;
+        }
+        if (r->len != XS_REC_HDR + r->need) {
+            r->active = 0;
+            r->dropped++;
+            return 0;
+        }
+        r->active = 0;
+        *body = r->buf + XS_REC_HDR;
+        *body_n = r->need;
+        *hdr = r->buf;
+        *rel = r->rel0;
+        return 1;
+    }
+    if (r->active) {
+        /* Продолжение не пришло: сегмент потерялся или приехал не по порядку. Незаконченное
+         * выбрасываем — держать его дольше значило бы склеить чужие байты с нашими. Повторов у нас
+         * нет и не будет, поэтому это просто потерянный внутренний пакет. */
+        r->active = 0;
+        r->dropped++;
+    }
+    if (n < XS_REC_MIN) return 0;
+    if (pl[0] != XS_REC_TYPE || pl[1] != XS_REC_V0 || pl[2] != XS_REC_V1) return 0;
+    size_t want = ((size_t)pl[3] << 8) | pl[4];
+    if (want < XS_TAG || want > XS_MAX_RECORD) return 0;
+    if (XS_REC_HDR + want == n) {              /* целая запись в одном сегменте */
+        *body = pl + XS_REC_HDR;
+        *body_n = want;
+        *hdr = pl;
+        *rel = xs_rel(seq, isn_rx);
+        return 1;
+    }
+    if (XS_REC_HDR + want > n) {               /* начало разрезанной записи */
+        if (n > sizeof(r->buf)) return 0;
+        memcpy(r->buf, pl, n);
+        r->len = n;
+        r->need = want;
+        r->rel0 = xs_rel(seq, isn_rx);
+        r->next_seq = seq + (uint32_t)n;
+        r->active = 1;
+        return 0;
+    }
+    /* Заявлено меньше, чем пришло: за концом записи что-то ещё. Мы такого не отправляем. */
+    return 0;
 }
