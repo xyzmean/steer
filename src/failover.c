@@ -367,6 +367,20 @@ enum tbl_state {
 };
 
 struct route_facts {
+    /* known — удалось ли вообще прочитать состояние ядра.
+     *
+     * Это не перестраховка, а защита от худшего исхода всей затеи. Сверка отвечает на вопрос
+     * «состояние разъехалось?», и если ответ построен на ПУСТОМ дампе, он всегда «да» — тогда
+     * сторож каждую минуту сносил бы привязку живого выхода (`ip route flush table N`) и
+     * поднимал заново, то есть сам делал бы короткий провал помеченного трафика раз в минуту и
+     * заливал журнал. Ровно этот класс беды в этом файле уже описан выше про ifdown/ifup.
+     *
+     * Признак «прочитать не удалось» — ПУСТОЙ вывод `ip rule show`. На живой коробке он пуст не
+     * бывает никогда: там всегда лежат три правила ядра (0, 32766, 32767). Поэтому пустота
+     * означает не «правил нет», а «спросить не получилось»: нет `ip`, busybox не понял ключ,
+     * отказал popen. Проверять код возврата было бы хуже — busybox отдаёт ноль и на том, чего
+     * не понял. */
+    int known;
     int rule;             /* правило `fwmark <метка> table <таблица>` в ядре есть */
     enum tbl_state table;
     char dev[32];         /* устройство из default, когда table == TBL_DEV */
@@ -381,9 +395,11 @@ struct route_facts {
 static struct route_facts route_facts_of(const char *rules, const char *routes,
                                          uint32_t mark, int table) {
     struct route_facts f;
+    f.known = rules && rules[0] != '\0';
     f.rule = 0;
     f.table = TBL_EMPTY;
     f.dev[0] = '\0';
+    if (!f.known) return f;
 
     char want_tbl[16];
     snprintf(want_tbl, sizeof(want_tbl), "%d", table);
@@ -714,7 +730,15 @@ int cmd_failover(const char *spec, int verbose) {
                  * Спрашиваем ядро, а не свою память: см. «сверка фактического
                  * состояния» выше, там же почему пинг при этом идёт. */
                 struct route_facts f = route_facts_read(o);
-                if (!routing_live_ok(&f, chosen)) {
+                if (!f.known) {
+                    /* Состояние прочитать не удалось. Оставляем как есть: переписать живую
+                     * привязку по незнанию хуже, чем не заметить поломку — та лечится
+                     * следующим проходом, а провал трафика уже случится. Строка на проход
+                     * при -v: молча гадать тоже нельзя. */
+                    if (verbose)
+                        fprintf(stderr, LOG_W "%s: состояние маршрутизации не прочитать "
+                                        "(нет ip?) — ничего не меняю\n", o->name);
+                } else if (!routing_live_ok(&f, chosen)) {
                     fprintf(stderr, LOG_W "выход %s: %s отвечает, но маршрутизация "
                                     "разъехалась (%s) — возвращаю маршрут\n",
                             o->name, chosen, facts_why(&f, chosen));
@@ -736,7 +760,14 @@ int cmd_failover(const char *spec, int verbose) {
                 changed = 1;
             } else {
                 struct route_facts f = route_facts_read(o);
-                if (!routing_failed_ok(&f, o->on_fail)) {
+                if (!f.known) {
+                    /* То же, что в живой ветке: по незнанию не трогаем. Здесь цена ошибки
+                     * даже выше — apply_failed при on_fail=drop останавливает трафик, и
+                     * сделать это «на всякий случай» значило бы уронить работающий выход. */
+                    if (verbose)
+                        fprintf(stderr, LOG_W "%s: состояние маршрутизации не прочитать "
+                                        "(нет ip?) — ничего не меняю\n", o->name);
+                } else if (!routing_failed_ok(&f, o->on_fail)) {
                     fprintf(stderr, LOG_W "выход %s: живых устройств по-прежнему нет, а "
                                     "маршрутизация разъехалась (%s) — возвращаю "
                                     "on_fail=%s\n",
