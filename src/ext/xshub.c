@@ -185,6 +185,9 @@ struct worker {
 
 static struct worker g_w[XSH_WORKERS_MAX];
 static int g_workers = 1;
+/* Аварийный выключатель нового формата: см. пояснение у batch_max в hs_confirm. Читается один раз
+ * при старте, а не на каждом пакете. */
+static int g_compat;
 
 static struct sess *sess_find(struct worker *w, uint32_t addr, uint16_t port) {
     int i = xs_sidx_find(&w->idx, addr, port);
@@ -482,8 +485,12 @@ static void hs_confirm(struct worker *w, struct sess *s, const struct obfs_seg *
     xs_win_reset(&s->win);
     xs_reasm_reset(&s->reasm);
     /* Пачка начинается с двух кадров и растёт по чистой обратной связи: начинать с восьми значило
-     * бы платить на рваном пути с первой же секунды. */
-    s->batch_max = 2;
+     * бы платить на рваном пути с первой же секунды.
+     *
+     * STEER_XS_COMPAT=1 оставляет один кадр навсегда: это аварийный выключатель нового формата на
+     * время обновления, когда к хабу ещё приходят пиры предыдущей версии. Сборку Hello из
+     * сегментов выключать не нужно — короткий Hello старого пира она разбирает сразу. */
+    s->batch_max = g_compat ? 1 : 2;
     s->cool_until = 0;
     s->last_drops = s->reasm.dropped;
     s->phase = PH_EST;
@@ -842,7 +849,7 @@ static void *worker_loop(void *arg) {
                 }
             }
             /* Рост пачки на чистом пути: медленно вверх, мгновенно вниз (см. hub_frame). */
-            if (s->phase == PH_EST && now >= s->cool_until &&
+            if (!g_compat && s->phase == PH_EST && now >= s->cool_until &&
                 now - s->last_grow >= XSH_REASM_GROW_MS && s->batch_max < XS_BATCH_FRAMES_MAX) {
                 s->batch_max *= 2;
                 if (s->batch_max > XS_BATCH_FRAMES_MAX) s->batch_max = XS_BATCH_FRAMES_MAX;
@@ -886,6 +893,10 @@ int cmd_xsteer_hub(const char *conf_path) {
     xs_router_build(&g_router, g_conf.peer, g_conf.peer_n);
 
     int debug = getenv("STEER_XS_DEBUG") != NULL;
+    g_compat = getenv("STEER_XS_COMPAT") != NULL;
+    if (g_compat)
+        fprintf(stderr, LOG_I "STEER_XS_COMPAT: везу по одному кадру в записи — формат предыдущей "
+                              "версии, для пиров, которые ещё не обновлены\n");
 
     /* ---- воркеры ---------------------------------------------------------- */
     /* СКОЛЬКО ПОТОКОВ, и почему не «по числу ядер».

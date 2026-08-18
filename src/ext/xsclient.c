@@ -351,8 +351,14 @@ static int do_handshake(struct spoke *s) {
     xs_win_reset(&s->win);
     xs_reasm_reset(&s->reasm);
     /* Пачка начинается с двух кадров и растёт по чистой обратной связи: начинать с восьми значило
-     * бы платить на рваном пути с первой же секунды. */
-    s->batch_max = 2;
+     * бы платить на рваном пути с первой же секунды.
+     *
+     * STEER_XS_COMPAT=1 оставляет один кадр в записи навсегда — это аварийный выключатель нового
+     * формата на время обновления. Хаб предыдущей версии не умеет ни собирать разрезанную запись,
+     * ни разбирать контейнер пачки, и пока он где-то работает, туннель к нему поднимается только
+     * так. Переменной, а не настройкой в конфигурации: это временная мера на один рабочий день, а
+     * не свойство выхода, и в spec.json ей места нет. */
+    s->batch_max = getenv("STEER_XS_COMPAT") ? 1 : 2;
     s->cool_until = 0;
     s->last_drops = s->reasm.dropped;
     s->up = 1;
@@ -1040,8 +1046,8 @@ static void *worker_main(void *arg) {
             }
         }
         /* Рост пачки на чистом пути: медленно вверх, мгновенно вниз (см. spoke_frame). */
-        if (now >= s->cool_until && now - s->last_grow >= XSC_REASM_GROW_MS &&
-            s->batch_max < XS_BATCH_FRAMES_MAX) {
+        if (!getenv("STEER_XS_COMPAT") && now >= s->cool_until &&
+            now - s->last_grow >= XSC_REASM_GROW_MS && s->batch_max < XS_BATCH_FRAMES_MAX) {
             s->batch_max *= 2;
             if (s->batch_max > XS_BATCH_FRAMES_MAX) s->batch_max = XS_BATCH_FRAMES_MAX;
             s->last_grow = now;

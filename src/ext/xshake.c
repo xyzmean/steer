@@ -1,6 +1,7 @@
 /* xsteer: рукопожатие Noise IK внутри ClientHello. Раскладка полей и доводы — в xshake.h. */
 #define _GNU_SOURCE
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <time.h>
 
@@ -311,7 +312,10 @@ static int xs_hs_client_hello_impl(struct xs_hs *hs, const struct xs_secrets *se
      * против 1759 у настоящего Chrome и уезжает одним сегментом вместо двух — и то и другое
      * считается наблюдателем даром (см. поле pq в reality.h). Клиенту VLESS этого не нужно: его
      * Hello заморожен побайтово и сверен с живыми узлами. */
-    struct reality_carrier car = { .priv = hs->e_priv, .pub = hs->e_pub, .pq = 1,
+    /* Постквантовый обмен выключается тем же аварийным выключателем, что и пачки: хаб предыдущей
+     * версии не собирает ClientHello из сегментов, а с постквантовым ключом он в один не влезает. */
+    struct reality_carrier car = { .priv = hs->e_priv, .pub = hs->e_pub,
+                                   .pq = getenv("STEER_XS_COMPAT") ? 0 : 1,
                                    .fill_ech = carry_ech, .fill_sid = carry_sid, .ctx = &cc };
     struct reality_state st;
     size_t n = 0;
