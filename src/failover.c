@@ -12,6 +12,11 @@
  * по адресу источника кандидата — иначе, чтобы проверить запасной туннель, пришлось
  * бы сначала переключиться на него, то есть уронить работающий ради вопроса
  * «работает ли другой».
+ *
+ * Проход не только выбирает устройство, но и СВЕРЯЕТ фактическую маршрутизацию выхода с
+ * тем, какой она должна быть, — правило fwmark и содержимое таблицы. Состояние здесь
+ * самовосстанавливающееся, а не поправляемое по событию, и почему именно так — подробно
+ * в комментарии «сверка фактического состояния маршрутизации» ниже.
  */
 #define _GNU_SOURCE
 #include <stdio.h>
@@ -235,7 +240,12 @@ static int zapret_running(void) {
     return found;
 }
 
-static void apply_failed(struct output *o) {
+/* announce=0 — то же самое приведение состояния в порядок, но без объявления отказа:
+ * сторож зовёт apply_failed не только когда выход ТОЛЬКО ЧТО отказал, но и когда отказ
+ * длится, а состояние в ядре с тех пор разъехалось (см. сверку ниже). Строку «живых
+ * устройств нет» в этом случае печатает вызывающий, и печатает вместе с причиной
+ * расхождения — иначе журнал раз в минуту повторял бы одно и то же без новостей. */
+static void apply_failed(struct output *o, int announce) {
     char tbl[16], mark[24];
     snprintf(tbl, sizeof(tbl), "%d", o->table);
     snprintf(mark, sizeof(mark), "0x%08x", o->mark);
@@ -249,8 +259,18 @@ static void apply_failed(struct output *o) {
         const char *bh[] = { "ip", "route", "add", "blackhole", "default",
                              "table", tbl, NULL };
         run_quiet(bh);
-        fprintf(stderr, LOG_W "выход %s: живых устройств нет, трафик остановлен "
-                        "(on_fail=drop)\n", o->name);
+        /* Правило пересоздаётся и здесь. Без него blackhole лежит в таблице, которую
+         * никто не спрашивает: помеченный пакет провалится дальше и уйдёт напрямую —
+         * то самое, от чего on_fail=drop и защищает. А снять правило было кому:
+         * прежний отказ мог случиться в режиме direct/zapret (ниже), и режим меняют
+         * в интерфейсе, не перезапуская ничего. */
+        const char *rd[] = { "ip", "rule", "del", "fwmark", mark, "table", tbl, NULL };
+        while (run_quiet(rd) == 0) ;
+        const char *ra[] = { "ip", "rule", "add", "fwmark", mark, "table", tbl, NULL };
+        run_quiet(ra);
+        if (announce)
+            fprintf(stderr, LOG_W "выход %s: живых устройств нет, трафик остановлен "
+                            "(on_fail=drop)\n", o->name);
         return;
     }
 
@@ -258,6 +278,7 @@ static void apply_failed(struct output *o) {
     const char *rd[] = { "ip", "rule", "del", "fwmark", mark, "table", tbl, NULL };
     while (run_quiet(rd) == 0) ;
 
+    if (!announce) return;
     if (o->on_fail == FAIL_ZAPRET && !zapret_running())
         fprintf(stderr, LOG_W "выход %s: живых устройств нет, трафик пущен напрямую, "
                         "но zapret не запущен — обхода DPI не будет\n", o->name);
@@ -288,6 +309,228 @@ void bind_device(struct output *o, const char *dev) {
     run_quiet(flush);
     const char *rt[] = { "ip", "route", "add", "default", "dev", dev, "table", tbl, NULL };
     run_quiet(rt);
+}
+
+/* ---- сверка фактического состояния маршрутизации -----------------------------
+ *
+ * Зачем это вообще есть. На живом роутере наблюдалось так: выход kind=vless сторож
+ * объявляет не отвечающим, интерфейс поднимается заново и действительно поднимается,
+ * пинг через устройство идёт, splify2 показывает выход живым — а ВСЕ каналы и маршруты,
+ * которые через этот выход ходили, молчат. Перезапуск движка возвращает всё мгновенно.
+ * Это описание не оборванного туннеля, а разъехавшейся ПОЛИТИЧЕСКОЙ маршрутизации: у
+ * выхода своя таблица и своя метка, помеченный трафик ходит через `ip rule fwmark`, и
+ * пинг с роутера в эту таблицу не заглядывает вовсе — потому «пинг есть» и «каналы
+ * мертвы» спокойно живут вместе.
+ *
+ * Причина была в том, что состояние правилось ТОЛЬКО ПО СОБЫТИЮ «сменилось устройство»:
+ * при was == chosen проход не проверял ничего. Сломать состояние при неизменном имени
+ * устройства может как минимум четыре обычных вещи:
+ *   - apply_failed при on_fail=drop ставит в таблицу `blackhole default`. Устройство
+ *     потом оживает под тем же именем (процесс туннеля поднимает procd) — и запрет
+ *     остаётся лежать до перезапуска движка;
+ *   - apply, не найдя устройства, ставит тот же blackhole (см. apply_routing в steer.c);
+ *   - apply_failed при on_fail=direct/zapret СНИМАЕТ правило fwmark, а возвращал его
+ *     только bind_device по событию смены устройства;
+ *   - процесс туннеля умер вместе со своим TUN — ядро вычистило из таблицы маршрут,
+ *     ссылавшийся на исчезнувшее устройство, и таблица осталась ПУСТОЙ. Пустая таблица
+ *     означает не «нет пути», а «ищи дальше»: помеченный пакет уходит напрямую, то есть
+ *     ровно туда, куда его не пускали. Для человека это те же «сервисы не работают» —
+ *     прямым путём они как раз и заблокированы.
+ * Плюс гонка, которая не нуждается ни в одной поломке снаружи: клиент vless привязывает
+ * таблицу к своему устройству сам, в момент готовности TUN (см. bind_device выше), и
+ * если тик сторожа в это время уже ждал в revive, его apply_failed ложится ПОВЕРХ
+ * только что сделанной живой привязки.
+ *
+ * Почему проба здоровья этого не замечает. И `ping -I dev`, и проба TCP с
+ * SO_BINDTODEVICE не несут нашей метки, поэтому таблицу выхода не спрашивают; больше
+ * того, при заданном устройстве ядро, не найдя маршрута, считает адресата «за этим
+ * устройством» и всё равно отправляет пакет. То есть проба принципиально не видит того
+ * состояния, за которое сторож отвечает, и врать в сторону «всё хорошо» будет всегда.
+ *
+ * Отсюда решение: проверять ФАКТ, а не помнить событие. Раз в тик читаются `ip rule
+ * show` и `ip route show table N` выхода, и если действительность разошлась с тем, что
+ * должно быть, она приводится в порядок тем же bind_device (или тем же apply_failed).
+ * Два коротких чтения на выход раз в минуту не стоят ничего рядом с туннелем, который
+ * иначе лежит до перезапуска движка. Перезапуск движка лечением НЕ является: он лечит
+ * следствие, и лечит его ровно тем, что переписывает эти же правила заново.
+ *
+ * Про cleanup_stale_routing (steer.c): там устройство выхода нарочно не проверяется, и
+ * это решение остаётся в силе. Оно про ДРУГОЙ вопрос — «жива ли метка», и ответ «правило
+ * снять нельзя только потому, что TUN ещё не поднялся» здесь ничем не задет: сверка
+ * ниже правило не снимает, а возвращает. */
+
+enum tbl_state {
+    TBL_EMPTY,        /* в таблице нет ничего похожего на default */
+    TBL_BLACKHOLE,    /* запрет: blackhole/unreachable/prohibit default */
+    TBL_DEV,          /* default через устройство */
+    TBL_OTHER,        /* default есть, но устройство из него не вычитывается */
+};
+
+struct route_facts {
+    int rule;             /* правило `fwmark <метка> table <таблица>` в ядре есть */
+    enum tbl_state table;
+    char dev[32];         /* устройство из default, когда table == TBL_DEV */
+};
+
+/* Разбор дословного вывода `ip rule show` и `ip route show table N`.
+ *
+ * Чистая функция, без единого вызова ip: иначе решение «состояние разъехалось» нельзя
+ * было бы закрыть стендом, а ошибка именно здесь ничего не сломает заметно — она просто
+ * оставит туннель мёртвым до перезапуска движка, то есть вернёт ту самую неполадку.
+ * Стенд: tests/failovermatch.c. */
+static struct route_facts route_facts_of(const char *rules, const char *routes,
+                                         uint32_t mark, int table) {
+    struct route_facts f;
+    f.rule = 0;
+    f.table = TBL_EMPTY;
+    f.dev[0] = '\0';
+
+    char want_tbl[16];
+    snprintf(want_tbl, sizeof(want_tbl), "%d", table);
+
+    for (const char *ln = rules; ln && *ln; ) {
+        const char *end = strchr(ln, '\n');
+        size_t len = end ? (size_t)(end - ln) : strlen(ln);
+        char line[512];
+        size_t n = len < sizeof(line) - 1 ? len : sizeof(line) - 1;
+        memcpy(line, ln, n);
+        line[n] = '\0';
+        ln = end ? end + 1 : NULL;
+
+        const char *fm = strstr(line, "fwmark ");
+        if (!fm) continue;
+        char *stop = NULL;
+        unsigned long got = strtoul(fm + 7, &stop, 16);
+        /* Метка с МАСКОЙ — не наша: свою мы ставим без маски, а `fwmark 0x100000/0xff`
+         * поймает не тот трафик, и считать её своей значило бы согласиться с чужим
+         * правилом вместо того, чтобы поставить своё. */
+        if (!stop || *stop == '/') continue;
+        if ((uint32_t)got != mark) continue;
+        /* Куда правило смотрит. Номер таблицы iproute2 печатает как есть, но может
+         * напечатать и ИМЯ, если оно заведено в /etc/iproute2/rt_tables кем-то ещё.
+         * Имя здесь не разрешить, и в этом случае правило считается нашим: метка уже
+         * наша, а ставит её только наш набор правил. Другой ЧИСЛОВОЙ номер — наоборот,
+         * повод правило пересоздать. */
+        const char *lk = strstr(line, "lookup ");
+        if (lk) {
+            const char *t = lk + 7;
+            size_t tl = strcspn(t, " \t");
+            int numeric = tl > 0;
+            for (size_t i = 0; i < tl; i++)
+                if (!isdigit((unsigned char)t[i])) numeric = 0;
+            if (numeric && (tl != strlen(want_tbl) || strncmp(t, want_tbl, tl) != 0))
+                continue;
+        }
+        f.rule = 1;
+    }
+
+    for (const char *ln = routes; ln && *ln; ) {
+        const char *end = strchr(ln, '\n');
+        size_t len = end ? (size_t)(end - ln) : strlen(ln);
+        char line[512];
+        size_t n = len < sizeof(line) - 1 ? len : sizeof(line) - 1;
+        memcpy(line, ln, n);
+        line[n] = '\0';
+        ln = end ? end + 1 : NULL;
+
+        const char *p = line;
+        while (*p == ' ' || *p == '\t') p++;
+        /* Интересует только запись про default: адресные маршруты в таблице выхода
+         * никому не мешают (их кладёт, например, `ip addr` на само устройство). */
+        int blocked = !strncmp(p, "blackhole ", 10) || !strncmp(p, "unreachable ", 12) ||
+                      !strncmp(p, "prohibit ", 9);
+        if (blocked) {
+            if (!strstr(p, "default")) continue;
+            f.table = TBL_BLACKHOLE;
+            f.dev[0] = '\0';
+            continue;
+        }
+        if (strncmp(p, "default", 7) != 0) continue;
+        const char *d = strstr(p, " dev ");
+        if (!d) { f.table = TBL_OTHER; continue; }
+        d += 5;
+        size_t dl = strcspn(d, " \t");
+        if (dl == 0 || dl >= sizeof(f.dev)) { f.table = TBL_OTHER; continue; }
+        memcpy(f.dev, d, dl);
+        f.dev[dl] = '\0';
+        f.table = TBL_DEV;
+    }
+    return f;
+}
+
+/* Годится ли фактическое состояние для «выход живёт через dev». */
+static int routing_live_ok(const struct route_facts *f, const char *dev) {
+    return f->rule && f->table == TBL_DEV && strcmp(f->dev, dev) == 0;
+}
+
+/* Годится ли фактическое состояние для «живых устройств нет» при данном режиме отказа.
+ * drop требует и правила, и запрета в таблице: запрет без правила — это утечка напрямую
+ * (таблицу никто не спрашивает), правило без запрета — трафик в мёртвый туннель. */
+static int routing_failed_ok(const struct route_facts *f, enum on_fail of) {
+    if (of == FAIL_DROP) return f->rule && f->table == TBL_BLACKHOLE;
+    return !f->rule;
+}
+
+/* Чем разошлось состояние при отказе. Отдельно от facts_why, потому что при отказе
+ * «правило есть» бывает не бедой, а самой бедой: в режимах direct и zapret оно ОБЯЗАНО
+ * быть снято, и сказать про такую таблицу «пуста — трафик уходил напрямую» значило бы
+ * назвать бедой обещанное поведение. */
+static const char *failed_why(const struct route_facts *f, enum on_fail of) {
+    if (of != FAIL_DROP)
+        return f->rule ? "правило fwmark на месте, хотя трафик обещан прямым путём"
+                       : "правило fwmark снято";
+    if (!f->rule) return "правила fwmark нет — помеченный трафик уходил напрямую";
+    if (f->table == TBL_BLACKHOLE) return "запрет на месте";
+    if (f->table == TBL_DEV) return "в таблице default на устройство, которое не отвечает";
+    return "в таблице нет запрета — помеченный трафик уходил напрямую";
+}
+
+/* Чем именно разошлось — для журнала. Человек по этой строке отличает «правило снесли»
+ * от «в таблице остался запрет», а это разные причины с разной историей. */
+static const char *facts_why(const struct route_facts *f, const char *dev) {
+    static char buf[128];
+    if (!f->rule) return "правила fwmark нет";
+    switch (f->table) {
+    case TBL_EMPTY:
+        return "таблица пуста — помеченный трафик уходил напрямую";
+    case TBL_BLACKHOLE:
+        return "в таблице остался запрет (blackhole)";
+    case TBL_OTHER:
+        return "default в таблице без устройства";
+    case TBL_DEV:
+        if (dev && strcmp(f->dev, dev)) {
+            snprintf(buf, sizeof(buf), "default ведёт на %s, а не на %s", f->dev, dev);
+            return buf;
+        }
+        snprintf(buf, sizeof(buf), "в таблице default на %s", f->dev);
+        return buf;
+    }
+    return "состояние не разобрано";
+}
+
+/* Прочитать вывод команды. popen, а не run_quiet: тому вывод нужен выброшенным, а нам —
+ * прочитанным. Подменяется стендом ровно так же, как в tests/fwmatch.c. */
+static void ip_show(const char *cmd, char *out, size_t n) {
+    out[0] = '\0';
+    FILE *p = popen(cmd, "r");
+    if (!p) return;
+    size_t got = fread(out, 1, n - 1, p);
+    out[got] = '\0';
+    pclose(p);
+}
+
+static struct route_facts route_facts_read(const struct output *o) {
+    /* Статические, и с запасом. Вывод `ip rule show` — это ВСЕ правила коробки, а не
+     * только наши: рядом живут mwan3, fw4 и чужие туннели, у которых правил бывают
+     * десятки. Обрезанный дамп означал бы «нашего правила нет» и пересоздание живой
+     * привязки каждую минуту — то есть короткий провал помеченного трафика на ровном
+     * месте. Статические, потому что процесс короткоживущий и делить с этим стек незачем. */
+    static char rules[16384], routes[8192];
+    char cmd[64];
+    ip_show("ip -4 rule show 2>/dev/null", rules, sizeof(rules));
+    snprintf(cmd, sizeof(cmd), "ip -4 route show table %d 2>/dev/null", o->table);
+    ip_show(cmd, routes, sizeof(routes));
+    return route_facts_of(rules, routes, o->mark, o->table);
 }
 
 /* Что выбрано сейчас — чтобы не переписывать маршруты и не шуметь в лог, когда
@@ -466,14 +709,43 @@ int cmd_failover(const char *spec, int verbose) {
                 printf("steer: выход %s -> %s%s\n", o->name, chosen,
                        was[0] && strcmp(was, "-") ? " (переключение)" : "");
                 changed = 1;
-            } else if (verbose) {
-                fprintf(stderr, LOG_I "%s: %s работает\n", o->name, chosen);
+            } else {
+                /* Имя устройства то же — и это НЕ значит, что маршрутизация цела.
+                 * Спрашиваем ядро, а не свою память: см. «сверка фактического
+                 * состояния» выше, там же почему пинг при этом идёт. */
+                struct route_facts f = route_facts_read(o);
+                if (!routing_live_ok(&f, chosen)) {
+                    fprintf(stderr, LOG_W "выход %s: %s отвечает, но маршрутизация "
+                                    "разъехалась (%s) — возвращаю маршрут\n",
+                            o->name, chosen, facts_why(&f, chosen));
+                    bind_device(o, chosen);
+                    changed = 1;
+                } else if (verbose) {
+                    fprintf(stderr, LOG_I "%s: %s работает\n", o->name, chosen);
+                }
             }
         } else {
             o->device[0] = '\0';
+            /* Тоже по факту, а не по записи в active. Запись «-» говорит лишь о том, что
+             * об отказе уже сообщали, а не о том, что заявленный on_fail всё ещё стоит в
+             * ядре: клиент туннеля мог с тех пор подняться и привязать таблицу к
+             * устройству, которое не отвечает, — тогда трафик уходит в мёртвый туннель
+             * вместо остановки, обещанной on_fail=drop. */
             if (strcmp(was, "-") != 0) {
-                apply_failed(o);
+                apply_failed(o, 1);         /* отказ только что случился — объявляем */
                 changed = 1;
+            } else {
+                struct route_facts f = route_facts_read(o);
+                if (!routing_failed_ok(&f, o->on_fail)) {
+                    fprintf(stderr, LOG_W "выход %s: живых устройств по-прежнему нет, а "
+                                    "маршрутизация разъехалась (%s) — возвращаю "
+                                    "on_fail=%s\n",
+                            o->name, failed_why(&f, o->on_fail),
+                            o->on_fail == FAIL_DROP ? "drop" :
+                            o->on_fail == FAIL_ZAPRET ? "zapret" : "direct");
+                    apply_failed(o, 0);
+                    changed = 1;
+                }
             }
         }
     }
