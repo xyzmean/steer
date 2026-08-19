@@ -355,6 +355,19 @@ int main(void) {
         refuses("отказ: префиксов больше предела", t, XS_ROLE_SPOKE);
     }
     {
+        /* А ПРЕДЕЛА хватает: полный туннель с исключениями — это одна длинная строка на
+         * несколько десятков префиксов, и раньше её резал не счётчик, а буфер строки в 512
+         * байт. Здесь сорок префиксов одной строкой (под семьсот символов) обязаны пройти. */
+        char t[8192];
+        int o = snprintf(t, sizeof(t), "[Interface]\nPrivateKey=%s\nAddress=10.0.0.2/24\n"
+                         "[Peer]\nPublicKey=%s\nEndpoint=1.2.3.4:443\nAllowedIPs=", KEY_A, KEY_B);
+        for (int i = 0; i < 40; i++)
+            o += snprintf(t + o, sizeof(t) - (size_t)o, "%s%d.0.0.0/8", i ? "," : "", i + 1);
+        snprintf(t + o, sizeof(t) - (size_t)o, "\n");
+        check("длинный список исключений принят", 0, parse(t, XS_ROLE_SPOKE));
+        check("длинный список: все сорок префиксов на месте", 40, (long)g_c.peer[0].allowed_n);
+    }
+    {
         char t[16384];
         int o = snprintf(t, sizeof(t), "[Interface]\nPrivateKey=%s\nAddress=10.0.0.1/24\n"
                          "ListenPort=443\n", KEY_A);

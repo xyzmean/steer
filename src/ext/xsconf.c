@@ -196,7 +196,11 @@ int xs_conf_parse(const char *text, size_t n, enum xs_role role,
     while (p < end) {
         const char *nl = memchr(p, '\n', (size_t)(end - p));
         size_t len = nl ? (size_t)(nl - p) : (size_t)(end - p);
-        char raw[512];
+        /* Две тысячи, а не пятьсот: AllowedIPs едет ОДНОЙ строкой через запятую, и полный
+         * туннель с исключениями — до шестидесяти четырёх префиксов (XS_ALLOWED_MAX) — это
+         * под тысячу символов. С прежними 512 такая строка отвергалась как «слишком длинная»
+         * ещё до подсчёта префиксов, то есть у самого частого сценария. */
+        char raw[2048];
         if (len >= sizeof(raw)) FAIL("строка %d: слишком длинная", line_no + 1);
         memcpy(raw, p, len);
         raw[len] = '\0';
