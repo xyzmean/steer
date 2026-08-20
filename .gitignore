@@ -28,6 +28,9 @@ build/obfsmatch
 build/visionmatch
 build/specmatch-ext
 build/xswirematch
+build/xsstreammatch
+build/xsepochmatch
+build/tungromatch
 build/xsconfmatch
 build/xsroutematch
 build/chellomatch

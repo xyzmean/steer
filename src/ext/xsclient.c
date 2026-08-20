@@ -32,11 +32,16 @@
 #include <arpa/inet.h>
 #include <sys/socket.h>
 
+#include <netinet/in.h>
+#include <netinet/tcp.h>
+
 #include "../spec.h"
 #include "xsconn.h"
 #include "xsconf.h"
+#include "xsepoch.h"
 #include "xshake.h"
 #include "xsroute.h"
+#include "xsstream.h"
 #include "tun.h"
 #include "reality.h"
 
@@ -53,6 +58,24 @@ int run_quiet(const char *const argv[]);
 /* Обратная связь по сборке разрезанных записей. Десять секунд везём по одному кадру после жалобы
  * той стороны — достаточно, чтобы всплеск потерь прошёл, и мало, чтобы надолго терять выигрыш
  * пачек; сообщаем не чаще раза в две секунды; наращиваем обратно раз в три. */
+/* ---- режим потока (xsstream.h) ---------------------------------------------
+ *
+ * Проба живости раз в две секунды. В потоке согласовывать MTU нечем — сегментацией
+ * распоряжается ядро, — но проба нужна не ради размера: хаб отвечает на неё эхом, и это
+ * ЕДИНСТВЕННЫЙ признак того, что канал несёт трафик в обратную сторону. Без него полный
+ * туннель не отличил бы работающий хаб от хаба, который принимает всё и не отвечает ничем, а
+ * разница между ними для человека — это разница между «VPN» и «нет интернета». Кадр
+ * крохотный (четыре байта) и стоит столько же, сколько один keepalive.
+ *
+ * Столько же (2000) стоит в реализации на Go, и по той же причине: сторож считает канал живым,
+ * пока кадры от хаба не старше пяти секунд, так что три пропущенные подряд пробы — уже не
+ * случайность. */
+#define XSC_STREAM_PROBE_MS 2000
+/* Сколько ждать установления соединения TCP и рукопожатия. Раздельно: «порт не отвечает» и
+ * «отвечает, но не наш хаб» — разные отказы, и человеку полезно знать, какой из них. */
+#define XSC_STREAM_DIAL_MS  10000
+#define XSC_STREAM_HS_MS    15000
+
 #define XSC_REASM_COOL_MS   10000
 #define XSC_REASM_REPORT_MS 2000
 #define XSC_REASM_GROW_MS   3000
@@ -153,6 +176,27 @@ struct spoke {
     /* Какой MTU этот воркер уже назвал хабу: своя сессия у каждого соединения, и хаб должен
      * знать размер по каждой — иначе подрезка MSS на обратном пути её пропустит. */
     int mtu_told;
+
+    /* ---- режим потока (xsstream.h) ----------------------------------------------
+     *
+     * stream — режим выбран человеком (ключ --stream или поле спеки). Тогда поддельный TCP не
+     * поднимается вовсе: ни сырого сокета, ни правила против RST, ни окна приёма, ни сборки
+     * разрезанных записей, ни проб пути.
+     *
+     * st выделяется НА ВРЕМЯ соединения, а не лежит в структуре: в нём буфер чтения на 64 КБ,
+     * и платить их в каждом воркере при поддельном TCP, где поток не используется, незачем —
+     * на роутере с 128 МБ четыре таких буфера это уже заметно. */
+    int stream, stream_port;
+    struct xs_stream *st;
+    /* Ратчет эпох: по одному на направление. Включается только в потоке — почему, сказано в
+     * шапке xsepoch.h (в поддельном TCP смещение выбирает отправитель сегмента). */
+    struct xs_epoch ep_tx, ep_rx;
+    long long stream_rx;          /* когда последний раз пришла запись: тишина здесь = обрыв */
+    /* Склейка соседних сегментов одного потока в одну запись в устройство (см. tun.h).
+     * Буферов не держит: кадры внутри расшифрованной записи уже лежат подряд, и склейка
+     * ссылается на них векторами. Отдаётся ВСЕГДА в конце обработки записи — пакет не живёт
+     * дольше одного круга цикла, то есть задержки не появляется. */
+    struct tun_gro gro;
 };
 
 /* Воркеры пира. Статические, а не на стеке: в каждом по 50 КБ буферов. */
@@ -195,7 +239,11 @@ static void state_write(struct spoke *s) {
                ",\"tx_packets\":%llu,\"tx_bytes\":%llu"
                ",\"rx_packets\":%llu,\"rx_bytes\":%llu,\"dropped\":%llu}\n",
             s->out_name, any_up ? "true" : "false", s->mtu, g_conns,
-            s->conf->peer[0].endpoint, s->conf->peer[0].endpoint_port, fp,
+            s->conf->peer[0].endpoint,
+            /* Порт называется ТОТ, к которому мы на самом деле подключены: в режиме потока он
+             * может быть задан отдельно, и «в состоянии один порт, в журнале другой» — верный
+             * способ искать причину не там. */
+            s->stream && s->stream_port ? s->stream_port : s->conf->peer[0].endpoint_port, fp,
             hs_at ? (xs_now_ms() - hs_at) / 1000 : -1,
             tp, tb2, rp, rb, dr);
     fclose(f);
@@ -321,9 +369,29 @@ static int do_handshake(struct spoke *s) {
         if (got + seg.plen > sizeof(in)) { xs_hs_wipe(&hs); return -1; }
         memcpy(in + got, seg.payload, seg.plen);
         got += seg.plen;
+        /* ГРАНИЦУ ОТВЕТА ОПРЕДЕЛЯЕТ РАМКА ЗАПИСЕЙ, А НЕ КОД ОТКАЗА РАЗБОРА.
+         *
+         * Прежде здесь стояло «позвать finish и, если он сказал XS_EFORMAT, ждать остаток».
+         * Это работало ровно потому, что ответ хаба всегда влезал в один сегмент, — а на
+         * канале с меньшим MSS сломалось бы скрытно: xs_hs_client_finish ВБИРАЕТ прочитанное в
+         * транскрипт по мере разбора, поэтому на неполном ответе он успевает вобрать
+         * ServerHello, а повторный вызов на дособранном ответе вбирает его ВТОРОЙ РАЗ. Тег
+         * подтверждения после этого не сходится при совершенно верной криптографии, и выглядит
+         * это как «хаб не признал нас» — то есть причину искали бы в ключах и конфигурации.
+         * Теперь finish зовётся один раз и только на целом ответе. */
+        /* Фатальное оповещение TLS — это ОТВЕТ, и он говорит больше, чем тишина: хаб нас не
+         * признал (не тот ключ, нас нет в его конфигурации). Без этой ветки ждать пришлось бы
+         * до конца срока, а человек увидел бы «не ответил на рукопожатие» — то есть неправду. */
+        if (got >= 2 && in[0] == 0x15) {
+            fprintf(stderr, LOG_W "хаб %s:%d ответил отказом TLS: нас нет в его конфигурации "
+                                  "или публичный ключ не тот\n",
+                    s->conf->peer[0].endpoint, s->hub_port);
+            xs_hs_wipe(&hs);
+            return -1;
+        }
+        if (!xs_hs_response_complete(in, got)) continue;
         size_t used = 0;
         rc = xs_hs_client_finish(&hs, in, got, &s->tx, &s->rx, &used);
-        if (rc == XS_EFORMAT && got < sizeof(in)) continue;    /* ждём остаток */
         if (rc != 0) {
             fprintf(stderr, LOG_W "хаб не признал нас или ответил не тем: %d\n", rc);
             xs_hs_wipe(&hs);
@@ -499,11 +567,20 @@ static void session_down(struct spoke *s) {
  * Скопировать цикл во второй раз значило бы два места для одной ошибки в пути данных. */
 static int spoke_run(struct spoke *s, const char *dev, const char *chain_label, int managed,
                      struct output *o);
-static int cmd_xsteer_spec(const char *spec_path, const char *out_name, const char *conf_path);
+static int cmd_xsteer_spec(const char *spec_path, const char *out_name, const char *conf_path,
+                           int stream, int stream_port);
 
 int cmd_xsteer(const char *spec_path, const char *out_name, const char *conf_path,
-               const char *device) {
+               const char *device, int stream, int stream_port) {
     static struct spoke sd;
+    /* Режим транспорта задаётся ключом и только здесь: дальше он едет полем spoke, потому что
+     * его читает и цикл, и подъём устройства, и файл состояния.
+     *
+     * Ключ трёхзначен: 1 — «--stream», -1 — «--no-stream», 0 — не назван. В режиме netifd
+     * спеки нет вовсе, поэтому «не назван» и «выключен» здесь одно и то же; различие нужно
+     * ниже, где ключ спорит с полем спеки. */
+    sd.stream = stream > 0;
+    sd.stream_port = stream_port;
     /* Без имени выхода спека не читается ВОВСЕ: на маршрутизаторе, где туннелем владеет
      * netifd, выходов и каналов может не быть, а требовать спеку ради того, чтобы её не
      * использовать, значило бы требовать настройку, которая ни на что не влияет. */
@@ -525,10 +602,11 @@ int cmd_xsteer(const char *spec_path, const char *out_name, const char *conf_pat
                  g_state_dir, device);
         return spoke_run(&sd, device, device, 1, NULL);
     }
-    return cmd_xsteer_spec(spec_path, out_name, conf_path);
+    return cmd_xsteer_spec(spec_path, out_name, conf_path, stream, stream_port);
 }
 
-static int cmd_xsteer_spec(const char *spec_path, const char *out_name, const char *conf_path) {
+static int cmd_xsteer_spec(const char *spec_path, const char *out_name, const char *conf_path,
+                           int stream, int stream_port) {
     load_spec(spec_path);
     struct output *o = out_by_name(out_name);
     if (!o) die("нет такого выхода: %s", out_name);
@@ -541,6 +619,12 @@ static int cmd_xsteer_spec(const char *spec_path, const char *out_name, const ch
 
     static struct spoke s;
     s.out_name = o->name;
+    /* Ключ командной строки СИЛЬНЕЕ спеки, а не наоборот: спека описывает постоянную
+     * настройку выхода, а ключом человек проверяет руками — и «проверил ключом, а работало по
+     * спеке» это потерянный час. Отсутствие ключа (0) при заданном в спеке потоке оставляет
+     * поток: выключить его руками можно --no-stream, который приезжает сюда как -1. */
+    s.stream = stream ? stream > 0 : o->xs_stream;
+    s.stream_port = stream_port ? stream_port : o->xs_stream_port;
     char err[256];
     const char *path = conf_path ? conf_path : o->xs_conf;
     if (xs_conf_load(path, XS_ROLE_SPOKE, &g_cf, &g_sc, err, sizeof(err)) != 0) {
@@ -625,6 +709,14 @@ static int spoke_run(struct spoke *s, const char *dev, const char *chain_label, 
         s->hub_addr = h2.s_addr;
         s->mtu = s->conf->mtu ? s->conf->mtu : XS_MTU_DEF;
     }
+    /* DNS из конфигурации разбор принимает, но применить его здесь нельзя: именами на
+     * роутере распоряжается dnsmasq, и вырывать резолвер у него из туннеля значило бы
+     * ломать доменные каналы движка. Сказать об этом надо ОДИН РАЗ и прямо — иначе человек,
+     * написавший DNS, будет считать, что запросы идут в туннель (см. xsconf.c). */
+    if (s->conf->dns_n)
+        fprintf(stderr, LOG_W "в конфигурации задан DNS (%d адр.): здесь он НЕ применяется — "
+                              "именами распоряжается dnsmasq, заведите доменный канал\n",
+                s->conf->dns_n);
     g_conns = spoke_conns();
     /* Очереди TUN: по одной на воркера. Ядро раскладывает пакеты по очередям симметричным
      * хэшем потока, поэтому обе половины одного соединения всегда достаются одному воркеру. */
@@ -637,8 +729,14 @@ static int spoke_run(struct spoke *s, const char *dev, const char *chain_label, 
     g_mtu_now = s->mtu;
     /* Правило против RST собственного ядра: без него стек роутера сам рвёт нашу сессию.
      * Цепочка своя (вид 'x'), таблица общая с обфускатором — имя её историческое. Правило одно
-     * на все соединения: оно описано портом ХАБА, а не нашим. */
-    if (obfs_guard_up('x', chain_label, s->conf->peer[0].endpoint, s->hub_port, 0) != 0)
+     * на все соединения: оно описано портом ХАБА, а не нашим.
+     *
+     * В режиме потока правило НЕ НУЖНО, и это ровно то, чем он и ценен: соединением владеет
+     * само ядро, RST на живой сессии оно не пошлёт, и права CAP_NET_ADMIN на nft здесь не
+     * требуются вовсе. Ставить его всё равно значило бы просить прав и трогать firewall без
+     * причины. */
+    if (!s->stream && obfs_guard_up('x', chain_label, s->conf->peer[0].endpoint,
+                                    s->hub_port, 0) != 0)
         fprintf(stderr, LOG_W "%s: правило против RST не встало — сессию может оборвать "
                               "собственное ядро (нет nft?)\n", chain_label);
     if (o) bind_device(o, dev);
@@ -685,11 +783,18 @@ static void spoke_frame(struct spoke *s, const uint8_t *pt, size_t pn, const cha
     enum xs_kind kind = xs_frame_kind(pt, pn);
     if (kind == XS_IPV4 || kind == XS_IPV6) {
         xs_mss_clamp((uint8_t *)(uintptr_t)pt, pn, s->mtu);
-        tun_write_ctl(&s->tun, pt, pn);
+        /* Отдача идёт через склейку: восемь пакетов одного потока уезжают одной записью, и
+         * ядро проходит стек один раз вместо восьми. Условия склейки строгие, всё
+         * несклеиваемое (ICMP, UDP, голые подтверждения, чужой поток) уходит отдельной
+         * записью ровно как раньше — см. tun.h. */
+        tun_gro_push(&s->tun, &s->gro, (uint8_t *)(uintptr_t)pt, pn);
         s->down_pkts++;
         s->down_bytes += pn;
         return;
     }
+    /* Служебный кадр закрывает набор: за ним в устройство ничего не поедет, а держать
+     * накопленное дольше записи нельзя. */
+    tun_gro_flush(&s->tun, &s->gro);
     if (kind != XS_CTL) return;
     int acked = xs_pack_size(pt, pn);
     if (acked > 0) {
@@ -723,9 +828,501 @@ static void spoke_frame_cb(void *ctx, const uint8_t *f, size_t n) {
     spoke_frame(c->s, f, n, c->dev, c->now);
 }
 
+/* ---- режим потока: записи по НАСТОЯЩЕМУ соединению TCP ----------------------
+ *
+ * Зачем он есть — в шапке xsstream.h. Коротко: поддельный TCP требует сырого сокета и правила
+ * против RST собственного ядра, и там, где их нет, недоступен весь протокол целиком; а хаб
+ * реализации на Go принимает пиров и так, и так.
+ *
+ * Чего в этом режиме НЕТ и почему:
+ *
+ *   - проб ПУТИ. Внешним MTU распоряжается ядро (оно само делает обнаружение MTU пути и режет
+ *     поток на сегменты), а размер записи ему безразличен. Первая ступень согласования —
+ *     минимум пределов сторон из рукопожатия — остаётся, вторая теряет смысл;
+ *   - окна приёма и сборки разрезанных записей. Поток доставляет всё и по порядку, поэтому и
+ *     пачка всегда полного размера;
+ *   - ретайра по объёму. Он существовал ровно для того, чтобы 32-битное смещение не
+ *     завернулось и не повторило nonce; здесь смещение 64-битное, заворот недостижим, а
+ *     ключи меняются эпохами — без разрыва внутренних сессий TCP (xsepoch.h).
+ */
+
+/* Отдать поток и ключи. Отдельно от session_down: там закрывается поддельное соединение,
+ * которого здесь нет вовсе. */
+static void stream_down(struct spoke *s) {
+    if (s->up) {
+        tls13_keys_free(&s->tx);
+        tls13_keys_free(&s->rx);
+        memset(&s->tx, 0, sizeof(s->tx));
+        memset(&s->rx, 0, sizeof(s->rx));
+    }
+    /* Прошлые ключи эпох живут в ратчете, и освободить их обязан он: у них свой контекст
+     * шифра в куче. Затирается там же и корень — из него выводятся все будущие ключи. */
+    xs_epoch_stop(&s->ep_tx);
+    xs_epoch_stop(&s->ep_rx);
+    s->up = 0;
+    if (s->st) {
+        if (s->st->fd >= 0) close(s->st->fd);
+        free(s->st);
+        s->st = NULL;
+    }
+}
+
+/* Порт хаба для потока: назван ключом или тот же, что у поддельного TCP.
+ *
+ * ПОЧЕМУ ЭТО МОЖЕТ БЫТЬ РАЗНЫЙ ПОРТ. Слушающий сокет ядра на хабе отвечает SYN-ACK всякому,
+ * кто постучится, — включая пиров, которые ведут ПОДДЕЛЬНЫЙ TCP. Тогда на один их SYN
+ * приходит два ответа с разными начальными номерами, и сессия рассыпается. Поэтому у хаба,
+ * который держит оба режима, они живут на разных портах, и какой из них поставить на :443,
+ * решает оператор. */
+static int stream_port(const struct spoke *s) {
+    return s->stream_port ? s->stream_port : s->hub_port;
+}
+
+/* Открыть соединение к хабу.
+ *
+ * Неблокирующий connect с ожиданием по poll, а не блокирующий: блокирующий висит до таймаута
+ * ядра (это минуты), а нам надо вернуться, сказать причину и попробовать снова — ровно как в
+ * половине поддельного TCP, где ожидание ограничено числом попыток SYN. */
+static int stream_dial(struct spoke *s) {
+    int fd = socket(AF_INET, SOCK_STREAM, 0);
+    if (fd < 0) return -1;
+    int fl = fcntl(fd, F_GETFL, 0);
+    fcntl(fd, F_SETFL, fl | O_NONBLOCK);
+    /* Без задержки Нейгла: мелкий кадр (внутреннее подтверждение, проба, keepalive) не должен
+     * ждать, пока наберётся сегмент. Задержка здесь стоила бы кругов внутреннему TCP, который
+     * едет внутри и своего ожидания уже не понимает.
+     *
+     * Размеры буферов сокета при этом НЕ задаются — почему, сказано в шапке xsstream.h: любой
+     * явный setsockopt отключает автоподстройку окна и режется по net.core.{r,w}mem_max. */
+    int one = 1;
+    setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
+    /* СВОЁ соединение к хабу из туннеля исключать НЕ НУЖНО, и это свойство раскладки правил, а
+     * не удача. Метку, по которой трафик уходит в таблицу выхода, ставит цепочка в хуке
+     * prerouting по адресу ИСТОЧНИКА из локальной сети (см. src/steer.c); пакеты, рождённые
+     * самим роутером, prerouting не проходят вовсе, поэтому метки не получают и в туннель не
+     * попадают — даже при полном туннеле 0.0.0.0/0. Ни SO_MARK, ни привязки к устройству, ни
+     * обхода /32 к адресу хаба здесь поэтому нет. На Windows у реализации на Go всё иначе (там
+     * маршрутами владеет система, и сокет приходится привязывать через IP_UNICAST_IF), и
+     * разница между платформами объяснена там же, в tun/pin_other.go. */
+    struct sockaddr_in to;
+    memset(&to, 0, sizeof(to));
+    to.sin_family = AF_INET;
+    to.sin_port = htons((uint16_t)stream_port(s));
+    to.sin_addr.s_addr = s->hub_addr;
+    if (connect(fd, (struct sockaddr *)&to, sizeof(to)) != 0 && errno != EINPROGRESS) {
+        fprintf(stderr, LOG_W "поток к %s:%d не открылся: %s\n",
+                s->conf->peer[0].endpoint, stream_port(s), strerror(errno));
+        close(fd);
+        return -1;
+    }
+    struct pollfd p = { fd, POLLOUT, 0 };
+    int n = poll(&p, 1, XSC_STREAM_DIAL_MS);
+    int err = 0;
+    socklen_t el = sizeof(err);
+    if (n <= 0 || getsockopt(fd, SOL_SOCKET, SO_ERROR, &err, &el) != 0 || err != 0) {
+        /* Причина называется вслух и разными словами: «не ответил вовсе» это закрытый порт
+         * или фильтр, а «отказал» — как правило, никого нет на порту. Без этого различия
+         * снаружи видно только «туннель не поднялся». */
+        if (n == 0)
+            fprintf(stderr, LOG_W "%s:%d не отвечает на SYN (%d мс): хаб не запущен, порт "
+                                  "закрыт или режим потока на хабе не включён\n",
+                    s->conf->peer[0].endpoint, stream_port(s), XSC_STREAM_DIAL_MS);
+        else
+            fprintf(stderr, LOG_W "поток к %s:%d не открылся: %s\n",
+                    s->conf->peer[0].endpoint, stream_port(s), strerror(err ? err : errno));
+        close(fd);
+        return -1;
+    }
+    return fd;
+}
+
+/* Дождаться n байт подряд, но не дольше срока. 1 — есть, 0 — время вышло, -1 — обрыв. */
+static int stream_need(struct spoke *s, size_t n, const uint8_t **p, long long deadline) {
+    for (;;) {
+        int rc = xs_stream_peek(s->st, n, p);
+        if (rc != 0) return rc;
+        long long left = deadline - xs_now_ms();
+        if (left <= 0) return 0;
+        struct pollfd pf = { s->st->fd, POLLIN, 0 };
+        poll(&pf, 1, (int)(left > XSC_TICK_MS * 5 ? XSC_TICK_MS * 5 : left));
+    }
+}
+
+/* Одно рукопожатие по потоку целиком.
+ *
+ * Хореография та же, что в поддельном TCP (do_handshake), и различается только рамкой: Hello
+ * уходит одним вызовом — резать его на сегменты дело ядра, — а ответ собирается ПО ЗАПИСЯМ,
+ * ни байтом больше. Последнее обязательно: данные, приехавшие вплотную за рукопожатием, должны
+ * остаться в буфере потока, иначе первая же запись данных пропадёт, а выглядеть это будет как
+ * «туннель поднялся и молчит».
+ *
+ * xs_hs_client_finish зовётся РОВНО ОДИН РАЗ и только на целом ответе — см. xs_hs_response_complete. */
+static int stream_handshake(struct spoke *s, const char *dev) {
+    struct xs_hs hs;
+    size_t hn = 0;
+    /* Свой предел называется так же, как в поддельном TCP: не больше XS_MTU_DEF и не больше
+     * заданного человеком. MTU канала здесь НЕ спрашивается, и это не упущение: наружу поток
+     * режет ядро, оно же ведёт обнаружение MTU пути, поэтому канал в 1492 байта не обязывает
+     * нас уменьшать внутренний размер — он обязывает ядро сделать сегмент короче. То же самое
+     * и в тех же числах называет реализация на Go. */
+    int say = XS_MTU_DEF;
+    if (s->mtu_cap > 0 && s->mtu_cap < say) say = s->mtu_cap;
+    int rc = xs_hs_client_hello(&hs, s->sec, s->hub_pub, s->conf->sni, say, s->conn_id,
+                                s->txb, sizeof(s->txb), &hn);
+    if (rc != 0) {
+        fprintf(stderr, LOG_W "рукопожатие не собралось: %d\n", rc);
+        return rc;
+    }
+    if (xs_stream_write_raw(s->st, s->txb, hn) != 0) {
+        fprintf(stderr, LOG_W "Hello не ушёл: %s\n", strerror(errno));
+        xs_hs_wipe(&hs);
+        return -1;
+    }
+    /* Ответ хаба заведомо меньше двух строк: ServerHello, фальшивый ChangeCipherSpec, запись
+     * «сертификата» правдоподобной длины и подтверждение. Больше этого — не наш собеседник или
+     * порча; копить дальше значило бы позволить чужому раздуть память. */
+    uint8_t acc[2 * XS_ROW];
+    size_t an = 0;
+    long long deadline = xs_now_ms() + XSC_STREAM_HS_MS;
+    while (!xs_hs_response_complete(acc, an)) {
+        const uint8_t *h;
+        int pr = stream_need(s, XS_REC_HDR, &h, deadline);
+        if (pr <= 0) {
+            fprintf(stderr, LOG_W "хаб %s:%d %s на рукопожатие\n", s->conf->peer[0].endpoint,
+                    stream_port(s), pr == 0 ? "не ответил" : "оборвал соединение");
+            xs_hs_wipe(&hs);
+            return -1;
+        }
+        /* Фатальное оповещение TLS в ответ — это ОТВЕТ, и он говорит больше, чем тишина: хаб
+         * нас не признал (не тот ключ, не тот пир в конфигурации). Ждать после него до конца
+         * срока значило бы показать человеку «не отвечает» там, где ответ был. */
+        if (an == 0 && h[0] == 0x15) {
+            fprintf(stderr, LOG_W "хаб %s:%d ответил отказом TLS: нас нет в его конфигурации "
+                                  "или публичный ключ не тот\n",
+                    s->conf->peer[0].endpoint, stream_port(s));
+            xs_hs_wipe(&hs);
+            return -1;
+        }
+        size_t rn = ((size_t)h[3] << 8) | h[4];
+        if (an + XS_REC_HDR + rn > sizeof(acc) || rn > XS_MAX_RECORD) {
+            fprintf(stderr, LOG_W "хаб %s:%d ответил не тем: %zu байт без узнаваемого конца "
+                                  "рукопожатия\n", s->conf->peer[0].endpoint, stream_port(s),
+                    an + rn);
+            xs_hs_wipe(&hs);
+            return -1;
+        }
+        pr = stream_need(s, XS_REC_HDR + rn, &h, deadline);
+        if (pr <= 0) {
+            fprintf(stderr, LOG_W "ответ хаба приехал не весь\n");
+            xs_hs_wipe(&hs);
+            return -1;
+        }
+        memcpy(acc + an, h, XS_REC_HDR + rn);
+        an += XS_REC_HDR + rn;
+        xs_stream_drop(s->st, XS_REC_HDR + rn);
+    }
+    size_t used = 0;
+    rc = xs_hs_client_finish(&hs, acc, an, &s->tx, &s->rx, &used);
+    if (rc != 0) {
+        fprintf(stderr, LOG_W "хаб не признал нас или ответил не тем: %d\n", rc);
+        xs_hs_wipe(&hs);
+        return rc;
+    }
+    size_t fn = 0;
+    rc = xs_hs_client_confirm(&hs, &s->tx, s->txb, sizeof(s->txb), &fn);
+    if (rc == 0 && xs_stream_write_raw(s->st, s->txb, fn) != 0) rc = -1;
+    int peer_mtu = hs.peer.mtu;
+    /* Корни эпох забираются ДО xs_hs_wipe: он затирает состояние рукопожатия целиком, и
+     * первая версия этой правки читала уже занулённые байты — ратчет пошёл бы от нуля у обеих
+     * сторон одинаково, то есть отказ не проявился бы вовсе, а прямая секретность исчезла. */
+    uint8_t troot[32], rroot[32];
+    xs_hs_roots(&hs, troot, rroot);
+    xs_hs_wipe(&hs);
+    if (rc != 0) {
+        volatile uint8_t *a = troot, *b = rroot;
+        for (int i = 0; i < 32; i++) { a[i] = 0; b[i] = 0; }
+        return rc;
+    }
+    /* Ратчет включается ДО первой записи данных и на ОБОИХ направлениях: номер эпохи считается
+     * из смещения, и сторона, включившая его позже, разошлась бы с другой на те записи, что
+     * успели уехать. На проводе от этого не меняется ни один байт. */
+    xs_epoch_start(&s->ep_tx, troot);
+    xs_epoch_start(&s->ep_rx, rroot);
+    {
+        volatile uint8_t *a = troot, *b = rroot;
+        for (int i = 0; i < 32; i++) { a[i] = 0; b[i] = 0; }
+    }
+
+    /* СОГЛАСОВАНИЕ MTU: только первая ступень — минимум пределов сторон. Второй (проверки
+     * самого пути пробами) в потоке нет, потому что сегментацией распоряжается ядро. */
+    s->mtu_agreed = say;
+    if (peer_mtu > 0 && peer_mtu < s->mtu_agreed) s->mtu_agreed = peer_mtu;
+    s->mtu_confirmed = s->mtu_agreed;
+    s->up = 1;
+    s->handshake_at = xs_now_ms();
+    s->stream_rx = s->handshake_at;
+    s->batch_max = XS_BATCH_FRAMES_MAX;
+    fprintf(stderr, LOG_I "рукопожатие с %s:%d прошло потоком, шифр %s, MTU %d, ключи меняются "
+                          "каждые %llu МиБ\n",
+            s->conf->peer[0].endpoint, stream_port(s),
+            s->tx.aead == TLS13_AEAD_AES128 ? "AES-128-GCM" : "ChaCha20-Poly1305",
+            s->mtu_agreed, (unsigned long long)(XS_EPOCH_BYTES >> 20));
+    /* Устройство и общее значение для остальных воркеров: тот же путь, что после пробоя в
+     * поддельном TCP, только значение известно сразу. */
+    mtu_apply(s, dev, s->mtu_agreed, "согласовано в рукопожатии (поток)");
+    if (!s->conn_id) g_mtu_pub = s->mtu_agreed;
+    return 0;
+}
+
+/* Одна запись наружу: собрать заголовок, зашифровать смещением и отдать потоку.
+ *
+ * Смещение спрашивается ровно перед шифрованием и отправкой: выдать его, зашифровать им и
+ * отправить нужно как одно действие, иначе две записи уедут под одним nonce. То же неделимое
+ * правило, что у xs_conn_rel_next в поддельном TCP. */
+static int stream_record(struct spoke *s, uint8_t *rec, size_t pn) {
+    uint64_t off = xs_stream_tx_next(s->st);
+    if (xs_rec_build(rec, pn + XS_TAG) != 0) return -1;
+    if (xs_epoch_seal(&s->ep_tx, &s->tx, off, rec, XS_REC_HDR, rec + XS_REC_HDR, pn,
+                      rec + XS_REC_HDR + pn) != 0)
+        return -1;
+    return xs_stream_send(s->st, rec, XS_REC_HDR + pn + XS_TAG);
+}
+
+/* Служебный кадр (проба, итог согласования, keepalive) одиночной записью. Тем же путём, что
+ * данные: своего канала у них нет, и это нарочно — иначе появился бы второй путь на проводе,
+ * который DPI различал бы по размеру и ритму. */
+static int stream_frame(struct spoke *s, const uint8_t *pt, size_t pn) {
+    if (!s->up || pn > (size_t)XS_MTU_DEF) return -1;
+    uint8_t *rec = s->txb + 20;
+    if (pn) memcpy(rec + XS_REC_HDR, pt, pn);
+    return stream_record(s, rec, pn);
+}
+
+/* Цикл одного соединения в режиме потока. */
+static void *stream_main(struct spoke *s) {
+    const char *dev = s->dev;
+    long long last_state = 0, last_probe = 0, last_tx = 0;
+    int keepalive_ms = s->conf->peer[0].keepalive * 1000;
+
+    for (;;) {
+        if (!s->up) {
+            if (!s->st) {
+                s->st = calloc(1, sizeof(*s->st));
+                if (!s->st) {
+                    fprintf(stderr, LOG_W "не хватило памяти на буфер потока\n");
+                    if (worker_give_up(s)) return (void *)1;
+                    continue;
+                }
+                s->st->fd = -1;
+            }
+            fprintf(stderr, LOG_I "подключаюсь к %s:%d настоящим TCP (режим потока)\n",
+                    s->conf->peer[0].endpoint, stream_port(s));
+            int fd = stream_dial(s);
+            if (fd < 0) {
+                stream_down(s);
+                if (!s->conn_id) state_write(s);
+                if (worker_give_up(s)) return (void *)1;
+                continue;
+            }
+            xs_stream_init(s->st, fd);
+            if (stream_handshake(s, dev) != 0) {
+                stream_down(s);
+                if (!s->conn_id) state_write(s);
+                if (worker_give_up(s)) return (void *)1;
+                continue;
+            }
+            /* Хабу называется рабочий размер тем же служебным кадром, что в поддельном TCP: по
+             * нему он подрезает MSS обратного трафика ДЛЯ ЭТОЙ сессии. Не сказав, мы получили
+             * бы «через одно соединение большие пакеты ходят, через другое нет». */
+            uint8_t fin[8];
+            size_t fnn = xs_mtu_build(fin, sizeof(fin), s->mtu_agreed);
+            if (fnn && stream_frame(s, fin, fnn) == 0) s->mtu_told = s->mtu_agreed;
+            last_tx = xs_now_ms();
+            state_write(s);
+        }
+
+        /* Хвост недописанной записи — единственная причина ждать готовности к записи: пока он
+         * не уехал, следующую запись отправлять нельзя (половина записи в потоке это не
+         * потерянный пакет, а разъехавшийся поток). */
+        int busy = xs_stream_busy(s->st);
+        struct pollfd fds[2] = { { s->tun.fd, POLLIN, 0 },
+                                 { s->st->fd, (short)(POLLIN | (busy ? POLLOUT : 0)), 0 } };
+        int n = poll(fds, 2, XSC_TICK_MS);
+        long long now = xs_now_ms();
+        if (n < 0 && errno != EINTR) break;
+        if (busy && xs_stream_flush(s->st) < 0) {
+            fprintf(stderr, LOG_W "поток оборвался при досылке записи\n");
+            stream_down(s);
+            continue;
+        }
+
+        /* ---- наружу: TUN → поток ------------------------------------------------
+         *
+         * Кадры читаются ПРЯМО в буфер записи, на свои места в контейнере пачки: пачка
+         * собирается без единой лишней копии. Резать запись на сегменты не нужно — это работа
+         * ядра, и она же снимает предел «запись не длиннее сегмента»: здесь запись живёт своей
+         * длиной до восьми килобайт, ровно как у настоящего TLS. */
+        if (s->up && !xs_stream_busy(s->st) && n > 0 && (fds[0].revents & POLLIN)) {
+            uint8_t *rec = s->rb + 20;
+            uint8_t *pay = rec + XS_REC_HDR;
+            size_t off = XS_BATCH_HDR;
+            int frames = 0;
+            unsigned long long payload = 0;
+            /* Пачка всегда полного размера: разрезанных записей в потоке не бывает, поэтому
+             * обратной связи по сборке (и схлопывания пачки) здесь нет вовсе. */
+            while (frames < XS_BATCH_FRAMES_MAX) {
+                if (frames > 0 && off + 2 + (size_t)s->mtu + XS_TAG > XS_MAX_RECORD) break;
+                ssize_t r = tun_read_packet(&s->tun, pay + off + 2, (size_t)s->mtu);
+                if (r <= 0) break;
+                xs_mss_clamp(pay + off + 2, (size_t)r, s->mtu);
+                pay[off] = (uint8_t)((size_t)r >> 8);
+                pay[off + 1] = (uint8_t)((size_t)r & 0xFF);
+                off += 2 + (size_t)r;
+                payload += (unsigned long long)r;
+                frames++;
+            }
+            if (frames > 0) {
+                size_t pn;
+                if (frames == 1) {
+                    pn = off - XS_BATCH_HDR - 2;
+                    memmove(pay, pay + XS_BATCH_HDR + 2, pn);
+                } else {
+                    pay[0] = XS_CTL_BATCH;
+                    pn = off;
+                }
+                int rc = stream_record(s, rec, pn);
+                if (rc == 0) {
+                    s->up_pkts += (unsigned long long)frames;
+                    s->up_bytes += payload;
+                    last_tx = now;
+                } else if (rc == -2) {
+                    /* Очередь сокета переполнена посреди прошлой записи. Кадры отбрасываются, а
+                     * не копятся: повторных передач у нас нет по построению, а очередь означала
+                     * бы задержку вместо потери — то есть подмену одного класса отказов другим,
+                     * менее заметным. Внутренний TCP разберётся с потерей сам. */
+                    s->dropped += (unsigned long long)frames;
+                } else {
+                    fprintf(stderr, LOG_W "поток оборвался при отправке: %s\n", strerror(errno));
+                    stream_down(s);
+                    continue;
+                }
+            }
+        }
+
+        /* ---- обратно: поток → TUN ----------------------------------------------- */
+        if (s->up && n > 0 && (fds[1].revents & (POLLIN | POLLHUP | POLLERR))) {
+            /* Записей за один круг — не больше предела, и это не микрооптимизация.
+             *
+             * Поток надёжен и при насыщенной загрузке приносит байты быстрее, чем мы успеваем
+             * их разобрать; цикл «читать, пока приходит» в таком режиме не кончается вовсе, и
+             * чтение TUN не получает управления — то есть отдача встаёт целиком, пока идёт
+             * приём. В поддельном TCP от этого спасает сама пачка recvmmsg (цикл выходит на
+             * неполной), здесь границу приходится назвать. Сто двадцать восемь записей это
+             * около мегабайта за круг: и накладные на poll остаются незаметными, и обратное
+             * направление не голодает. */
+            int left_recs = XSC_BATCH * XS_BATCH_FRAMES_MAX;
+            while (left_recs-- > 0) {
+                const uint8_t *hdr, *body;
+                size_t bn;
+                uint64_t rel;
+                int rc = xs_stream_recv(s->st, &hdr, &body, &bn, &rel);
+                if (rc == 0) break;
+                if (rc < 0) {
+                    /* И обрыв, и «в потоке не запись xsteer» кончаются одним: соединением
+                     * пользоваться больше нельзя. Границы следующей записи известны только из
+                     * длины, которой мы уже не верим, — пропустить один кадр, как в поддельном
+                     * TCP, здесь невозможно. */
+                    fprintf(stderr, LOG_W "поток закрылся%s\n",
+                            rc == -2 ? ": пришла не запись xsteer" : "");
+                    stream_down(s);
+                    break;
+                }
+                uint8_t *ct = (uint8_t *)(uintptr_t)body;
+                if (xs_epoch_open(&s->ep_rx, &s->rx, rel, hdr, XS_REC_HDR, ct, bn) != 0) {
+                    fprintf(stderr, LOG_W "запись не расшифровалась — поднимаю соединение "
+                                          "заново\n");
+                    stream_down(s);
+                    break;
+                }
+                s->stream_rx = now;
+                size_t pn = bn - XS_TAG;
+                struct spoke_fctx fc = { s, dev, now };
+                if (pn && ct[0] == XS_CTL_BATCH) {
+                    if (xs_batch_iter(ct, pn, spoke_frame_cb, &fc) != 0) s->dropped++;
+                } else {
+                    spoke_frame(s, ct, pn, dev, now);
+                }
+                /* Склеенное отдаётся ЗДЕСЬ, до следующей записи: её буфер будет
+                 * переиспользован, а склейка ссылается на кадры в нём. Заодно это и есть
+                 * обещание «ни миллисекунды задержки» — накопленное не переживает обработку
+                 * одной записи. */
+                tun_gro_flush(&s->tun, &s->gro);
+            }
+        }
+
+        if (!s->up) continue;
+
+        /* Проба живости. Ответ на неё — единственный признак того, что канал несёт трафик в
+         * обратную сторону: сам поток TCP о смерти хаба узнаёт через минуты, а туннель к тому
+         * времени уже «не работает, и непонятно почему». */
+        if (now - last_probe >= XSC_STREAM_PROBE_MS) {
+            uint8_t probe[XS_PROBE_MIN];
+            if (xs_probe_build(probe, sizeof(probe), XS_PROBE_MIN) == XS_PROBE_MIN &&
+                stream_frame(s, probe, XS_PROBE_MIN) == 0)
+                last_tx = now;
+            last_probe = now;
+        }
+        /* Тишина при активной отправке — это обрыв, и признаётся он так же, как в поддельном
+         * TCP (xs_conn_tick): «мы отправили ПОСЛЕ того, как получили». Иначе туннель на покое,
+         * однажды отправивший пакет, считался бы мёртвым навсегда. */
+        if (last_tx > s->stream_rx && now - s->stream_rx >= XSC_DEAD_MS) {
+            fprintf(stderr, LOG_W "поток молчит %d мс при активной отправке — поднимаю "
+                                  "соединение заново\n", XSC_DEAD_MS);
+            stream_down(s);
+            continue;
+        }
+        /* Keepalive: пустая запись. Пир за NAT обязана поддерживать отображение живым, потому
+         * что дозвониться до неё хаб не может; настоящий TCP держит соединение своими
+         * средствами лишь через часы, а отображение NAT живёт минуты.
+         *
+         * ИНТЕРВАЛ С РАЗБРОСОМ, а не ровный: пакет одного и того же размера ровно каждые
+         * keepalive секунд не встречается ни в одном браузерном соединении и находится
+         * подсчётом пауз между мелкими пакетами. */
+        if (keepalive_ms && !s->keep_next) s->keep_next = keepalive_ms;
+        if (keepalive_ms && now - last_tx >= s->keep_next) {
+            if (stream_frame(s, NULL, 0) == 0) last_tx = now;
+            uint32_t j = 0;
+            xc_random((unsigned char *)&j, sizeof(j));
+            s->keep_next = keepalive_ms * 8 / 10 +
+                           (long long)(j % (uint32_t)(keepalive_ms * 4 / 10 + 1));
+        }
+        /* Соединения кроме нулевого: подхватываем согласованный MTU и называем его хабу — у
+         * каждого соединения на хабе своя сессия, и подрезку MSS обратного трафика он делает по
+         * MTU ТОЙ сессии, в которую отправляет. */
+        if (s->conn_id) {
+            if (g_mtu_now > 0 && s->mtu != g_mtu_now) s->mtu = g_mtu_now;
+            if (g_mtu_pub > 0 && s->mtu_told != g_mtu_pub) {
+                uint8_t fin[8];
+                size_t fnn = xs_mtu_build(fin, sizeof(fin), g_mtu_pub);
+                if (fnn && stream_frame(s, fin, fnn) == 0) s->mtu_told = g_mtu_pub;
+            }
+        }
+        if (!s->conn_id && now - last_state >= 2000) { state_write(s); last_state = now; }
+    }
+    stream_down(s);
+    if (!s->conn_id) xs_conf_wipe(s->sec);
+    return (void *)1;
+}
+
 /* Цикл одного соединения. */
 static void *worker_main(void *arg) {
     struct spoke *s = arg;
+    /* Режим потока — отдельный цикл, а не ветки внутри этого. Общего у них ровно рамка
+     * (устройство, MTU, keepalive, файл состояния), а различается ВСЁ на пути данных: там нет
+     * ни окна приёма, ни сборки записей, ни проб пути, ни ретайра, зато есть досылка хвоста и
+     * ратчет эпох. Ветки на каждом шаге сделали бы оба пути труднее для чтения, чем каждый по
+     * отдельности. Так же разделены они и в реализации на Go (client/stream.go). */
+    if (s->stream) return stream_main(s);
     const char *dev = s->dev;
     long long last_state = 0, last_keep = 0;
     int keepalive_ms = s->conf->peer[0].keepalive * 1000;
@@ -965,6 +1562,7 @@ static void *worker_main(void *arg) {
                     } else {
                         spoke_frame(s, ct, pn, dev, now);
                     }
+                    tun_gro_flush(&s->tun, &s->gro);   /* см. пояснение выше */
                     /* keepalive молча учтён: он уже обновил last_rx. */
                 }
                 if (got < XSC_BATCH) break;

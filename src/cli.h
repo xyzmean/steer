@@ -52,6 +52,11 @@ struct cli_args {
     const char *forward;
     const char *config;      /* конфигурация xsteer в стиле wg */
     const char *device;      /* готовое устройство TUN (режим netifd) */
+    /* Транспорт xsteer. Трёхзначно нарочно: 1 — «--stream», -1 — «--no-stream», 0 — не
+     * назван. Различие нужно потому, что режим можно задать и в спеке, а ключ обязан её
+     * перебивать в обе стороны — иначе выключить руками заданный в спеке поток было бы
+     * нечем. */
+    int stream, stream_port;
     const char *pos[CLI_MAXPOS];
     int npos;
     int dry_run, verbose, obfs, node, timeout, listen;

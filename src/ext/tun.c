@@ -112,6 +112,9 @@ int tun_open(struct tun_dev *d, int max_queues, const char *name) {
      * без возможности вернуться на прежний путь одной переменной — это утверждение, которое
      * нельзя перепроверить на том же железе и той же подписке. */
     int want_gso = getenv("STEER_TUN_NOGSO") == NULL;
+    /* Склейка — отдельным переключателем от разгрузки: с ней сравнивают, а не отключают
+     * вместе с заголовком vnet, иначе замер мешал бы два изменения в одно. */
+    int want_gro = getenv("STEER_TUN_NOGRO") == NULL;
     if (max_queues < 1) max_queues = 1;
 
     static const struct { int gso, multi; } order[] = {
@@ -128,6 +131,7 @@ int tun_open(struct tun_dev *d, int max_queues, const char *name) {
         if (fd < 0) continue;
         d[0].fd = fd;
         d[0].gso = order[i].gso;
+        d[0].gro = order[i].gso && want_gro;
 
         int n = 1;
         if (order[i].multi) {
@@ -138,6 +142,7 @@ int tun_open(struct tun_dev *d, int max_queues, const char *name) {
                 if (extra < 0) break;
                 d[n].fd = extra;
                 d[n].gso = order[i].gso;
+                d[n].gro = order[i].gso && want_gro;
                 n++;
             }
         }
@@ -431,6 +436,161 @@ void tun_write_ctl(const struct tun_dev *d, const unsigned char *pkt, size_t n) 
     /* Без повторов и без проверки: потерянный SYN-ACK или ACK клиент пришлёт заново сам,
      * а вешать на это ожидание значило бы задержать весь цикл ради пакета без данных. */
     (void)!writev(d->fd, iov, i);
+}
+
+/* ---- склейка соседних сегментов в одну запись -------------------------------
+ *
+ * Обоснование, условия и цена — в tun.h. Здесь только арифметика.
+ */
+
+/* Разобрать пакет настолько, насколько нужно склейке. 0 — годен, -1 — нет.
+ *
+ * Требования жёсткие: IPv4 без опций, TCP без опций, не фрагмент, флаги ровно ACK или
+ * ACK|PSH. Всё остальное отдаётся отдельной записью — склеить лишнее означает отдать
+ * клиенту испорченный поток, и заметить это можно только дампом. */
+static int gro_parse(const unsigned char *p, size_t n, size_t *hdr_n, size_t *pay_n,
+                    uint32_t *seq) {
+    if (n < 40) return -1;
+    if (p[0] != 0x45) return -1;                       /* IPv4, ihl 20, без опций IP */
+    if (p[9] != 6) return -1;                          /* TCP */
+    /* Фрагменты: смещение обязано быть нулевым, флаг MF снят. DF (0x40) допустим. */
+    if ((p[6] & 0x3F) != 0 || p[7] != 0) return -1;
+    if ((p[6] & 0x20) != 0) return -1;                 /* MF */
+    size_t tot = ((size_t)p[2] << 8) | p[3];
+    if (tot != n || tot < 40) return -1;
+    /* ОПЦИИ TCP РАЗРЕШЕНЫ, и это не мелочь: Linux по умолчанию включает метки времени, то
+     * есть заголовок у обычного сегмента 32 байта, а не 20. Первая версия этой склейки
+     * требовала «без опций» и поэтому не склеивала НИ ОДНОГО пакета живого потока —
+     * счётчики показали 100% отказов разбора. Опции склейке не мешают, потому что ядро при
+     * нарезке копирует заголовок целиком в каждый кусок; условие ниже требует, чтобы у
+     * склеиваемых пакетов байты опций были ОДИНАКОВЫ, — тогда результат нарезки совпадает с
+     * тем, что отправитель послал бы одним суперкадром. Так же поступает аппаратный GRO. */
+    size_t doff = (size_t)(p[32] >> 4) * 4;
+    if (doff < 20 || doff > 60 || 20 + doff >= tot) return -1;
+    *hdr_n = 20 + doff;
+    unsigned char fl = p[33];
+    /* SYN, FIN, RST, URG — смена состояния соединения; такие пакеты не склеиваем вовсе,
+     * хотя ядро и умеет ставить FIN на последний кусок: цена ошибки здесь несоизмерима с
+     * выигрышем на одном пакете за соединение. */
+    if (fl & ~(unsigned char)0x18) return -1;          /* разрешены только ACK и PSH */
+    if (!(fl & 0x10)) return -1;                       /* ACK обязателен */
+    *pay_n = tot - *hdr_n;
+    if (*pay_n == 0) return -1;                        /* голое подтверждение склеивать нечего */
+    uint32_t s;
+    memcpy(&s, p + 24, 4);
+    *seq = ntohl(s);
+    return 0;
+}
+
+/* Тот же поток и та же обстановка, что у уже накопленного? Сравниваются адреса, порты,
+ * ttl, tos, номер подтверждения и окно: ядро при нарезке КОПИРУЕТ заголовок первого пакета
+ * во все куски, меняя только номер, сумму и флаги последнего. Значит склеивать пакеты с
+ * разным окном или подтверждением нельзя — получатель увидел бы в ранних сегментах поздние
+ * значения. */
+static int gro_same(const unsigned char *a, const unsigned char *b, size_t hdr_n) {
+    if (a[1] != b[1] || a[8] != b[8]) return 0;        /* tos, ttl */
+    if (memcmp(a + 12, b + 12, 8) != 0) return 0;      /* адреса */
+    if (memcmp(a + 20, b + 20, 4) != 0) return 0;      /* порты */
+    if (memcmp(a + 28, b + 28, 4) != 0) return 0;      /* номер подтверждения */
+    if (a[32] != b[32]) return 0;                      /* длина заголовка TCP */
+    if (memcmp(a + 34, b + 34, 2) != 0) return 0;      /* окно */
+    /* Опции TCP байт в байт: ядро скопирует опции ПЕРВОГО пакета во все куски, поэтому
+     * разные метки времени в склеенном наборе означали бы, что получатель увидит не то, что
+     * ему отправили. */
+    if (hdr_n > 40 && memcmp(a + 40, b + 40, hdr_n - 40) != 0) return 0;
+    return 1;
+}
+
+void tun_gro_flush(const struct tun_dev *d, struct tun_gro *g) {
+    if (g->frames <= 0) { tun_gro_reset(g); return; }
+    if (g->frames == 1) {
+        /* Один пакет — ровно прежнее поведение: суммы в нём уже верные (он пришёл таким из
+         * туннеля), поэтому ядру говорим «ничего считать не надо». */
+        tun_write_ctl(d, g->first, g->hdr_n + g->seg);
+        tun_gro_reset(g);
+        return;
+    }
+    unsigned char *p = g->first;
+    size_t tot = g->hdr_n + g->total_pay;
+    /* Длина всего склеенного в заголовке IP: по ней ядро и поймёт, что резать. */
+    p[2] = (unsigned char)(tot >> 8);
+    p[3] = (unsigned char)(tot & 0xFF);
+    p[10] = p[11] = 0;
+    uint16_t ipsum = csum_fin(csum_add(p, 20, 0));
+    p[10] = (unsigned char)(ipsum >> 8);
+    p[11] = (unsigned char)ipsum;
+    /* Сумма TCP — НЕДОСЧИТАННАЯ, только псевдозаголовок, в том же виде, что готовит себе
+     * ядро в __tcp_v4_send_check (см. подробное объяснение в tun_write_data: инвертировать
+     * её здесь ещё раз означало бы отдать сумму, которая не сойдётся ни у одного куска). */
+    uint32_t src, dst;
+    memcpy(&src, p + 12, 4);
+    memcpy(&dst, p + 16, 4);
+    uint16_t partial = (uint16_t)~csum_fin(tcp_pseudo_sum(src, dst,
+                                                         g->hdr_n - 20 + g->total_pay));
+    p[20 + 16] = (unsigned char)(partial >> 8);
+    p[20 + 17] = (unsigned char)partial;
+
+    struct vnet_hdr vh;
+    memset(&vh, 0, sizeof(vh));
+    vh.flags = VNET_F_NEEDS_CSUM;
+    vh.csum_start = 20;
+    vh.csum_offset = 16;
+    vh.hdr_len = (uint16_t)g->hdr_n;
+    vh.gso_type = VNET_GSO_TCPV4;
+    vh.gso_size = (uint16_t)g->seg;
+    memcpy(g->vh, &vh, sizeof(vh));
+    g->iov[0].iov_base = g->vh;
+    g->iov[0].iov_len = sizeof(vh);
+    /* Записи без повторов и без проверки — как в tun_write_ctl: переполненная очередь
+     * устройства это перегрузка, а не отказ, и внутренний TCP разберётся с потерей сам. */
+    (void)!writev(d->fd, g->iov, g->nio);
+    tun_gro_reset(g);
+}
+
+void tun_gro_push(const struct tun_dev *d, struct tun_gro *g, unsigned char *pkt, size_t n) {
+    size_t pay_n = 0, hdr_n = 0;
+    uint32_t seq = 0;
+    /* Без разгрузки склеивать нечем: ядро не поймёт пометку, а считать суммы за него по
+     * всем данным дороже, чем сэкономленный вызов. */
+    if (!d->gro || gro_parse(pkt, n, &hdr_n, &pay_n, &seq) != 0) {
+        tun_gro_flush(d, g);
+        tun_write_ctl(d, pkt, n);
+        return;
+    }
+    if (g->frames > 0) {
+        int fits = g->nio < (int)(sizeof(g->iov) / sizeof(g->iov[0]));
+        /* Приклеиваем, только если номер продолжает предыдущий, размер не больше первого
+         * (последний кусок вправе быть короче, остальные обязаны быть ровно как первый) и
+         * поток тот же. */
+        if (fits && seq == g->next_seq && pay_n <= g->seg && hdr_n == g->hdr_n &&
+            gro_same(g->first, pkt, hdr_n)) {
+            g->iov[g->nio].iov_base = pkt + hdr_n;
+            g->iov[g->nio].iov_len = pay_n;
+            g->nio++;
+            g->total_pay += pay_n;
+            g->frames++;
+            g->next_seq = seq + (uint32_t)pay_n;
+            /* Короткий кусок закрывает набор: за ним нарезка уже не сойдётся. То же и с
+             * PSH — ядро ставит его только на последний кусок, значит он и должен быть
+             * последним. */
+            if (pay_n < g->seg || (pkt[33] & 0x08)) tun_gro_flush(d, g);
+            return;
+        }
+        tun_gro_flush(d, g);
+    }
+    /* Начинаем новый набор: первый пакет едет целиком одним вектором (заголовок и нагрузка
+     * у него уже лежат подряд), остальные — только нагрузками. */
+    g->first = pkt;
+    g->seg = pay_n;
+    g->hdr_n = hdr_n;
+    g->total_pay = pay_n;
+    g->frames = 1;
+    g->next_seq = seq + (uint32_t)pay_n;
+    g->nio = 2;
+    g->iov[1].iov_base = pkt;
+    g->iov[1].iov_len = hdr_n + pay_n;
+    /* PSH на первом же пакете означает «набора не будет»: отдаём сразу. */
+    if (pkt[33] & 0x08) tun_gro_flush(d, g);
 }
 
 /* ICMP «порт недостижим» на пакет, который мы нести не умеем.

@@ -102,6 +102,11 @@ struct output {
      * имени выхода — держать два имени, которым позволено разойтись, незачем (то же
      * решение, что с device). */
     char xs_conf[256];
+    /* Режим потока для kind=xsteer: записи по НАСТОЯЩЕМУ TCP вместо поддельного (см.
+     * ext/xsstream.h). Нужен там, где сырой сокет недоступен — у провайдера, который его
+     * режет, в контейнере без CAP_NET_RAW, — и там, где хаб держит только этот режим.
+     * xs_stream_port — порт хаба для потока; 0 означает «тот же, что в Endpoint». */
+    int xs_stream, xs_stream_port;
     struct out_obfs obfs;
     uint32_t mark;      /* 0 for direct: claiming a packet needs no mark */
     int table;

@@ -416,6 +416,13 @@ static void parse_outputs(struct js *j) {
             else if (!strcmp(key, "obfs")) parse_obfs(j, &o);
             else if (!strcmp(key, "sub_file")) js_str(j, o.sub_file, sizeof(o.sub_file));
             else if (!strcmp(key, "conf")) js_str(j, o.xs_conf, sizeof(o.xs_conf));
+            /* Транспорт выхода xsteer. Полем спеки, а не только ключом командной строки,
+             * потому что процесс поднимает procd: ключи ему передать негде, а настройка
+             * обязана переживать перезагрузку. */
+            /* Проверяем на 't', как соседнее `enabled` проверяется на 'f': значение здесь
+             * либо true, либо false, и разбирать его полноценным разбором JSON незачем. */
+            else if (!strcmp(key, "stream")) { js_ws(j); o.xs_stream = (*j->p == 't'); js_skip(j); }
+            else if (!strcmp(key, "stream_port")) o.xs_stream_port = (int)js_num(j);
             else if (!strcmp(key, "node")) o.node_index = (int)js_num(j);
             else if (!strcmp(key, "on_fail")) {
                 char m[16];
@@ -469,6 +476,13 @@ static void parse_outputs(struct js *j) {
              * сервиса. Годность к JSON: путь печатается в status, diag и xsteer-peers. */
             else if (o.xs_conf[0] != '/' || !label_ok(o.xs_conf))
                 die("outputs.%s: conf должен быть абсолютным путём без кавычек", o.name);
+            if (o.xs_stream_port && (o.xs_stream_port < 1 || o.xs_stream_port > 65535))
+                die("outputs.%s: stream_port вне 1..65535", o.name);
+            /* Порт без режима — это настройка, которая ничего не делает: сказать «настроено»,
+             * не настроив, хуже, чем отказать. Тот же довод, что у obfs при чужом kind. */
+            if (o.xs_stream_port && !o.xs_stream)
+                die("outputs.%s: stream_port без stream: транспорт остался бы поддельным TCP",
+                    o.name);
         }
         else if (!strcmp(kind, "interface")) {
             o.kind = OUT_INTERFACE;
@@ -487,6 +501,10 @@ static void parse_outputs(struct js *j) {
          * «настроено», не настроив ничего. */
         if (o.obfs.on && o.kind != OUT_INTERFACE)
             die("outputs.%s: obfs есть только у kind=interface", o.name);
+        /* Режим потока — свойство транспорта xsteer, и у прочих видов выхода его нет. Принять
+         * поле молча значило бы сказать «настроено», не настроив ничего. */
+        if ((o.xs_stream || o.xs_stream_port) && o.kind != OUT_XSTEER)
+            die("outputs.%s: stream есть только у kind=xsteer", o.name);
         if (g_out_n >= MAX_OUTPUTS) die("too many outputs", NULL);
         g_out[g_out_n++] = o;
         js_ws(j);

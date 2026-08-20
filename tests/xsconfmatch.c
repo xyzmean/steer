@@ -230,14 +230,36 @@ int main(void) {
         refuses("отказ: Device с пробелом", t, XS_ROLE_HUB);
     }
 
+    /* ---- DNS: принимается, но не применяется --------------------------------
+     *
+     * Ключ отвергать нельзя, и это не мелочь: конфигурация носится между роутером и
+     * десктопом, а десктопный клиент DNS применяет. Файл, принятый одной реализацией и
+     * отвергнутый другой, означает, что «настроено» зависит от того, куда его положили.
+     * Применить его здесь тоже нельзя (именами распоряжается dnsmasq), поэтому разбор
+     * СЧИТАЕТ адреса, а сказать о них один раз — дело того, кто поднимает туннель. */
+    {
+        char t[1024];
+        snprintf(t, sizeof(t),
+                 "[Interface]\nPrivateKey=%s\nAddress=10.0.0.2/24\nDNS=1.1.1.1, 8.8.8.8\n"
+                 "[Peer]\nPublicKey=%s\nAllowedIPs=0.0.0.0/0\nEndpoint=1.2.3.4:443\n",
+                 KEY_A, KEY_B);
+        check("DNS: файл принят, а не отвергнут", 0, parse(t, XS_ROLE_SPOKE));
+        check("DNS: посчитаны оба адреса, а не строка", 2, g_c.dns_n);
+        check("DNS: неизвестных ключей не появилось", 0, g_c.unknown_n);
+        snprintf(t, sizeof(t),
+                 "[Interface]\nPrivateKey=%s\nAddress=10.0.0.2/24\n"
+                 "[Peer]\nPublicKey=%s\nAllowedIPs=0.0.0.0/0\nEndpoint=1.2.3.4:443\n",
+                 KEY_A, KEY_B);
+        check("DNS: без ключа счётчик нулевой", 0, parse(t, XS_ROLE_SPOKE));
+        check("DNS: и равен нулю", 0, g_c.dns_n);
+    }
+
     /* ---- отказы ------------------------------------------------------------- */
     {
         char t[1024];
 #define SPOKE_HEAD "[Interface]\nPrivateKey=%s\nAddress=10.0.0.2/24\n"
 #define PEER_OK    "[Peer]\nPublicKey=%s\nAllowedIPs=0.0.0.0/0\nEndpoint=1.2.3.4:443\n"
 
-        snprintf(t, sizeof(t), SPOKE_HEAD PEER_OK "DNS=1.1.1.1\n", KEY_A, KEY_B);
-        refuses("отказ: DNS (им владеет резолвер движка)", t, XS_ROLE_SPOKE);
         snprintf(t, sizeof(t), SPOKE_HEAD "Table=off\n" PEER_OK, KEY_A, KEY_B);
         refuses("отказ: Table (таблицами владеет apply)", t, XS_ROLE_SPOKE);
         snprintf(t, sizeof(t), SPOKE_HEAD "FwMark=0x100\n" PEER_OK, KEY_A, KEY_B);

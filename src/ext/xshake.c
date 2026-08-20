@@ -104,12 +104,17 @@ static int decrypt_and_hash(struct xs_hs *hs, const uint8_t *ct, size_t ct_n, ui
     return 0;
 }
 
-/* Split: транспортные ключи. Восемьдесят восемь байт одним расширением — ключ и iv на
- * каждое направление. Направления названы от инициатора: i2r и r2i. */
+/* Split: транспортные ключи. Ключ и iv на каждое направление, а за ними — корни эпох, по
+ * одному на направление (см. xsepoch.h). Направления названы от инициатора: i2r и r2i.
+ *
+ * СТО ПЯТЬДЕСЯТ ДВА БАЙТА ВМЕСТО ВОСЬМИДЕСЯТИ ВОСЬМИ, И ПЕРВЫЕ 88 ПРИ ЭТОМ ТЕ ЖЕ САМЫЕ.
+ * HKDF-Expand — поток (T1||T2||…), и запрос большего числа байт не меняет уже выданные.
+ * Поэтому сборка, которая про эпохи ничего не знает, продолжает считать в точности прежние
+ * ключи: совместимость на проводе не тронута, и поддельный TCP не задет вовсе. */
 static int split_keys(struct xs_hs *hs, struct tls13_keys *i2r, struct tls13_keys *r2i) {
     const mbedtls_md_info_t *md = mbedtls_md_info_from_type(MBEDTLS_MD_SHA256);
     if (!md) return XS_ECRYPTO;
-    uint8_t prk[32], out[88];
+    uint8_t prk[32], out[152];
     if (mbedtls_hkdf_extract(md, hs->ck, 32, (const uint8_t *)"", 0, prk) != 0) return XS_ECRYPTO;
     if (mbedtls_hkdf_expand(md, prk, 32, (const uint8_t *)"xsteer split", 12,
                             out, sizeof(out)) != 0) return XS_ECRYPTO;
@@ -122,7 +127,21 @@ static int split_keys(struct xs_hs *hs, struct tls13_keys *i2r, struct tls13_key
     memcpy(i2r->iv, out + 32, 12);
     memcpy(r2i->key, out + 44, kn);
     memcpy(r2i->iv, out + 76, 12);
-    if (tls13_keys_setup(i2r) != 0 || tls13_keys_setup(r2i) != 0) return XS_ECRYPTO;
+    /* Корни эпох кладутся в состояние рукопожатия, а не в ключи: struct tls13_keys общая с
+     * Reality, а эпохи — свойство xsteer. Забирает их вызывающий (xs_hs_roots) сразу после
+     * Split и до xs_hs_wipe, который затирает здесь всё. */
+    memcpy(hs->root_i2r, out + 88, 32);
+    memcpy(hs->root_r2i, out + 120, 32);
+    int setup_bad = tls13_keys_setup(i2r) != 0 || tls13_keys_setup(r2i) != 0;
+    /* Выведенный материал затирается ЗДЕСЬ, а не оставляется на стеке: за ключами в out
+     * лежат корни эпох, из которых выводятся ВСЕ будущие ключи соединения, — то есть цена
+     * забытых шестидесяти четырёх байт равна цене забытого ключа. */
+    {
+        volatile uint8_t *a = out, *b = prk;
+        for (size_t i = 0; i < sizeof(out); i++) a[i] = 0;
+        for (size_t i = 0; i < sizeof(prk); i++) b[i] = 0;
+    }
+    if (setup_bad) return XS_ECRYPTO;
     /* Ключ шага рукопожатия больше не нужен: Split — его последнее применение. Освобождаем
      * ЗДЕСЬ, а не оставляем вызывающему: контекст AES лежит в куче, а рукопожатий за час
      * работы хаба проходят тысячи, и «вызывающий не забудет» — не то свойство, на которое
@@ -157,6 +176,30 @@ void xs_hs_wipe(struct xs_hs *hs) {
     tls13_keys_free(&hs->hk);
     volatile uint8_t *p = (volatile uint8_t *)hs;
     for (size_t i = 0; i < sizeof(*hs); i++) p[i] = 0;
+}
+
+void xs_hs_roots(const struct xs_hs *hs, uint8_t tx_root[32], uint8_t rx_root[32]) {
+    /* Направления названы от ИНИЦИАТОРА, а «tx» и «rx» — от нас. У пира (инициатора) tx это
+     * i2r, у хаба — наоборот. Ровно так же расставлены и сами ключи в местах вызова
+     * split_keys, и разойтись эти два места не должны. */
+    const uint8_t *tx = hs->role_init ? hs->root_i2r : hs->root_r2i;
+    const uint8_t *rx = hs->role_init ? hs->root_r2i : hs->root_i2r;
+    memcpy(tx_root, tx, 32);
+    memcpy(rx_root, rx, 32);
+}
+
+int xs_hs_response_complete(const uint8_t *in, size_t n) {
+    size_t i = 0;
+    int saw_sh = 0;
+    while (i + XS_REC_HDR <= n) {
+        uint8_t typ = in[i];
+        size_t len = ((size_t)in[i + 3] << 8) | in[i + 4];
+        if (i + XS_REC_HDR + len > n) return 0;      /* запись заявлена, но приехала не вся */
+        if (typ == 0x16) saw_sh = 1;
+        if (typ == 0x17 && len == XS_FIN_BODY && saw_sh) return 1;
+        i += XS_REC_HDR + len;
+    }
+    return 0;
 }
 
 enum tls13_aead xs_aead_for_cpu(void) {

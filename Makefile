@@ -18,7 +18,7 @@ $(BUILD)/steer: src/steer.c src/spec.c src/dnsd.c src/failover.c src/aggregate.c
 	$(CC) $(CFLAGS) $(DEFS) -o $@ src/steer.c src/spec.c src/dnsd.c src/failover.c \
 	      src/aggregate.c src/obfs.c src/cli.c
 
-test: all ext-syntax $(BUILD)/dnsmatch $(BUILD)/specmatch $(BUILD)/specmatch-ext $(BUILD)/xswirematch $(BUILD)/xsconfmatch $(BUILD)/xsroutematch $(BUILD)/chellomatch $(BUILD)/failovermatch $(BUILD)/h2match $(BUILD)/submatch $(BUILD)/fwmatch $(BUILD)/obfsmatch $(BUILD)/visionmatch $(BUILD)/diagsim
+test: all ext-syntax $(BUILD)/dnsmatch $(BUILD)/specmatch $(BUILD)/specmatch-ext $(BUILD)/xswirematch $(BUILD)/xsstreammatch $(BUILD)/tungromatch $(BUILD)/xsconfmatch $(BUILD)/xsroutematch $(BUILD)/chellomatch $(BUILD)/failovermatch $(BUILD)/h2match $(BUILD)/submatch $(BUILD)/fwmatch $(BUILD)/obfsmatch $(BUILD)/visionmatch $(BUILD)/diagsim
 	@sh tests/run.sh
 	@sh tests/gen.sh
 	@sh tests/climatch.sh
@@ -35,6 +35,8 @@ test: all ext-syntax $(BUILD)/dnsmatch $(BUILD)/specmatch $(BUILD)/specmatch-ext
 	@$(BUILD)/obfsmatch
 	@$(BUILD)/visionmatch
 	@$(BUILD)/xswirematch
+	@$(BUILD)/xsstreammatch
+	@$(BUILD)/tungromatch
 	@$(BUILD)/xsconfmatch
 	@$(BUILD)/xsroutematch
 	@$(BUILD)/chellomatch
@@ -135,6 +137,23 @@ $(BUILD)/xswirematch: tests/xswirematch.c src/ext/xswire.c src/ext/xswire.h
 	@mkdir -p $(BUILD)
 	$(CC) $(CFLAGS) -o $@ tests/xswirematch.c
 
+# Рамка записей по настоящему потоку TCP: границы записей, смещения (они же nonce) и досылка
+# недописанного хвоста. Стенд входит в обычный make test по той же причине, что xswirematch:
+# xsstream.c не требует ни mbedtls, ни сети — обстановка делается из socketpair. Проверять это
+# на живом туннеле пришлось бы гигабайтом трафика, а ломается всё здесь молча.
+$(BUILD)/xsstreammatch: tests/xsstreammatch.c src/ext/xsstream.c src/ext/xsstream.h src/ext/xswire.h
+	@mkdir -p $(BUILD)
+	$(CC) $(CFLAGS) -Isrc -o $@ tests/xsstreammatch.c
+
+# Склейка соседних сегментов в одну запись в устройство: что склеивается, что нет и какими
+# байтами уезжает. В make test входит потому, что tun.c не требует ни mbedtls, ни сети, а
+# обстановка делается из socketpair датаграммами — по одной на writev, поэтому видно и число
+# записей, и их содержимое. Ошибка здесь либо портит поток клиента (склеили лишнее), либо тихо
+# отключает выигрыш (не склеили ничего) — второе тут и случилось на живом прогоне.
+$(BUILD)/tungromatch: tests/tungromatch.c src/ext/tun.c src/ext/tun.h
+	@mkdir -p $(BUILD)
+	$(CC) $(CFLAGS) -Isrc -o $@ tests/tungromatch.c
+
 # Разбор конфигурации xsteer — единственное место, куда в движок попадает текст, который
 # человек написал руками, поэтому разбор строгий, а стенд перечисляет каждый отказ.
 # Отдельно проверяется, что приватный ключ не попадает в вывод: обещание держится на том,
@@ -168,7 +187,7 @@ $(BUILD)/chellomatch: tests/chellomatch.c tests/chello-frozen.h src/ext/chello.c
 clean:
 	rm -rf $(BUILD)/steer $(BUILD)/steer-* $(BUILD)/dnsmatch $(BUILD)/specmatch $(BUILD)/specmatch-ext \
 	       $(BUILD)/failovermatch $(BUILD)/h2match $(BUILD)/submatch $(BUILD)/fwmatch $(BUILD)/obfsmatch \
-	       $(BUILD)/visionmatch $(BUILD)/xswirematch $(BUILD)/xsconfmatch $(BUILD)/xsroutematch $(BUILD)/chellomatch $(BUILD)/hellofreeze $(BUILD)/xsloop $(BUILD)/xsbench \
+	       $(BUILD)/visionmatch $(BUILD)/xswirematch $(BUILD)/xsstreammatch $(BUILD)/xsepochmatch $(BUILD)/tungromatch $(BUILD)/xsconfmatch $(BUILD)/xsroutematch $(BUILD)/chellomatch $(BUILD)/hellofreeze $(BUILD)/xsloop $(BUILD)/xsbench \
 	       $(BUILD)/steer-hub $(BUILD)/steer-ext \
 	       $(BUILD)/diagsim $(BUILD)/libmbed-*.a \
 	       $(BUILD)/*.err $(BUILD)/pkg $(BUILD)/scripts out

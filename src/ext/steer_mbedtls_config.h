@@ -103,6 +103,11 @@
 #if defined(__aarch64__)
 #define MBEDTLS_AESCE_C
 #elif defined(__x86_64__) || defined(__i386__)
+/* ОДНОГО ЭТОГО ОПРЕДЕЛЕНИЯ НЕДОСТАТОЧНО ДЛЯ БЫСТРОГО AES, и это выяснилось замером.
+ * mbedtls выбирает между ассемблерным путём и путём на intrinsics по флагам набора команд, а
+ * они задаются сборкой: без `-maes -mpclmul -msse4.1` у файла aesni.c берётся ассемблерный, и
+ * AES-128-GCM на x86_64 даёт 309 МБ/с вместо 450. Числа и обоснование — в build/build-ext.sh
+ * рядом с AESNI_FLAGS. */
 #define MBEDTLS_AESNI_C
 #endif
 #endif

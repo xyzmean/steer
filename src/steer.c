@@ -96,7 +96,7 @@ static int cmd_xsteer_check(const char *conf) { (void)conf; return no_xsteer_adm
 
 #ifdef STEER_EXTENDED
 int cmd_xsteer(const char *spec_path, const char *out_name, const char *conf,
-               const char *device);
+               const char *device, int stream, int stream_port);
 int cmd_xsteer_peers(const char *spec_path, const char *out_name, const char *conf);
 #else
 static int no_xsteer(void) {
@@ -107,8 +107,9 @@ static int no_xsteer(void) {
     return 2;
 }
 static int cmd_xsteer(const char *spec_path, const char *out_name, const char *conf,
-                      const char *device) {
+                      const char *device, int stream, int stream_port) {
     (void)spec_path; (void)out_name; (void)conf; (void)device;
+    (void)stream; (void)stream_port;
     return no_xsteer();
 }
 static int cmd_xsteer_peers(const char *spec_path, const char *out_name, const char *conf) {
@@ -1941,7 +1942,8 @@ int main(int argc, char **argv) {
     /* Серверная половина. Спека ей не нужна и не читается: сервер живёт на VPS, где
      * ни выходов, ни каналов нет — есть порт, который слушать, и локальный WireGuard,
      * которому пересылать. */
-    if (!strcmp(cmd, "xsteer")) return cmd_xsteer(spec, arg, a.config, a.device);
+    if (!strcmp(cmd, "xsteer"))
+        return cmd_xsteer(spec, arg, a.config, a.device, a.stream, a.stream_port);
     if (!strcmp(cmd, "xsteer-peers")) return cmd_xsteer_peers(spec, arg, a.config);
     if (!strcmp(cmd, "xsteer-key")) return cmd_xsteer_key();
     if (!strcmp(cmd, "xsteer-check")) return cmd_xsteer_check(a.config);
