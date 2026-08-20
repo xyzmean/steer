@@ -24,6 +24,10 @@
 # Не нашлась — ГРОМКИЙ пропуск (echo + выход 0), а не падение и не молчание: молчаливый
 # пропуск читается как «прошло», ровно как молчаливо пропущенный ui-harness в splify2.
 #
+# В РЕЛИЗЕ этот же файл зовётся ВНУТРИ образа сборщика, где mbedtls та самая, которой собирается
+# расширенный пакет: обвязка — build/ext-test-image.sh, шаг — в .github/workflows/release.yml
+# (R-063). Оттуда приходят STEER_MBEDTLS и CC="zig cc".
+#
 # ВЕРСИЯ. src/ext/reality.c писан под mbedtls 3.x и пользуется макросом MBEDTLS_PRIVATE:
 # в 2.x его нет, поэтому нужна заглушка -D'MBEDTLS_PRIVATE(x)=x'; в 3.x доступ к приватным
 # полям открывает -DMBEDTLS_ALLOW_PRIVATE_ACCESS. Флаг выбирается по мажорной версии. Прогон
@@ -106,8 +110,32 @@ $CC -O2 -w -Isrc $MBED_INC "$PRIV" -o "$BUILD/xsloop" tests/xsloop.c \
 "$BUILD/xsloop"
 
 # spokematch — освобождение ключей при неудаче, под AddressSanitizer.
-echo "ext-test: собираю и прогоняю spokematch (под ASan)..."
-$CC -O1 -g -w -Isrc -fsanitize=address $MBED_INC "$PRIV" -o "$BUILD/spokematch" \
+#
+# Доступен ли санитайзер — проверяется ПРОБОЙ, а не догадкой по имени компилятора. В образе
+# сборщика (zig cc, musl) рантайма ASan нет вовсе, а на musl нет и LeakSanitizer — то есть ровно
+# того, на чём стоит этот стенд (I-067, утечка контекста шифра). Собрать там без санитайзера
+# МОЛЧА значило бы получить зелёный стенд, который больше не проверяет то, ради чего написан,
+# — поэтому пропуск громкий, как и пропуск по ненайденной библиотеке.
+#
+# Проба выделяет и ОСВОБОЖДАЕТ память: программа с утечкой была бы отвергнута самим ASan там,
+# где он работает, и проба выключала бы его на ровном месте.
+ASAN="-fsanitize=address"
+probe="$BUILD/asan-probe"
+mkdir -p "$BUILD"
+printf '#include <stdlib.h>\nint main(void){char*p=malloc(16);p[0]=1;free(p);return 0;}\n' \
+	> "$probe.c"
+if $CC -O0 $ASAN -o "$probe" "$probe.c" >/dev/null 2>&1 && "$probe" >/dev/null 2>&1; then
+	:
+else
+	echo "ext-test: ВНИМАНИЕ — AddressSanitizer здесь не работает (нет рантайма либо нет"
+	echo "ext-test:            LeakSanitizer, как на musl). spokematch собирается БЕЗ него:"
+	echo "ext-test:            проверки в нём прогонятся, утечка (I-067) — НЕТ."
+	ASAN=""
+fi
+rm -f "$probe" "$probe.c"
+
+echo "ext-test: собираю и прогоняю spokematch (ASan: ${ASAN:-нет})..."
+$CC -O1 -g -w -Isrc $ASAN $MBED_INC "$PRIV" -o "$BUILD/spokematch" \
 	tests/spokematch.c \
 	src/ext/xsconn.c src/ext/xswire.c src/ext/xsepoch.c src/ext/xsroute.c \
 	src/ext/xsconf.c src/ext/xsstream.c src/ext/xshake.c src/ext/chello.c \

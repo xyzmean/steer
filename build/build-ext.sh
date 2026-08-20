@@ -33,6 +33,11 @@ VERSION="${4:-dev}"
 # Роль: router (умолчание) или server. Пятым аргументом, чтобы прежние вызовы с четырьмя
 # аргументами продолжали значить то же, что значили.
 ROLE="${5:-router}"
+# Ревизия сборки — шестым аргументом и по той же причине, что версия: git внутри образа нет,
+# а каталога .git там нет и подавно (смонтирован только рабочий каталог). Умолчание честное:
+# «неизвестна» лучше числа, которое ничему не соответствует, — печатает её `steer --version`
+# (R-045).
+REV="${6:-неизвестна}"
 
 MBED_INC=/opt/mbedtls/include
 EXT_INC=/src/src/ext
@@ -143,6 +148,7 @@ esac
 # shellcheck disable=SC2086
 zig cc -target "$TARGET" ${MCPU:+-mcpu=$MCPU} -static $OPT -s \
     -I"$MBED_INC" -I"$EXT_INC" $CFG $ROLEDEF -DSTEER_VERSION="\"$VERSION\"" \
+    -DSTEER_REV="\"$REV\"" \
     -o "$OUT" \
     /src/src/steer.c /src/src/spec.c /src/src/dnsd.c /src/src/failover.c \
     /src/src/aggregate.c /src/src/obfs.c /src/src/cli.c \

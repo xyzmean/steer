@@ -7,6 +7,21 @@
 set -eu
 
 VERSION="$(cat VERSION 2>/dev/null || echo 0.1.0)"
+# Ревизия сборки: чем этот бинарник отличается от релиза с тем же номером версии. Версия
+# между релизами не меняется, поэтому релизный движок и движок из main через два коммита
+# после него назывались одним числом, и на стенде два РАЗНЫХ бинарника отчитывались как
+# «0.9.6-r1» (R-045/I-054). Печатает её `steer --version`; имена пакетов и версия пакета не
+# затронуты намеренно — интерфейс версию берёт от менеджера пакетов.
+#
+# Считается ЗДЕСЬ, а не внутри docker: в образе нет ни git, ни каталога .git — смонтирован
+# только рабочий каталог, — и describe там вернул бы пустоту при любом состоянии дерева.
+#
+# Без `--dirty`, в отличие от Makefile: релизный workflow сам записывает номер в VERSION
+# ПЕРЕД сборкой и коммитит его после (см. .github/workflows/release.yml), поэтому дерево во
+# время релизной сборки грязное всегда, и флаг помечал бы «-dirty» каждый релиз — то есть
+# перестал бы что-либо значить.
+REV="$(git describe --tags --always 2>/dev/null || true)"
+[ -n "$REV" ] || REV="неизвестна"
 OUT=out
 # Свой образ, а не образ сборщика splify: в том нет исходников mbedtls, и расширенная
 # сборка в нём падает на «mbedtls/sha256.h не найден», тогда как базовая проходит.
@@ -117,7 +132,7 @@ for spec in $ISAS; do
     printf '  %-26s ' "$arch"
     if docker run --rm -v "$PWD:/src" -w /src "$IMAGE" \
             cc -target "$target" -mcpu="$mcpu" -static -Os -Wall -Wextra \
-               -DSTEER_VERSION="\"$VERSION\"" \
+               -DSTEER_VERSION="\"$VERSION\"" -DSTEER_REV="\"$REV\"" \
                -o "build/steer-$arch" $BASE_SRC \
                2>"build/$arch.err"; then
         echo "$(stat -c %s "build/steer-$arch") bytes"
@@ -135,7 +150,7 @@ for spec in $ISAS; do
     printf '  %-26s ' "$arch (extended)"
     if docker run --rm -v "$PWD:/src" -w /src --entrypoint sh "$IMAGE" \
             /src/build/build-ext.sh "$target" "$mcpu" "/src/build/steer-ext-$arch" \
-            "$VERSION" \
+            "$VERSION" router "$REV" \
             2>"build/$arch-ext.err"; then
         echo "$(stat -c %s "build/steer-ext-$arch") bytes"
     else
@@ -145,10 +160,20 @@ for spec in $ISAS; do
 
     root="build/pkg/$arch"
     rm -rf "$root"
-    mkdir -p "$root/usr/sbin" "$root/etc/init.d" "$root/etc/steer/lists"
+    mkdir -p "$root/usr/sbin" "$root/etc/init.d" "$root/etc/steer/lists" \
+             "$root/lib/upgrade/keep.d"
     cp "build/steer-$arch" "$root/usr/sbin/steer"
     cp files/etc/init.d/steer "$root/etc/init.d/steer"
+    # Настройки объявляются системе, иначе их не существует для sysupgrade и для «Создать
+    # архив» в LuCI: список файлов там собирается из /etc/sysupgrade.conf и
+    # /lib/upgrade/keep.d/*, и всё, чего в нём нет, обновление прошивки «с сохранением
+    # настроек» просто теряет — молча (I-037: на стенде sysupgrade -l не знал ни spec.json,
+    # ни sub.txt, то есть переживал обновление только URL подписки в /etc/config, без узлов).
+    # Файл кладётся В ПОЛЕЗНУЮ НАГРУЗКУ, а не в скрипт установки: он обязан исчезнуть вместе
+    # с пакетом и принадлежать ему, как init-скрипт.
+    cp files/lib/upgrade/keep.d/steer "$root/lib/upgrade/keep.d/steer"
     chmod 0755 "$root/usr/sbin/steer" "$root/etc/init.d/steer"
+    chmod 0644 "$root/lib/upgrade/keep.d/steer"
 
     # OUTSIDE the package root: anything inside it ships as a FILE, so a
     # .post-install written there arrives on the router as /.post-install and
@@ -179,10 +204,17 @@ EOF
     if [ -f "build/steer-ext-$arch" ]; then
         eroot="build/pkg/$arch-ext"
         rm -rf "$eroot"
-        mkdir -p "$eroot/usr/sbin" "$eroot/etc/init.d" "$eroot/etc/steer/lists"
+        mkdir -p "$eroot/usr/sbin" "$eroot/etc/init.d" "$eroot/etc/steer/lists" \
+                 "$eroot/lib/upgrade/keep.d"
         cp "build/steer-ext-$arch" "$eroot/usr/sbin/steer"
         cp files/etc/init.d/steer "$eroot/etc/init.d/steer"
+        # Тот же файл, что и в базовом пакете: расширенный ставится ВМЕСТО базового
+        # (provides/replaces), и без своей копии keep.d замена пакета молча снимала бы
+        # объявление настроек — то есть возвращала бы I-037 на ровно том пакете, который
+        # ставит большинство.
+        cp files/lib/upgrade/keep.d/steer "$eroot/lib/upgrade/keep.d/steer"
         chmod 0755 "$eroot/usr/sbin/steer" "$eroot/etc/init.d/steer"
+        chmod 0644 "$eroot/lib/upgrade/keep.d/steer"
         docker run --rm -v "$PWD":/w -w /w alpine:latest sh -c \
             "apk add --no-cache apk-tools >/dev/null 2>&1; apk mkpkg \
                --info name:steer-extended --info version:$VERSION-r1 \
@@ -292,7 +324,7 @@ for arch in x86_64 aarch64_generic; do
     printf '  %-26s ' "$uarch"
     if docker run --rm -v "$PWD:/src" -w /src --entrypoint sh "$IMAGE" \
             /src/build/build-ext.sh "$target" "$mcpu" "/src/build/steer-hub-$arch" \
-            "$VERSION" server \
+            "$VERSION" server "$REV" \
             2>"build/$arch-hub.err"; then
         :
     else
