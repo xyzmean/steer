@@ -32,6 +32,7 @@
 int run_quiet(const char *const argv[]) { (void)argv; return -1; }
 
 #include "../src/ext/xshub.c"
+#include "chello-frozen.h"
 
 static int fails;
 
@@ -704,6 +705,255 @@ int main(void) {
             printf("  размера не назвал никто:\n");
             check("  MSS не тронут", 1460, (long)syn_mss(pt));
         }
+    }
+
+    /* ---- прикрытие по имени из SNI (R-070) -----------------------------------
+     *
+     * Одно постоянное прикрытие даёт подлинный сертификат только тому, кто спросил имя ЭТОГО
+     * прикрытия; всякий другой прибор видит «просил A — получил сертификат B», то есть ровно
+     * тот признак, ради устранения которого дорожка proxy и заведена. Имена разрешаются в
+     * адреса один раз при подъёме, а здесь проверяется выбор по таблице — и, главное, его
+     * поведение на недоверенных байтах: разбор SNI происходит ДО всякой аутентификации, на
+     * публичном порту, куда пишет кто угодно.
+     *
+     * Hello берётся НАСТОЯЩИЙ (замороженные байты reality.c, SNI www.example.com), а не
+     * выдуманный: разбор придирчив к длине записи, к session_id и к key_share, и стенд на
+     * самодельном Hello проверял бы не то, что приходит в бою. */
+    printf("\n== хаб: прикрытие по имени из SNI ==\n");
+    {
+        const uint8_t *hello = (const uint8_t *)FROZEN_AES;
+        const uint32_t A_COM = inet_addr("198.51.100.7");
+        const uint32_t A_NET = inet_addr("198.51.100.8");
+        const uint32_t A_FIX = inet_addr("203.0.113.9");
+
+        memset(&g_conf, 0, sizeof(g_conf));
+        g_conf.listen_port = 443;
+        g_conf.decoy = XS_DECOY_PROXY;
+        snprintf(g_conf.decoy_dest, sizeof(g_conf.decoy_dest), "203.0.113.9");
+        g_conf.decoy_port = 443;
+
+        /* Таблица — та, что заполняет hub_decoy_resolve при подъёме. Имена в ней уже
+         * нормализованы разбором конфигурации: нижний регистр, без завершающей точки. */
+        memset(g_decoy_map, 0, sizeof(g_decoy_map));
+        snprintf(g_decoy_map[0].name, XS_DECOY_SNI_LEN, "www.example.com");
+        g_decoy_map[0].addr = A_COM;
+        snprintf(g_decoy_map[1].name, XS_DECOY_SNI_LEN, "cdn.example.net");
+        g_decoy_map[1].addr = A_NET;
+        g_decoy_map_n = 2;
+
+        check("имя из SNI ведёт к своему прикрытию, а не к постоянному",
+              (long)A_COM, (long)decoy_dest_for(hello, FROZEN_N));
+
+        /* Имя ВНЕ таблицы — прежнее поведение, а не отказ. Отказывай мы по незнакомому имени,
+         * порт отвечал бы по-разному на разные имена, и сама эта разница рассказывала бы
+         * прибору, какие имена мы обслуживаем. Подменяем имя той же длины, чтобы ни одно поле
+         * длины в Hello не поехало. */
+        uint8_t buf[FROZEN_N];
+        size_t sni_off = 0;
+        for (size_t i = 0; i + 15 <= FROZEN_N; i++)
+            if (memcmp(hello + i, "www.example.com", 15) == 0) { sni_off = i; break; }
+        check("имя нашлось в замороженном Hello", 1, sni_off != 0);
+
+        memcpy(buf, hello, FROZEN_N);
+        memcpy(buf + sni_off, "www.example.ORG", 15);
+        check("незнакомое имя — постоянное прикрытие, а не отказ",
+              (long)A_FIX, (long)decoy_dest_for(buf, FROZEN_N));
+
+        /* Регистр имени выбирает прибор, а не мы: DNS его не различает, и «WWW.» от того же
+         * прибора не должно означать другое прикрытие. */
+        memcpy(buf, hello, FROZEN_N);
+        memcpy(buf + sni_off, "WWW.Example.COM", 15);
+        check("регистр имени не важен", (long)A_COM, (long)decoy_dest_for(buf, FROZEN_N));
+
+        /* Посторонний символ в имени — прежнее поведение. Сравнивать такое имя не с чем, а
+         * отвечать иначе, чем прочим неопознанным, нельзя. */
+        memcpy(buf, hello, FROZEN_N);
+        memcpy(buf + sni_off, "www.examp/e.com", 15);
+        check("имя с посторонним символом — постоянное прикрытие",
+              (long)A_FIX, (long)decoy_dest_for(buf, FROZEN_N));
+
+        /* Не TLS вовсе и полуприсланное — тоже прежнее поведение. */
+        check("мусор вместо Hello — постоянное прикрытие", (long)A_FIX,
+              (long)decoy_dest_for((const uint8_t *)"GET / HTTP/1.1\r\n\r\n", 18));
+        check("Hello дочитан наполовину — постоянное прикрытие", (long)A_FIX,
+              (long)decoy_dest_for(hello, FROZEN_N / 2));
+        check("нечего разбирать вовсе — постоянное прикрытие", (long)A_FIX,
+              (long)decoy_dest_for(hello, 0));
+
+        /* Таблица пуста — ведём себя ровно как до появления ключа. */
+        g_decoy_map_n = 0;
+        check("без таблицы имён — прежнее поведение", (long)A_FIX,
+              (long)decoy_dest_for(hello, FROZEN_N));
+        g_decoy_map_n = 2;
+
+        /* ГРАНИЦЫ. Разбор смотрит на присланные байты до всякой аутентификации, поэтому
+         * проверяется не «разобралось ли», а что НИ ОДНА обрезка и ни одна порча байта не
+         * уводит исполнение за буфер и не даёт адреса, которого нет в таблице. Под
+         * -fsanitize=address,undefined это и есть проверка границ; без него — проверка того,
+         * что ответ всегда один из трёх известных. */
+        int bad = 0;
+        for (size_t n = 0; n <= FROZEN_N; n++) {
+            uint32_t got = decoy_dest_for(hello, n);
+            if (got != A_FIX && got != A_COM) bad++;
+        }
+        check("любая обрезка Hello даёт известный адрес и не выходит за буфер", 0, bad);
+        bad = 0;
+        for (size_t i = 0; i < FROZEN_N; i++) {
+            memcpy(buf, hello, FROZEN_N);
+            buf[i] ^= 0xFF;
+            uint32_t got = decoy_dest_for(buf, FROZEN_N);
+            if (got != A_FIX && got != A_COM && got != A_NET) bad++;
+        }
+        check("порча любого байта Hello не уводит к чужому адресу", 0, bad);
+    }
+
+    /* ---- то же на НАСТОЯЩЕМ соединении: прибор назвал имя — туда и позвонили --- */
+    printf("\n== хаб: соединение к прикрытию, выбранному именем ==\n");
+    {
+        static struct worker w;
+        struct sess *s = &g_sess[0];
+
+        int srv = socket(AF_INET, SOCK_STREAM, 0);
+        struct sockaddr_in sa;
+        socklen_t sl = sizeof(sa);
+        memset(&sa, 0, sizeof(sa));
+        sa.sin_family = AF_INET;
+        sa.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+        if (srv < 0 || bind(srv, (struct sockaddr *)&sa, sizeof(sa)) != 0 ||
+            listen(srv, 4) != 0 || getsockname(srv, (struct sockaddr *)&sa, &sl) != 0) {
+            printf("нет петлевого сокета — проверка невозможна\n");
+            return 1;
+        }
+        int port = ntohs(sa.sin_port);
+        /* Слушающий сокет НЕБЛОКИРУЮЩИЙ, и ждём мы его через poll с пределом: если выбор по
+         * имени не сработает, дорожка уйдёт к постоянному прикрытию, сюда не позвонит никто, и
+         * блокирующий accept подвесил бы весь стенд навсегда вместо того, чтобы показать
+         * провалившуюся проверку. */
+        {
+            int sfl = fcntl(srv, F_GETFL, 0);
+            fcntl(srv, F_SETFL, sfl | O_NONBLOCK);
+        }
+
+        memset(&g_conf, 0, sizeof(g_conf));
+        g_conf.listen_port = 443;
+        g_conf.decoy = XS_DECOY_PROXY;
+        /* Постоянное прикрытие ведёт ТУДА, ГДЕ НИКТО НЕ СЛУШАЕТ: если выбор по имени не
+         * сработает, дорожка пойдёт к нему, и это будет видно, а не спрячется за успехом. */
+        snprintf(g_conf.decoy_dest, sizeof(g_conf.decoy_dest), "127.0.0.2");
+        g_conf.decoy_port = port;
+        memset(g_decoy_map, 0, sizeof(g_decoy_map));
+        snprintf(g_decoy_map[0].name, XS_DECOY_SNI_LEN, "www.example.com");
+        g_decoy_map[0].addr = inet_addr("127.0.0.1");
+        g_decoy_map_n = 1;
+
+        memset(&w, 0, sizeof(w));
+        w.listen_port = 443; w.rx = -1; w.tx0 = -1; w.base = 0; w.cap = 1;
+        xs_sidx_reset(&w.idx);
+        memset(s, 0, sizeof(*s));
+        s->phase = PH_SYN; s->peer = -1; s->conn_id = -1; s->up_fd = -1;
+        s->conn.fd = wire_open(); s->conn.sport = 443; s->conn.dport = 40000;
+        s->conn.daddr = htonl(0x0A000001u);
+        g_decoy_live = 0;
+        wire_drain();
+
+        /* Настоящий ClientHello с настоящим SNI. Рукопожатие на нём не сойдётся (ключи в
+         * заморозке чужие), значит хаб пойдёт по дорожке неопознанного — ровно как в бою. */
+        struct obfs_seg seg;
+        memset(&seg, 0, sizeof(seg));
+        seg.flags = 0x18;
+        seg.sport = 40000;
+        seg.saddr = htonl(0x0A000001u);
+        seg.payload = (const uint8_t *)FROZEN_AES;
+        seg.plen = FROZEN_N;
+        hs_step(&w, s, &seg, 443, 1000);
+
+        check("сессия на дорожке прикрытия", (long)PH_PROXY, (long)s->phase);
+        check("позвонили по имени из SNI, а не в DecoyDest",
+              (long)inet_addr("127.0.0.1"), (long)s->up_addr);
+        struct pollfd wait_fd = { srv, POLLIN, 0 };
+        poll(&wait_fd, 1, 2000);
+        int up = accept(srv, NULL, NULL);
+        check("прикрытие, названное именем, приняло соединение", 1, up >= 0);
+        decoy_event(&w, s, POLLOUT, 1010);
+        check("присланное отдано ему целиком", 1, (long)s->up_ready);
+        {
+            uint8_t got[FROZEN_N + 16];
+            ssize_t gn = up >= 0 ? recv(up, got, sizeof(got), 0) : -1;
+            check("и ровно те же байты, без единой правки", (long)FROZEN_N, (long)gn);
+            check("байт в байт", 0, gn == (ssize_t)FROZEN_N ? memcmp(got, FROZEN_AES, FROZEN_N) : 1);
+        }
+        if (up >= 0) close(up);
+        sess_free(&w, s);
+        close(srv);
+        g_decoy_map_n = 0;
+        g_decoy_live = 0;
+    }
+
+    /* ---- вытеснение сессий: живую забираем, только если она почти мертва (R-067, I-082) ----
+     *
+     * Комментарий в sess_alloc обещал, что подтверждённую сессию может забрать только другая
+     * подтверждённая, а код при полной таблице отдавал самую давно молчавшую ЖИВУЮ по
+     * неаутентифицированному SYN. То есть посторонний с одного хоста, посылая SYN с меняющихся
+     * портов, забирал рукопожавшийся туннель — молча, потому что отказа никто не печатал.
+     *
+     * Проверяется политика, а не сокеты: sess_alloc открывает сырой сокет (нужны права root и
+     * настоящая сеть), а решает всё sess_evict_pick — две структуры в памяти. */
+    printf("\n== хаб: вытеснение только почти мёртвой сессии ==\n");
+    {
+        static struct worker w;
+        struct sess *live = &g_sess[0], *raw = &g_sess[1];
+        const long long NOW = 10000000;
+
+        /* Срок обязан лежать МЕЖДУ двумя уже существующими: за границей, по которой пир сама
+         * считает путь мёртвым, и заметно раньше уборки по простою. Иначе правило либо
+         * забирает работающий туннель, либо не меняет ничего — место освободилось бы и без
+         * него. Это же число стоит в реализации на Go. */
+        check("порог — шесть периодов keepalive хаба", 60000, (long)XSH_EVICT_QUIET_MS);
+        check("он за границей мёртвого пути (пир уже пересоединяется)", 1,
+              XSH_EVICT_QUIET_MS > XSC_DEAD_MS);
+        check("и заметно раньше уборки по простою — правило не повторяет её", 1,
+              XSH_EVICT_QUIET_MS * 2 < XSH_IDLE_MS);
+
+        /* Приоритет неподтверждённых не тронут: он и есть защита от потока SYN. */
+        memset(&w, 0, sizeof(w));
+        memset(live, 0, sizeof(*live));
+        memset(raw, 0, sizeof(*raw));
+        live->phase = PH_EST;  live->conn.last_rx = NOW - 1;
+        raw->phase = PH_SYN;   raw->conn.last_rx = NOW - 100;
+        check("неподтверждённая уходит первой, даже будучи моложе живой", 1,
+              sess_evict_pick(&w, raw, live, NOW) == raw);
+        check("отказа при этом не было", 0, (long)w.d_full);
+
+        /* Живая и молодая НЕ ВЫТЕСНЯЕТСЯ: в приёме отказано. */
+        memset(&w, 0, sizeof(w));
+        live->conn.last_rx = NOW - 1000;
+        check("живая и молодая остаётся на месте", 1,
+              sess_evict_pick(&w, NULL, live, NOW) == NULL);
+        check("отказ сосчитан", 1, (long)w.d_full);
+        check("и о нём сказано в журнале — молчаливого отказа быть не должно", 1,
+              w.rl_full.last != 0);
+        check("вторая такая же строка подавлена своим ограничителем", 1,
+              (sess_evict_pick(&w, NULL, live, NOW + 10) == NULL) && w.rl_full.held == 1);
+        check("чужие ограничители не тронуты", 0,
+              (long)(w.rl_synest.last | w.rl_decoy.last | w.rl_unknown.last));
+
+        /* Ровно на пороге — ещё не вытесняется: сравнение строгое, как и в Go. */
+        memset(&w, 0, sizeof(w));
+        live->conn.last_rx = NOW - XSH_EVICT_QUIET_MS;
+        check("ровно на пороге молчания — ещё не вытесняется", 1,
+              sess_evict_pick(&w, NULL, live, NOW) == NULL);
+
+        /* На миллисекунду дольше — уже почти мертва, место отдаётся. */
+        memset(&w, 0, sizeof(w));
+        live->conn.last_rx = NOW - XSH_EVICT_QUIET_MS - 1;
+        check("молчит дольше порога — место отдаётся новому пиру", 1,
+              sess_evict_pick(&w, NULL, live, NOW) == live);
+        check("это не отказ, и он не сосчитан", 0, (long)w.d_full);
+
+        /* Таблица пуста в смысле кандидатов — отказ без падения. */
+        memset(&w, 0, sizeof(w));
+        check("кандидатов нет вовсе — отказ, а не разыменование нуля", 1,
+              sess_evict_pick(&w, NULL, NULL, NOW) == NULL);
     }
 
     printf(fails ? "\nПРОВАЛОВ: %d\n" : "\nвсе проверки прошли\n", fails);

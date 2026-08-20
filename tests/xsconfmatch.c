@@ -281,6 +281,81 @@ int main(void) {
                  "[Peer]\nPublicKey=%s\nAllowedIPs=0.0.0.0/0\nEndpoint=1.2.3.4:443\n",
                  KEY_A, KEY_B);
         refuses("отказ: Decoy в конфигурации пира", t, XS_ROLE_SPOKE);
+
+        /* ---- имена прикрытия (DecoySNI, R-070) -------------------------------
+         *
+         * Список имён, по которым прибор сам выбирает прикрытие: без него подлинный сертификат
+         * получает только тот, кто спросил имя нашего DecoyDest, а всякий другой видит
+         * расхождение «просил A — получил сертификат B». Разрешаются имена ОДИН РАЗ при
+         * подъёме хаба, поэтому здесь проверяется ровно то, что можно проверить по тексту:
+         * имя нормализовано (нижний регистр, без завершающей точки — сравнивать его предстоит
+         * с чужим SNI, и нормализовать обе стороны на каждом неопознанном было бы лишней
+         * работой над недоверенными байтами) и заведомо негодное отвергнуто ДО подъёма.
+         *
+         * Отдельно — подстановка: она отвергается СВОЕЙ причиной, потому что человек пишет её
+         * не по опечатке, а копируя ключ --decoy-sni реализации на Go, где подстановки есть. */
+        snprintf(t, sizeof(t),
+                 HUB_HEAD "Decoy=proxy\nDecoyDest=93.184.216.34:443\n"
+                 "DecoySNI = WWW.Example.COM. , cdn.example.net\n" HUB_PEER, KEY_A, KEY_B);
+        check("DecoySNI: список принят", 0, parse(t, XS_ROLE_HUB));
+        check("DecoySNI: посчитаны оба имени, а не строка", 2, (long)g_c.decoy_sni_n);
+        check_str("DecoySNI: имя приведено к нижнему регистру и без точки в конце",
+                  "www.example.com", g_c.decoy_sni[0]);
+        check_str("DecoySNI: второе имя на месте", "cdn.example.net", g_c.decoy_sni[1]);
+        check("DecoySNI: постоянное прикрытие никуда не делось", 443, g_c.decoy_port);
+
+        snprintf(t, sizeof(t),
+                 HUB_HEAD "Decoy=proxy\nDecoyDest=93.184.216.34:443\n"
+                 "DecoySNI=*.example.com\n" HUB_PEER, KEY_A, KEY_B);
+        refuses("отказ: подстановка в DecoySNI", t, XS_ROLE_HUB);
+        check("и отказ назвал именно подстановку", 1,
+              strstr(g_err, "одстановк") != NULL);
+
+        snprintf(t, sizeof(t),
+                 HUB_HEAD "Decoy=proxy\nDecoyDest=93.184.216.34:443\n"
+                 "DecoySNI=www.example.com/../etc\n" HUB_PEER, KEY_A, KEY_B);
+        refuses("отказ: в имени посторонние символы", t, XS_ROLE_HUB);
+        snprintf(t, sizeof(t),
+                 HUB_HEAD "Decoy=proxy\nDecoyDest=93.184.216.34:443\n"
+                 "DecoySNI=www..example.com\n" HUB_PEER, KEY_A, KEY_B);
+        refuses("отказ: две точки подряд", t, XS_ROLE_HUB);
+        snprintf(t, sizeof(t),
+                 HUB_HEAD "Decoy=proxy\nDecoyDest=93.184.216.34:443\n"
+                 "DecoySNI=.example.com\n" HUB_PEER, KEY_A, KEY_B);
+        refuses("отказ: имя с точки — это подстановка формы Go", t, XS_ROLE_HUB);
+        {
+            /* Имя длиннее буфера ОТВЕРГАЕТСЯ, а не обрезается: обрезанное не совпало бы ни с
+             * одним настоящим SNI никогда, то есть ключ выглядел бы настроенным и молчал. */
+            char longname[XS_DECOY_SNI_LEN + 16];
+            memset(longname, 'a', sizeof(longname) - 1);
+            longname[sizeof(longname) - 1] = '\0';
+            snprintf(t, sizeof(t),
+                     HUB_HEAD "Decoy=proxy\nDecoyDest=93.184.216.34:443\nDecoySNI=%s\n"
+                     HUB_PEER, KEY_A, longname, KEY_B);
+            refuses("отказ: имя длиннее буфера", t, XS_ROLE_HUB);
+        }
+        {
+            char names[512] = "";
+            for (int i = 0; i <= XS_DECOY_SNI_MAX; i++) {
+                char one[32];
+                snprintf(one, sizeof(one), "%sn%d.example.com", i ? "," : "", i);
+                strncat(names, one, sizeof(names) - strlen(names) - 1);
+            }
+            snprintf(t, sizeof(t),
+                     HUB_HEAD "Decoy=proxy\nDecoyDest=93.184.216.34:443\nDecoySNI=%s\n"
+                     HUB_PEER, KEY_A, names, KEY_B);
+            refuses("отказ: имён больше предела", t, XS_ROLE_HUB);
+        }
+
+        snprintf(t, sizeof(t),
+                 HUB_HEAD "Decoy=alert\nDecoySNI=www.example.com\n" HUB_PEER, KEY_A, KEY_B);
+        refuses("отказ: DecoySNI без режима proxy", t, XS_ROLE_HUB);
+        snprintf(t, sizeof(t),
+                 "[Interface]\nPrivateKey=%s\nAddress=10.0.0.2/24\n"
+                 "DecoySNI=www.example.com\n"
+                 "[Peer]\nPublicKey=%s\nAllowedIPs=0.0.0.0/0\nEndpoint=1.2.3.4:443\n",
+                 KEY_A, KEY_B);
+        refuses("отказ: DecoySNI в конфигурации пира", t, XS_ROLE_SPOKE);
     }
 
     /* ---- DNS: принимается, но не применяется --------------------------------

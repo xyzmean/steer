@@ -46,9 +46,11 @@
 #include <string.h>
 #include <unistd.h>
 #include <arpa/inet.h>
+#include <netdb.h>
 #include <sys/socket.h>
 #include <pthread.h>
 
+#include "chello.h"
 #include "xsconn.h"
 #include "xsconf.h"
 #include "xshake.h"
@@ -87,6 +89,34 @@
  * обрывом. Ровно это и показал живой стенд. Так же устроен WireGuard: keepalive посылает
  * ПРИНИМАЮЩАЯ сторона, и по той же причине. Десять секунд — его же интервал. */
 #define XSH_KEEPALIVE_MS 10000
+/* ---- когда живую сессию МОЖНО вытеснить (R-067, I-082) -----------------------
+ *
+ * Шесть периодов keepalive хаба — минута молчания. Число выведено из сроков, которые уже есть,
+ * а не выбрано на глаз, и обязано лежать между двумя из них:
+ *
+ *   СНИЗУ его держит XSC_DEAD_MS (45 с) — срок, по которому пир САМА считает путь мёртвым и
+ *     начинает соединяться заново. Сессия, молчавшая дольше него, уже не несёт трафика ни для
+ *     кого: пир либо ушла, либо строит на её месте новую. Ниже этого порога вытеснение забирало
+ *     бы работающий туннель у живого пира, а по нашу сторону хаб присылает keepalive каждые
+ *     10 с и получает от пира её собственный (умолчание PersistentKeepalive — 25 с), то есть
+ *     минута тишины не наступает у здоровой сессии никогда.
+ *   СВЕРХУ — XSH_IDLE_MS (180 с), по которому сессию убирает обслуживание само. Порог обязан
+ *     наступать ЗАМЕТНО раньше, иначе правило не меняет ничего: место освободилось бы и без
+ *     него. Втрое раньше — это две минуты, в которые вытеснение работает.
+ *
+ * ЦЕНА НАЗЫВАЕТСЯ ВСЛУХ: пока таблица воркера полна ЖИВЫМИ и молодыми сессиями, новый пир в
+ * приёме получит отказ — до тех пор, пока какая-нибудь из них не замолчит на минуту. Прежде
+ * такого отказа не было вовсе, потому что новый брал место у самой давно молчавшей независимо
+ * от того, жива она или нет (I-082); цена этого — поток поддельных SYN с меняющихся портов
+ * выбивал из таблицы рукопожавшиеся туннели. Отказ виден в журнале, потеря туннеля — нет.
+ *
+ * ЧИСЛО ОБЩЕЕ С РЕАЛИЗАЦИЕЙ НА GO, и это требование, а не совпадение: сроки там те же (10 с
+ * keepalive, 45 с мёртвого пути, 180 с уборки по простою), значит и порог обязан быть тем же —
+ * иначе одна и та же звезда вела бы себя по-разному в зависимости от того, на чём поднят хаб, и
+ * выяснилось бы это только под потоком SYN. Сравнение СТРОГОЕ (молчит дольше порога), тоже как
+ * там. Неподтверждённые вытесняются без всякого срока — их приоритет и есть защита от потока
+ * SYN, и он этим правилом не тронут. */
+#define XSH_EVICT_QUIET_MS (XSH_KEEPALIVE_MS * 6)
 /* ---- защита от активного зондирования (Decoy, R-062) ------------------------
  *
  * Числа взяты у реализации на Go (hub/decoy.go), где эта дорожка уже прошла стенд настоящим
@@ -174,11 +204,16 @@ struct sess {
      * up_ready — connect завершился И присланное прибором уже отдано прикрытию целиком.
      * up_sent  — сколько байт присланного уже ушло: сокет неблокирующий, значит запись бывает
      *            частичной, и остаток дописывается по следующему POLLOUT.
-     * up_at    — последнее движение на дорожке: по нему считаются оба срока выше. */
+     * up_at    — последнее движение на дорожке: по нему считаются оба срока выше.
+     * up_addr  — К КОМУ ИМЕННО открыто это соединение, в сетевом порядке. Хранится, потому что
+     *            прикрытие теперь выбирается именем из SNI (см. decoy_dest_for) и постоянным
+     *            DecoyDest уже не описывается: строка журнала, называющая не тот адрес, хуже
+     *            отсутствующей. */
     int      up_fd;
     int      up_ready;
     size_t   up_sent;
     long long up_at;
+    uint32_t up_addr;
 };
 
 static struct sess g_sess[XSH_MAX_SESS];
@@ -202,6 +237,18 @@ static int16_t g_peer_sess[XS_PEERS_MAX][XS_CONNS_MAX];
  * защищает сайт-прикрытие и наши дескрипторы, а они общие для всех воркеров. Живёт под g_ctl —
  * меняется раз на неопознанное соединение, то есть на горячем пути не встречается. */
 static int g_decoy_live;
+
+/* Таблица «имя прикрытия → адрес». Заполняется РОВНО ОДИН РАЗ, при подъёме хаба
+ * (hub_decoy_resolve), до создания единого воркера, и дальше только читается — поэтому замка у
+ * неё нет и быть не должно: разрешение имени в цикле воркера означало бы блокирующий вызов там,
+ * где его нет ни одного, а это и есть та причина, по которой подстановок вроде *.example.com
+ * здесь не будет никогда (см. decoy_sni в xsconf.h).
+ *
+ * Имена лежат уже нормализованными разбором конфигурации: нижний регистр, без завершающей
+ * точки. Имя, которое не разрешилось, в таблицу НЕ ПОПАДАЕТ — хаб от этого не падает, просто по
+ * этому имени работает прежнее поведение с DecoyDest. */
+static struct { char name[XS_DECOY_SNI_LEN]; uint32_t addr; } g_decoy_map[XS_DECOY_SNI_MAX];
+static int g_decoy_map_n;
 
 /* Замок на ОТПРАВКУ в сессию. Держится ОТДЕЛЬНО от struct sess, а не полем в ней, и это не
  * вкус: sess_free обнуляет структуру целиком (memset), а обнулить мьютекс, который в этот миг
@@ -257,9 +304,9 @@ struct worker {
      * несобранных записях пользовалось ограничителем предупреждения о повторе метки времени,
      * и признак повтора рукопожатия глушился потоком сообщений о потерях сборки). */
     struct xs_ratelog rl_unknown, rl_stamp, rl_synest, rl_reasm, rl_mtu, rl_ipv6,
-                      rl_decoy;
+                      rl_decoy, rl_full;
     unsigned long long d_seg, d_bad, d_syn, d_hs, d_data, d_alien, d_syn_est, d_ipv6,
-                       d_decoy;
+                       d_decoy, d_full;
 };
 
 /* Строка ОБЯЗАНА вмещать самую большую запись, какую собирает цикл TUN, вместе с местом под
@@ -323,7 +370,45 @@ static void sess_free(struct worker *w, struct sess *s) {
     pthread_mutex_unlock(&g_tx_lock[s - g_sess]);
 }
 
-static struct sess *sess_alloc(struct worker *w, const struct obfs_seg *seg, int listen_port) {
+/* Кого забрать при полной таблице — и забирать ли вообще.
+ *
+ * Вынесено из sess_alloc ради стенда: сама sess_alloc открывает сырой сокет (то есть требует
+ * прав root и настоящей сети), а решается здесь ровно одно — политика вытеснения, и проверять
+ * её надо на двух структурах в памяти, а не на живом хабе под потоком SYN.
+ *
+ * НЕПОДТВЕРЖДЁННАЯ УХОДИТ ПЕРВОЙ, и это не тонкость. Сессия создаётся на первом же поддельном
+ * SYN, то есть кем угодно и без всякой проверки; забирай мы просто «самую давно молчавшую»,
+ * поток SYN с меняющихся портов выбил бы из таблицы живые рукопожавшиеся туннели — отказ в
+ * обслуживании ценой в один цикл на постороннем хосте.
+ *
+ * ПОДТВЕРЖДЁННУЮ ЗАБИРАЕМ, ТОЛЬКО ЕСЛИ ОНА ПОЧТИ МЕРТВА — молчит дольше XSH_EVICT_QUIET_MS
+ * (см. там же, почему именно этот срок и чем за него плачено). Прежде комментарий обещал, что
+ * подтверждённую может забрать только другая подтверждённая, а код отдавал самую давно
+ * молчавшую живую по НЕАУТЕНТИФИЦИРОВАННОМУ SYN (I-082) — то есть обещание было неверным. */
+static struct sess *sess_evict_pick(struct worker *w, struct sess *oldest_raw,
+                                    struct sess *oldest, long long now) {
+    if (oldest_raw) return oldest_raw;
+    if (oldest && now - oldest->conn.last_rx > XSH_EVICT_QUIET_MS) return oldest;
+    /* Отказали. Сказать об этом обязательно: снаружи молчаливый отказ выглядит как «пир не
+     * подключается», и причину — «таблица воркера полна живыми сессиями» — не видно ниоткуда.
+     * Ограничитель обязателен по той же причине, что и у соседей: сюда добирается кто угодно из
+     * интернета одним поддельным SYN, и без него одна такая строка заливает журнал VPS. Свой,
+     * а не общий с соседями: общий на два события означает, что они глушат друг друга, а хвост
+     * «и ещё N таких же» называет число, посчитанное по обоим (I-064). */
+    w->d_full++;
+    unsigned long long held = 0;
+    if (xs_ratelog(&w->rl_full, now, XS_LOG_EVERY_MS, &held)) {
+        char tail[64];
+        fprintf(stderr, LOG_W "таблица сессий воркера %d полна работающими туннелями — новому "
+                              "отказано; место освободится, когда какой-нибудь из них замолчит "
+                              "дольше %d с%s\n",
+                w->id, XSH_EVICT_QUIET_MS / 1000, xs_held_str(held, tail, sizeof(tail)));
+    }
+    return NULL;
+}
+
+static struct sess *sess_alloc(struct worker *w, const struct obfs_seg *seg, int listen_port,
+                               long long now) {
     struct sess *free_slot = NULL, *oldest = NULL, *oldest_raw = NULL;
     /* Только СВОЙ отрезок таблицы: сессия, созданная здесь, будет и приниматься здесь —
      * фильтр на сокете это гарантирует, — а лазить в чужой отрезок значило бы делить таблицу
@@ -336,16 +421,9 @@ static struct sess *sess_alloc(struct worker *w, const struct obfs_seg *seg, int
             (!oldest_raw || g_sess[i].conn.last_rx < oldest_raw->conn.last_rx))
             oldest_raw = &g_sess[i];
     }
-    /* Свободного нет — вытесняем. Отказать вместо вытеснения значило бы, что одна забытая
-     * сессия навсегда закрывает вход новой пиру.
-     *
-     * НО: неподтверждённая вытесняется ПЕРВОЙ, и это не тонкость. Сессия создаётся на первом
-     * же поддельном SYN, то есть кем угодно и без всякой проверки; вытесняй мы просто «самую
-     * давно молчавшую», поток SYN с меняющихся портов выбил бы из таблицы живые
-     * рукопожавшиеся туннели — отказ в обслуживании ценой в один цикл на постороннем хосте.
-     * Подтверждённую сессию у нас может забрать только другая подтверждённая. */
+    /* Свободного нет — решаем, вытеснять ли (политика и её цена — в sess_evict_pick). */
     if (!free_slot) {
-        struct sess *victim = oldest_raw ? oldest_raw : oldest;
+        struct sess *victim = sess_evict_pick(w, oldest_raw, oldest, now);
         if (!victim) return NULL;
         sess_free(w, victim);
         free_slot = victim;
@@ -367,7 +445,7 @@ static struct sess *sess_alloc(struct worker *w, const struct obfs_seg *seg, int
     s->conn.seq = s->conn.isn_tx;
     s->conn.isn_rx = seg->seq;
     s->conn.ack = seg->seq + 1;
-    s->conn.born = s->conn.last_rx = s->conn.last_tx = xs_now_ms();
+    s->conn.born = s->conn.last_rx = s->conn.last_tx = now;
     s->conn.state = XSC_SYN_RCVD;
     s->phase = PH_SYN;
     if (xs_sidx_insert(&w->idx, ntohl(seg->saddr), seg->sport, (int)(s - g_sess)) != 0) {
@@ -487,6 +565,106 @@ static void hub_alert(struct sess *s) {
     if (an) xs_conn_send(&s->conn, 0x18 /* PSH|ACK */, alert, an, 0);
 }
 
+/* Привести имя из чужого ClientHello к тому же виду, в котором лежат имена в таблице:
+ * нижний регистр, без завершающей точки. 0 — годится, -1 — нет.
+ *
+ * ЭТО НЕДОВЕРЕННЫЕ БАЙТЫ ДО ВСЯКОЙ АУТЕНТИФИКАЦИИ, поэтому здесь белый список символов, а не
+ * чёрный: всё, что не буква, не цифра, не дефис и не точка, отвергается целиком. Имя, длиннее
+ * буфера таблицы, тоже отвергается, а не обрезается — обрезанное совпало бы не с тем. Дальше
+ * это имя участвует РОВНО в одном действии: сравнении strcmp с именем из конфигурации; никуда
+ * больше — ни в журнал, ни в путь, ни в запрос — оно не идёт. */
+static int decoy_name_norm(const char *in, char *out, size_t outn) {
+    size_t n = strlen(in);
+    if (n && in[n - 1] == '.') n--;
+    if (!n || n >= outn) return -1;
+    for (size_t i = 0; i < n; i++) {
+        char ch = in[i];
+        if (ch >= 'A' && ch <= 'Z') ch = (char)(ch + 32);
+        if (!((ch >= 'a' && ch <= 'z') || (ch >= '0' && ch <= '9') || ch == '-' || ch == '.'))
+            return -1;
+        out[i] = ch;
+    }
+    out[n] = '\0';
+    return 0;
+}
+
+/* Куда отдавать ЭТОГО неопознанного: адрес в СЕТЕВОМ порядке, 0 — некуда (тогда отвечаем как
+ * прежде). hello/n — то, что прибор прислал, целиком и как есть.
+ *
+ * ПОЧЕМУ ИМЯ ВЫБИРАЕТ ПРИБОР. Постоянное прикрытие отдаёт подлинный сертификат только тому, кто
+ * спросил имя этого прикрытия; всякий другой видит «просил A — получил сертификат B», а это
+ * ровно тот признак, ради устранения которого дорожка и заведена.
+ *
+ * ИМЯ ВНЕ ТАБЛИЦЫ — ЭТО ПРЕЖНЕЕ ПОВЕДЕНИЕ, А НЕ ОТКАЗ, и это важнее удобства: отказывай мы по
+ * незнакомому имени, порт хаба начал бы отвечать ПО-РАЗНОМУ на разные имена, и сама эта разница
+ * рассказывала бы прибору, какие имена мы обслуживаем. Не разобрался Hello, нет SNI, имя с
+ * посторонними символами — тоже прежнее поведение, по той же причине.
+ *
+ * Никакого разрешения имён здесь нет и быть не может: таблица разрешена при подъёме
+ * (hub_decoy_resolve), а эта функция зовётся из цикла воркера. */
+static uint32_t decoy_dest_for(const uint8_t *hello, size_t n) {
+    struct in_addr fixed;
+    uint32_t fallback = inet_pton(AF_INET, g_conf.decoy_dest, &fixed) == 1 ? fixed.s_addr : 0;
+    if (g_decoy_map_n <= 0) return fallback;
+    /* ГРАНИЦЫ ПРОВЕРЯЮТСЯ ДО ЕДИНОГО ЧТЕНИЯ. Разбору отдаётся РОВНО ОДНА запись, длиной, которую
+     * назвал сам прибор, и только если она уже пришла целиком: chello_parse требует, чтобы
+     * заявленная длина совпала с переданной, и передать ему больше (хвост следующей записи) или
+     * меньше (недочитанное) значило бы либо разбирать не то, либо получать отказ на верном
+     * Hello. Всё остальное — забота самого разбора: он писан как граница доверия и проверяется
+     * отдельным стендом на обрезанных и испорченных Hello. */
+    if (n < 5 || hello[0] != 0x16) return fallback;
+    size_t want = 5 + ((size_t)hello[3] << 8) + hello[4];
+    if (want > n) return fallback;
+    struct chello_ref ref;
+    if (chello_parse(hello, want, &ref) != 0 || !ref.sni[0]) return fallback;
+    char nm[XS_DECOY_SNI_LEN];
+    if (decoy_name_norm(ref.sni, nm, sizeof(nm)) != 0) return fallback;
+    /* Линейный обход: имён не больше восьми, и зовётся это раз на НЕОПОЗНАННОЕ соединение, а не
+     * на пакет. Заводить здесь индекс значило бы усложнять то, чего никто не считает. */
+    for (int i = 0; i < g_decoy_map_n; i++)
+        if (strcmp(nm, g_decoy_map[i].name) == 0) return g_decoy_map[i].addr;
+    return fallback;
+}
+
+/* Разрешить имена прикрытия в адреса. РОВНО ОДИН РАЗ, при подъёме хаба и до создания первого
+ * воркера — дальше таблица только читается, поэтому замка у неё нет.
+ *
+ * Имя, которое не разрешилось, хаб НЕ РОНЯЕТ: прикрытие — это защита от зондирования, а не
+ * условие работы туннелей, и отказаться поднимать звезду из-за недоступного в эту минуту DNS
+ * значило бы обменять работающий VPN на неработающую защиту. Такое имя просто не участвует в
+ * выборе, и об этом есть строка в журнале — иначе разница «имя есть в файле, но не работает»
+ * не обнаруживалась бы ничем, кроме зондирования собственного порта. */
+static void hub_decoy_resolve(void) {
+    if (g_conf.decoy != XS_DECOY_PROXY) return;
+    for (size_t i = 0; i < g_conf.decoy_sni_n && g_decoy_map_n < XS_DECOY_SNI_MAX; i++) {
+        struct addrinfo hints, *res = NULL;
+        memset(&hints, 0, sizeof(hints));
+        /* Только IPv4: наружу движок ходит только по нему (см. «чего протокол не делает»), и
+         * адрес AF_INET6 в таблице означал бы соединение, которое не откроется никогда. */
+        hints.ai_family = AF_INET;
+        hints.ai_socktype = SOCK_STREAM;
+        int rc = getaddrinfo(g_conf.decoy_sni[i], NULL, &hints, &res);
+        if (rc != 0 || !res || !res->ai_addr || res->ai_addrlen < sizeof(struct sockaddr_in)) {
+            fprintf(stderr, LOG_W "прикрытие %s: имя не разрешилось (%s) — по этому имени "
+                                  "отдаём %s:%d, как прежде\n",
+                    g_conf.decoy_sni[i], rc ? gai_strerror(rc) : "нет адреса IPv4",
+                    g_conf.decoy_dest, g_conf.decoy_port);
+            if (res) freeaddrinfo(res);
+            continue;
+        }
+        struct sockaddr_in sa;
+        memcpy(&sa, res->ai_addr, sizeof(sa));
+        freeaddrinfo(res);
+        snprintf(g_decoy_map[g_decoy_map_n].name, XS_DECOY_SNI_LEN, "%s", g_conf.decoy_sni[i]);
+        g_decoy_map[g_decoy_map_n].addr = sa.sin_addr.s_addr;
+        g_decoy_map_n++;
+        char t[INET_ADDRSTRLEN];
+        inet_ntop(AF_INET, &sa.sin_addr, t, sizeof(t));
+        fprintf(stderr, LOG_I "прикрытие %s → %s:%d\n", g_conf.decoy_sni[i], t,
+                g_conf.decoy_port);
+    }
+}
+
 /* Открыть соединение к сайту-прикрытию. 1 — дорожка началась (сессия жива и переходит в
  * PH_PROXY), 0 — не вышло, отвечать придётся как прежде. */
 static int decoy_start(struct worker *w, struct sess *s, long long now) {
@@ -506,11 +684,16 @@ static int decoy_start(struct worker *w, struct sess *s, long long now) {
         }
         return 0;
     }
+    /* Прикрытие выбирается ИМЕНЕМ, которое назвал сам прибор, и только из таблицы, разрешённой
+     * при подъёме. Порт один и тот же (DecoyDest): прибор постучался на наш слушающий порт, а
+     * какой порт у прикрытия — свойство настройки, а не запроса. */
+    uint32_t dst = decoy_dest_for(s->hs_buf, s->hs_len);
+    if (!dst) goto fail;
     struct sockaddr_in to;
     memset(&to, 0, sizeof(to));
     to.sin_family = AF_INET;
     to.sin_port = htons((uint16_t)g_conf.decoy_port);
-    if (inet_pton(AF_INET, g_conf.decoy_dest, &to.sin_addr) != 1) goto fail;
+    to.sin_addr.s_addr = dst;
     {
         int fd = socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
         if (fd < 0) goto fail;
@@ -523,6 +706,7 @@ static int decoy_start(struct worker *w, struct sess *s, long long now) {
     s->up_ready = 0;
     s->up_sent = 0;
     s->up_at = now;
+    s->up_addr = dst;
     s->phase = PH_PROXY;
     w->d_decoy++;
     return 1;
@@ -589,11 +773,16 @@ static int decoy_event(struct worker *w, struct sess *s, short rev, long long no
         s->up_at = now;
         unsigned long long held = 0;
         if (xs_ratelog(&w->rl_decoy, now, XS_LOG_EVERY_MS, &held)) {
-            struct in_addr in;
-            char tail[64];
+            struct in_addr in, up;
+            char tail[64], dst[INET_ADDRSTRLEN];
             in.s_addr = s->conn.daddr;
+            up.s_addr = s->up_addr;
+            /* Адрес прикрытия печатается ИЗ СЕССИИ, а не из конфигурации: с выбором по имени
+             * они расходятся, а строка журнала, называющая не тот адрес, хуже отсутствующей.
+             * inet_ntop, а не второй inet_ntoa: у того один статический буфер на вызов. */
+            inet_ntop(AF_INET, &up, dst, sizeof(dst));
             fprintf(stderr, LOG_I "неопознанный с %s: отдаю настоящему серверу %s:%d%s\n",
-                    inet_ntoa(in), g_conf.decoy_dest, g_conf.decoy_port,
+                    inet_ntoa(in), dst, g_conf.decoy_port,
                     xs_held_str(held, tail, sizeof(tail)));
         }
         return 0;
@@ -1101,7 +1290,7 @@ static struct sess *sess_on_syn(struct worker *w, struct sess *s, const struct o
         }
         return NULL;
     }
-    if (!s) s = sess_alloc(w, seg, g_conf.listen_port);
+    if (!s) s = sess_alloc(w, seg, g_conf.listen_port, now);
     else s->conn.seq -= 1;          /* повтор того же SYN-ACK */
     if (!s) return NULL;
     s->conn.ack = seg->seq + 1;
@@ -1286,9 +1475,10 @@ static void *worker_loop(void *arg) {
         if (w->debug && now - d_last >= 1000) {
             fprintf(stderr, LOG_I "воркер %d: сегментов %llu, битых %llu, чужих %llu, SYN %llu, "
                                   "рукопожатий %llu, данных %llu, SYN в живую сессию %llu, "
-                                  "кадров IPv6 %llu, неопознанных к прикрытию %llu\n",
+                                  "кадров IPv6 %llu, неопознанных к прикрытию %llu, "
+                                  "отказов при полной таблице %llu\n",
                     w->id, w->d_seg, w->d_bad, w->d_alien, w->d_syn, w->d_hs, w->d_data,
-                    w->d_syn_est, w->d_ipv6, w->d_decoy);
+                    w->d_syn_est, w->d_ipv6, w->d_decoy, w->d_full);
             d_last = now;
         }
 
@@ -1504,6 +1694,10 @@ int cmd_xsteer_hub(const char *conf_path) {
     fprintf(stderr, LOG_I "слушаю поддельный TCP :%d, пиров %zu, устройство %s, воркеров %d "
                           "(по %d сессий)\n",
             g_conf.listen_port, g_conf.peer_n, dev, n, per);
+    /* Имена прикрытия разрешаются ЗДЕСЬ — при подъёме, до создания потоков и до первого
+     * прохода цикла. Позже это сделать негде: в цикле воркера нет ни одного блокирующего
+     * вызова, а getaddrinfo — именно он. */
+    hub_decoy_resolve();
     /* Что отвечаем неопознанным — говорится вслух при подъёме: настройка защиты, о которой
      * нельзя узнать из журнала, проверяется только зондированием собственного порта. */
     switch (g_conf.decoy) {
@@ -1516,8 +1710,9 @@ int cmd_xsteer_hub(const char *conf_path) {
         break;
     case XS_DECOY_PROXY:
         fprintf(stderr, LOG_I "неопознанным: отдавать настоящему серверу %s:%d (не больше %d "
-                              "одновременно)\n",
-                g_conf.decoy_dest, g_conf.decoy_port, XSH_DECOY_MAX);
+                              "одновременно), имён прикрытия разрешено %d из %zu\n",
+                g_conf.decoy_dest, g_conf.decoy_port, XSH_DECOY_MAX, g_decoy_map_n,
+                g_conf.decoy_sni_n);
         break;
     default:
         fprintf(stderr, LOG_I "неопознанным: фатальное оповещение TLS (отличимо от настоящего "

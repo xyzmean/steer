@@ -119,7 +119,7 @@ static const struct { const char *key; const char *why; } REFUSED[] = {
  * виду» в cli.c: опечатка в имени ключа не должна требовать чтения документации. */
 static const char *KNOWN[] = {
     "PrivateKey", "Address", "MTU", "ListenPort", "SNI", "Device", "DNS",
-    "Decoy", "DecoyDest",
+    "Decoy", "DecoyDest", "DecoySNI",
     "PublicKey", "AllowedIPs", "Endpoint", "PersistentKeepalive",
 };
 #define KNOWN_N (sizeof(KNOWN) / sizeof(KNOWN[0]))
@@ -176,6 +176,46 @@ static int parse_pfx(const char *s, struct xs_allowed *a) {
     a->net = net & mask;
     a->mask = mask;
     a->plen = plen;
+    return 0;
+}
+
+/* Одно имя прикрытия из DecoySNI.
+ *
+ * Приводится к НИЖНЕМУ РЕГИСТРУ и лишается завершающей точки прямо здесь, а не при сравнении:
+ * сравнивать это имя предстоит с именем из чужого ClientHello, то есть на пути, куда попадает
+ * кто угодно из интернета, и нормализовать там обе стороны значило бы делать лишнюю работу над
+ * недоверенными байтами на каждом неопознанном соединении.
+ *
+ * Проверка строгая по той же причине, что и у остальных ключей: имя, принятое с мусором внутри,
+ * не совпало бы ни с одним настоящим SNI никогда — то есть ключ выглядел бы настроенным и молча
+ * не работал. 0 — записано, -1 — не годится, и тогда в why лежит причина. */
+static int parse_decoy_name(const char *in, char *out, size_t outn, const char **why) {
+    size_t n = strlen(in);
+    /* Подстановка отвергается ОТДЕЛЬНОЙ причиной, а не общим «недопустимый символ»: человек,
+     * написавший *.example.com, скопировал её из ключа --decoy-sni реализации на Go, где
+     * подстановки есть, и обязан узнать, почему здесь их нет, а не гадать об опечатке. */
+    if (strchr(in, '*')) {
+        *why = "подстановки невозможны: имена разрешаются в адреса один раз при подъёме хаба, "
+               "а имя из подстановки становится известно только в момент прихода прибора, то "
+               "есть потребовало бы разрешения из цикла воркера";
+        return -1;
+    }
+    if (n && in[n - 1] == '.') n--;          /* завершающая точка — законная форма FQDN */
+    if (!n) { *why = "имя пустое"; return -1; }
+    if (n >= outn) { *why = "длиннее буфера"; return -1; }
+    if (in[0] == '.' || in[0] == '-' || in[n - 1] == '-') {
+        *why = "имя не может начинаться с точки или дефиса и кончаться дефисом";
+        return -1;
+    }
+    for (size_t i = 0; i < n; i++) {
+        char ch = in[i];
+        int ok = (ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z') ||
+                 (ch >= '0' && ch <= '9') || ch == '-' || ch == '.';
+        if (!ok) { *why = "допустимы только буквы, цифры, дефис и точка"; return -1; }
+        if (ch == '.' && i && in[i - 1] == '.') { *why = "две точки подряд"; return -1; }
+        out[i] = (ch >= 'A' && ch <= 'Z') ? (char)(ch + 32) : ch;
+    }
+    out[n] = '\0';
     return 0;
 }
 
@@ -331,6 +371,34 @@ int xs_conf_parse(const char *text, size_t n, enum xs_role role,
                     FAIL("строка %d: DecoyDest длиннее буфера", line_no);
                 snprintf(c->decoy_dest, sizeof(c->decoy_dest), "%s", val);
                 c->decoy_port = (int)port;
+            } else if (ieq(key, "DecoySNI")) {
+                /* Имена прикрытия, которые хабу разрешено обслуживать: список через запятую,
+                 * ровно как у AllowedIPs. Здесь имя ПРОВЕРЯЕТСЯ и нормализуется, а разрешается
+                 * в адрес — один раз при подъёме хаба (xshub.c); почему так и почему подстановок
+                 * нет, написано у поля decoy_sni в xsconf.h.
+                 *
+                 * Ключ называется так же, как --decoy-sni у реализации на Go: одно и то же
+                 * свойство обязано называться одним словом в файле, в журнале и в документации
+                 * обеих половин — тот же довод, что у Decoy выше. */
+                char *save = val;
+                while (*save) {
+                    char *comma = strchr(save, ',');
+                    if (comma) *comma = '\0';
+                    char *item = trim(save);
+                    if (*item) {
+                        const char *why = "";
+                        if (c->decoy_sni_n >= XS_DECOY_SNI_MAX)
+                            FAIL("строка %d: DecoySNI: имён больше %d", line_no,
+                                 XS_DECOY_SNI_MAX);
+                        if (parse_decoy_name(item, c->decoy_sni[c->decoy_sni_n],
+                                             XS_DECOY_SNI_LEN, &why) != 0)
+                            FAIL("строка %d: DecoySNI: имя %s не годится — %s",
+                                 line_no, item, why);
+                        c->decoy_sni_n++;
+                    }
+                    if (!comma) break;
+                    save = comma + 1;
+                }
             } else if (ieq(key, "Device")) {
                 /* Имя устройства ядра: те же ограничения, что у ip link — буквы, цифры и
                  * несколько знаков, короче IFNAMSIZ. Иначе `ip` откажет уже на подъёме, а
@@ -431,7 +499,7 @@ int xs_conf_parse(const char *text, size_t n, enum xs_role role,
             FAIL("ListenPort — это конфигурация хаба: пир никуда не слушает");
         /* Защита от зондирования — про слушающий порт, а пир никуда не слушает. Принять ключ
          * молча значило бы сказать «настроено», не настроив ничего. */
-        if (c->decoy || c->decoy_port)
+        if (c->decoy || c->decoy_port || c->decoy_sni_n)
             FAIL("Decoy — это конфигурация хаба: неопознанные приходят на слушающий порт, "
                  "а пир никуда не слушает");
         /* Две секции [Peer] у пира означали бы, что часть трафика идёт мимо хаба, а маршрут
@@ -454,6 +522,13 @@ int xs_conf_parse(const char *text, size_t n, enum xs_role role,
          * бою: неверная настройка защиты, обнаруженная под зондированием, — защита, которой нет. */
         if (c->decoy == XS_DECOY_PROXY && !c->decoy_port)
             FAIL("Decoy = proxy требует DecoyDest — адрес сайта-прикрытия вида 1.2.3.4:443");
+        /* Имена без режима proxy ничего не выбирают: отвечать оповещением, RST или молчанием
+         * можно только одним способом, прикрытия в этих режимах нет вовсе. Принять список молча
+         * значило бы сказать «настроено», не настроив ничего, — то же правило, что у
+         * PresharedKey и у Decoy в конфигурации пира. */
+        if (c->decoy_sni_n && c->decoy != XS_DECOY_PROXY)
+            FAIL("DecoySNI имеет смысл только при Decoy = proxy: в остальных режимах "
+                 "прикрытия нет вовсе и выбирать нечего");
         for (size_t i = 0; i < c->peer_n; i++)
             if (c->peer[i].endpoint_port)
                 FAIL("пир %zu: Endpoint в конфигурации хаба бессмыслен — пира живут за "
