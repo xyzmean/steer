@@ -37,6 +37,7 @@ build/chellomatch
 build/hellofreeze
 build/xsloop
 build/spokematch
+build/hubmatch
 build/xsbench
 build/steer-hub
 build/steer-ext

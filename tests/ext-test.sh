@@ -6,10 +6,13 @@
 #   tests/spokematch.c — освобождение транспортных ключей при неудачном рукопожатии;
 #                        собирается под AddressSanitizer, потому что утекает именно
 #                        контекст шифра в куче (I-067).
+#   tests/hubmatch.c   — арифметика записи в хабе: правило набора кадров в пачку против
+#                        объявленной строки воркера (I-070). Включает src/ext/xshub.c, отсюда
+#                        и mbedtls: цикл хаба тянет за собой reality.c и TLS 1.3.
 #
 # В обычный `make test` они НЕ входят: там mbedtls нет по построению (R-014, см. ext-syntax),
-# а роутерная сборка src/ext идёт только docker'ом через build.sh. Из-за этого оба стенда до
-# запуска 42 не прогонялись НИ РАЗУ — и первый же прогон дал I-066 (xsloop был красным с
+# а роутерная сборка src/ext идёт только docker'ом через build.sh. Из-за этого первые два стенда
+# до запуска 42 не прогонялись НИ РАЗУ — и первый же прогон дал I-066 (xsloop был красным с
 # 18 августа) и I-067 (утечка 576 байт на попытку). Эта цель закрывает разрыв: проверяемость
 # src/ext хоть где-то, кроме релизной сборки (R-058).
 #
@@ -111,5 +114,14 @@ $CC -O1 -g -w -Isrc -fsanitize=address $MBED_INC "$PRIV" -o "$BUILD/spokematch" 
 	src/ext/reality.c src/ext/tls13.c src/ext/h2.c src/ext/tun.c src/obfs.c \
 	src/spec.c $MBED_LIB -lpthread
 "$BUILD/spokematch"
+
+# hubmatch — согласие правила набора пачки с размером строки воркера.
+echo "ext-test: собираю и прогоняю hubmatch..."
+$CC -O2 -w -Isrc $MBED_INC "$PRIV" -o "$BUILD/hubmatch" tests/hubmatch.c \
+	src/ext/xsconn.c src/ext/xswire.c src/ext/xsepoch.c src/ext/xsroute.c \
+	src/ext/xsconf.c src/ext/xsstream.c src/ext/xshake.c src/ext/chello.c \
+	src/ext/reality.c src/ext/tls13.c src/ext/h2.c src/ext/tun.c src/obfs.c \
+	src/spec.c $MBED_LIB -lpthread
+"$BUILD/hubmatch"
 
 echo "ext-test: все стенды прошли на mbedtls ${MBED_VER:-?}"
