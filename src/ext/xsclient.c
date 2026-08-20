@@ -551,13 +551,21 @@ static void probe_done(struct spoke *s, const char *dev, long long now) {
     if (fn2) send_frame(s, fin, fn2, now);
 }
 
+/* КЛЮЧИ ОСВОБОЖДАЮТСЯ БЕЗ ОГЛЯДКИ НА s->up, и это не перестраховка. Ключи выводит
+ * xs_hs_client_finish, а s->up ставится ПОЗЖЕ — после отправки подтверждения. Значит между
+ * этими двумя точками есть отказы (подтверждение хаба не сошлось, само подтверждение не
+ * ушло), после которых контексты шифра уже выделены, а условие «if (s->up)» их не
+ * освобождает. Следующая попытка входит в split_keys, тот делает memset ключа — указатель на
+ * прежний контекст AES теряется, и это утечка, а не отложенное освобождение. Цена: 576 байт
+ * на попытку, попытки идут каждые 5 секунд, воркер запасного соединения не сдаётся никогда
+ * (worker_give_up). Мерено стендом tests/spokematch.c под LeakSanitizer.
+ *
+ * Условие лишнее и без этого: tls13_keys_free сам выходит на !ctx_ready. */
 static void session_down(struct spoke *s) {
-    if (s->up) {
-        tls13_keys_free(&s->tx);
-        tls13_keys_free(&s->rx);
-        memset(&s->tx, 0, sizeof(s->tx));
-        memset(&s->rx, 0, sizeof(s->rx));
-    }
+    tls13_keys_free(&s->tx);
+    tls13_keys_free(&s->rx);
+    memset(&s->tx, 0, sizeof(s->tx));
+    memset(&s->rx, 0, sizeof(s->rx));
     s->up = 0;
     xs_conn_close(&s->conn);
 }
@@ -849,12 +857,11 @@ static void spoke_frame_cb(void *ctx, const uint8_t *f, size_t n) {
 /* Отдать поток и ключи. Отдельно от session_down: там закрывается поддельное соединение,
  * которого здесь нет вовсе. */
 static void stream_down(struct spoke *s) {
-    if (s->up) {
-        tls13_keys_free(&s->tx);
-        tls13_keys_free(&s->rx);
-        memset(&s->tx, 0, sizeof(s->tx));
-        memset(&s->rx, 0, sizeof(s->rx));
-    }
+    /* Без оглядки на s->up — по той же причине, что в session_down. */
+    tls13_keys_free(&s->tx);
+    tls13_keys_free(&s->rx);
+    memset(&s->tx, 0, sizeof(s->tx));
+    memset(&s->rx, 0, sizeof(s->rx));
     /* Прошлые ключи эпох живут в ратчете, и освободить их обязан он: у них свой контекст
      * шифра в куче. Затирается там же и корень — из него выводятся все будущие ключи. */
     xs_epoch_stop(&s->ep_tx);
