@@ -9,7 +9,7 @@ BUILD  := build
 VERSION := $(shell cat VERSION 2>/dev/null || echo dev)
 DEFS    := -DSTEER_VERSION='"$(VERSION)"'
 
-.PHONY: all test clean ext-syntax
+.PHONY: all test clean ext-syntax ext-test
 all: $(BUILD)/steer
 
 $(BUILD)/steer: src/steer.c src/spec.c src/dnsd.c src/failover.c src/aggregate.c \
@@ -61,6 +61,16 @@ ext-syntax:
 		$(CC) $(CFLAGS) -fsyntax-only -Itests/stub -Isrc $$f || exit 1; \
 	done
 	@echo "ext-syntax: src/ext компилируется"
+
+# Стенды src/ext, которым нужен НАСТОЯЩИЙ mbedtls: xsloop (рукопожатие целиком) и spokematch
+# (освобождение ключей под ASan). В `make test` они не входят — там mbedtls нет по построению
+# (R-014, см. ext-syntax), а роутерная сборка ext идёт только docker'ом (build.sh), поэтому оба
+# до запуска 42 не прогонялись ни разу и дали I-066/I-067 первым же прогоном. Цель закрывает
+# разрыв (R-058): библиотека ищется через STEER_MBEDTLS, pkg-config или системные пути; не
+# нашлась — ГРОМКИЙ пропуск, а не падение; версия печатается (docker собирает 3.x, зелёное на
+# 2.28 не равно зелёному в релизе). Вся логика — в tests/ext-test.sh, как у прочих *.sh-стендов.
+ext-test:
+	@BUILD=$(BUILD) CC="$(CC)" sh tests/ext-test.sh
 
 # Подбор доменного правила проверяется отдельной программой, а не через движок: сам подбор
 # статический внутри dnsd.c, и дотянуться до него иначе значило бы добавить в движок
