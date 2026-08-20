@@ -2664,7 +2664,7 @@ static struct vless_node g_nodes[MAX_NODES];
  * читается подписка» разошлось бы между подъёмом, списком и проверкой — а расхождение
  * здесь означало бы, что человек выбирает в интерфейсе не тот узел, который поднимется. */
 static int load_nodes(const char *spec_path, const char *out_name, struct output **out,
-                      size_t *cnt, size_t *skipped, size_t *foreign) {
+                      size_t *cnt, struct vless_sub_stats *st) {
     load_spec(spec_path);
     struct output *o = out_by_name(out_name);
     if (!o) { fprintf(stderr, LOG_W2 "выхода %s нет в спеке\n", out_name); return 2; }
@@ -2684,7 +2684,7 @@ static int load_nodes(const char *spec_path, const char *out_name, struct output
     const char *text = raw;
     if (!strstr(raw, "://")) { b64_decode(raw, n, dec, sizeof(dec)); text = dec; }
 
-    *cnt = vless_parse_sub(text, g_nodes, MAX_NODES, skipped, foreign);
+    *cnt = vless_parse_sub(text, g_nodes, MAX_NODES, st);
     return 0;
 }
 
@@ -2712,6 +2712,28 @@ static void node_json(const struct vless_node *n, int index) {
     printf("}");
 }
 
+/* Причины, по которым узлы не попали в список. Массив, а не одна строка: причин у
+ * одной подписки бывает несколько, и «поддержки ws нет» рядом с «reality без pbk» —
+ * это два разных действия для владельца подписки. Печатается всегда, в том числе
+ * пустым: потребитель, который проверяет наличие поля, не должен отличать «причин нет»
+ * от «движок старый». */
+static void skipped_json(const struct vless_sub_stats *st) {
+    printf(",\"skipped_reasons\":[");
+    for (size_t i = 0; i < st->reasons_n; i++) {
+        if (i) putchar(',');
+        printf("{\"reason\":");
+        json_str(st->reasons[i].reason);
+        printf(",\"count\":%zu,\"example\":", st->reasons[i].count);
+        json_str(st->reasons[i].example);
+        printf("}");
+    }
+    printf("]");
+    /* Причин больше, чем влезло в VLESS_SKIP_REASONS. Печатается только когда есть, но
+     * молчать об этом нельзя: иначе сумма count разойдётся со skipped, и читающий
+     * решит, что часть узлов пропала. */
+    if (st->reasons_dropped) printf(",\"skipped_other\":%zu", st->reasons_dropped);
+}
+
 /* Перечислить узлы подписки.
  *
  * Индекс здесь — это индекс среди ПРИГОДНЫХ узлов, и он же понимается движком в поле
@@ -2721,8 +2743,9 @@ static void node_json(const struct vless_node *n, int index) {
  * отдельно и объясняются причиной, но номеров не занимают. */
 int cmd_vless_nodes(const char *spec_path, const char *out_name) {
     struct output *o = NULL;
-    size_t cnt = 0, skipped = 0, foreign = 0;
-    int rc = load_nodes(spec_path, out_name, &o, &cnt, &skipped, &foreign);
+    size_t cnt = 0;
+    struct vless_sub_stats st;
+    int rc = load_nodes(spec_path, out_name, &o, &cnt, &st);
     if (rc) return rc;
 
     printf("{\"output\":");
@@ -2730,12 +2753,14 @@ int cmd_vless_nodes(const char *spec_path, const char *out_name) {
     printf(",\"sub_file\":");
     json_str(o->sub_file);
     printf(",\"node\":%d,\"usable\":%zu,\"skipped\":%zu,\"foreign\":%zu,\"nodes\":[",
-           o->node_index, cnt, skipped, foreign);
+           o->node_index, cnt, st.skipped, st.foreign);
     for (size_t i = 0; i < cnt; i++) {
         if (i) putchar(',');
         node_json(&g_nodes[i], (int)i);
     }
-    printf("]}\n");
+    printf("]");
+    skipped_json(&st);
+    printf("}\n");
     return 0;
 }
 
@@ -2749,12 +2774,15 @@ int cmd_vless_nodes(const char *spec_path, const char *out_name) {
  * ubus. Интерфейс спрашивает по одному и заполняет таблицу постепенно. */
 int cmd_vless_probe(const char *spec_path, const char *out_name, int node, int timeout_s) {
     struct output *o = NULL;
-    size_t cnt = 0, skipped = 0, foreign = 0;
-    int rc = load_nodes(spec_path, out_name, &o, &cnt, &skipped, &foreign);
+    size_t cnt = 0;
+    struct vless_sub_stats st;
+    int rc = load_nodes(spec_path, out_name, &o, &cnt, &st);
     if (rc) return rc;
     if (!cnt) {
         printf("{\"ok\":false,\"error\":\"в подписке нет пригодных узлов\","
-               "\"skipped\":%zu,\"foreign\":%zu}\n", skipped, foreign);
+               "\"skipped\":%zu,\"foreign\":%zu", st.skipped, st.foreign);
+        skipped_json(&st);
+        printf("}\n");
         return 1;
     }
     if (node >= (int)cnt) {
@@ -2789,16 +2817,24 @@ int cmd_vless_probe(const char *spec_path, const char *out_name, int node, int t
 
 int cmd_vless(const char *spec_path, const char *out_name) {
     struct output *o = NULL;
-    size_t cnt = 0, skipped = 0, foreign = 0;
-    int rc = load_nodes(spec_path, out_name, &o, &cnt, &skipped, &foreign);
+    size_t cnt = 0;
+    struct vless_sub_stats st;
+    int rc = load_nodes(spec_path, out_name, &o, &cnt, &st);
     if (rc) return rc;
     struct vless_node *nodes = g_nodes;
     if (!cnt) {
         fprintf(stderr, LOG_W2 "в подписке нет пригодных узлов "
-                        "(пропущено %zu, чужих протоколов %zu)\n", skipped, foreign);
+                        "(пропущено %zu, чужих протоколов %zu)\n", st.skipped, st.foreign);
+        /* Причины — в журнал тоже, а не только в ubus: подъём выхода идёт из procd, и
+         * человек, который смотрит logread, иначе видит ровно то же «пропущено 26» без
+         * объяснения, из-за которого и завёлся splicicd#16. */
+        for (size_t i = 0; i < st.reasons_n; i++)
+            fprintf(stderr, LOG_W2 "  %s — узлов %zu%s%s\n", st.reasons[i].reason,
+                    st.reasons[i].count, st.reasons[i].example[0] ? ", например " : "",
+                    st.reasons[i].example);
         return 1;
     }
-    fprintf(stderr, LOG_I2 "узлов %zu (пропущено %zu, чужих %zu)\n", cnt, skipped, foreign);
+    fprintf(stderr, LOG_I2 "узлов %zu (пропущено %zu, чужих %zu)\n", cnt, st.skipped, st.foreign);
 
     /* Выбор узла. node=-1 означает «первый рабочий», и это умолчание не из лени: номер
      * узла в подписке меняется при её обновлении, а проверка находит живой сама. */

@@ -171,13 +171,34 @@ int vless_parse_url(const char *url, struct vless_node *n) {
     return 0;
 }
 
+/* Отнести непригодный узел к его причине. Единственное место, где растёт skipped:
+ * счётчик и объяснение обязаны сходиться, а два независимых инкремента — это ровно тот
+ * случай, когда «пропущено 26» и «причин на 24 узла» уезжают друг от друга молча. */
+static void skip_note(struct vless_sub_stats *st, const struct vless_node *n,
+                      const char *reason) {
+    if (!st) return;
+    st->skipped++;
+    for (size_t i = 0; i < st->reasons_n; i++) {
+        if (!strcmp(st->reasons[i].reason, reason)) { st->reasons[i].count++; return; }
+    }
+    if (st->reasons_n >= VLESS_SKIP_REASONS) { st->reasons_dropped++; return; }
+    struct vless_skip *s = &st->reasons[st->reasons_n++];
+    snprintf(s->reason, sizeof(s->reason), "%s", reason);
+    /* Пример — чтобы причину можно было привязать к узлу в подписке. Имя есть не
+     * всегда: во ссылке без '#' его нет вовсе, а у неразобранной ссылки может не быть
+     * и host — тогда пример остаётся пустым, и это честнее выдуманного «узел 3». */
+    if (n && n->name[0]) snprintf(s->example, sizeof(s->example), "%s", n->name);
+    else if (n && n->host[0]) snprintf(s->example, sizeof(s->example), "%s:%u",
+                                      n->host, n->port);
+    s->count = 1;
+}
+
 /* Разобрать текст подписки (уже декодированный из base64) в массив узлов.
- * Возвращает число ПРИГОДНЫХ; skipped получает число пропущенных. */
+ * Возвращает число ПРИГОДНЫХ; остальное — в st (может быть NULL). */
 size_t vless_parse_sub(const char *text, struct vless_node *out, size_t max,
-                       size_t *skipped, size_t *foreign) {
+                       struct vless_sub_stats *st) {
     size_t n = 0;
-    if (skipped) *skipped = 0;
-    if (foreign) *foreign = 0;
+    if (st) memset(st, 0, sizeof(*st));
     const char *p = text;
     while (*p && n < max) {
         while (*p == '\n' || *p == '\r' || *p == ' ' || *p == '\t') p++;
@@ -232,27 +253,31 @@ size_t vless_parse_sub(const char *text, struct vless_node *out, size_t max,
         if (len >= sizeof(line)) {
             /* Ссылка длиннее буфера. Считается непригодной, а не пропадает: см. ниже —
              * счётчики обязаны сходиться с числом ссылок в тексте. */
-            if (skipped && !strncmp(p, "vless://", 8)) (*skipped)++;
+            if (!strncmp(p, "vless://", 8))
+                skip_note(st, NULL, "ссылка длиннее 2048 байт");
         } else {
             memcpy(line, p, len);
             line[len] = '\0';
             if (!strncmp(line, "vless://", 8)) {
                 struct vless_node node;
                 int rc = vless_parse_url(line, &node);
-                /* rc == 0 — узел взят; иначе НЕ ВЗЯТ, и разница между «транспорт не
-                 * поддержан» (1) и «ссылку не разобрали» (-1) важна коду, но не
-                 * счётчику: и то, и другое — узел, которого человек в списке не
-                 * увидит. Раньше -1 не считался нигде, и ссылка исчезала бесследно —
+                /* rc == 0 — узел взят; иначе НЕ ВЗЯТ, и для счётчика это одно и то
+                 * же — узел, которого человек в списке не увидит, — а для объяснения
+                 * разное: у «транспорт не поддержан» (1) причина уже названа разбором,
+                 * у «ссылку не разобрали» (-1) её приходится называть здесь, потому
+                 * что разбор бросил ссылку раньше, чем добрался до пригодности.
+                 * Раньше -1 не считался нигде, и ссылка исчезала бесследно —
                  * так пропадал, например, узел с IPv6-литералом в host: первое
                  * двоеточие оказывается внутри скобок, порт читается как 0, разбор
                  * возвращает -1. Заголовок этого файла обещает обратное: «в ней 26
                  * узлов, а steer видит 17» должно объясняться цифрой. */
                 if (rc == 0) out[n++] = node;
-                else if (skipped) (*skipped)++;
-            } else if (strstr(line, "://") && foreign) {
+                else skip_note(st, &node, rc > 0 ? node.skip_reason
+                                                 : "ссылка не разобрана");
+            } else if (strstr(line, "://") && st) {
                 /* hy2, ss, trojan и прочее. Считаем, но не трогаем: подписка общая, а
                  * «26 узлов в подписке, 17 у steer» должно объясняться числом. */
-                (*foreign)++;
+                st->foreign++;
             }
         }
         p = e;

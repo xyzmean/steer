@@ -103,20 +103,20 @@ int main(void) {
      * второй узел, а первому обнулялось имя. */
     {
         struct vless_node nodes[8];
-        size_t skipped = 0, foreign = 0;
+        struct vless_sub_stats st;
         size_t n = vless_parse_sub("vless://a@h1:443#one" "vless://b@h2:443#two",
-                                   nodes, 8, &skipped, &foreign);
+                                   nodes, 8, &st);
         check_n("две склеенные ссылки разобраны как две", 2, (long)n);
         check("первая: имя не съело вторую", "one", nodes[0].name);
         check("вторая: хост свой", "h2", nodes[1].host);
-        check_n("склеенные: чужих протоколов нет", 0, (long)foreign);
+        check_n("склеенные: чужих протоколов нет", 0, (long)st.foreign);
     }
     {
         /* Имя без '#'-хвоста: граница обязана встать по схеме, не по цифрам порта. */
         struct vless_node nodes[8];
-        size_t skipped = 0, foreign = 0;
+        struct vless_sub_stats st;
         size_t n = vless_parse_sub("vless://a@h1:443" "vless://b@h2:8443",
-                                   nodes, 8, &skipped, &foreign);
+                                   nodes, 8, &st);
         check_n("склейка без имён: две ссылки", 2, (long)n);
         check_n("первой не откусили порт", 443, (long)nodes[0].port);
         check_n("второй достался свой порт", 8443, (long)nodes[1].port);
@@ -124,12 +124,12 @@ int main(void) {
     {
         /* Имя, оканчивающееся именем схемы, — граница всё равно по байтам перед '://'. */
         struct vless_node nodes[8];
-        size_t skipped = 0, foreign = 0;
+        struct vless_sub_stats st;
         size_t n = vless_parse_sub("vless://a@h1:443#Express" "ss://b@h2:443#other",
-                                   nodes, 8, &skipped, &foreign);
+                                   nodes, 8, &st);
         check_n("имя кончается на имя схемы: узел один", 1, (long)n);
         check("имя не обрезано", "Express", nodes[0].name);
-        check_n("следующая ссылка учтена как чужая", 1, (long)foreign);
+        check_n("следующая ссылка учтена как чужая", 1, (long)st.foreign);
     }
 
     /* ---- арифметика подписки (I-027) --------------------------------------
@@ -141,34 +141,104 @@ int main(void) {
      * возвращают -1, а -1 не считался нигде — узел пропадал из подписки бесследно. */
     {
         struct vless_node nodes[16];
-        size_t skipped = 0, foreign = 0;
+        struct vless_sub_stats st;
         const char *sub =
             "vless://a@1.2.3.4:443?security=reality&pbk=K&sni=x.com#ok\n"
             "vless://b@[2001:db8::1]:443?security=reality&pbk=K&sni=x.com#ipv6\n"
             "vless://c@5.6.7.8:0?security=reality&pbk=K&sni=x.com#zero-port\n"
             "vless://d@9.9.9.9:443?security=tls#tls\n"
             "hy2://e@10.0.0.1:443#foreign\n";
-        size_t n = vless_parse_sub(sub, nodes, 16, &skipped, &foreign);
+        size_t n = vless_parse_sub(sub, nodes, 16, &st);
         check_n("пригодных узлов", 1, (long)n);
-        check_n("чужих протоколов", 1, (long)foreign);
+        check_n("чужих протоколов", 1, (long)st.foreign);
         /* Четыре ссылки vless: одна взята, три нет — и все три обязаны быть в счётчике. */
-        check_n("непригодных ссылок vless учтено", 3, (long)skipped);
+        check_n("непригодных ссылок vless учтено", 3, (long)st.skipped);
         check_n("сумма сходится с числом ссылок в тексте",
-                5, (long)(n + skipped + foreign));
+                5, (long)(n + st.skipped + st.foreign));
     }
 
     /* Ссылка длиннее буфера строки тоже исчезала бесследно: ветка длины отбрасывала
      * её раньше разбора. Считается как непригодная — она и есть непригодная. */
     {
         struct vless_node nodes[4];
-        size_t skipped = 0, foreign = 0;
+        struct vless_sub_stats st;
         char big[4096];
         int k = snprintf(big, sizeof(big), "vless://u@h:443?sni=");
         memset(big + k, 'x', 2200);
         big[k + 2200] = '\0';
-        size_t n = vless_parse_sub(big, nodes, 4, &skipped, &foreign);
+        size_t n = vless_parse_sub(big, nodes, 4, &st);
         check_n("слишком длинная ссылка: не взята", 0, (long)n);
-        check_n("слишком длинная ссылка: учтена как непригодная", 1, (long)skipped);
+        check_n("слишком длинная ссылка: учтена как непригодная", 1, (long)st.skipped);
+        check("слишком длинная ссылка: причина названа", "ссылка длиннее 2048 байт",
+              st.reasons[0].reason);
+    }
+
+    /* ---- причины непригодности: сгруппированы и сходятся (splicicd#16) -----
+     *
+     * Движок знал причину и не говорил её: skip_reason читал только этот стенд, а
+     * cmd_vless_nodes печатал «пригодно 0, пропущено 26». Человек с подпиской из
+     * tls-узлов делал единственный возможный вывод — «не подключается».
+     *
+     * Проверяется не наличие поля, а два свойства, на которых оно живёт: причины
+     * СХОДЯТСЯ (сумма count равна skipped — иначе часть узлов пропала бы уже в
+     * объяснении) и СХЛОПЫВАЮТСЯ по тексту (три tls-узла — одна строка со счётчиком,
+     * а не три одинаковых). */
+    {
+        struct vless_node nodes[16];
+        struct vless_sub_stats st;
+        const char *sub =
+            "vless://a@1.1.1.1:443?security=tls#Первый\n"
+            "vless://b@2.2.2.2:443?security=tls#Второй\n"
+            "vless://c@3.3.3.3:443?security=tls#Третий\n"
+            "vless://d@4.4.4.4:443?type=ws&security=none#Вебсокет\n"
+            "vless://e@[2001:db8::1]:443?security=none#IPv6\n"
+            "vless://f@6.6.6.6:443?security=reality&pbk=K&sni=x.com#Годный\n";
+        size_t n = vless_parse_sub(sub, nodes, 16, &st);
+        check_n("причины: пригоден один узел", 1, (long)n);
+        check_n("причины: непригодных пять", 5, (long)st.skipped);
+        check_n("причины: разных причин три", 3, (long)st.reasons_n);
+        check_n("причины: ничего не потерялось", 0, (long)st.reasons_dropped);
+
+        size_t sum = 0;
+        for (size_t i = 0; i < st.reasons_n; i++) sum += st.reasons[i].count;
+        check_n("причины: сумма сходится со skipped", (long)st.skipped, (long)sum);
+
+        /* Порядок — по первому появлению, поэтому он предсказуем и его можно
+         * проверять: иначе стенд молчал бы о том, что причины перепутались. */
+        check("первая причина: security=tls", "security=tls не поддержан",
+              st.reasons[0].reason);
+        check_n("tls схлопнут в одну строку со счётчиком 3", 3, (long)st.reasons[0].count);
+        check("tls: пример — имя первого узла", "Первый", st.reasons[0].example);
+        check("вторая причина: транспорт ws", "транспорт ws не поддержан",
+              st.reasons[1].reason);
+        check("ws: пример — имя своего узла", "Вебсокет", st.reasons[1].example);
+        /* IPv6-литерал разбор не осиливает и до проверки пригодности не доходит —
+         * причину называет уже сам обход подписки, иначе ссылка снова стала бы
+         * «пропущено на единицу больше» без объяснения. */
+        check("третья причина: ссылка не разобрана", "ссылка не разобрана",
+              st.reasons[2].reason);
+    }
+
+    /* Причин больше, чем ведёр: девятая обязана попасть в reasons_dropped, а не
+     * потеряться. Сумма count плюс dropped по-прежнему равна skipped — на этом
+     * свойстве держится доверие к числу «пропущено N». */
+    {
+        struct vless_node nodes[16];
+        struct vless_sub_stats st;
+        char sub[1024];
+        size_t off = 0;
+        for (int i = 1; i <= 9; i++)
+            off += (size_t)snprintf(sub + off, sizeof(sub) - off,
+                                    "vless://u@h%d:443?security=s%d#n%d\n", i, i, i);
+        size_t n = vless_parse_sub(sub, nodes, 16, &st);
+        check_n("переполнение: пригодных нет", 0, (long)n);
+        check_n("переполнение: непригодных девять", 9, (long)st.skipped);
+        check_n("переполнение: причин влезло восемь", VLESS_SKIP_REASONS,
+                (long)st.reasons_n);
+        check_n("переполнение: девятая учтена отдельно", 1, (long)st.reasons_dropped);
+        size_t sum = st.reasons_dropped;
+        for (size_t i = 0; i < st.reasons_n; i++) sum += st.reasons[i].count;
+        check_n("переполнение: сумма всё равно сходится", (long)st.skipped, (long)sum);
     }
 
     printf("\n%d проверок пройдено", g_pass);
