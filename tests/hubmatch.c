@@ -43,6 +43,84 @@ static void check(const char *what, long want, long got) {
     }
 }
 
+/* ---- наблюдатель за поддельным соединением -----------------------------------
+ *
+ * xs_conn_send собирает сегмент TCP и отправляет его send() по своему сокету. Стенду сырой
+ * сокет не нужен (и прав на него нет): подставляем сокет UDP, соединённый с петлёй, — тогда
+ * «что именно ушло прибору» становится читаемой датаграммой, а не рассуждением о том, куда
+ * пошло исполнение. Флаги лежат в 13-м байте сегмента, нагрузка — за заголовком. */
+static int obs_fd = -1, obs_port;
+
+static int wire_open(void) {
+    if (obs_fd < 0) {
+        struct sockaddr_in a;
+        socklen_t al = sizeof(a);
+        obs_fd = socket(AF_INET, SOCK_DGRAM, 0);
+        memset(&a, 0, sizeof(a));
+        a.sin_family = AF_INET;
+        a.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+        bind(obs_fd, (struct sockaddr *)&a, sizeof(a));
+        getsockname(obs_fd, (struct sockaddr *)&a, &al);
+        obs_port = ntohs(a.sin_port);
+        int fl = fcntl(obs_fd, F_GETFL, 0);
+        fcntl(obs_fd, F_SETFL, fl | O_NONBLOCK);
+    }
+    int fd = socket(AF_INET, SOCK_DGRAM, 0);
+    struct sockaddr_in to;
+    memset(&to, 0, sizeof(to));
+    to.sin_family = AF_INET;
+    to.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    to.sin_port = htons((uint16_t)obs_port);
+    connect(fd, (struct sockaddr *)&to, sizeof(to));
+    return fd;
+}
+
+/* Взять следующий ушедший сегмент. -1 — не ушло ничего. */
+static uint8_t wire_buf[2048];
+static int wire_take(uint8_t **pay, size_t *pn) {
+    ssize_t n = recv(obs_fd, wire_buf, sizeof(wire_buf), MSG_DONTWAIT);
+    if (n < 20) return -1;
+    size_t hl = (size_t)(wire_buf[12] >> 4) * 4;
+    if (hl > (size_t)n) return -1;
+    if (pay) *pay = wire_buf + hl;
+    if (pn) *pn = (size_t)n - hl;
+    return wire_buf[13];
+}
+
+static void wire_drain(void) {
+    while (wire_take(NULL, NULL) >= 0) {}
+}
+
+/* ---- минимальный SYN с опцией MSS -------------------------------------------
+ *
+ * Собирается руками, а не берётся из захвата: подрезка смотрит ровно на четыре поля (версия,
+ * протокол, флаг SYN, опция 2 длиной 4), и пакет из 44 байт содержит их все и ничего сверх. */
+static size_t syn_build(uint8_t *ip, uint32_t src, uint32_t dst, int mss) {
+    size_t n = 44;                                 /* 20 IP + 24 TCP (20 + опция MSS) */
+    memset(ip, 0, n);
+    ip[0] = 0x45;
+    ip[2] = (uint8_t)(n >> 8);
+    ip[3] = (uint8_t)(n & 0xFF);
+    ip[8] = 64;                                    /* TTL: хабу его ещё уменьшать */
+    ip[9] = 6;                                     /* TCP */
+    uint32_t sn = htonl(src), dn = htonl(dst);
+    memcpy(ip + 12, &sn, 4);
+    memcpy(ip + 16, &dn, 4);
+    uint8_t *tcp = ip + 20;
+    tcp[12] = 6 << 4;                              /* смещение данных — 6 слов */
+    tcp[13] = 0x02;                                /* SYN */
+    tcp[20] = 2;                                   /* kind = MSS */
+    tcp[21] = 4;                                   /* длина опции */
+    tcp[22] = (uint8_t)(mss >> 8);
+    tcp[23] = (uint8_t)(mss & 0xFF);
+    return n;
+}
+
+static int syn_mss(const uint8_t *ip) {
+    const uint8_t *tcp = ip + 20;
+    return (tcp[22] << 8) | tcp[23];
+}
+
 int main(void) {
     printf("== хаб: арифметика записи ==\n");
 
@@ -184,6 +262,417 @@ int main(void) {
         check("  ack встал за ним", (long)(SYN_SEQ + 1), (long)s->conn.ack);
         check("  SYN-ACK сосчитан", 1, (long)w.d_syn);
         check("  в живые сессии не записан", 0, (long)w.d_syn_est);
+    }
+
+    /* ---- ограничители разных событий не общие (I-064) ------------------------
+     *
+     * У воркера три ограничителя частоты, и каждый заведён под СВОЁ событие. Сообщение о
+     * несобранных записях пользовалось ограничителем предупреждения о повторе метки времени:
+     * тогда два разных события глушат друг друга в течение XS_LOG_EVERY_MS, а хвост «и ещё N
+     * таких же» называет число, которое к напечатанной строке не относится. Ограничитель
+     * заведён ровно для того, чтобы это число было верным.
+     *
+     * Проверяется наблюдаемое состояние ЧУЖОГО ограничителя: после двух кадров о потерях
+     * сборки ограничитель метки времени обязан остаться нетронутым. */
+    printf("\n== хаб: ограничитель на событие, а не на всех ==\n");
+    {
+        static struct worker w;
+        struct sess *s = &g_sess[0];
+        memset(&w, 0, sizeof(w));
+        w.listen_port = 443; w.rx = -1; w.tx0 = -1; w.cap = 1;
+        memset(s, 0, sizeof(*s));
+        s->phase = PH_EST; s->peer = 0; s->batch_max = 8;
+        s->conn.fd = -1; s->conn.sport = 443; s->conn.dport = 40000;
+
+        uint8_t loss[8];
+        size_t ln = xs_loss_build(loss, sizeof(loss), 3);
+        check("кадр обратной связи по сборке собран", 1, ln > 0);
+        hub_frame(&w, s, loss, ln, 1000);          /* печатается, ограничитель заряжен */
+        hub_frame(&w, s, loss, ln, 1100);          /* в том же окне — подавлено */
+        check("пачка схлопнута до одного кадра", 1, (long)s->batch_max);
+        check("ограничитель метки времени не тронут", 0, (long)w.rl_stamp.last);
+        check("подавленное не сосчитано ограничителем метки времени", 0,
+              (long)w.rl_stamp.held);
+        check("оно сосчитано своим ограничителем", 1, (long)w.rl_reasm.held);
+    }
+
+    /* ---- кадр IPv6 и нижняя граница MTU (I-073, I-075) -----------------------
+     *
+     * Оба про одно: недоверенное значение, которое дальше разбирается не тем, чем оно
+     * является. hub_frame пропускал XS_IPV6 в route_packet, где кадр разбирается
+     * ИСКЛЮЧИТЕЛЬНО как IPv4: адрес источника читается по смещению 12, а у пакета IPv6 там
+     * лежат байты 4-7 его адреса источника. Обычно такой кадр отбрасывает проверка права на
+     * адрес — то есть «не поддерживается» выводилось из случайного отказа, — но пира,
+     * описанная в конфигурации, может подобрать эти байты так, чтобы они попали в её
+     * разрешённый диапазон, и тогда кадр IPv6 уезжает в устройство как пакет IPv4.
+     *
+     * Второе: MTU, названный пиром в XS_CTL_MTU, принимался по единственному условию mv > 0.
+     * Ниже ~492 запись перестаёт резаться (xs_conn_split_mm отказывает: сегментов больше, чем
+     * векторов), и к этой пире не уходит НИ ОДНОГО пакета — ни данных, ни keepalive, ни
+     * обратной связи, — причём молча. Пол у протокола есть: XS_MTU_FLOOR.
+     *
+     * Устройство подменено концом трубы: тогда «уехало в ядро» — наблюдаемый факт, а не
+     * рассуждение о том, куда пошло исполнение. */
+    printf("\n== хаб: кадр IPv6 и пол MTU ==\n");
+    {
+        static struct worker w;
+        struct sess *s = &g_sess[0];
+        int pf[2];
+        if (pipe(pf) != 0) { printf("нет трубы — проверка невозможна\n"); return 1; }
+        int fl = fcntl(pf[0], F_GETFL, 0);
+        fcntl(pf[0], F_SETFL, fl | O_NONBLOCK);
+
+        memset(&w, 0, sizeof(w));
+        w.listen_port = 443; w.rx = -1; w.tx0 = -1; w.cap = 1;
+        w.tun.fd = pf[1];
+        xs_sidx_reset(&w.idx);
+        memset(s, 0, sizeof(*s));
+        s->phase = PH_EST; s->peer = 0; s->batch_max = 1;
+        s->conn.fd = -1; s->conn.sport = 443; s->conn.dport = 40000;
+
+        /* Пир имеет право на 10.7.0.0/24 — ровно те байты, которые разбор IPv4 прочитает у
+         * кадра IPv6 как адрес источника. */
+        memset(&g_conf, 0, sizeof(g_conf));
+        g_conf.listen_port = 443;
+        g_conf.peer_n = 1;
+        g_conf.peer[0].allowed_n = 1;
+        g_conf.peer[0].allowed[0].net = 0x0A070000u;
+        g_conf.peer[0].allowed[0].mask = 0xFFFFFF00u;
+        g_conf.peer[0].allowed[0].plen = 24;
+        xs_router_build(&g_router, g_conf.peer, g_conf.peer_n);
+
+        uint8_t *pt = w.row + XS_HDR_ROOM;
+        memset(pt, 0, 40);
+        pt[0] = 0x60;                                  /* версия 6 */
+        pt[7] = 64;                                    /* hop limit */
+        pt[12] = 0x0A; pt[13] = 0x07; pt[14] = 0x00; pt[15] = 0x02;  /* середина src */
+        check("кадр опознан как IPv6", (long)XS_IPV6, (long)xs_frame_kind(pt, 40));
+        check("а разбор IPv4 прочёл бы эти байты как разрешённый адрес источника", 1,
+              xs_src_ok(&g_conf.peer[0], 0x0A070002u));
+        hub_frame(&w, s, pt, 40, 1000);
+        uint8_t sink[64];
+        ssize_t got = read(pf[0], sink, sizeof(sink));
+        check("кадр IPv6 в устройство не уехал", -1, (long)got);
+        check("он сосчитан своим счётчиком", 1, (long)w.d_ipv6);
+        hub_frame(&w, s, pt, 40, 1010);
+        check("вторая такая же строка подавлена своим ограничителем", 1,
+              (long)w.rl_ipv6.held);
+
+        /* Пол MTU. Значение ниже пола не принимается вовсе: прежнее остаётся в силе. */
+        uint8_t mf[8];
+        s->mtu = 1400;
+        size_t mn = xs_mtu_build(mf, sizeof(mf), 400);
+        check("кадр XS_CTL_MTU собран", 1, mn > 0);
+        hub_frame(&w, s, mf, mn, 1020);
+        check("MTU ниже пола не принят", 1400, (long)s->mtu);
+        mn = xs_mtu_build(mf, sizeof(mf), XS_MTU_FLOOR - 1);
+        hub_frame(&w, s, mf, mn, 1030);
+        check("на байт ниже пола — тоже не принят", 1400, (long)s->mtu);
+        mn = xs_mtu_build(mf, sizeof(mf), XS_MTU_FLOOR);
+        hub_frame(&w, s, mf, mn, 1040);
+        check("ровно пол — принят", (long)XS_MTU_FLOOR, (long)s->mtu);
+        close(pf[0]);
+        close(pf[1]);
+    }
+
+    /* ---- ответ неопознанному: четыре режима (I-076, R-062) -------------------
+     *
+     * Активное зондирование — это прибор, который сам присылает ClientHello (или «GET /
+     * HTTP/1.1», или просто мусор) и смотрит НА ОТВЕТ. До появления режимов ответ был один —
+     * семь байт фатального оповещения TLS, — и он отличим от настоящего сервера с сертификатом
+     * одной командой openssl s_client. Здесь проверяется, что каждый режим отвечает ровно тем,
+     * что обещает, и что дорожка проксирования делает три вещи, которые в реализации на Go
+     * нашлись только стендом: отдаёт прикрытию присланное БЕЗ ПРАВОК, режет ответ на сегменты и
+     * закрывает НАШУ сессию, когда прикрытие закрыло своё.
+     *
+     * Прикрытие здесь настоящее: слушающий сокет на петле. Ни root, ни сети наружу это не
+     * требует, а проверяет ровно то, что происходит в бою, — включая неблокирующий connect. */
+    printf("\n== хаб: ответ неопознанному ==\n");
+    {
+        static struct worker w;
+        struct sess *s = &g_sess[0];
+        const char *probe = "GET / HTTP/1.1\r\nHost: example.com\r\n\r\n";
+        size_t probe_n = strlen(probe);
+
+        /* Слушающий сокет прикрытия. */
+        int srv = socket(AF_INET, SOCK_STREAM, 0);
+        struct sockaddr_in sa;
+        socklen_t sl = sizeof(sa);
+        memset(&sa, 0, sizeof(sa));
+        sa.sin_family = AF_INET;
+        sa.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+        if (srv < 0 || bind(srv, (struct sockaddr *)&sa, sizeof(sa)) != 0 ||
+            listen(srv, 4) != 0 || getsockname(srv, (struct sockaddr *)&sa, &sl) != 0) {
+            printf("нет петлевого сокета — проверка невозможна\n");
+            return 1;
+        }
+        int decoy_port = ntohs(sa.sin_port);
+
+        memset(&g_conf, 0, sizeof(g_conf));
+        g_conf.listen_port = 443;
+        g_conf.peer_n = 0;
+
+        /* Каждый случай начинается с чистой сессии в фазе рукопожатия и настоящего сегмента с
+         * мусором вместо TLS: ровно то, что присылает прибор первым делом. */
+        struct { int mode; const char *name; } modes[3] = {
+            { XS_DECOY_ALERT,  "alert" },
+            { XS_DECOY_SILENT, "silent" },
+            { XS_DECOY_RESET,  "reset" },
+        };
+        for (int m = 0; m < 3; m++) {
+            memset(&w, 0, sizeof(w));
+            w.listen_port = 443; w.rx = -1; w.tx0 = -1; w.base = 0; w.cap = 1;
+            xs_sidx_reset(&w.idx);
+            memset(s, 0, sizeof(*s));
+            s->phase = PH_SYN; s->peer = -1; s->conn_id = -1; s->up_fd = -1;
+            s->conn.fd = wire_open(); s->conn.sport = 443; s->conn.dport = 40000;
+            s->conn.daddr = htonl(0x0A000001u);
+            g_conf.decoy = modes[m].mode;
+            wire_drain();
+
+            struct obfs_seg seg;
+            memset(&seg, 0, sizeof(seg));
+            seg.flags = 0x18;
+            seg.sport = 40000;
+            seg.saddr = htonl(0x0A000001u);
+            seg.payload = (const uint8_t *)probe;
+            seg.plen = probe_n;
+            hs_step(&w, s, &seg, 443, 1000);
+
+            uint8_t *pay = NULL;
+            size_t pn = 0;
+            int flags = wire_take(&pay, &pn);
+            printf("  режим %s:\n", modes[m].name);
+            check("  сессия закрыта", (long)PH_FREE, (long)s->phase);
+            if (modes[m].mode == XS_DECOY_ALERT) {
+                check("  ушло фатальное оповещение TLS", 0x18, flags);
+                check("  ровно семь байт", 7, (long)pn);
+                check("  и это запись типа alert", 0x15, pay ? pay[0] : 0);
+                check("  fatal handshake_failure", 0x0228,
+                      pay && pn == 7 ? (pay[5] << 8) | pay[6] : 0);
+            } else if (modes[m].mode == XS_DECOY_SILENT) {
+                check("  не ушло ничего", -1, flags);
+            } else {
+                check("  ушёл RST", 0x14, flags);
+                check("  без нагрузки", 0, (long)pn);
+            }
+        }
+
+        /* ---- proxy: настоящее соединение к прикрытию ------------------------- */
+        printf("  режим proxy:\n");
+        memset(&w, 0, sizeof(w));
+        w.listen_port = 443; w.rx = -1; w.tx0 = -1; w.base = 0; w.cap = 1;
+        xs_sidx_reset(&w.idx);
+        memset(s, 0, sizeof(*s));
+        s->phase = PH_SYN; s->peer = -1; s->conn_id = -1; s->up_fd = -1;
+        s->conn.fd = wire_open(); s->conn.sport = 443; s->conn.dport = 40000;
+        s->conn.daddr = htonl(0x0A000001u);
+        g_conf.decoy = XS_DECOY_PROXY;
+        snprintf(g_conf.decoy_dest, sizeof(g_conf.decoy_dest), "127.0.0.1");
+        g_conf.decoy_port = decoy_port;
+        g_decoy_live = 0;
+        wire_drain();
+        {
+            struct obfs_seg seg;
+            memset(&seg, 0, sizeof(seg));
+            seg.flags = 0x18;
+            seg.sport = 40000;
+            seg.saddr = htonl(0x0A000001u);
+            seg.payload = (const uint8_t *)probe;
+            seg.plen = probe_n;
+            hs_step(&w, s, &seg, 443, 1000);
+        }
+        check("  сессия жива и переведена на дорожку прикрытия", (long)PH_PROXY, (long)s->phase);
+        check("  соединение к прикрытию открыто", 1, s->up_fd >= 0);
+        check("  прибору пока не ушло ни байта отказа", -1, wire_take(NULL, NULL));
+        check("  занято одно место из предела", 1, (long)g_decoy_live);
+        check("  сосчитано", 1, (long)w.d_decoy);
+
+        int up = accept(srv, NULL, NULL);
+        check("  прикрытие приняло соединение", 1, up >= 0);
+        decoy_event(&w, s, POLLOUT, 1010);
+        check("  присланное отдано прикрытию целиком", 1, (long)s->up_ready);
+        {
+            uint8_t got[256];
+            ssize_t gn = recv(up, got, sizeof(got), 0);
+            check("  прикрытию ушло столько же байт, сколько прислал прибор",
+                  (long)probe_n, (long)gn);
+            check("  и ровно те же байты, без единой правки", 0,
+                  gn == (ssize_t)probe_n ? memcmp(got, probe, probe_n) : 1);
+        }
+
+        /* Ответ прикрытия режется на сегменты: у нас датаграммная семантика, и сегмент больше
+         * MSS просто не дойдёт. */
+        {
+            uint8_t big[1500];
+            for (size_t i = 0; i < sizeof(big); i++) big[i] = (uint8_t)(i & 0xFF);
+            check("  прикрытие ответило", (long)sizeof(big),
+                  (long)send(up, big, sizeof(big), 0));
+            decoy_event(&w, s, POLLIN, 1020);
+            uint8_t *pay = NULL;
+            size_t pn = 0, total = 0;
+            int segs = 0, ok_bytes = 1;
+            int flags;
+            while ((flags = wire_take(&pay, &pn)) >= 0) {
+                if (flags != 0x18) ok_bytes = 0;
+                if (pn > XSH_DECOY_CHUNK) ok_bytes = 0;
+                if (memcmp(pay, big + total, pn) != 0) ok_bytes = 0;
+                total += pn;
+                segs++;
+            }
+            check("  ответ прикрытия дошёл прибору целиком", (long)sizeof(big), (long)total);
+            check("  разрезанный на сегменты не больше куска", 2, segs);
+            check("  байты те же и флаги как у данных", 1, ok_bytes);
+        }
+
+        /* Продолжение прибора уходит прикрытию как есть. */
+        {
+            const char *more = "второй запрос";
+            struct obfs_seg seg;
+            memset(&seg, 0, sizeof(seg));
+            seg.flags = 0x18;
+            seg.sport = 40000;
+            seg.saddr = htonl(0x0A000001u);
+            seg.payload = (const uint8_t *)more;
+            seg.plen = strlen(more);
+            decoy_up(&w, s, &seg, 1030);
+            uint8_t got[64];
+            ssize_t gn = recv(up, got, sizeof(got), 0);
+            check("  продолжение прибора ушло прикрытию", (long)strlen(more), (long)gn);
+            check("  и тоже без правок", 0,
+                  gn > 0 ? memcmp(got, more, (size_t)gn) : 1);
+        }
+
+        /* ЗАКРЫТИЕ ПРИКРЫТИЯ ЗАКРЫВАЕТ И НАС. Без этого прибор, приславший запрос HTTP, не
+         * получал ничего: прикрытие закрывалось, а поддельное соединение висело — снаружи это
+         * ровно тот признак, ради устранения которого дорожка и заведена. */
+        close(up);
+        wire_drain();
+        decoy_event(&w, s, POLLIN, 1040);
+        {
+            uint8_t *pay = NULL;
+            size_t pn = 0;
+            int flags = wire_take(&pay, &pn);
+            check("  прикрытие закрылось — ушёл FIN", 0x11, flags);
+            check("  и наша сессия закрыта", (long)PH_FREE, (long)s->phase);
+            check("  место в пределе освобождено", 0, (long)g_decoy_live);
+        }
+
+        /* ПРЕДЕЛ ОДНОВРЕМЕННО ПРОКСИРУЕМЫХ. Без него поток зондирования превращается в нашу же
+         * атаку на прикрытие и на собственные дескрипторы. Сверх предела отвечаем как прежде. */
+        g_decoy_live = XSH_DECOY_MAX;
+        memset(s, 0, sizeof(*s));
+        s->phase = PH_SYN; s->peer = -1; s->conn_id = -1; s->up_fd = -1;
+        s->conn.fd = wire_open(); s->conn.sport = 443; s->conn.dport = 40000;
+        s->conn.daddr = htonl(0x0A000001u);
+        wire_drain();
+        {
+            struct obfs_seg seg;
+            memset(&seg, 0, sizeof(seg));
+            seg.flags = 0x18;
+            seg.sport = 40000;
+            seg.saddr = htonl(0x0A000001u);
+            seg.payload = (const uint8_t *)probe;
+            seg.plen = probe_n;
+            hs_step(&w, s, &seg, 443, 1050);
+            uint8_t *pay = NULL;
+            size_t pn = 0;
+            int flags = wire_take(&pay, &pn);
+            printf("  сверх предела:\n");
+            check("  соединения к прикрытию нет", 1, s->up_fd < 0);
+            check("  предел не превышен", (long)XSH_DECOY_MAX, (long)g_decoy_live);
+            check("  ответ прежний — оповещение", 0x18, flags);
+            check("  и оно те же семь байт", 7, (long)pn);
+            check("  сессия закрыта", (long)PH_FREE, (long)s->phase);
+        }
+        g_decoy_live = 0;
+        close(srv);
+    }
+
+    /* ---- MSS пир↔пир: узкое место — минимум ДВУХ тоннелей (I-077) ------------
+     *
+     * MSS в SYN объявляет то, что отправитель готов ПРИНИМАТЬ, то есть ограничивает сегменты,
+     * которые вторая сторона пошлёт ОБРАТНО, — а обратный путь идёт через тоннель отправителя.
+     * Подрезка только по MTU получателя оставляла обратному потоку предел шире, чем держит
+     * тоннель отправителя: при отправителе 1380 и получателе 1420 SYN уходил с MSS 1380, и
+     * полноразмерные ответы получателя в тоннель 1380 не влезали. Снаружи это «мелкое ходит,
+     * большое пропадает» между двумя пирами с разными MTU, причём молча: ICMP «нужна
+     * фрагментация» внутри тоннеля не рождается, а посчитать минимум кроме хаба некому — пиры
+     * друг о друге ничего не знают.
+     *
+     * Обе стороны проверяются нарочно: при получателе уже отправителя прежний код давал верное
+     * число, и односторонняя проверка прошла бы на баге.
+     *
+     * Сессия получателя оставлена НЕ в PH_EST намеренно: send_to отказывает на первой же
+     * проверке фазы под своим замком, то есть до шифрования в той же строке, и подрезанный
+     * пакет остаётся читаемым. Проверяется ровно то число, которое хаб подставил в подрезку. */
+    printf("\n== хаб: MSS пир↔пир по минимуму тоннелей ==\n");
+    {
+        static struct worker w;
+        struct sess *from = &g_sess[0], *d = &g_sess[1];
+
+        memset(&g_conf, 0, sizeof(g_conf));
+        g_conf.listen_port = 443;
+        g_conf.peer_n = 2;
+        g_conf.peer[0].allowed_n = 1;
+        g_conf.peer[0].allowed[0].net = 0x0A070000u;
+        g_conf.peer[0].allowed[0].mask = 0xFFFFFF00u;
+        g_conf.peer[0].allowed[0].plen = 24;
+        g_conf.peer[1].allowed_n = 1;
+        g_conf.peer[1].allowed[0].net = 0x0A080000u;
+        g_conf.peer[1].allowed[0].mask = 0xFFFFFF00u;
+        g_conf.peer[1].allowed[0].plen = 24;
+        xs_router_build(&g_router, g_conf.peer, g_conf.peer_n);
+
+        /* Таблица пир→сессия у стенда нулевая, а ноль — это индекс живой сессии: без сброса
+         * peer_pick вернул бы сессию отправителя. */
+        for (int i = 0; i < XS_PEERS_MAX; i++)
+            for (int c = 0; c < XS_CONNS_MAX; c++) g_peer_sess[i][c] = -1;
+        g_peer_sess[1][0] = (int16_t)(d - g_sess);
+
+        struct { int from_mtu, d_mtu, want; const char *name; } cs[5] = {
+            { 1380, 1420, 1340, "тоннель отправителя уже: 1380 против 1420" },
+            { 1420, 1380, 1340, "тоннель получателя уже: 1420 против 1380" },
+            { 1300, 1300, 1260, "узкое место сам хаб — оба по 1300" },
+            {    0, 1420, 1380, "отправитель размера не назвал — по получателю" },
+            { 1420,    0, 1380, "получатель не назвал — по отправителю" },
+        };
+        for (int i = 0; i < 5; i++) {
+            memset(&w, 0, sizeof(w));
+            w.listen_port = 443; w.rx = -1; w.tx0 = -1; w.cap = 1;
+            w.tun.fd = -1;
+            xs_sidx_reset(&w.idx);
+            memset(from, 0, sizeof(*from));
+            memset(d, 0, sizeof(*d));
+            from->phase = PH_EST; from->peer = 0; from->conn_id = 0;
+            from->mtu = cs[i].from_mtu; from->conn.fd = -1;
+            d->phase = PH_SYN; d->peer = 1; d->conn_id = 0;
+            d->mtu = cs[i].d_mtu; d->conn.fd = -1;
+
+            uint8_t *pt = w.row + XS_HDR_ROOM;
+            size_t pn = syn_build(pt, 0x0A070002u, 0x0A080002u, 1460);
+            route_packet(&w, from, pt, pn, 1000);
+            printf("  %s:\n", cs[i].name);
+            check("  MSS по узкому месту пути, а не по одному концу",
+                  (long)cs[i].want, (long)syn_mss(pt));
+        }
+
+        /* Ни один MTU не согласован — подрезать не по чему, опция остаётся как пришла. */
+        memset(&w, 0, sizeof(w));
+        w.listen_port = 443; w.rx = -1; w.tx0 = -1; w.cap = 1;
+        w.tun.fd = -1;
+        xs_sidx_reset(&w.idx);
+        memset(from, 0, sizeof(*from));
+        memset(d, 0, sizeof(*d));
+        from->phase = PH_EST; from->peer = 0; from->conn.fd = -1;
+        d->phase = PH_SYN; d->peer = 1; d->conn.fd = -1;
+        {
+            uint8_t *pt = w.row + XS_HDR_ROOM;
+            size_t pn = syn_build(pt, 0x0A070002u, 0x0A080002u, 1460);
+            route_packet(&w, from, pt, pn, 1000);
+            printf("  размера не назвал никто:\n");
+            check("  MSS не тронут", 1460, (long)syn_mss(pt));
+        }
     }
 
     printf(fails ? "\nПРОВАЛОВ: %d\n" : "\nвсе проверки прошли\n", fails);

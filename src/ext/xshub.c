@@ -87,6 +87,28 @@
  * обрывом. Ровно это и показал живой стенд. Так же устроен WireGuard: keepalive посылает
  * ПРИНИМАЮЩАЯ сторона, и по той же причине. Десять секунд — его же интервал. */
 #define XSH_KEEPALIVE_MS 10000
+/* ---- защита от активного зондирования (Decoy, R-062) ------------------------
+ *
+ * Числа взяты у реализации на Go (hub/decoy.go), где эта дорожка уже прошла стенд настоящим
+ * openssl s_client, и каждое из них про свою цену:
+ *
+ * XSH_DECOY_MAX — сколько неопознанных проксируется ОДНОВРЕМЕННО на весь хаб. Предел
+ *   обязателен: каждое такое соединение — настоящий сокет к сайту-прикрытию, и без предела
+ *   поток зондирования превращался бы в нашу же атаку на прикрытие и на собственные
+ *   дескрипторы. Тридцать два — то же число, что в Go.
+ * XSH_DECOY_CONN_MS — сколько ждём, пока прикрытие ответит на connect. Прибор всё это время
+ *   не получает ничего; дольше пяти секунд молчать хуже, чем ответить оповещением, поэтому по
+ *   истечении срока дорожка сдаётся и отвечает как прежде.
+ * XSH_DECOY_IDLE_MS — сколько живёт дорожка без единого байта. Тридцать секунд: сессии
+ *   зондирования не нужен предел простоя хаба (три минуты), а держать сокет к прикрытию
+ *   дольше — значит платить за прибор, который уже ушёл.
+ * XSH_DECOY_CHUNK — сколько байт ответа прикрытия уезжает одним поддельным сегментом. Меньше
+ *   MSS по построению: у нас датаграммная семантика, и сегмент больше MSS просто не дойдёт. */
+#define XSH_DECOY_MAX     32
+#define XSH_DECOY_CONN_MS 5000
+#define XSH_DECOY_IDLE_MS 30000
+#define XSH_DECOY_CHUNK   1200
+
 /* Обратная связь по сборке разрезанных записей — те же числа, что у пира, и по тем же причинам. */
 #define XSH_REASM_COOL_MS   10000
 #define XSH_REASM_REPORT_MS 2000
@@ -94,7 +116,10 @@
 
 int run_quiet(const char *const argv[]);
 
-enum sess_phase { PH_FREE, PH_SYN, PH_HS, PH_EST };
+/* PH_PROXY — не наша сессия вовсе: её байты переливаются настоящему серверу и обратно
+ * (см. Decoy ниже). Ключей у неё нет и никогда не будет, поэтому ни один путь данных пиров её
+ * не касается: send_to отправляет только в PH_EST, а привязка пир→сессия ей не выдаётся. */
+enum sess_phase { PH_FREE, PH_SYN, PH_HS, PH_EST, PH_PROXY };
 
 struct sess {
     struct xs_conn conn;
@@ -121,6 +146,19 @@ struct sess {
     int      mtu;
     long long handshake_at;
     unsigned long long up_pkts, down_pkts;
+    /* ---- дорожка неопознанного (Decoy = proxy) ------------------------------
+     * up_fd    — НАСТОЯЩЕЕ соединение к сайту-прикрытию; -1, если его нет. Неблокирующее и
+     *            живёт в том же poll, что сырой сокет и очередь TUN: блокирующего вызова в
+     *            цикле воркера нет ни одного, и появиться он здесь не должен тем более —
+     *            прикрытие может не ответить вовсе.
+     * up_ready — connect завершился И присланное прибором уже отдано прикрытию целиком.
+     * up_sent  — сколько байт присланного уже ушло: сокет неблокирующий, значит запись бывает
+     *            частичной, и остаток дописывается по следующему POLLOUT.
+     * up_at    — последнее движение на дорожке: по нему считаются оба срока выше. */
+    int      up_fd;
+    int      up_ready;
+    size_t   up_sent;
+    long long up_at;
 };
 
 static struct sess g_sess[XSH_MAX_SESS];
@@ -139,6 +177,11 @@ static uint64_t g_last_stamp[XS_PEERS_MAX];
  * определено ею, а не порядком прихода — переподключение одного соединения не задевает
  * остальные. -1 означает «этого соединения нет». */
 static int16_t g_peer_sess[XS_PEERS_MAX][XS_CONNS_MAX];
+
+/* Сколько неопознанных проксируется прямо сейчас. На ВЕСЬ хаб, а не на воркера: предел
+ * защищает сайт-прикрытие и наши дескрипторы, а они общие для всех воркеров. Живёт под g_ctl —
+ * меняется раз на неопознанное соединение, то есть на горячем пути не встречается. */
+static int g_decoy_live;
 
 /* Замок на ОТПРАВКУ в сессию. Держится ОТДЕЛЬНО от struct sess, а не полем в ней, и это не
  * вкус: sess_free обнуляет структуру целиком (memset), а обнулить мьютекс, который в этот миг
@@ -185,9 +228,18 @@ struct worker {
     uint8_t hs[2048];
     /* Ограничители на строки, которые вызывает чужой пакет: до них добирается кто угодно из
      * интернета, и без ограничителя одна такая строка — способ залить журнал VPS. Свои у
-     * каждого воркера: общие потребовали бы замка на пути, который и так под потоком. */
-    struct xs_ratelog rl_unknown, rl_stamp, rl_synest;
-    unsigned long long d_seg, d_bad, d_syn, d_hs, d_data, d_alien, d_syn_est;
+     * каждого воркера: общие потребовали бы замка на пути, который и так под потоком.
+     *
+     * ОГРАНИЧИТЕЛЬ — НА СОБЫТИЕ, а не на воркера, и это не аккуратность. Общий на два события
+     * означает, что они глушат друг друга в течение XS_LOG_EVERY_MS, а хвост «и ещё N таких
+     * же» называет число, посчитанное по обоим — то есть не относящееся к напечатанной строке.
+     * Ограничитель заведён ровно для того, чтобы это число было верным (I-064: сообщение о
+     * несобранных записях пользовалось ограничителем предупреждения о повторе метки времени,
+     * и признак повтора рукопожатия глушился потоком сообщений о потерях сборки). */
+    struct xs_ratelog rl_unknown, rl_stamp, rl_synest, rl_reasm, rl_mtu, rl_ipv6,
+                      rl_decoy;
+    unsigned long long d_seg, d_bad, d_syn, d_hs, d_data, d_alien, d_syn_est, d_ipv6,
+                       d_decoy;
 };
 
 /* Строка ОБЯЗАНА вмещать самую большую запись, какую собирает цикл TUN, вместе с местом под
@@ -231,11 +283,23 @@ static void sess_free(struct worker *w, struct sess *s) {
     tls13_keys_free(&s->tx);
     tls13_keys_free(&s->rx);
     xs_hs_wipe(&s->hs);
+    /* Соединение с прикрытием закрывается ЗДЕСЬ, а не в отдельной уборке: сессию освобождают
+     * шесть разных путей, и «закрою сокет там, где освобождаю» означало бы утечку дескрипторов
+     * на том из них, о котором забудут. Счётчик одновременно проксируемых уменьшается тем же
+     * действием, поэтому разойтись с числом живых сокетов ему нечем. */
+    if (s->up_fd >= 0) {
+        close(s->up_fd);
+        s->up_fd = -1;
+        pthread_mutex_lock(&g_ctl);
+        if (g_decoy_live > 0) g_decoy_live--;
+        pthread_mutex_unlock(&g_ctl);
+    }
     xs_conn_close(&s->conn);
     memset(s, 0, sizeof(*s));
     s->peer = -1;
     s->conn_id = -1;
     s->conn.fd = -1;
+    s->up_fd = -1;
     pthread_mutex_unlock(&g_tx_lock[s - g_sess]);
 }
 
@@ -270,6 +334,7 @@ static struct sess *sess_alloc(struct worker *w, const struct obfs_seg *seg, int
     memset(s, 0, sizeof(*s));
     s->peer = -1;
     s->conn_id = -1;
+    s->up_fd = -1;                  /* ноль — это stdin: дескриптор обязан быть назван явно */
     /* Свой сырой сокет на сессию, подключённый к её адресу: тогда ядро само демультиплексирует
      * отправку, и адрес не приходится указывать на каждый пакет. Тот же приём, что в obfs.c. */
     s->conn.fd = obfs_raw_open(seg->saddr, &s->conn.saddr);
@@ -373,6 +438,221 @@ static void sess_tick_locked(struct sess *s, long long now) {
     pthread_mutex_unlock(lk);
 }
 
+/* ---- дорожка неопознанного --------------------------------------------------
+ *
+ * ПОЧЕМУ ПРОКСИРОВАНИЕ ЗДЕСЬ ВОЗМОЖНО, ХОТЯ В ПЛАНЕ БЫЛО НАПИСАНО, ЧТО НЕТ. Прежний довод
+ * звучал так: «проксирование требует настоящей точки TCP, а слушающий сокет на том же порту
+ * отвечал бы SYN-ACK нашим же пирам». Это верно про слушающий сокет ЯДРА и неверно про нас:
+ * поддельным TCP хаб владеет сам, в пользовательском пространстве (src/obfs.c, сырые сокеты), и
+ * сокета ядра на порту нет вовсе. Значит хаб может сам открыть НАСТОЯЩЕЕ соединение к
+ * сайту-прикрытию и переливать байты в обе стороны через своё поддельное. Пир при этом не
+ * задета ничем: её сессия опознана раньше, чем начинается эта дорожка.
+ *
+ * ЧЕГО ЭТА ДОРОЖКА НЕ ДАЁТ, СКАЗАНО ПРЯМО. Наш поддельный TCP не делает повторных передач:
+ * потерянный сегмент рукопожатия TLS означает для прибора зависшее соединение, а не
+ * «поддельный сервер». На обычном пути потерь нет, и прибор видит настоящий сайт; на рваном он
+ * увидит обрыв — подозрительно, но неотличимо от плохой связи. Второе: прикрытие отвечает
+ * ЧЕРЕЗ нас, поэтому круг задержки складывается, и прибор, умеющий мерить время до ServerHello,
+ * разницу увидит; лечится выбором прикрытия рядом с хабом.
+ *
+ * НИ ОДНОГО БЛОКИРУЮЩЕГО ВЫЗОВА. Соединение открывается неблокирующим connect и живёт в том же
+ * poll, что сырой сокет и очередь TUN. Иначе один не отвечающий сайт-прикрытие останавливал бы
+ * весь воркер вместе со всеми его туннелями — цена защиты оказалась бы выше защищаемого. */
+
+/* Отказ формой настоящего фатального оповещения TLS: так отвечает сервер, которому предложили
+ * то, чего он не может. Вынесено в функцию, потому что этих мест стало пять. */
+static void hub_alert(struct sess *s) {
+    uint8_t alert[16];
+    size_t an = xs_hs_alert(alert, sizeof(alert));
+    if (an) xs_conn_send(&s->conn, 0x18 /* PSH|ACK */, alert, an, 0);
+}
+
+/* Открыть соединение к сайту-прикрытию. 1 — дорожка началась (сессия жива и переходит в
+ * PH_PROXY), 0 — не вышло, отвечать придётся как прежде. */
+static int decoy_start(struct worker *w, struct sess *s, long long now) {
+    if (g_conf.decoy != XS_DECOY_PROXY || !g_conf.decoy_port) return 0;
+    /* Предел проверяется ПЕРВЫМ и занимает место сразу: между проверкой и занятием другой
+     * воркер успел бы занять последнее место, и «не больше тридцати двух» стало бы «около». */
+    pthread_mutex_lock(&g_ctl);
+    int taken = g_decoy_live < XSH_DECOY_MAX;
+    if (taken) g_decoy_live++;
+    pthread_mutex_unlock(&g_ctl);
+    if (!taken) {
+        unsigned long long held = 0;
+        if (xs_ratelog(&w->rl_decoy, now, XS_LOG_EVERY_MS, &held)) {
+            char tail[64];
+            fprintf(stderr, LOG_W "неопознанных больше %d одновременно — этому отказываю%s\n",
+                    XSH_DECOY_MAX, xs_held_str(held, tail, sizeof(tail)));
+        }
+        return 0;
+    }
+    struct sockaddr_in to;
+    memset(&to, 0, sizeof(to));
+    to.sin_family = AF_INET;
+    to.sin_port = htons((uint16_t)g_conf.decoy_port);
+    if (inet_pton(AF_INET, g_conf.decoy_dest, &to.sin_addr) != 1) goto fail;
+    {
+        int fd = socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
+        if (fd < 0) goto fail;
+        if (connect(fd, (struct sockaddr *)&to, sizeof(to)) != 0 && errno != EINPROGRESS) {
+            close(fd);
+            goto fail;
+        }
+        s->up_fd = fd;
+    }
+    s->up_ready = 0;
+    s->up_sent = 0;
+    s->up_at = now;
+    s->phase = PH_PROXY;
+    w->d_decoy++;
+    return 1;
+fail:
+    pthread_mutex_lock(&g_ctl);
+    if (g_decoy_live > 0) g_decoy_live--;
+    pthread_mutex_unlock(&g_ctl);
+    return 0;
+}
+
+/* ЕДИНСТВЕННАЯ дорожка для тех, кто не наш, и это её главное свойство.
+ *
+ * Отвечать оповещением из четырёх разных мест (не разобрали Hello, не похоже на TLS вовсе, нет
+ * такого пира, метка времени старее прошлой) означало, что четыре ответа могут разойтись по
+ * поведению — а разница в ответе на два разных «не наш» рассказывает прибору, ГДЕ его отвергли.
+ * Ровно это и было: три места отвечали оповещением, а повтор метки времени молча закрывал
+ * сессию, то есть отвечал «silent» независимо от настройки. */
+static void hub_stranger(struct worker *w, struct sess *s, long long now) {
+    switch (g_conf.decoy) {
+    case XS_DECOY_SILENT:
+        break;
+    case XS_DECOY_RESET:
+        xs_conn_send(&s->conn, 0x14 /* RST|ACK */, NULL, 0, 0);
+        break;
+    case XS_DECOY_PROXY:
+        if (decoy_start(w, s, now)) return;   /* сессию доведёт сама дорожка */
+        /* Не вышло открыть соединение — отвечаем как настоящий сервер, у которого не сошлось:
+         * это хуже проксирования, но лучше молчания. */
+        hub_alert(s);
+        break;
+    default:
+        hub_alert(s);
+        break;
+    }
+    sess_free(w, s);
+}
+
+/* Событие на соединении с прикрытием. Возвращает 1, если сессия освобождена.
+ *
+ * Вынесено из цикла воркера ради стенда: внутри цикла эту дорожку окружают poll и сырой сокет,
+ * а проверять её надо на настоящем соединении к настоящему слушающему сокету (tests/hubmatch.c
+ * поднимает его на петле). */
+static int decoy_event(struct worker *w, struct sess *s, short rev, long long now) {
+    if (s->phase != PH_PROXY || s->up_fd < 0) return 0;
+    /* ---- connect ещё не завершился ---------------------------------------- */
+    if (!s->up_ready) {
+        if (rev & (POLLERR | POLLHUP | POLLNVAL)) goto give_up;
+        if (!(rev & POLLOUT)) return 0;
+        int err = 0;
+        socklen_t el = sizeof(err);
+        if (getsockopt(s->up_fd, SOL_SOCKET, SO_ERROR, &err, &el) != 0 || err) goto give_up;
+        /* ПЕРВЫМ ДЕЛОМ уходит всё, что прислал прибор, — целиком и без единой правки. Именно
+         * всё накопленное, а не последний сегмент: Hello браузерного размера приходит
+         * несколькими сегментами, и отдать прикрытию только последний значило бы, что оно видит
+         * обрубок и отвечает не так, как ответило бы прибору напрямую. */
+        while (s->up_sent < s->hs_len) {
+            ssize_t n = send(s->up_fd, s->hs_buf + s->up_sent, s->hs_len - s->up_sent,
+                             MSG_NOSIGNAL);
+            if (n > 0) { s->up_sent += (size_t)n; continue; }
+            if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR)) return 0;
+            goto give_up;
+        }
+        s->up_ready = 1;
+        s->up_at = now;
+        unsigned long long held = 0;
+        if (xs_ratelog(&w->rl_decoy, now, XS_LOG_EVERY_MS, &held)) {
+            struct in_addr in;
+            char tail[64];
+            in.s_addr = s->conn.daddr;
+            fprintf(stderr, LOG_I "неопознанный с %s: отдаю настоящему серверу %s:%d%s\n",
+                    inet_ntoa(in), g_conf.decoy_dest, g_conf.decoy_port,
+                    xs_held_str(held, tail, sizeof(tail)));
+        }
+        return 0;
+    }
+    /* ---- ответ прикрытия — прибору ---------------------------------------- */
+    if (rev & POLLIN) {
+        /* Не больше XSH_BATCH кусков за событие: остальное дочитается следующим кругом poll, а
+         * туннели соседних сессий не ждут, пока прибор скачает страницу. */
+        for (int i = 0; i < XSH_BATCH; i++) {
+            uint8_t buf[XSH_DECOY_CHUNK];
+            ssize_t n = recv(s->up_fd, buf, sizeof(buf), MSG_DONTWAIT);
+            if (n == 0) goto closed;                 /* прикрытие закрылось */
+            if (n < 0) {
+                if (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR) break;
+                goto closed;
+            }
+            /* Отправка под тем же замком, что и данные пиров, только БЕЗ шифрования: прибор
+             * говорит настоящий TLS с настоящим сервером, и наше дело перенести байты, а не
+             * подписать их. Замок здесь не про nonce (у этой сессии ключей нет вовсе), а про то,
+             * что номер последовательности двигают ещё и подтверждения из обслуживания. */
+            pthread_mutex_lock(&g_tx_lock[s - g_sess]);
+            int rc = xs_conn_send(&s->conn, 0x18 /* PSH|ACK */, buf, (size_t)n, 0);
+            pthread_mutex_unlock(&g_tx_lock[s - g_sess]);
+            s->up_at = now;
+            if (rc != 0) goto closed;
+            if ((size_t)n < sizeof(buf)) break;
+        }
+        return 0;
+    }
+    if (rev & (POLLERR | POLLHUP | POLLNVAL)) goto closed;
+    return 0;
+
+give_up:
+    /* Прикрытие недоступно, а прибор ещё не получил ни байта — отвечаем как прежде. */
+    hub_alert(s);
+    sess_free(w, s);
+    return 1;
+closed:
+    /* ЗАКРЫТИЕ ПРИКРЫТИЯ ЗАКРЫВАЕТ И НАС, и это не вежливость. Настоящий сервер HTTPS на запрос
+     * HTTP отвечает отказом или закрывает соединение, но делает это БЫСТРО. Пока этого не было
+     * (в реализации на Go поймано стендом), прибор, приславший «GET / HTTP/1.1», не получал
+     * ничего: прикрытие закрывалось, а наше поддельное соединение оставалось висеть — снаружи
+     * это выглядит как открытый порт, который молчит, то есть как ровно тот признак, ради
+     * устранения которого вся дорожка и заведена. */
+    xs_conn_send(&s->conn, 0x11 /* FIN|ACK */, NULL, 0, 0);
+    sess_free(w, s);
+    return 1;
+}
+
+/* То, что прибор присылает дальше, уходит настоящему серверу. */
+static void decoy_up(struct worker *w, struct sess *s, const struct obfs_seg *seg,
+                     long long now) {
+    if (s->up_fd < 0) { sess_free(w, s); return; }
+    if (!seg->plen) return;
+    /* Присланное рукопожатие ещё не ушло целиком — дописываем в тот же буфер, иначе продолжение
+     * потока обогнало бы своё же начало. Предел буфера тот же, что у сборки Hello: сюда пишет
+     * кто угодно из интернета. */
+    if (!s->up_ready) {
+        if (s->hs_len + seg->plen > sizeof(s->hs_buf)) {
+            xs_conn_send(&s->conn, 0x11 /* FIN|ACK */, NULL, 0, 0);
+            sess_free(w, s);
+            return;
+        }
+        memcpy(s->hs_buf + s->hs_len, seg->payload, seg->plen);
+        s->hs_len += seg->plen;
+        return;
+    }
+    ssize_t n = send(s->up_fd, seg->payload, seg->plen, MSG_NOSIGNAL);
+    if (n != (ssize_t)seg->plen) {
+        /* Частичная отправка — это обрубок в середине записи TLS: прикрытию честнее закрыть
+         * соединение, чем скормить половину. Полный буфер отправки на этом пути означает, что
+         * прибор льёт быстрее, чем прикрытие читает, а зондирование так не выглядит. */
+        xs_conn_send(&s->conn, 0x11 /* FIN|ACK */, NULL, 0, 0);
+        sess_free(w, s);
+        return;
+    }
+    s->up_at = now;
+}
+
 /* Разобрать рукопожатие пира и ответить. */
 static void hs_step(struct worker *w, struct sess *s, const struct obfs_seg *seg,
                     int listen_port, long long now) {
@@ -382,10 +662,7 @@ static void hs_step(struct worker *w, struct sess *s, const struct obfs_seg *seg
      * из-за постквантового ключа), и наш такой же — иначе размер Hello сам по себе признак.
      * Значит первый сегмент почти всегда неполон, и разбирать его сразу нельзя. */
     if (s->hs_len + seg->plen > sizeof(s->hs_buf)) {
-        uint8_t alert[16];
-        size_t an = xs_hs_alert(alert, sizeof(alert));
-        if (an) xs_conn_send(&s->conn, 0x18, alert, an, 0);
-        sess_free(w, s);
+        hub_stranger(w, s, now);
         return;
     }
     memcpy(s->hs_buf + s->hs_len, seg->payload, seg->plen);
@@ -397,10 +674,7 @@ static void hs_step(struct worker *w, struct sess *s, const struct obfs_seg *seg
      * значит молчать в ответ на запрос HTTP — чего настоящий сервер не делает никогда, и что
      * отличимо не хуже молчания на Hello. */
     if (s->hs_len >= 2 && (s->hs_buf[0] != 0x16 || s->hs_buf[1] != 0x03)) {
-        uint8_t alert[16];
-        size_t an = xs_hs_alert(alert, sizeof(alert));
-        if (an) xs_conn_send(&s->conn, 0x18, alert, an, 0);
-        sess_free(w, s);
+        hub_stranger(w, s, now);
         return;
     }
     if (s->hs_len < 5) return;
@@ -409,17 +683,14 @@ static void hs_step(struct worker *w, struct sess *s, const struct obfs_seg *seg
         if (s->hs_len < want) return;
     }
     int rc = xs_hs_server_read(&s->hs, &g_sec, s->hs_buf, s->hs_len, peer_static);
-    s->hs_len = 0;
     if (rc != 0) {
-        /* Отказ имеет форму настоящего фатального оповещения TLS. Молчание было бы отличимо
-         * ещё сильнее — но от целенаправленного зондирования это всё равно не спасает, о чём
-         * сказано в docs/xsteer.md прямо. */
-        uint8_t alert[16];
-        size_t an = xs_hs_alert(alert, sizeof(alert));
-        if (an) xs_conn_send(&s->conn, 0x18, alert, an, 0);
-        sess_free(w, s);
+        /* Накопленное НЕ ОЧИЩАЕТСЯ до этой развилки нарочно: дорожка неопознанного отдаёт
+         * прикрытию именно присланное целиком, а очистка оставила бы ей последний сегмент
+         * вместо всего Hello — то есть прикрытие отвечало бы на обрубок. */
+        hub_stranger(w, s, now);
         return;
     }
+    s->hs_len = 0;
     /* Личность известна — ищем пира. Линейный обход: раз на рукопожатие. */
     int found = -1;
     for (size_t i = 0; i < g_conf.peer_n; i++)
@@ -435,7 +706,7 @@ static void hs_step(struct worker *w, struct sess *s, const struct obfs_seg *seg
             fprintf(stderr, LOG_W "пир %s не описан в конфигурации — отказ%s\n",
                     fp, xs_held_str(held, tail, sizeof(tail)));
         }
-        sess_free(w, s);
+        hub_stranger(w, s, now);
         return;
     }
     /* Воспроизведение записанного msg1: метка времени обязана быть новее прошлой от этого
@@ -455,7 +726,11 @@ static void hs_step(struct worker *w, struct sess *s, const struct obfs_seg *seg
             fprintf(stderr, LOG_W "пир %zu: метка времени старее прошлой — похоже на повтор%s\n",
                     (size_t)found + 1, xs_held_str(held, tail, sizeof(tail)));
         }
-        sess_free(w, s);
+        /* Повтор записанного msg1 — тоже «не наш», и отвечать на него иначе, чем на прочих
+         * неопознанных, значило бы рассказывать прибору, что этот Hello он подобрал правильно.
+         * Прежде эта ветка молча закрывала сессию, то есть отвечала «silent» при любой
+         * настройке. */
+        hub_stranger(w, s, now);
         return;
     }
     s->peer = (int16_t)found;
@@ -560,6 +835,14 @@ static int16_t peer_pick(int peer, const uint8_t *pt, size_t pn) {
     return -1;
 }
 
+/* Узкое место из двух согласованных MTU. Ноль означает «сторона ещё не назвала свой размер»
+ * и в минимуме не участвует: подрезать по нему не по чему. */
+static int hub_min_mtu(int a, int b) {
+    if (a <= 0) return b;
+    if (b <= 0) return a;
+    return a < b ? a : b;
+}
+
 /* Расшифрованный пакет: проверить право на адрес источника и развести. */
 static void route_packet(struct worker *w, struct sess *from, uint8_t *pt, size_t pn, long long now) {
     if (pn < 20) return;
@@ -581,10 +864,22 @@ static void route_packet(struct worker *w, struct sess *from, uint8_t *pt, size_
         /* Пир↔пир: уменьшаем TTL (иначе петля живёт вечно) и шифруем В ТОЙ ЖЕ строке. */
         if (xs_ttl_dec(pt, pn) != 0) return;
         struct sess *d = &g_sess[di];
-        /* Подрезка по MTU ПОЛУЧАТЕЛЯ: у пиров он свой у каждой (у одной 1431, у другой 1387),
-         * и путь между ними — узкое место из двух. Кроме хаба это посчитать некому: пира
-         * друг о друге ничего не знают. */
-        if (d->mtu > 0) xs_mss_clamp(pt, pn, d->mtu);
+        /* Подрезка по УЗКОМУ МЕСТУ пути пир→пир, а это МИНИМУМ MTU обеих сессий: у пиров он
+         * свой у каждой (у одной 1431, у другой 1387).
+         *
+         * Только по получателю недостаточно, и это не перестраховка. MSS в SYN объявляет то,
+         * что отправитель готов ПРИНИМАТЬ, то есть ограничивает сегменты, которые вторая
+         * сторона пошлёт ОБРАТНО, — а обратный путь идёт через тоннель ОТПРАВИТЕЛЯ. При
+         * отправителе 1387 и получателе 1431 подрезка по 1431 оставляла обратному потоку
+         * предел шире, чем держит тоннель отправителя, и его полноразмерные ответы молча
+         * пропадали: ICMP «нужна фрагментация» внутри тоннеля не рождается. Кроме хаба этот
+         * минимум посчитать некому: пира друг о друге ничего не знают.
+         *
+         * Ноль (размер ещё не согласован) из минимума выпадает, а не отменяет подрезку целиком:
+         * известный конец — это уже предел, который надо соблюсти. Когда узкое место сам хаб,
+         * согласование опускает обе сессии до его размера, и минимум даёт то же число. */
+        int clamp = hub_min_mtu(from->mtu, d->mtu);
+        if (clamp > 0) xs_mss_clamp(pt, pn, clamp);
         send_to(w, d, w->row, pn, now);
         return;
     }
@@ -641,7 +936,7 @@ static void hub_frame(struct worker *w, struct sess *s, const uint8_t *pt, size_
             s->batch_max = 1;
             s->cool_until = now + XSH_REASM_COOL_MS;
             unsigned long long held = 0;
-            if (xs_ratelog(&w->rl_stamp, now, XS_LOG_EVERY_MS, &held)) {
+            if (xs_ratelog(&w->rl_reasm, now, XS_LOG_EVERY_MS, &held)) {
                 char tail[64];
                 fprintf(stderr, LOG_I "пир не собрал %d записей — везу по одному кадру%s\n",
                         lost, xs_held_str(held, tail, sizeof(tail)));
@@ -654,6 +949,25 @@ static void hub_frame(struct worker *w, struct sess *s, const uint8_t *pt, size_
         if (mv > 0) {
             int own = g_conf.mtu ? g_conf.mtu : XS_MTU_DEF;
             int was = s->mtu;
+            /* НИЖНЯЯ ГРАНИЦА ОБЯЗАТЕЛЬНА, и она не про разумность значения (I-075). Запись
+             * режется на сегменты по MTU этой сессии, и при MTU меньше ~492 предельная запись
+             * требует больше сегментов, чем есть векторов у sendmmsg: xs_conn_split_mm
+             * отказывает, send_to возвращает -1 ВСЕГДА, и к этой пире не уходит ни данных, ни
+             * keepalive, ни обратной связи по сборке. Пира отваливается по своей же тишине, а в
+             * журнале хаба нет ни строки. Пол у протокола есть — XS_MTU_FLOOR, ниже него не
+             * опускается сам пробой пути, — поэтому меньшее значение это не «узкий путь», а
+             * непроверенное число из провода. */
+            if (mv < XS_MTU_FLOOR) {
+                unsigned long long held = 0;
+                if (xs_ratelog(&w->rl_mtu, now, XS_LOG_EVERY_MS, &held)) {
+                    char fp2[12], tail[64];
+                    xs_key_fp(g_conf.peer[s->peer >= 0 ? s->peer : 0].pub, fp2);
+                    fprintf(stderr, LOG_W "пир %s: назвал MTU %d — ниже предела %d, оставляю "
+                                          "прежний %d%s\n", fp2, mv, XS_MTU_FLOOR,
+                            was ? was : XS_MTU_DEF, xs_held_str(held, tail, sizeof(tail)));
+                }
+                return;
+            }
             s->mtu = mv < own ? mv : own;
             /* Печатаем только ИЗМЕНЕНИЕ: кадр приходит после каждого пробоя пира, то есть раз в
              * две минуты на каждого, и строка «согласован тот же MTU» через год работы звезды из
@@ -667,7 +981,26 @@ static void hub_frame(struct worker *w, struct sess *s, const uint8_t *pt, size_
         }
         return;
     }
-    if (kind != XS_IPV4 && kind != XS_IPV6) return;
+    /* IPv6 ОТБРАСЫВАЕТСЯ ЯВНО, а не по случайному отказу дальше (I-073). Маршрутизации IPv6 в
+     * хабе нет: route_packet разбирает любой кадр как IPv4 — адрес источника читается по
+     * смещению 12, а у пакета IPv6 там лежат байты 4-7 его же адреса источника. Обычно такой
+     * кадр останавливает проверка права на адрес, и «не поддерживается» выводилось из того, что
+     * она случайно отказывает. Но пира, описанная в конфигурации, может подобрать эти байты так,
+     * чтобы они попали в её разрешённый диапазон, — и тогда кадр IPv6 уезжает как пакет IPv4: с
+     * уменьшением не того байта, пересчётом контрольной суммы, которой в IPv6 нет, и подрезкой
+     * MSS не там. Пока маршрутизации нет, отказ обязан быть решением, а не совпадением. */
+    if (kind == XS_IPV6) {
+        w->d_ipv6++;
+        unsigned long long held = 0;
+        if (xs_ratelog(&w->rl_ipv6, now, XS_LOG_EVERY_MS, &held)) {
+            char fp2[12], tail[64];
+            xs_key_fp(g_conf.peer[s->peer >= 0 ? s->peer : 0].pub, fp2);
+            fprintf(stderr, LOG_W "пир %s: кадр IPv6 — маршрутизации IPv6 в хабе нет, "
+                                  "отброшен%s\n", fp2, xs_held_str(held, tail, sizeof(tail)));
+        }
+        return;
+    }
+    if (kind != XS_IPV4) return;
     /* Пакет поедет дальше из строки с местом под заголовки впереди, а пришёл он либо в приёмном
      * буфере, либо в буфере сборки — переносим, если он не там. */
     if (pt != w->row + XS_HDR_ROOM) {
@@ -753,12 +1086,34 @@ static void *worker_loop(void *arg) {
     long long d_last = xs_now_ms();
     for (;;) {
         struct pollfd fds[2 + XSH_MAX_SESS];
-        int nf = 0;
+        int pmap[XSH_MAX_SESS];
+        int nf = 0, np = 0;
         fds[nf].fd = w->rx; fds[nf].events = POLLIN; fds[nf].revents = 0; nf++;
         fds[nf].fd = w->tun.fd; fds[nf].events = POLLIN; fds[nf].revents = 0; nf++;
+        /* Соединения с сайтом-прикрытием живут в ТОМ ЖЕ poll, что сырой сокет и очередь TUN:
+         * блокирующего вызова в этом цикле нет ни одного, и появиться он здесь не должен тем
+         * более — прикрытие может не ответить вовсе. POLLOUT нужен, пока connect не завершился
+         * или пока присланное прибором не ушло целиком. */
+        for (int i = w->base; i < w->base + w->cap; i++) {
+            struct sess *s = &g_sess[i];
+            if (s->phase != PH_PROXY || s->up_fd < 0) continue;
+            fds[nf].fd = s->up_fd;
+            fds[nf].events = (short)(POLLIN | (s->up_ready ? 0 : POLLOUT));
+            fds[nf].revents = 0;
+            pmap[np++] = i;
+            nf++;
+        }
         int n = poll(fds, (nfds_t)nf, XSC_TICK_MS * 5);
         long long now = xs_now_ms();
         if (n < 0 && errno != EINTR) break;
+
+        /* Прикрытие обслуживается ПЕРЕД приёмом от пиров, и порядок здесь имеет значение: приём
+         * может освободить ту же сессию, и тогда события на её уже закрытом дескрипторе
+         * относились бы к чужому сокету с тем же номером. */
+        if (n > 0)
+            for (int p = 0; p < np; p++)
+                if (fds[2 + p].revents)
+                    decoy_event(w, &g_sess[pmap[p]], fds[2 + p].revents, now);
 
         /* ---- со пиров -------------------------------------------------------- */
         if (n > 0 && (fds[0].revents & POLLIN)) {
@@ -814,6 +1169,8 @@ static void *worker_loop(void *arg) {
 
                 if (s->phase == PH_SYN) { w->d_hs++; hs_step(w, s, &seg, g_conf.listen_port, now); continue; }
                 if (s->phase == PH_HS) { w->d_hs++; hs_confirm(w, s, &seg, now); continue; }
+                /* Не наш вовсе: байты идут настоящему серверу как есть. */
+                if (s->phase == PH_PROXY) { decoy_up(w, s, &seg, now); continue; }
                 w->d_data++;
 
                 /* Сборка записи, которая могла быть разрезана между сегментами. Она же
@@ -872,6 +1229,9 @@ static void *worker_loop(void *arg) {
                 int16_t di = to >= 0 ? peer_pick(to, pay + off + 2, (size_t)r) : -1;
                 if (di < 0) continue;                          /* нет пира — отбросить */
                 struct sess *d = &g_sess[di];
+                /* Здесь подрезка ИМЕННО по получателю, а не по минимуму двух, как на пути
+                 * пир→пир: пакет пришёл из ядра, и обратный поток пойдёт через тот же
+                 * единственный тоннель — тоннель получателя. Второго тоннеля в этом пути нет. */
                 if (d->mtu > 0) xs_mss_clamp(pay + off + 2, (size_t)r, d->mtu);
                 if (dst && d != dst) {
                     /* Пакет другому пиру закрывает набор. Его самого переносим в начало и делаем
@@ -893,9 +1253,10 @@ static void *worker_loop(void *arg) {
 
         if (w->debug && now - d_last >= 1000) {
             fprintf(stderr, LOG_I "воркер %d: сегментов %llu, битых %llu, чужих %llu, SYN %llu, "
-                                  "рукопожатий %llu, данных %llu, SYN в живую сессию %llu\n",
+                                  "рукопожатий %llu, данных %llu, SYN в живую сессию %llu, "
+                                  "кадров IPv6 %llu, неопознанных к прикрытию %llu\n",
                     w->id, w->d_seg, w->d_bad, w->d_alien, w->d_syn, w->d_hs, w->d_data,
-                    w->d_syn_est);
+                    w->d_syn_est, w->d_ipv6, w->d_decoy);
             d_last = now;
         }
 
@@ -903,6 +1264,22 @@ static void *worker_loop(void *arg) {
         for (int i = w->base; i < w->base + w->cap; i++) {
             struct sess *s = &g_sess[i];
             if (s->phase == PH_FREE) continue;
+            /* Дорожка неопознанного живёт по своим срокам, и они куда короче простоя туннеля:
+             * прибор, которому нечего сказать, не должен занимать сокет к прикрытию три минуты, а
+             * прикрытие, не ответившее на connect за пять секунд, хуже честного оповещения. */
+            if (s->phase == PH_PROXY) {
+                long long lim = s->up_ready ? XSH_DECOY_IDLE_MS : XSH_DECOY_CONN_MS;
+                if (now - s->up_at > lim) {
+                    if (s->up_ready) xs_conn_send(&s->conn, 0x11 /* FIN|ACK */, NULL, 0, 0);
+                    else hub_alert(s);
+                    sess_free(w, s);
+                    continue;
+                }
+                /* Подтверждения этой сессии идут тем же порядком, что у пиров: прибор говорит
+                 * настоящий TCP, и отсутствие отложенного подтверждения он бы заметил. */
+                sess_tick_locked(s, now);
+                continue;
+            }
             if (now - s->conn.last_rx > XSH_IDLE_MS) { sess_free(w, s); continue; }
             /* Смещённая сессия: пир пересоединился с другого порта, привязка пир→сессия
              * указывает уже не на нас. Убирает её именно ВЛАДЕЛЕЦ — тот, в чьём индексе лежит
@@ -965,6 +1342,7 @@ int cmd_xsteer_hub(const char *conf_path) {
         g_sess[i].conn.fd = -1;
         g_sess[i].peer = -1;
         g_sess[i].conn_id = -1;
+        g_sess[i].up_fd = -1;
     }
     xs_router_build(&g_router, g_conf.peer, g_conf.peer_n);
 
@@ -1094,6 +1472,26 @@ int cmd_xsteer_hub(const char *conf_path) {
     fprintf(stderr, LOG_I "слушаю поддельный TCP :%d, пиров %zu, устройство %s, воркеров %d "
                           "(по %d сессий)\n",
             g_conf.listen_port, g_conf.peer_n, dev, n, per);
+    /* Что отвечаем неопознанным — говорится вслух при подъёме: настройка защиты, о которой
+     * нельзя узнать из журнала, проверяется только зондированием собственного порта. */
+    switch (g_conf.decoy) {
+    case XS_DECOY_SILENT:
+        fprintf(stderr, LOG_I "неопознанным: не отвечать (отличимо: открытый порт, замолчавший "
+                              "на ClientHello)\n");
+        break;
+    case XS_DECOY_RESET:
+        fprintf(stderr, LOG_I "неопознанным: RST\n");
+        break;
+    case XS_DECOY_PROXY:
+        fprintf(stderr, LOG_I "неопознанным: отдавать настоящему серверу %s:%d (не больше %d "
+                              "одновременно)\n",
+                g_conf.decoy_dest, g_conf.decoy_port, XSH_DECOY_MAX);
+        break;
+    default:
+        fprintf(stderr, LOG_I "неопознанным: фатальное оповещение TLS (отличимо от настоящего "
+                              "сервера с сертификатом; см. Decoy в конфигурации)\n");
+        break;
+    }
 
     /* Воркер 0 работает в этом же потоке: при n == 1 процесс ведёт себя ровно так, как до
      * появления потоков вовсе, и отладка одного потока остаётся возможной. */

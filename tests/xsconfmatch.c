@@ -230,6 +230,59 @@ int main(void) {
         refuses("отказ: Device с пробелом", t, XS_ROLE_HUB);
     }
 
+    /* ---- защита от зондирования: режим и адрес прикрытия ---------------------
+     *
+     * Ключи хаба, и проверяется у них главное: режим называется словом, адрес прикрытия — это
+     * литерал IPv4 с портом (имя пришлось бы разрешать через DNS из цикла, где нет ни одного
+     * блокирующего вызова), режим proxy без адреса отвергается ДО подъёма, а у пира этих ключей
+     * нет вовсе — неопознанные приходят на слушающий порт, а пир никуда не слушает.
+     *
+     * Отказ до подъёма здесь не придирчивость: неверная настройка защиты, обнаруженная под
+     * зондированием, — это защита, которой нет. */
+    {
+        char t[1024];
+#define HUB_HEAD "[Interface]\nPrivateKey=%s\nAddress=10.77.0.1/24\nListenPort=443\n"
+#define HUB_PEER "[Peer]\nPublicKey=%s\nAllowedIPs=10.77.0.2/32\n"
+        snprintf(t, sizeof(t), HUB_HEAD HUB_PEER, KEY_A, KEY_B);
+        check("без ключа Decoy: режим — прежнее поведение", 0, parse(t, XS_ROLE_HUB));
+        check("и это оповещение TLS", (long)XS_DECOY_ALERT, (long)g_c.decoy);
+        check("адреса прикрытия нет", 0, g_c.decoy_port);
+
+        snprintf(t, sizeof(t), HUB_HEAD "Decoy=silent\n" HUB_PEER, KEY_A, KEY_B);
+        check("Decoy = silent принят", 0, parse(t, XS_ROLE_HUB));
+        check("режим silent", (long)XS_DECOY_SILENT, (long)g_c.decoy);
+        snprintf(t, sizeof(t), HUB_HEAD "decoy = RESET\n" HUB_PEER, KEY_A, KEY_B);
+        check("Decoy = reset принят в любом регистре", 0, parse(t, XS_ROLE_HUB));
+        check("режим reset", (long)XS_DECOY_RESET, (long)g_c.decoy);
+
+        snprintf(t, sizeof(t), HUB_HEAD "Decoy=proxy\nDecoyDest=93.184.216.34:443\n" HUB_PEER,
+                 KEY_A, KEY_B);
+        check("Decoy = proxy с адресом принят", 0, parse(t, XS_ROLE_HUB));
+        check("режим proxy", (long)XS_DECOY_PROXY, (long)g_c.decoy);
+        check_str("адрес прикрытия", "93.184.216.34", g_c.decoy_dest);
+        check("порт прикрытия", 443, g_c.decoy_port);
+        check("неизвестных ключей не появилось", 0, g_c.unknown_n);
+
+        snprintf(t, sizeof(t), HUB_HEAD "Decoy=proxy\n" HUB_PEER, KEY_A, KEY_B);
+        refuses("отказ: proxy без DecoyDest", t, XS_ROLE_HUB);
+        snprintf(t, sizeof(t), HUB_HEAD "Decoy=quiet\n" HUB_PEER, KEY_A, KEY_B);
+        refuses("отказ: неизвестный режим", t, XS_ROLE_HUB);
+        snprintf(t, sizeof(t),
+                 HUB_HEAD "Decoy=proxy\nDecoyDest=www.example.com:443\n" HUB_PEER, KEY_A, KEY_B);
+        refuses("отказ: прикрытие именем, а не адресом", t, XS_ROLE_HUB);
+        snprintf(t, sizeof(t), HUB_HEAD "Decoy=proxy\nDecoyDest=93.184.216.34\n" HUB_PEER,
+                 KEY_A, KEY_B);
+        refuses("отказ: прикрытие без порта", t, XS_ROLE_HUB);
+        snprintf(t, sizeof(t), HUB_HEAD "Decoy=proxy\nDecoyDest=93.184.216.34:0\n" HUB_PEER,
+                 KEY_A, KEY_B);
+        refuses("отказ: порт прикрытия вне диапазона", t, XS_ROLE_HUB);
+        snprintf(t, sizeof(t),
+                 "[Interface]\nPrivateKey=%s\nAddress=10.0.0.2/24\nDecoy=silent\n"
+                 "[Peer]\nPublicKey=%s\nAllowedIPs=0.0.0.0/0\nEndpoint=1.2.3.4:443\n",
+                 KEY_A, KEY_B);
+        refuses("отказ: Decoy в конфигурации пира", t, XS_ROLE_SPOKE);
+    }
+
     /* ---- DNS: принимается, но не применяется --------------------------------
      *
      * Ключ отвергать нельзя, и это не мелочь: конфигурация носится между роутером и

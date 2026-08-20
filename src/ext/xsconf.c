@@ -119,6 +119,7 @@ static const struct { const char *key; const char *why; } REFUSED[] = {
  * виду» в cli.c: опечатка в имени ключа не должна требовать чтения документации. */
 static const char *KNOWN[] = {
     "PrivateKey", "Address", "MTU", "ListenPort", "SNI", "Device", "DNS",
+    "Decoy", "DecoyDest",
     "PublicKey", "AllowedIPs", "Endpoint", "PersistentKeepalive",
 };
 #define KNOWN_N (sizeof(KNOWN) / sizeof(KNOWN[0]))
@@ -302,6 +303,34 @@ int xs_conf_parse(const char *text, size_t n, enum xs_role role,
                 c->dns_n++;
                 for (const char *q = val; *q; q++)
                     if (*q == ',') c->dns_n++;
+            } else if (ieq(key, "Decoy")) {
+                /* Режим называется словом, а не числом: в журнале и в файле должно стоять то
+                 * же слово, что в документации и в ключе --decoy реализации на Go. */
+                if (ieq(val, "alert")) c->decoy = XS_DECOY_ALERT;
+                else if (ieq(val, "silent")) c->decoy = XS_DECOY_SILENT;
+                else if (ieq(val, "reset")) c->decoy = XS_DECOY_RESET;
+                else if (ieq(val, "proxy")) c->decoy = XS_DECOY_PROXY;
+                else FAIL("строка %d: Decoy: неизвестный режим %s (alert, silent, reset "
+                          "или proxy)", line_no, val);
+            } else if (ieq(key, "DecoyDest")) {
+                /* Адрес сайта-прикрытия. Литерал IPv4 и порт — те же требования, что у
+                 * Endpoint: соединяться с прикрытием приходится из цикла воркера, где нет ни
+                 * одного блокирующего вызова, а разрешение имени им и было бы. */
+                char *colon = strrchr(val, ':');
+                if (!colon) FAIL("строка %d: DecoyDest должен быть вида адрес:порт", line_no);
+                *colon = '\0';
+                long port = atol(colon + 1);
+                if (port < 1 || port > 65535)
+                    FAIL("строка %d: DecoyDest: порт вне 1..65535", line_no);
+                struct in_addr in;
+                if (inet_pton(AF_INET, val, &in) != 1)
+                    FAIL("строка %d: DecoyDest задаётся адресом, а не именем: разрешение "
+                         "имени пошло бы через DNS из цикла, где нет блокирующих вызовов",
+                         line_no);
+                if (strlen(val) >= sizeof(c->decoy_dest))
+                    FAIL("строка %d: DecoyDest длиннее буфера", line_no);
+                snprintf(c->decoy_dest, sizeof(c->decoy_dest), "%s", val);
+                c->decoy_port = (int)port;
             } else if (ieq(key, "Device")) {
                 /* Имя устройства ядра: те же ограничения, что у ip link — буквы, цифры и
                  * несколько знаков, короче IFNAMSIZ. Иначе `ip` откажет уже на подъёме, а
@@ -400,6 +429,11 @@ int xs_conf_parse(const char *text, size_t n, enum xs_role role,
     if (role == XS_ROLE_SPOKE) {
         if (c->listen_port)
             FAIL("ListenPort — это конфигурация хаба: пир никуда не слушает");
+        /* Защита от зондирования — про слушающий порт, а пир никуда не слушает. Принять ключ
+         * молча значило бы сказать «настроено», не настроив ничего. */
+        if (c->decoy || c->decoy_port)
+            FAIL("Decoy — это конфигурация хаба: неопознанные приходят на слушающий порт, "
+                 "а пир никуда не слушает");
         /* Две секции [Peer] у пира означали бы, что часть трафика идёт мимо хаба, а маршрут
          * пир↔пир через хаб — обещание топологии, а не деталь реализации. */
         if (c->peer_n != 1)
@@ -414,6 +448,12 @@ int xs_conf_parse(const char *text, size_t n, enum xs_role role,
         if (!c->peer[0].keepalive_set) c->peer[0].keepalive = 25;
     } else {
         if (!c->listen_port) FAIL("хабу нужен ListenPort");
+        /* Режим proxy без адреса прикрытия — это не «работает вполсилы», а хаб, который на
+         * каждого неопознанного пытается открыть соединение в никуда и отвечает оповещением,
+         * то есть ровно то поведение, от которого настройка и уводит. Отказ здесь, а не в
+         * бою: неверная настройка защиты, обнаруженная под зондированием, — защита, которой нет. */
+        if (c->decoy == XS_DECOY_PROXY && !c->decoy_port)
+            FAIL("Decoy = proxy требует DecoyDest — адрес сайта-прикрытия вида 1.2.3.4:443");
         for (size_t i = 0; i < c->peer_n; i++)
             if (c->peer[i].endpoint_port)
                 FAIL("пир %zu: Endpoint в конфигурации хаба бессмыслен — пира живут за "
