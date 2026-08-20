@@ -114,6 +114,26 @@
 #define XSH_REASM_REPORT_MS 2000
 #define XSH_REASM_GROW_MS   3000
 
+/* ---- потолок MTU ------------------------------------------------------------
+ *
+ * XSH_MTU_CEIL — потолок СОГЛАСОВАННОГО MTU, один и тот же для числа из провода
+ * (XS_CTL_MTU от пира), для числа из конфигурации и для предела, который хаб называет в
+ * рукопожатии. Пропускать его нельзя ни на одном из трёх входов: конфигурация принимает MTU
+ * до XS_LINK_MAX (xsconf.c, «576..1500»), а на проводе и в рукопожатии число вообще чужое.
+ *
+ * Числа выведены одно из другого и спорят при КОМПИЛЯЦИИ — то же правило, что у размеров в
+ * шапке xswire.h. XSH_MAX_SEG_CEIL это то же выражение, которое считает send_to (mtu плюс
+ * наши накладные минус заголовки IP и TCP), но при предельном MTU; вместе с заголовками IP и
+ * TCP оно обязано давать РОВНО кадр канала. Пока потолка не было, хаб с MTU канала вместо MTU
+ * туннеля в файле (обычная описка: оба числа называются «MTU») и пир, назвавший столько же,
+ * давали сегмент 1521 и пакет на проводе 1561 байт — а дальше либо ядро фрагментировало его
+ * (фрагментация сама по себе признак протокола, и такие пакеты режут по пути), либо sendmmsg
+ * отвечал EMSGSIZE, и к этому пиру не уходило ни одного крупного кадра. Мелкое ходит, крупное
+ * молча пропадает — тот же худший класс отказов, что и при MTU ниже пола. */
+#define XSH_MTU_CEIL     XS_MTU_DEF
+#define XSH_MAX_SEG_CEIL (XSH_MTU_CEIL + XS_OVERHEAD - 40)
+XS_STATIC_ASSERT(XS_IP_HDR + XS_TCP_HDR + XSH_MAX_SEG_CEIL == XS_LINK_MAX, hub_seg_fits);
+
 int run_quiet(const char *const argv[]);
 
 /* PH_PROXY — не наша сессия вовсе: её байты переливаются настоящему серверу и обратно
@@ -406,8 +426,8 @@ static int send_to(struct worker *w, struct sess *d, uint8_t *row, size_t plen, 
          * согласованный пробами размер нельзя. Пачка больше сегмента по построению, поэтому путь
          * через xs_conn_split_mm теперь общий и для одиночных записей — при одном сегменте он
          * ровно эквивалентен прежнему xs_conn_ahead. */
-        int mtu = d->mtu > 0 ? d->mtu : XS_MTU_DEF;
-        size_t max_seg = (size_t)mtu + XS_OVERHEAD - 40;
+        int mtu = d->mtu > 0 ? d->mtu : XSH_MTU_CEIL;
+        size_t max_seg = (size_t)mtu + XS_OVERHEAD - 40;   /* не больше XSH_MAX_SEG_CEIL */
         int segs = xs_conn_split_mm(&d->conn, rec, XS_REC_HDR + plen + XS_TAG, max_seg,
                                     w->hdrs, w->siov, w->smm,
                                     sizeof(w->hdrs) / sizeof(w->hdrs[0]), now);
@@ -738,13 +758,18 @@ static void hs_step(struct worker *w, struct sess *s, const struct obfs_seg *seg
     size_t on = 0;
     /* Хаб называет свой предел так же, как пир: MTU настоящего канала минус накладные, но
      * не больше заданного в конфигурации. Из этих двух чисел стороны берут минимум. */
-    int own_limit = XS_MTU_DEF;
+    int own_limit = XSH_MTU_CEIL;
     {
         char ifn[32] = "";
         int link = xs_egress_mtu(s->conn.saddr, ifn, sizeof(ifn));
         if (link > 0) own_limit = xs_mtu(link);
     }
     if (g_conf.mtu && g_conf.mtu < own_limit) own_limit = g_conf.mtu;
+    /* И ЗДЕСЬ ТОЖЕ ПОТОЛОК, хотя оба слагаемых выше выглядят своими. Канал наружу может быть
+     * шире Ethernet — на jumbo-кадрах xs_mtu(9000) даёт 8939, — и назвать пиру такой предел
+     * значило бы позвать его отправлять записи, которые не влезают ни в строку буфера (XS_ROW),
+     * ни в кадр канала на его стороне. */
+    if (own_limit > XSH_MTU_CEIL) own_limit = XSH_MTU_CEIL;
     rc = xs_hs_server_write(&s->hs, own_limit, w->hs, sizeof(w->hs), &on, &s->tx, &s->rx);
     if (rc != 0 || xs_conn_send(&s->conn, 0x18, w->hs, on, 0) != 0) {
         fprintf(stderr, LOG_W "ответ на рукопожатие не ушёл: %d\n", rc);
@@ -947,7 +972,14 @@ static void hub_frame(struct worker *w, struct sess *s, const uint8_t *pt, size_
          * пределом — больше него мы всё равно не отправим. */
         int mv = xs_mtu_value(pt, pn);
         if (mv > 0) {
-            int own = g_conf.mtu ? g_conf.mtu : XS_MTU_DEF;
+            /* ПОТОЛОК ОДИН И ТОТ ЖЕ для числа из провода и для числа из конфигурации, и
+             * пропускать его нельзя. Прежде конфигурация зажимала пира, а сама не зажималась
+             * ничем: MTU=1500 в файле плюс пир, назвавший столько же, давали сегмент больше
+             * предельного (см. XSH_MTU_CEIL). Тот же класс, что нижняя граница ниже: число из
+             * провода проверяется против СВОИХ пределов, а не только против другого числа из
+             * настроек. */
+            int own = g_conf.mtu;
+            if (own <= 0 || own > XSH_MTU_CEIL) own = XSH_MTU_CEIL;
             int was = s->mtu;
             /* НИЖНЯЯ ГРАНИЦА ОБЯЗАТЕЛЬНА, и она не про разумность значения (I-075). Запись
              * режется на сегменты по MTU этой сессии, и при MTU меньше ~492 предельная запись
