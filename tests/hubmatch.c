@@ -110,6 +110,82 @@ int main(void) {
         check("предельная запись режется и влезает в векторы", 1, segs > 0);
     }
 
+    /* ---- SYN в живую сессию (I-071) -----------------------------------------
+     *
+     * Поддельный SYN не несёт ни байта аутентификации, а ветка SYN приёмного цикла правила
+     * по нему isn_rx — базу, из которой выводится nonce расшифровки. Одно постороннее
+     * сообщение останавливало входящий поток целиком, и сессия при этом не умирала по
+     * XSH_IDLE_MS, потому что last_rx обновляется каждым принятым сегментом.
+     *
+     * Про seq проверка ниже стоит не потому, что он уезжал: откат на единицу сходится сам,
+     * SYN-ACK занимает этот номер обратно. Она стоит потому, что откат шёл БЕЗ g_tx_lock, а
+     * записи данных в ту же сессию пишет другой воркер под этим замком — и номер между
+     * откатом и SYN-ACK мог достаться настоящей записи. Такую гонку стендом не поймать;
+     * поймать можно только то, что теперь по этому пути номер не меняется вовсе.
+     *
+     * Проверяется ровно граница: до подтверждённого рукопожатия SYN принимается (иначе
+     * потерянный SYN-ACK нельзя было бы переспросить), после — не трогает ничего. Дотянуться
+     * до этого удаётся потому, что ветка вынесена в sess_on_syn: внутри worker_loop её
+     * окружают poll и сырой сокет. */
+    printf("\n== хаб: SYN в живую сессию ==\n");
+    {
+        static struct worker w;
+        struct sess *s = &g_sess[0];
+        const uint32_t ISN_RX = 0x11111111u, SEQ = 0x22222222u, ACK = 0x33333333u;
+        const uint32_t SYN_SEQ = 0x99999999u;
+
+        int phases[2] = { PH_EST, PH_HS };
+        const char *names[2] = { "работающая сессия", "сессия в рукопожатии" };
+        for (int i = 0; i < 2; i++) {
+            memset(&w, 0, sizeof(w));
+            w.listen_port = 443; w.rx = -1; w.tx0 = -1; w.cap = 1;
+            memset(s, 0, sizeof(*s));
+            s->phase = phases[i];
+            s->conn.fd = -1; s->conn.sport = 443; s->conn.dport = 40000;
+            s->conn.isn_rx = ISN_RX; s->conn.seq = SEQ; s->conn.ack = ACK;
+
+            struct obfs_seg seg;
+            memset(&seg, 0, sizeof(seg));
+            seg.flags = 0x02;                   /* SYN без ACK */
+            seg.seq = SYN_SEQ;
+            seg.sport = 40000;
+            seg.saddr = htonl(0x0A000001);
+            struct sess *r = sess_on_syn(&w, s, &seg, 1000);
+
+            printf("  %s:\n", names[i]);
+            check("  SYN отброшен, сессия не возвращена", 1, r == NULL);
+            check("  isn_rx не подменён (nonce расшифровки цел)", (long)ISN_RX,
+                  (long)s->conn.isn_rx);
+            check("  seq не тронут вовсе (гонке с записью данных нечего забрать)", (long)SEQ,
+                  (long)s->conn.seq);
+            check("  ack не тронут", (long)ACK, (long)s->conn.ack);
+            check("  отброшенный сосчитан", 1, (long)w.d_syn_est);
+            check("  SYN-ACK не отправлялся", 0, (long)w.d_syn);
+        }
+
+        /* Обратная сторона границы: в фазе PH_SYN повторный SYN обязан приниматься —
+         * иначе потерянный SYN-ACK означал бы, что пир не поднимется вовсе. */
+        memset(&w, 0, sizeof(w));
+        w.listen_port = 443; w.rx = -1; w.tx0 = -1; w.cap = 1;
+        memset(s, 0, sizeof(*s));
+        s->phase = PH_SYN;
+        s->conn.fd = -1; s->conn.sport = 443; s->conn.dport = 40000;
+        s->conn.isn_rx = ISN_RX; s->conn.seq = SEQ; s->conn.ack = ACK;
+        struct obfs_seg seg2;
+        memset(&seg2, 0, sizeof(seg2));
+        seg2.flags = 0x02;
+        seg2.seq = SYN_SEQ;
+        seg2.sport = 40000;
+        seg2.saddr = htonl(0x0A000001);
+        struct sess *r2 = sess_on_syn(&w, s, &seg2, 1000);
+        printf("  повтор в фазе рукопожатия:\n");
+        check("  SYN принят", 1, r2 == s);
+        check("  isn_rx взят из этого SYN", (long)SYN_SEQ, (long)s->conn.isn_rx);
+        check("  ack встал за ним", (long)(SYN_SEQ + 1), (long)s->conn.ack);
+        check("  SYN-ACK сосчитан", 1, (long)w.d_syn);
+        check("  в живые сессии не записан", 0, (long)w.d_syn_est);
+    }
+
     printf(fails ? "\nПРОВАЛОВ: %d\n" : "\nвсе проверки прошли\n", fails);
     return fails ? 1 : 0;
 }

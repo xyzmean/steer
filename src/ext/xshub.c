@@ -186,8 +186,8 @@ struct worker {
     /* Ограничители на строки, которые вызывает чужой пакет: до них добирается кто угодно из
      * интернета, и без ограничителя одна такая строка — способ залить журнал VPS. Свои у
      * каждого воркера: общие потребовали бы замка на пути, который и так под потоком. */
-    struct xs_ratelog rl_unknown, rl_stamp;
-    unsigned long long d_seg, d_bad, d_syn, d_hs, d_data, d_alien;
+    struct xs_ratelog rl_unknown, rl_stamp, rl_synest;
+    unsigned long long d_seg, d_bad, d_syn, d_hs, d_data, d_alien, d_syn_est;
 };
 
 /* Строка ОБЯЗАНА вмещать самую большую запись, какую собирает цикл TUN, вместе с местом под
@@ -686,6 +686,68 @@ static void hub_frame_cb(void *ctx, const uint8_t *f, size_t n) {
 
 /* Цикл одного воркера. Всё, что он трогает, — либо его личное (буферы, индекс, свой отрезок
  * таблицы), либо взято под замок отправки. */
+/* Ветка SYN приёмного цикла. Возвращает сессию, которой сегмент принадлежит, или NULL,
+ * если он отброшен.
+ *
+ * Отдельной функцией, а не строками внутри worker_loop, ради стенда: до неё нужно дотянуться
+ * из tests/hubmatch.c, а внутри цикла её окружают poll и сырой сокет.
+ *
+ * СЕССИЮ В РАБОТЕ SYN НЕ ТРОГАЕТ — это главное свойство, и оно новое. Поддельный SYN не
+ * несёт ни байта аутентификации: такой сегмент собирает кто угодно, кто знает адрес хаба и
+ * порт пира. Раньше эта ветка по нему правила isn_rx — базу, из которой xs_reasm_feed
+ * считает смещение принятой записи, а из смещения выводится nonce расшифровки. Одно
+ * постороннее сообщение останавливало входящий поток целиком, и сессия при этом даже не
+ * умирала по XSH_IDLE_MS: last_rx обновляется каждым принятым сегментом, включая
+ * нерасшифрованные (I-071).
+ *
+ * Второе следствие тоньше и живёт в замках. Откат `seq -= 1` сам по себе сходится: SYN-ACK
+ * тут же занимает этот номер обратно (xs_conn_send прибавляет единицу за флаг SYN). Но
+ * происходит он БЕЗ g_tx_lock, а записи данных в ту же сессию пишет другой воркер именно
+ * под этим замком — то есть между откатом и SYN-ACK номер может достаться настоящей записи.
+ * Номер и есть смещение, из которого выводится nonce отправки, а повтор nonce — это полная
+ * потеря AEAD, о чём шапка xsconn.h говорит прямо.
+ *
+ * У WireGuard граница проведена там же: состояние живой сессии меняет только УЖЕ
+ * ПРОВЕРЕННЫЙ пакет. Инициация рукопожатия несёт mac1 на статическом ключе получателя (а под
+ * нагрузкой ещё и cookie), проверяется до всякой дорогой арифметики — и даже пройдя
+ * проверку, не трогает текущую пару ключей: та сменяется только после ЗАВЕРШЁННОГО
+ * рукопожатия, а прежняя ещё живёт на расшифровку. Наш аутентификатор едет в session_id
+ * ClientHello, то есть в сегменте ПОСЛЕ SYN, поэтому на сам SYN опираться нечем, и
+ * единственный честный ответ — не менять по нему ничего.
+ *
+ * Цена отказа мала: пир выбирает порт источника случайно из 28000 (xsconn.c), поэтому SYN в
+ * ту же четвёрку от своего же пира после перезапуска — один случай на семь тысяч, и он
+ * разрешается сам: сессия уходит по XSH_IDLE_MS, пир соединяется с нового порта. Полный
+ * ответ на этот случай — SYN-cookie на неопознанный SYN и подмена сессии только после
+ * сошедшегося аутентификатора, как у WireGuard; это отдельная работа, R-059. */
+static struct sess *sess_on_syn(struct worker *w, struct sess *s, const struct obfs_seg *seg,
+                                long long now) {
+    if (s && s->phase != PH_SYN) {
+        w->d_syn_est++;
+        /* Строку вызывает пришедший из сети пакет, значит её частоту выбирает не хозяин
+         * хаба — отсюда ограничитель, как у неопознанного пира выше. */
+        unsigned long long held = 0;
+        if (xs_ratelog(&w->rl_synest, now, XS_LOG_EVERY_MS, &held)) {
+            struct in_addr in;
+            char tail[64];
+            in.s_addr = seg->saddr;
+            fprintf(stderr, LOG_W "SYN в сессию, которая уже работает (%s:%u) — отброшен%s\n",
+                    inet_ntoa(in), seg->sport, xs_held_str(held, tail, sizeof(tail)));
+        }
+        return NULL;
+    }
+    if (!s) s = sess_alloc(w, seg, g_conf.listen_port);
+    else s->conn.seq -= 1;          /* повтор того же SYN-ACK */
+    if (!s) return NULL;
+    s->conn.ack = seg->seq + 1;
+    s->conn.isn_rx = seg->seq;
+    s->conn.state = XSC_SYN_RCVD;
+    s->conn.last_rx = now;
+    w->d_syn++;
+    xs_conn_send(&s->conn, 0x12 /* SYN|ACK */, NULL, 0, OBFS_OPT_SCALE);
+    return s;
+}
+
 static void *worker_loop(void *arg) {
     struct worker *w = arg;
     long long d_last = xs_now_ms();
@@ -718,15 +780,7 @@ static void *worker_loop(void *arg) {
                 struct sess *s = sess_find(w, ntohl(seg.saddr), seg.sport);
 
                 if ((seg.flags & 0x02) && !(seg.flags & 0x10)) {         /* SYN */
-                    if (!s) s = sess_alloc(w, &seg, g_conf.listen_port);
-                    else s->conn.seq -= 1;          /* повтор того же SYN-ACK */
-                    if (!s) continue;
-                    s->conn.ack = seg.seq + 1;
-                    s->conn.isn_rx = seg.seq;
-                    s->conn.state = XSC_SYN_RCVD;
-                    s->conn.last_rx = now;
-                    w->d_syn++;
-                    xs_conn_send(&s->conn, 0x12 /* SYN|ACK */, NULL, 0, OBFS_OPT_SCALE);
+                    sess_on_syn(w, s, &seg, now);
                     continue;
                 }
                 if (!s) {
@@ -839,8 +893,9 @@ static void *worker_loop(void *arg) {
 
         if (w->debug && now - d_last >= 1000) {
             fprintf(stderr, LOG_I "воркер %d: сегментов %llu, битых %llu, чужих %llu, SYN %llu, "
-                                  "рукопожатий %llu, данных %llu\n", w->id,
-                    w->d_seg, w->d_bad, w->d_alien, w->d_syn, w->d_hs, w->d_data);
+                                  "рукопожатий %llu, данных %llu, SYN в живую сессию %llu\n",
+                    w->id, w->d_seg, w->d_bad, w->d_alien, w->d_syn, w->d_hs, w->d_data,
+                    w->d_syn_est);
             d_last = now;
         }
 
