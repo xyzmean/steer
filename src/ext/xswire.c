@@ -8,7 +8,11 @@
  * здесь 0x0304 значило бы отличаться от всякого настоящего TLS 1.3 на проводе первым же
  * байтом каждой записи. */
 int xs_rec_build(uint8_t *hdr, size_t body_n) {
-    if (body_n < XS_TAG || body_n > 0xFFFF) return -1;
+    /* Предел ФОРМАТА, а не предел ПОЛЯ: записей длиннее XS_MAX_RECORD мы не отправляем никогда, и
+     * приёмники (xs_reasm_feed, xs_stream_read_record) проверяют ровно этим числом. Пока здесь
+     * стояло 0xFFFF, переполнение набора кадров доезжало до провода и обрывало соединение у
+     * получателя вместо того, чтобы отказать у отправителя. */
+    if (body_n < XS_TAG || body_n > XS_MAX_RECORD) return -1;
     hdr[0] = XS_REC_TYPE;
     hdr[1] = XS_REC_V0;
     hdr[2] = XS_REC_V1;
@@ -144,7 +148,9 @@ size_t xs_batch_build(uint8_t *dst, size_t cap, const struct xs_frame *fr, size_
     if (n < 2) return 0;                       /* одиночный кадр едет без контейнера */
     size_t need = XS_BATCH_HDR;
     for (size_t i = 0; i < n; i++) need += 2 + fr[i].n;
-    if (need > cap || need > XS_MAX_RECORD) return 0;
+    /* Предел ОТКРЫТОГО текста, а не ёмкости буфера: буфер держит XS_MAX_RECORD+XS_TAG и
+     * пропустил бы пачку, которую приёмник отвергнет по длине тела. */
+    if (need > cap || need > XS_MAX_PLAIN) return 0;
     dst[0] = XS_CTL_BATCH;
     size_t o = XS_BATCH_HDR;
     for (size_t i = 0; i < n; i++) {
