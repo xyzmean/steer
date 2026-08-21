@@ -186,8 +186,23 @@ struct sess {
     /* Сборка разрезанных записей и обратная связь по ней (см. xswire.h). */
     struct xs_reasm reasm;
     unsigned long long last_drops;
+    /* ТРИ ПОЛЯ НИЖЕ ЧИТАЕТ ЧУЖОЙ ПОТОК, и это свойство пути данных, а не оплошность.
+     *
+     * batch_max, cool_until и mtu пишет ВЛАДЕЛЕЦ сессии (тот воркер, чей осколок сырого сокета
+     * ловит её пира), а читает цикл TUN ЛЮБОГО воркера: получатель пакета из ядра определяется
+     * маршрутом, а не тем, кто читает устройство. Замок сессии здесь взять нельзя дёшево —
+     * цикл TUN читает предел пачки и MTU получателя ДО того, как узнал получателя записи, то
+     * есть держал бы чужой замок отправки поперёк чтения устройства, — а перенастройка MTU
+     * (hub_retune_mtu) обходит ВСЕ сессии под общим замком, и замок каждой под ним завёл бы
+     * второй порядок замков там, где хватает одного слова.
+     *
+     * Поэтому обращения к ним идут через XSH_LOAD/XSH_STORE. На arm64 и amd64 слово машинного
+     * размера не порвётся и без этого, но модель памяти такого не обещает, а «новый MTU
+     * применился к половине пакетов пачки» здесь возможно. Порт правки из реализации на Go
+     * (I-093), где то же место помечал детектор гонок. */
     int      batch_max;
-    long long cool_until, last_report, last_grow, keep_next;
+    long long cool_until;
+    long long last_report, last_grow, keep_next;
     int16_t  peer;                 /* индекс пира или -1, пока не опознан */
     int8_t   conn_id;              /* номер соединения этой пира (0..XS_CONNS_MAX-1) */
     /* MTU, о котором договорились с этой пиром. Ноль — ещё не договорились. Хранится на
@@ -215,6 +230,11 @@ struct sess {
     long long up_at;
     uint32_t up_addr;
 };
+
+/* Расслабленные обращения к полям, которые читает чужой поток: см. шапку struct sess. Порядок
+ * между ними не нужен — каждое значение самостоятельно и стоит само за себя. */
+#define XSH_LOAD(p)     __atomic_load_n(&(p), __ATOMIC_RELAXED)
+#define XSH_STORE(p, v) __atomic_store_n(&(p), (v), __ATOMIC_RELAXED)
 
 static struct sess g_sess[XSH_MAX_SESS];
 static struct xs_router g_router;
@@ -462,8 +482,10 @@ static void hub_retune_mtu(void) {
     pthread_mutex_lock(&g_ctl);
     int best = 0;
     for (int i = 0; i < XSH_MAX_SESS; i++)
-        if (g_sess[i].phase == PH_EST && g_sess[i].mtu > 0)
-            if (!best || g_sess[i].mtu < best) best = g_sess[i].mtu;
+        if (g_sess[i].phase == PH_EST) {
+            int m = XSH_LOAD(g_sess[i].mtu);
+            if (m > 0 && (!best || m < best)) best = m;
+        }
     static int applied;
     if (!best || applied == best) { pthread_mutex_unlock(&g_ctl); return; }
     char val[8];
@@ -504,7 +526,8 @@ static int send_to(struct worker *w, struct sess *d, uint8_t *row, size_t plen, 
          * согласованный пробами размер нельзя. Пачка больше сегмента по построению, поэтому путь
          * через xs_conn_split_mm теперь общий и для одиночных записей — при одном сегменте он
          * ровно эквивалентен прежнему xs_conn_ahead. */
-        int mtu = d->mtu > 0 ? d->mtu : XSH_MTU_CEIL;
+        int mtu = XSH_LOAD(d->mtu);
+        if (mtu <= 0) mtu = XSH_MTU_CEIL;
         size_t max_seg = (size_t)mtu + XS_OVERHEAD - 40;   /* не больше XSH_MAX_SEG_CEIL */
         int segs = xs_conn_split_mm(&d->conn, rec, XS_REC_HDR + plen + XS_TAG, max_seg,
                                     w->hdrs, w->siov, w->smm,
@@ -998,8 +1021,8 @@ static void hs_confirm(struct worker *w, struct sess *s, const struct obfs_seg *
      * STEER_XS_COMPAT=1 оставляет один кадр навсегда: это аварийный выключатель нового формата на
      * время обновления, когда к хабу ещё приходят пиры предыдущей версии. Сборку Hello из
      * сегментов выключать не нужно — короткий Hello старого пира она разбирает сразу. */
-    s->batch_max = g_compat ? 1 : 2;
-    s->cool_until = 0;
+    XSH_STORE(s->batch_max, g_compat ? 1 : 2);
+    XSH_STORE(s->cool_until, 0);
     s->last_drops = s->reasm.dropped;
     s->phase = PH_EST;
     s->handshake_at = now;
@@ -1092,7 +1115,7 @@ static void route_packet(struct worker *w, struct sess *from, uint8_t *pt, size_
          * Ноль (размер ещё не согласован) из минимума выпадает, а не отменяет подрезку целиком:
          * известный конец — это уже предел, который надо соблюсти. Когда узкое место сам хаб,
          * согласование опускает обе сессии до его размера, и минимум даёт то же число. */
-        int clamp = hub_min_mtu(from->mtu, d->mtu);
+        int clamp = hub_min_mtu(XSH_LOAD(from->mtu), XSH_LOAD(d->mtu));
         if (clamp > 0) xs_mss_clamp(pt, pn, clamp);
         send_to(w, d, w->row, pn, now);
         return;
@@ -1147,8 +1170,8 @@ static void hub_frame(struct worker *w, struct sess *s, const uint8_t *pt, size_
          * рваном пути она делает хуже, а не лучше. */
         int lost = xs_loss_value(pt, pn);
         if (lost > 0) {
-            s->batch_max = 1;
-            s->cool_until = now + XSH_REASM_COOL_MS;
+            XSH_STORE(s->batch_max, 1);
+            XSH_STORE(s->cool_until, now + XSH_REASM_COOL_MS);
             unsigned long long held = 0;
             if (xs_ratelog(&w->rl_reasm, now, XS_LOG_EVERY_MS, &held)) {
                 char tail[64];
@@ -1169,7 +1192,7 @@ static void hub_frame(struct worker *w, struct sess *s, const uint8_t *pt, size_
              * настроек. */
             int own = g_conf.mtu;
             if (own <= 0 || own > XSH_MTU_CEIL) own = XSH_MTU_CEIL;
-            int was = s->mtu;
+            int was = XSH_LOAD(s->mtu);
             /* НИЖНЯЯ ГРАНИЦА ОБЯЗАТЕЛЬНА, и она не про разумность значения (I-075). Запись
              * режется на сегменты по MTU этой сессии, и при MTU меньше ~492 предельная запись
              * требует больше сегментов, чем есть векторов у sendmmsg: xs_conn_split_mm
@@ -1189,14 +1212,14 @@ static void hub_frame(struct worker *w, struct sess *s, const uint8_t *pt, size_
                 }
                 return;
             }
-            s->mtu = mv < own ? mv : own;
+            XSH_STORE(s->mtu, mv < own ? mv : own);
             /* Печатаем только ИЗМЕНЕНИЕ: кадр приходит после каждого пробоя пира, то есть раз в
              * две минуты на каждого, и строка «согласован тот же MTU» через год работы звезды из
              * тридцати пиров — это четверть миллиона строк ни о чём. */
-            if (s->mtu != was) {
+            if (XSH_LOAD(s->mtu) != was) {
                 char fp2[12];
                 xs_key_fp(g_conf.peer[s->peer >= 0 ? s->peer : 0].pub, fp2);
-                fprintf(stderr, LOG_I "пир %s: согласован MTU %d\n", fp2, s->mtu);
+                fprintf(stderr, LOG_I "пир %s: согласован MTU %d\n", fp2, XSH_LOAD(s->mtu));
             }
             hub_retune_mtu();
         }
@@ -1438,8 +1461,8 @@ static void *worker_loop(void *arg) {
             size_t off = XS_BATCH_HDR;
             int frames = 0;
             for (int i = 0; i < XSH_BATCH * XS_BATCH_FRAMES_MAX; i++) {
-                int max = dst ? dst->batch_max : XS_BATCH_FRAMES_MAX;
-                if (dst && now < dst->cool_until) max = 1;
+                int max = dst ? XSH_LOAD(dst->batch_max) : XS_BATCH_FRAMES_MAX;
+                if (dst && now < XSH_LOAD(dst->cool_until)) max = 1;
                 if (frames >= max) break;
                 if (frames > 0 && off + 2 + XS_MTU_DEF + XS_TAG > XS_MAX_RECORD) break;
                 ssize_t r = tun_read_packet(&w->tun, pay + off + 2, XS_MTU_DEF);
@@ -1453,7 +1476,8 @@ static void *worker_loop(void *arg) {
                 /* Здесь подрезка ИМЕННО по получателю, а не по минимуму двух, как на пути
                  * пир→пир: пакет пришёл из ядра, и обратный поток пойдёт через тот же
                  * единственный тоннель — тоннель получателя. Второго тоннеля в этом пути нет. */
-                if (d->mtu > 0) xs_mss_clamp(pay + off + 2, (size_t)r, d->mtu);
+                int dmtu = XSH_LOAD(d->mtu);
+                if (dmtu > 0) xs_mss_clamp(pay + off + 2, (size_t)r, dmtu);
                 if (dst && d != dst) {
                     /* Пакет другому пиру закрывает набор. Его самого переносим в начало и делаем
                      * первым кадром следующей записи: откладывать его до следующего круга значило
@@ -1522,10 +1546,12 @@ static void *worker_loop(void *arg) {
                 }
             }
             /* Рост пачки на чистом пути: медленно вверх, мгновенно вниз (см. hub_frame). */
-            if (!g_compat && s->phase == PH_EST && now >= s->cool_until &&
-                now - s->last_grow >= XSH_REASM_GROW_MS && s->batch_max < XS_BATCH_FRAMES_MAX) {
-                s->batch_max *= 2;
-                if (s->batch_max > XS_BATCH_FRAMES_MAX) s->batch_max = XS_BATCH_FRAMES_MAX;
+            int bm = XSH_LOAD(s->batch_max);
+            if (!g_compat && s->phase == PH_EST && now >= XSH_LOAD(s->cool_until) &&
+                now - s->last_grow >= XSH_REASM_GROW_MS && bm < XS_BATCH_FRAMES_MAX) {
+                bm *= 2;
+                if (bm > XS_BATCH_FRAMES_MAX) bm = XS_BATCH_FRAMES_MAX;
+                XSH_STORE(s->batch_max, bm);
                 s->last_grow = now;
             }
             /* Пустая запись и есть keepalive: длина нагрузки ноль, тип кадра пир опознаёт по

@@ -292,7 +292,8 @@ static int tun_up_queues(struct spoke *s, struct tun_dev *q, int want, const cha
             if (fgets(buf, sizeof(buf), mf)) dev_mtu = atoi(buf);
             fclose(mf);
         }
-        if (dev_mtu > 0) s->mtu = dev_mtu;
+        /* Зажимаем, а не только предупреждаем: по этому числу считается предельный сегмент. */
+        if (dev_mtu > 0) s->mtu = xs_mtu_clamp(dev_mtu);
         fprintf(stderr, LOG_I "%s: устройством владеет netifd, MTU %d (накладные %d)\n",
                 dev, s->mtu, XS_OVERHEAD);
         if (dev_mtu > XS_MTU_DEF)
@@ -458,6 +459,10 @@ static int send_frame(struct spoke *s, const uint8_t *pt, size_t pn, long long n
  * поднял интерфейс. Значение, заданное человеком в конфигурации, при этом никогда не
  * превышается: если он написал 1380, мы не поставим 1431, даже если путь его несёт. */
 static void mtu_apply(struct spoke *s, const char *dev, int mtu, const char *why) {
+    /* Тем же потолком, что и остальные два входа: пробой пути число ОПУСКАЕТ, но приходит оно
+     * из провода, и проверять его надо против своих пределов, а не только против другого числа
+     * из настроек. */
+    mtu = xs_mtu_clamp(mtu);
     if (mtu == s->mtu) return;
     /* Устройство одно на все соединения, поэтому МЕНЯЕТ его только воркер 0 — тот же, что ведёт
      * пробой пути. Иначе несколько потоков дёргали бы `ip link` с разными числами, и на
@@ -715,7 +720,7 @@ static int spoke_run(struct spoke *s, const char *dev, const char *chain_label, 
             return 2;
         }
         s->hub_addr = h2.s_addr;
-        s->mtu = s->conf->mtu ? s->conf->mtu : XS_MTU_DEF;
+        s->mtu = xs_mtu_clamp(s->conf->mtu);
     }
     /* DNS из конфигурации разбор принимает, но применить его здесь нельзя: именами на
      * роутере распоряжается dnsmasq, и вырывать резолвер у него из туннеля значило бы
