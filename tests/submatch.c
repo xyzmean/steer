@@ -19,8 +19,24 @@
 #include <string.h>
 
 #include "../src/ext/sub.c"
+/* Вывод UUID живёт в vless_proto.c, а проверка пригодности — в sub.c, и стенду нужны
+ * оба: ссылка из панели обязана и пройти проверку пригодности, и дать те самые 16 байт,
+ * которые уедут в заголовок запроса. Исходник включается тем же приёмом, что и sub.c —
+ * mbedtls он не требует (см. заголовок vless_proto.c), поэтому стенд остаётся в обычном
+ * make test. */
+#include "../src/ext/vless_proto.c"
 
 static int g_pass, g_fail;
+
+/* UUID в каноническую запись: сравнивать 16 байт глазами в отчёте стенда нельзя. */
+static const char *uuid_str(const unsigned char u[16]) {
+    static char s[37];
+    snprintf(s, sizeof(s),
+             "%02x%02x%02x%02x-%02x%02x-%02x%02x-%02x%02x-%02x%02x%02x%02x%02x%02x",
+             u[0], u[1], u[2], u[3], u[4], u[5], u[6], u[7],
+             u[8], u[9], u[10], u[11], u[12], u[13], u[14], u[15]);
+    return s;
+}
 
 static void check(const char *name, const char *expected, const char *actual) {
     if (!strcmp(expected, actual)) {
@@ -239,6 +255,166 @@ int main(void) {
         size_t sum = st.reasons_dropped;
         for (size_t i = 0; i < st.reasons_n; i++) sum += st.reasons[i].count;
         check_n("переполнение: сумма всё равно сходится", (long)st.skipped, (long)sum);
+    }
+
+    /* ---- идентификатор пользователя: правило XRAY, а не «строгий hex» ------
+     *
+     * Панели выдают узлы, у которых id — короткое имя вроде «TMG_74317ba5f91», и это
+     * законный VLESS: Xray в common/uuid/uuid.go смотрит на ДЛИНУ строки. 32-36 знаков
+     * разбираются как шестнадцатеричный UUID (дефисы необязательны), 1-30 знаков —
+     * ВЫВОДЯТСЯ: sha1(16 нулевых байт || строка), первые 16 байт, версия 5 и вариант
+     * в байтах 6 и 8. Ровно 31, длиннее 36 и пустая строка — отказ.
+     *
+     * До правки движок требовал строгий hex, и такой узел проходил проверку пригодности
+     * (то есть попадал в кандидаты и тратил попытки сторожа), а падал молча уже на
+     * подключении: «UUID неразборчив» в пробе и conn_drop без причины в туннеле. */
+    {
+        struct vless_node n;
+        int rc = vless_parse_url(
+            "vless://TMG_74317ba5f91@203.0.113.7:443?type=xhttp&encryption=none"
+            "&path=%2FdRh-l74-MZE3z&host=amazon.com&mode=auto&security=reality"
+            "&fp=firefox&pbk=KEY&sni=amazon.com&sid=9392&spx=%2F"
+            "#TMG_74317ba5f91-%D0%93%D0%B5%D1%80%D0%BC%D0%B0%D0%BD%D0%B8%D1%8F", &n);
+        check_n("ссылка панели с коротким id: узел пригоден", 0, rc);
+        check("ссылка панели: id взят как есть", "TMG_74317ba5f91", n.uuid);
+
+        unsigned char u[16] = { 0 };
+        check_n("короткий id разобран", 0, vless_uuid_parse(n.uuid, u));
+        /* Вектор посчитан независимо от этого кода — питоном по алгоритму Xray. */
+        check("короткий id даёт UUID версии 5",
+              "dd4748e6-1f48-5b36-bbc6-656b42ccfd75", uuid_str(u));
+    }
+
+    /* SHA-1 прибит к опубликованному вектору. Реализация в vless_proto.c своя (mbedtls
+     * этого проекта собирается без SHA-1 — см. комментарий там), и без этой проверки
+     * ошибка в ней выглядела бы как «сервер не признаёт пользователя»: 16 байт уходят
+     * не те, а сказать об этом некому. */
+    {
+        unsigned char d[20];
+        char hex[41];
+        check_n("sha1: сообщение длиной с блок отвергнуто", -1,
+                sha1_short((const unsigned char *)"", 56, d));
+        check_n("sha1(\"abc\") посчитан", 0, sha1_short((const unsigned char *)"abc", 3, d));
+        for (int i = 0; i < 20; i++) snprintf(hex + 2 * i, 3, "%02x", d[i]);
+        check("sha1(\"abc\") — вектор NIST",
+              "a9993e364706816aba3e25717850c26c9cd0d89d", hex);
+    }
+
+    /* Обычный UUID: с дефисами и без — одни и те же 16 байт. Оба написания встречаются
+     * в подписках, и разойтись они не имеют права. */
+    {
+        unsigned char a[16] = { 0 }, b[16] = { 0 };
+        check_n("UUID 36 знаков с дефисами разобран", 0,
+                vless_uuid_parse("11111111-2222-3333-4444-555555555555", a));
+        check_n("UUID 32 знака без дефисов разобран", 0,
+                vless_uuid_parse("11111111222233334444555555555555", b));
+        check("UUID с дефисами: те же байты", "11111111-2222-3333-4444-555555555555",
+              uuid_str(a));
+        check_n("UUID без дефисов даёт то же", 0, memcmp(a, b, 16));
+        /* Заглавные знаки Xray принимает (hex.Decode), значит принимаем и мы. */
+        unsigned char c[16] = { 0 };
+        check_n("UUID заглавными разобран", 0,
+                vless_uuid_parse("AABBCCDD-EEFF-0011-2233-445566778899", c));
+        check("UUID заглавными: байты те же", "aabbccdd-eeff-0011-2233-445566778899",
+              uuid_str(c));
+    }
+
+    /* Границы длины — то, из-за чего правило нельзя писать как «сначала hex, потом
+     * вывод»: 32 и 36 разбираются, 30 выводится, 31 и 37 отвергаются, и всё это
+     * решается ДЛИНОЙ строки, а не тем, похожа ли она на шестнадцатеричную. */
+    {
+        unsigned char u[16] = { 0 };
+        char s30[31], s31[32], s37[38];
+        memset(s30, 'a', 30); s30[30] = '\0';
+        memset(s31, 'a', 31); s31[31] = '\0';
+        memset(s37, 'a', 37); s37[37] = '\0';
+
+        check_n("30 знаков: форма — вывод", VLESS_UUID_DERIVED, vless_uuid_form(s30));
+        check_n("30 знаков: UUID выведен", 0, vless_uuid_parse(s30, u));
+        /* Вектор посчитан питоном по алгоритму Xray, а не этим кодом. */
+        check("30 знаков: вывод совпал", "d20a3bd4-9d58-52e0-8caa-820ca42d1ad0",
+              uuid_str(u));
+
+        check_n("31 знак: форма — щель", VLESS_UUID_GAP, vless_uuid_form(s31));
+        check_n("31 знак: разбора нет", -1, vless_uuid_parse(s31, u));
+
+        check_n("37 знаков: форма — слишком длинно", VLESS_UUID_TOOLONG,
+                vless_uuid_form(s37));
+        check_n("37 знаков: разбора нет", -1, vless_uuid_parse(s37, u));
+
+        check_n("32 знака hex: форма — UUID", VLESS_UUID_HEX,
+                vless_uuid_form("0123456789abcdef0123456789abcdef"));
+        check_n("36 знаков с дефисами: форма — UUID", VLESS_UUID_HEX,
+                vless_uuid_form("01234567-89ab-cdef-0123-456789abcdef"));
+
+        check_n("пусто: форма — пусто", VLESS_UUID_EMPTY, vless_uuid_form(""));
+        check_n("пусто: разбора нет", -1, vless_uuid_parse("", u));
+
+        /* Длина как у UUID, но знак посторонний: у Xray это ошибка hex.Decode, и
+         * коротким именем такая строка стать уже не может — она слишком длинная. */
+        check_n("32 знака с посторонним: форма — не hex", VLESS_UUID_NOTHEX,
+                vless_uuid_form("0123456789abcdef0123456789abcdeZ"));
+        check_n("32 знака с посторонним: разбора нет", -1,
+                vless_uuid_parse("0123456789abcdef0123456789abcdeZ", u));
+        /* Дефис допускается ТОЛЬКО между группами: внутри группы это посторонний знак. */
+        check_n("дефис внутри группы: не hex", VLESS_UUID_NOTHEX,
+                vless_uuid_form("0123-456789ab-cdef-0123-456789abcdef"));
+    }
+
+    /* Длина 31 — щель между двумя формами: для вывода слишком длинно, для UUID коротко.
+     * Знаки при этом шестнадцатеричные, то есть отказ идёт именно по ДЛИНЕ, как у Xray. */
+    {
+        struct vless_node n;
+        check_n("id из 31 знака: узел пропущен", 1,
+                vless_parse_url("vless://0123456789abcdef0123456789abcde@h:443"
+                                "?security=none#x", &n));
+        check("id из 31 знака: причина названа", "идентификатор: 31 знак, нужен UUID",
+              n.skip_reason);
+    }
+
+    /* Остальные непригодные формы — каждая со своей причиной: причина уезжает в
+     * интерфейс, и «узел пропущен» без неё уже разбиралось в splicicd#16. */
+    {
+        struct vless_node n;
+        char url[128];
+        check_n("пустой id: узел пропущен", 1,
+                vless_parse_url("vless://@h:443?security=none#x", &n));
+        check("пустой id: причина названа", "идентификатор пуст", n.skip_reason);
+
+        char long_id[40];
+        memset(long_id, 'a', 37); long_id[37] = '\0';
+        snprintf(url, sizeof(url), "vless://%s@h:443?security=none#x", long_id);
+        check_n("id длиннее UUID: узел пропущен", 1, vless_parse_url(url, &n));
+        check("id длиннее UUID: причина названа", "идентификатор длиннее UUID",
+              n.skip_reason);
+
+        check_n("id длины UUID с посторонним знаком: пропущен", 1,
+                vless_parse_url("vless://0123456789abcdef0123456789abcdeZ@h:443"
+                                "?security=none#x", &n));
+        check("id с посторонним знаком: причина названа", "UUID с недопустимым знаком",
+              n.skip_reason);
+    }
+
+    /* Подписка целиком: пригодные узлы с обоими видами id взяты, непригодный по id
+     * учтён и объяснён. Арифметика та же, на которой стоит весь этот стенд — ни одна
+     * ссылка не имеет права исчезнуть, не попав ни в один счётчик. */
+    {
+        struct vless_node nodes[16];
+        struct vless_sub_stats st;
+        const char *sub =
+            "vless://TMG_74317ba5f91@1.2.3.4:443?security=reality&pbk=K&sni=x.com#Короткий\n"
+            "vless://11111111-2222-3333-4444-555555555555@5.6.7.8:443"
+            "?security=reality&pbk=K&sni=x.com#UUID\n"
+            "vless://0123456789abcdef0123456789abcde@9.9.9.9:443"
+            "?security=reality&pbk=K&sni=x.com#Щель\n";
+        size_t n = vless_parse_sub(sub, nodes, 16, &st);
+        check_n("подписка: пригодны оба вида id", 2, (long)n);
+        check("подписка: короткий id сохранён", "TMG_74317ba5f91", nodes[0].uuid);
+        check_n("подписка: непригоден один", 1, (long)st.skipped);
+        check("подписка: причина непригодного названа",
+              "идентификатор: 31 знак, нужен UUID", st.reasons[0].reason);
+        check("подписка: пример — имя своего узла", "Щель", st.reasons[0].example);
+        check_n("подписка: сумма сходится", 3, (long)(n + st.skipped + st.foreign));
     }
 
     printf("\n%d проверок пройдено", g_pass);

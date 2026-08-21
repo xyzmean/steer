@@ -143,7 +143,13 @@ $(BUILD)/visionmatch: tests/visionmatch.c src/ext/vision.c src/ext/vision.h
 	@mkdir -p $(BUILD)
 	$(CC) $(CFLAGS) -o $@ tests/visionmatch.c
 
-$(BUILD)/submatch: tests/submatch.c src/ext/sub.c src/ext/vless.h
+# vless_proto.c — в предпосылках и в стенде: разбор подписки решает, ПРИГОДЕН ли
+# идентификатор, а превращает его в 16 байт vless_proto.c, и правило у них одно (правило
+# Xray по длине строки). Без этой строки правка вывода UUID не пересобирала стенд, то есть
+# зелёный прогон ничего не значил бы. Библиотек файл не тянет — mbedtls здесь нет
+# по построению (см. ext-syntax).
+$(BUILD)/submatch: tests/submatch.c src/ext/sub.c src/ext/vless.h \
+                  src/ext/vless_proto.c src/ext/vless_proto.h
 	@mkdir -p $(BUILD)
 	$(CC) $(CFLAGS) -o $@ tests/submatch.c
 

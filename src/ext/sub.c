@@ -13,6 +13,10 @@
 #include <stdlib.h>
 #include <string.h>
 #include "vless.h"
+/* Ради vless_uuid_form: пригодность идентификатора — такая же часть пригодности узла, как
+ * транспорт и security, а правило, по которому он превращается в 16 байт, живёт в одном
+ * месте — в vless_proto.c. Библиотек это не тянет. */
+#include "vless_proto.h"
 
 /* base64: только декодирование и только то, что встречается в подписках — с переводами
  * строк внутри и, возможно, без выравнивающих '='. URL-safe алфавит тоже принимается:
@@ -28,11 +32,17 @@ static int b64val(unsigned char c) {
 
 size_t b64_decode(const char *in, size_t n, char *out, size_t out_n) {
     size_t o = 0;
-    int acc = 0, bits = 0;
+    /* Накопитель БЕЗ знака и с маской: читаются из него только младшие bits+8 разрядов
+     * (bits после уменьшения не больше 7), а старшие копились без нужды — на длинной
+     * подписке int переполнялся, то есть разбор недоверенного текста упирался в
+     * неопределённое поведение. UBSan на стенде подписки это и показывал:
+     * «left shift of 496703836 by 6 places cannot be represented in type int». */
+    unsigned acc = 0;
+    int bits = 0;
     for (size_t i = 0; i < n; i++) {
         int v = b64val((unsigned char)in[i]);
         if (v < 0) continue;                  /* переводы строк, '=', мусор */
-        acc = (acc << 6) | v;
+        acc = ((acc << 6) | (unsigned)v) & 0x3FFFu;   /* хватает 14 разрядов: 7 + 6 + 1 */
         bits += 6;
         if (bits >= 8) {
             bits -= 8;
@@ -136,6 +146,36 @@ int vless_parse_url(const char *url, struct vless_node *n) {
      * транспортами было бы ошибкой — причины у них разные. Пустое поле security означает
      * то же самое: в ссылке его просто опускают. */
     if (!n->security[0]) snprintf(n->security, sizeof(n->security), "none");
+
+    /* Идентификатор пользователя. Проверяется ЗДЕСЬ по той же причине, что и всё
+     * остальное в этом блоке: непригодный узел не должен попасть в кандидаты.
+     *
+     * Пригодность здесь — это правило Xray (см. vless_uuid_form): либо шестнадцатеричный
+     * UUID в 32-36 знаков, либо короткая строка до 30 знаков, из которой UUID выводится
+     * хэшем. Панели выдают и то, и другое, и «TMG_74317ba5f91» — законный узел, а не
+     * ошибка. Непригодны ровно три случая, и стать 16 байтами они не могут никак:
+     * пустая строка, ровно 31 знак (для вывода длинно, для UUID коротко) и длиннее
+     * UUID; отдельно — строка нужной длины с посторонним знаком внутри.
+     *
+     * До этой проверки такой узел считался пригодным, доходил до подключения и молчал:
+     * проба отвечала «UUID неразборчив», а туннель ронял соединение без причины. */
+    switch (vless_uuid_form(n->uuid)) {
+    case VLESS_UUID_EMPTY:
+        snprintf(n->skip_reason, sizeof(n->skip_reason), "идентификатор пуст");
+        return 1;
+    case VLESS_UUID_GAP:
+        snprintf(n->skip_reason, sizeof(n->skip_reason),
+                 "идентификатор: 31 знак, нужен UUID");
+        return 1;
+    case VLESS_UUID_TOOLONG:
+        snprintf(n->skip_reason, sizeof(n->skip_reason), "идентификатор длиннее UUID");
+        return 1;
+    case VLESS_UUID_NOTHEX:
+        snprintf(n->skip_reason, sizeof(n->skip_reason), "UUID с недопустимым знаком");
+        return 1;
+    default:
+        break;
+    }
 
     if (strcmp(n->security, "reality") != 0 && strcmp(n->security, "none") != 0) {
         /* tls и xtls остаются непригодными по-настоящему: для них нужна проверка
