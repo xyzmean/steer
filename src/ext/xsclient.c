@@ -170,9 +170,6 @@ struct spoke {
      * и в XS_ROW он не влезает — первая версия получала на этом XS_ESMALL с сообщением
      * «рукопожатие не собралось», не называя причину. */
     uint8_t txb[2560];
-    uint8_t tb[XSC_BATCH][XS_ROW];
-    struct mmsghdr tmm[XSC_BATCH];
-    struct iovec tiov[XSC_BATCH];
     /* Какой MTU этот воркер уже назвал хабу: своя сессия у каждого соединения, и хаб должен
      * знать размер по каждой — иначе подрезка MSS на обратном пути её пропустит. */
     int mtu_told;
@@ -1336,7 +1333,7 @@ static void *worker_main(void *arg) {
      * отдельности. Так же разделены они и в реализации на Go (client/stream.go). */
     if (s->stream) return stream_main(s);
     const char *dev = s->dev;
-    long long last_state = 0, last_keep = 0;
+    long long last_state = 0;
     int keepalive_ms = s->conf->peer[0].keepalive * 1000;
 
     for (;;) {
@@ -1685,7 +1682,6 @@ static void *worker_main(void *arg) {
             s->keep_next = keepalive_ms * 8 / 10 + (long long)(j % (uint32_t)(keepalive_ms * 4 / 10 + 1));
         }
         if (!s->conn_id && now - last_state >= 2000) { state_write(s); last_state = now; }
-        (void)last_keep;
     }
     session_down(s);
     if (!s->conn_id) xs_conf_wipe(s->sec);
