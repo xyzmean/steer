@@ -53,3 +53,4 @@ build/bx-*
 # Объекты mbedtls, собранные под хост для прогона стендов src/ext в образе
 build/mbedtls-host/
 build/asan-probe*
+build/devupmatch

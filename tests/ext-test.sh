@@ -9,6 +9,9 @@
 #   tests/hubmatch.c   — арифметика записи в хабе: правило набора кадров в пачку против
 #                        объявленной строки воркера (I-070). Включает src/ext/xshub.c, отсюда
 #                        и mbedtls: цикл хаба тянет за собой reality.c и TLS 1.3.
+#   tests/devupmatch.c — подъём устройства туннеля: каждый отказ `ip` обязан быть назван, и
+#                        назван своим тоном (I-114). Включает src/ext/tunnel.c — оттуда та же
+#                        зависимость от mbedtls.
 #
 # В обычный `make test` они НЕ входят: там mbedtls нет по построению (R-014, см. ext-syntax),
 # а роутерная сборка src/ext идёт только docker'ом через build.sh. Из-за этого первые два стенда
@@ -151,5 +154,13 @@ $CC -O2 -w -Isrc $MBED_INC "$PRIV" -o "$BUILD/hubmatch" tests/hubmatch.c \
 	src/ext/reality.c src/ext/tls13.c src/ext/h2.c src/ext/tun.c src/obfs.c \
 	src/spec.c $MBED_LIB -lpthread
 "$BUILD/hubmatch"
+
+# devupmatch — подъём устройства туннеля называет свои отказы (I-114).
+echo "ext-test: собираю и прогоняю devupmatch..."
+$CC -O2 -w -Isrc $MBED_INC "$PRIV" -o "$BUILD/devupmatch" tests/devupmatch.c \
+	src/ext/client.c src/ext/vless_proto.c src/ext/vision.c src/ext/tls13.c \
+	src/ext/reality.c src/ext/h2.c src/ext/tun.c src/ext/rtx.c src/ext/sub.c \
+	src/spec.c $MBED_LIB -lpthread
+"$BUILD/devupmatch"
 
 echo "ext-test: все стенды прошли на mbedtls ${MBED_VER:-?}"
