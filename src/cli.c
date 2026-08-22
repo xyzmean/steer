@@ -53,6 +53,7 @@ static const struct cli_flag FLAGS[] = {
     {"--verbose",   "-v", NULL,         "рассказывать по шагам, что проверяется"},
     {"--kind",      NULL, "ВИД",        "только выходы этого вида: interface, vless, xsteer, direct"},
     {"--obfs",      NULL, NULL,         "только выходы, у которых настроена обфускация"},
+    {"--devices",   NULL, NULL,         "печатать имена устройств, а не имена выходов"},
     {"--node",      NULL, "N",          "номер узла подписки, с нуля; -1 — первый рабочий (по умолчанию)"},
     {"--timeout",   NULL, "СЕК",        "сколько ждать ответа узла (по умолчанию 5)"},
     {"--listen",    NULL, "ПОРТ",       "порт поддельного TCP, который слушает сервер"},
@@ -120,7 +121,7 @@ static const struct cli_cmd CMDS[] = {
  "Нужен init-скрипту: он спрашивает движок, для каких выходов поднимать процессы.\n"
  "Спрашивать движок надёжнее, чем искать ключ в спеке grep-ом, — переименование поля\n"
  "ломает grep молча, а вместе с ним и запуск.",
- "--spec --state-dir --kind --obfs", 0, 0, 0, 0, 0},
+ "--spec --state-dir --kind --obfs --devices", 0, 0, 0, 0, 0},
 
 {"needs-dnsd", "Диагностика", "",
  "код 0, если в спеке есть доменные каналы",
@@ -504,6 +505,7 @@ void cli_parse(const struct cli_cmd *cmd, int argc, char **argv, int from,
         else if (!strcmp(f->name, "--dry-run"))    out->dry_run = 1;
         else if (!strcmp(f->name, "--verbose"))    out->verbose = 1;
         else if (!strcmp(f->name, "--obfs"))       out->obfs = 1;
+        else if (!strcmp(f->name, "--devices"))    out->devices = 1;
         /* Нижняя граница -1, а не 0: это часовой «первый рабочий», то же умолчание, и
          * splify2 передаёт его явно (`vless-probe --node -1`). Диапазон с нуля молча
          * сломал бы проверку выхода в интерфейсе. */

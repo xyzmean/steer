@@ -1912,6 +1912,12 @@ int main(int argc, char **argv) {
             /* --obfs — отдельный признак, а не вид: обфускация есть свойство выхода,
              * и init-скрипту нужен именно список тех, кому поднимать процесс. */
             if (a.obfs && !g_out[i].obfs.on) continue;
+            /* --devices печатает устройство, и выход без устройства (kind=direct) при этом
+             * пропускается: пустая строка в списке для настройки фаервола хуже её отсутствия. */
+            if (a.devices) {
+                if (g_out[i].device[0]) printf("%s\n", g_out[i].device);
+                continue;
+            }
             printf("%s\n", g_out[i].name);
         }
         return 0;
