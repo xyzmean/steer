@@ -782,6 +782,10 @@ const char *vless_strerror(int rc) {
         case TLS13_EBADREC: return "испорченная TLS-запись";
         case TLS13_ECLOSED: return "TLS закрыт сервером";
         case TLS13_EIO: return "ошибка чтения TLS";
+        /* «Молчит», а не «ошибка»: соединение TCP встало, а на ClientHello ответа нет. Так
+         * выглядит блокировка по имени в SNI, лежачий узел и потерянный пакет — то есть
+         * причина снаружи движка, и текст обязан отправлять смотреть туда. */
+        case TLS13_ETIMEOUT: return "узел не ответил на ClientHello (таймаут)";
         default: return "неизвестная ошибка";
     }
 }

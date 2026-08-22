@@ -113,6 +113,10 @@ static int read_full(int fd, unsigned char *buf, size_t n) {
         if (r == 0) return TLS13_ECLOSED;
         if (r < 0) {
             if (errno == EINTR) continue;
+            /* Сокет рукопожатия блокирующий и со сроком (SO_RCVTIMEO), поэтому EAGAIN здесь
+             * значит ровно одно: срок вышел, а узел не ответил. Это не ошибка ввода-вывода,
+             * и называть её так — уводить в сторону: искать надо снаружи. */
+            if (errno == EAGAIN || errno == EWOULDBLOCK) return TLS13_ETIMEOUT;
             return TLS13_EIO;
         }
         got += (size_t)r;
