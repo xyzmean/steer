@@ -290,6 +290,11 @@ struct worker {
     int tx0;                         /* сокет для RST тем, чьей сессии нет */
     struct tun_dev tun;              /* своя очередь TUN */
     struct xs_sidx idx;              /* свой индекс сессий: чужих он не увидит по построению */
+    /* Свой кэш последнего решения маршрутизации. Роутер общий и только для чтения, а
+     * изменяемая часть — здесь: общий кэш давал гонку, у которой последствие «пакет уехал
+     * не тому пиру» (подробности в xsroute.h). Оба пути воркера — приёмный и из TUN —
+     * работают в одном потоке, поэтому кэша достаточно одного. */
+    struct xs_route_cache rcache;
     int base, cap;                   /* свой отрезок g_sess */
     int listen_port;
     int debug;
@@ -1091,7 +1096,7 @@ static void route_packet(struct worker *w, struct sess *from, uint8_t *pt, size_
     /* ОБЯЗАТЕЛЬНАЯ проверка: без неё одна скомпрометированная пир подделывает трафик любой
      * другой. Право на адрес даёт конфигурация, а не сам пакет. */
     if (from->peer < 0 || !xs_src_ok(&g_conf.peer[from->peer], src)) return;
-    int to = xs_route(&g_router, dst);
+    int to = xs_route(&g_router, dst, &w->rcache);
     /* Привязка пир→сессия читается один раз в локальную переменную: между чтением и отправкой
      * владелец сессии может её сменить, и «прочитать дважды» означало бы отправку по индексу,
      * который уже другой. Что сессия к моменту отправки ещё жива, проверяет сама send_to под
@@ -1469,7 +1474,7 @@ static void *worker_loop(void *arg) {
                 if (r <= 20) break;
                 uint32_t dip;
                 memcpy(&dip, pay + off + 2 + 16, 4);
-                int to = xs_route(&g_router, ntohl(dip));
+                int to = xs_route(&g_router, ntohl(dip), &w->rcache);
                 int16_t di = to >= 0 ? peer_pick(to, pay + off + 2, (size_t)r) : -1;
                 if (di < 0) continue;                          /* нет пира — отбросить */
                 struct sess *d = &g_sess[di];

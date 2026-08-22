@@ -81,15 +81,12 @@ int main(void) {
         xs_router_build(&r, peers, 3);
         check("маршрут: три записи", 3, (long)r.n);
         check("маршрут: разложены по длине по убыванию", 24, r.ent[0].plen);
-        check("маршрут: /24 побеждает /16 и /8", 2, xs_route(&r, ip4(10, 9, 5, 7)));
-        r.cache_valid = 0;
-        check("маршрут: /16 побеждает /8", 1, xs_route(&r, ip4(10, 9, 6, 7)));
-        r.cache_valid = 0;
-        check("маршрут: /8 достаётся остальному", 0, xs_route(&r, ip4(10, 1, 1, 1)));
-        r.cache_valid = 0;
+        check("маршрут: /24 побеждает /16 и /8", 2, xs_route(&r, ip4(10, 9, 5, 7), NULL));
+        check("маршрут: /16 побеждает /8", 1, xs_route(&r, ip4(10, 9, 6, 7), NULL));
+        check("маршрут: /8 достаётся остальному", 0, xs_route(&r, ip4(10, 1, 1, 1), NULL));
         /* Отсутствие совпадения — это РЕШЕНИЕ отбросить. Отдать пакет «первому пиру»
          * означало бы утечку трафика между пирами звезды. */
-        check("маршрут: нет совпадения — отбросить", -1, xs_route(&r, ip4(192, 168, 1, 1)));
+        check("маршрут: нет совпадения — отбросить", -1, xs_route(&r, ip4(192, 168, 1, 1), NULL));
     }
     {
         /* Кэш обязан давать тот же ответ, что обход: иначе первый пакет потока уходит
@@ -101,15 +98,15 @@ int main(void) {
         struct xs_router r;
         xs_router_build(&r, peers, 2);
         int bad = 0;
+        struct xs_route_cache rc;
+        memset(&rc, 0, sizeof(rc));
         for (int i = 0; i < 20000; i++) {
             uint32_t d = rnd();
-            struct xs_router fresh;
-            xs_router_build(&fresh, peers, 2);
-            int with_cache = xs_route(&r, d);      /* r несёт кэш от прошлых вызовов */
-            int no_cache = xs_route(&fresh, d);
+            int with_cache = xs_route(&r, d, &rc);   /* rc несёт кэш от прошлых вызовов */
+            int no_cache = xs_route(&r, d, NULL);    /* NULL — честный обход */
             if (with_cache != no_cache) bad++;
             /* Тот же адрес второй раз — попадание в кэш, ответ обязан не измениться. */
-            if (xs_route(&r, d) != with_cache) bad++;
+            if (xs_route(&r, d, &rc) != with_cache) bad++;
         }
         check("маршрут: кэш даёт тот же ответ, что обход", 0, bad);
     }
@@ -121,11 +118,9 @@ int main(void) {
         add_allowed(&peers[1], ip4(1, 1, 1, 1), 32);
         struct xs_router r;
         xs_router_build(&r, peers, 2);
-        check("маршрут: /32 побеждает /0", 1, xs_route(&r, ip4(1, 1, 1, 1)));
-        r.cache_valid = 0;
-        check("маршрут: /0 забирает остальное", 0, xs_route(&r, ip4(8, 8, 8, 8)));
-        r.cache_valid = 0;
-        check("маршрут: /0 забирает и нуль", 0, xs_route(&r, 0));
+        check("маршрут: /32 побеждает /0", 1, xs_route(&r, ip4(1, 1, 1, 1), NULL));
+        check("маршрут: /0 забирает остальное", 0, xs_route(&r, ip4(8, 8, 8, 8), NULL));
+        check("маршрут: /0 забирает и нуль", 0, xs_route(&r, 0, NULL));
     }
     {
         struct xs_router r;
@@ -133,7 +128,7 @@ int main(void) {
         memset(&none, 0, sizeof(none));
         xs_router_build(&r, &none, 1);
         check("маршрут: пир без префиксов не даёт записей", 0, (long)r.n);
-        check("маршрут: пустая таблица отбрасывает всё", -1, xs_route(&r, ip4(10, 0, 0, 1)));
+        check("маршрут: пустая таблица отбрасывает всё", -1, xs_route(&r, ip4(10, 0, 0, 1), NULL));
     }
 
     /* ---- проверка источника ------------------------------------------------ */

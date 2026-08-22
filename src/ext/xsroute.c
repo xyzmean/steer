@@ -28,14 +28,19 @@ void xs_router_build(struct xs_router *r, const struct xs_peer *peers, size_t pe
     }
 }
 
-int xs_route(struct xs_router *r, uint32_t dst_host) {
-    if (r->cache_valid && r->cache_dst == dst_host) return r->cache_peer;
+int xs_route(const struct xs_router *r, uint32_t dst_host, struct xs_route_cache *c) {
+    if (c && c->valid && c->dst == dst_host) return c->peer;
     int found = -1;
     for (size_t i = 0; i < r->n; i++)
         if ((dst_host & r->ent[i].mask) == r->ent[i].net) { found = r->ent[i].peer; break; }
-    r->cache_dst = dst_host;
-    r->cache_peer = (int16_t)found;
-    r->cache_valid = 1;
+    /* Кэш личный, поэтому порядок записи здесь ни на что не влияет — но признак годности
+     * всё равно ставится последним: та же строка, скопированная однажды в общий кэш, была
+     * бы гонкой, и пусть она читается как гонка сразу. */
+    if (c) {
+        c->dst = dst_host;
+        c->peer = (int16_t)found;
+        c->valid = 1;
+    }
     return found;
 }
 
