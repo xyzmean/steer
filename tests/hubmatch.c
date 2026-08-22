@@ -26,10 +26,74 @@
 #define _GNU_SOURCE
 #include <stdio.h>
 #include <string.h>
+#include <stdlib.h>
+#include <unistd.h>
 
-/* Хабу run_quiet нужен для `ip link` (hub_retune_mtu, cmd_xsteer_hub); в src/steer.c его
- * настоящая реализация, а стенду достаточно отказа: ничего из этого он не вызывает. */
-int run_quiet(const char *const argv[]) { (void)argv; return -1; }
+/* Хабу run_quiet нужен для `ip link` (hub_retune_mtu, hub_dev_up, cmd_xsteer_hub); в
+ * src/steer.c его настоящая реализация, а здесь — ЗАПИСЬ вместо запуска: подъём устройства
+ * (hub_dev_up) проверяется именно по тому, какие команды он отдал и что сказал о неудавшихся.
+ * По умолчанию все проходят; отказать умеет ровно та, чью подстроку назвал стенд (тот же
+ * приём, что в tests/failovermatch.c). */
+static char g_cmd[64][256];
+static int  g_cmd_n;
+static const char *g_fail_on = "";
+
+int run_quiet(const char *const argv[]) {
+    if (!argv || !argv[0]) return -1;
+    char joined[256];
+    size_t jn = 0;
+    for (int i = 0; argv[i] && jn < sizeof(joined) - 2; i++)
+        jn += (size_t)snprintf(joined + jn, sizeof(joined) - jn, i ? " %s" : "%s", argv[i]);
+    if (g_cmd_n < (int)(sizeof(g_cmd) / sizeof(*g_cmd)))
+        snprintf(g_cmd[g_cmd_n++], sizeof(g_cmd[0]), "%s", joined);
+    if (g_fail_on[0] && strstr(joined, g_fail_on)) return 2;
+    return 0;
+}
+
+static int cmd_seen(const char *needle) {
+    for (int i = 0; i < g_cmd_n; i++)
+        if (strstr(g_cmd[i], needle)) return 1;
+    return 0;
+}
+
+/* ---- перехват журнала --------------------------------------------------------
+ *
+ * У подъёма устройства нет ни возвращаемого значения, ни следующей команды, по которой можно
+ * судить со стороны: единственное его наблюдаемое следствие при отказе — строка в журнале.
+ * Поэтому stderr на время вызова уводится в файл. Уровень строки проверяется отдельно:
+ * `steer[warn]` против `steer[info]` — это контракт с интерфейсом, а не оформление. */
+static char g_logpath[] = "/tmp/hubmatch-log.XXXXXX";
+static int  g_logfd = -1, g_saved_err = -1;
+static char g_log[8192];
+
+static void log_begin(void) {
+    if (g_logfd < 0) {
+        g_logfd = mkstemp(g_logpath);
+        unlink(g_logpath);
+        g_saved_err = dup(2);
+    }
+    fflush(stderr);
+    /* Обнуляются И длина, И смещение: запись идёт по смещению дескриптора, и без lseek
+     * следующий перехват начинался бы дырой из нулевых байтов, то есть пустой строкой при
+     * непустом файле. */
+    if (ftruncate(g_logfd, 0) != 0) { /* пусто и так */ }
+    lseek(g_logfd, 0, SEEK_SET);
+    dup2(g_logfd, 2);
+}
+
+static const char *log_end(void) {
+    fflush(stderr);
+    dup2(g_saved_err, 2);
+    ssize_t n = pread(g_logfd, g_log, sizeof(g_log) - 1, 0);
+    g_log[n > 0 ? n : 0] = '\0';
+    return g_log;
+}
+
+static int log_lines_with(const char *log, const char *level) {
+    int n = 0;
+    for (const char *p = log; (p = strstr(p, level)); p += strlen(level)) n++;
+    return n;
+}
 
 #include "../src/ext/xshub.c"
 #include "chello-frozen.h"
@@ -954,6 +1018,85 @@ int main(void) {
         memset(&w, 0, sizeof(w));
         check("кандидатов нет вовсе — отказ, а не разыменование нуля", 1,
               sess_evict_pick(&w, NULL, NULL, NOW) == NULL);
+    }
+
+    /* ---- подъём устройства хаба: каждый отказ `ip` назван (I-114) ----------------
+     *
+     * Симптом всех трёх отказов снаружи один и тот же — «хаб слушает, трафика нет», — и до
+     * этой правки ни один из них не оставлял в журнале ни строки: три команды шли через
+     * run_quiet, и ни у одной не смотрели код возврата. Регресс не виден ни в одной другой
+     * проверке: процесс работает, рукопожатия идут, ошибок нет.
+     *
+     * Ни сети, ни прав здесь не нужно: hub_dev_up только считает строки и зовёт run_quiet,
+     * который на стенде записывает команды вместо их запуска. Имя устройства НЕ содержит
+     * подстроки "up" — ею стенд отличает `ip link set ... up` от остальных команд. */
+    printf("\n== хаб: подъём устройства называет свои отказы ==\n");
+    {
+        memset(&g_conf, 0, sizeof(g_conf));
+        g_conf.addr = (10u << 24) | (77u << 16) | 1u;   /* 10.77.0.1 */
+        g_conf.addr_plen = 24;
+        g_conf.mtu = 1380;
+        g_conf.peer_n = 2;
+        g_conf.peer[0].allowed_n = 2;
+        g_conf.peer[0].allowed[0].net = (10u << 24) | (77u << 16) | (2u << 8); /* 10.77.2.0/24 */
+        g_conf.peer[0].allowed[0].plen = 24;
+        g_conf.peer[0].allowed[1].net = 0;              /* 0.0.0.0/0 — не наш маршрут */
+        g_conf.peer[0].allowed[1].plen = 0;
+        g_conf.peer[1].allowed_n = 1;
+        g_conf.peer[1].allowed[0].net = (192u << 24) | (168u << 16) | (9u << 8);
+        g_conf.peer[1].allowed[0].plen = 24;
+        const char *DEV = "xshub-tst0";
+
+        /* Успешный подъём: порядок команд тот же, что был, и журнал молчит. Вторая половина
+         * этой проверки — страховка от перестарания: предупреждение на исправном подъёме
+         * учило бы не смотреть в журнал. */
+        g_cmd_n = 0; g_fail_on = "";
+        log_begin();
+        hub_dev_up(DEV);
+        const char *log = log_end();
+        check("команд четыре: адрес, mtu+up и два маршрута к сетям пиров", 4, g_cmd_n);
+        check("адрес хаба ставится из конфигурации", 1,
+              cmd_seen("ip addr replace 10.77.0.1/24 dev xshub-tst0"));
+        check("MTU и подъём — одной командой", 1,
+              cmd_seen("ip link set dev xshub-tst0 mtu 1380 up"));
+        check("маршрут к сети первого пира", 1,
+              cmd_seen("ip route replace 10.77.2.0/24 dev xshub-tst0"));
+        check("маршрут к сети второго пира", 1,
+              cmd_seen("ip route replace 192.168.9.0/24 dev xshub-tst0"));
+        check("0.0.0.0/0 маршрутом не заводится", 0, cmd_seen("route replace 0.0.0.0/0"));
+        check("на успешном подъёме журнал молчит", 0, log_lines_with(log, "steer["));
+
+        g_cmd_n = 0; g_fail_on = "addr replace";
+        log_begin();
+        hub_dev_up(DEV);
+        log = log_end();
+        check("отказ адреса назван предупреждением", 1, log_lines_with(log, "steer[warn]") > 0);
+        check("и в нём сам адрес — видно, что именно не встало", 1,
+              strstr(log, "10.77.0.1/24") != NULL);
+        check("остальные команды всё равно отданы", 4, g_cmd_n);
+
+        g_cmd_n = 0; g_fail_on = " up";
+        log_begin();
+        hub_dev_up(DEV);
+        log = log_end();
+        check("отказ подъёма назван предупреждением", 1, log_lines_with(log, "steer[warn]") > 0);
+        check("названы обе настройки той команды — MTU тоже", 1,
+              strstr(log, "1380") != NULL);
+
+        /* Главный из трёх: отказ маршрута к сети пира — это работа В ОДНУ СТОРОНУ, и в
+         * строке обязана стоять СЕТЬ. Пиров бывает тридцать две; «маршрут не встал» без
+         * адреса не говорит, у кого именно связь окажется односторонней. */
+        g_cmd_n = 0; g_fail_on = "route replace 192.168.9.0/24";
+        log_begin();
+        hub_dev_up(DEV);
+        log = log_end();
+        check("отказ маршрута к сети пира назван", 1, log_lines_with(log, "steer[warn]") > 0);
+        check("и названа именно та сеть, что не встала", 1,
+              strstr(log, "192.168.9.0/24") != NULL);
+        check("а сеть, маршрут к которой встал, в журнале не поминается", 0,
+              strstr(log, "10.77.2.0/24") != NULL);
+        check("ровно одна строка — по одному отказу, не по всем пирам", 1,
+              log_lines_with(log, "steer[warn]"));
     }
 
     printf(fails ? "\nПРОВАЛОВ: %d\n" : "\nвсе проверки прошли\n", fails);

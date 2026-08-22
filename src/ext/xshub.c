@@ -503,6 +503,52 @@ static void hub_retune_mtu(void) {
     pthread_mutex_unlock(&g_ctl);
 }
 
+/* Поднять устройство хаба: адрес, MTU, `up` и маршруты к сетям пиров.
+ *
+ * ОТДЕЛЬНОЙ ФУНКЦИЕЙ — не ради красоты. Раньше эти команды стояли внутри xs_hub_run, а он
+ * целиком построен на I/O (сырой сокет, очереди TUN, потоки), то есть проверить решение
+ * «назвать отказ» стендом было нечем. Здесь оно проверяется: hubmatch подменяет run_quiet и
+ * читает журнал.
+ *
+ * Отказы называются по одному, потому что цена у них разная, а следствие у всех трёх одно и
+ * то же снаружи: «хаб слушает, трафика нет». Немых отказов на этом пути не остаётся — та же
+ * правка, что уже сделана в движке для клиента туннеля (адрес, up, txqueuelen) и для
+ * привязки таблицы выхода. */
+static void hub_dev_up(const char *dev) {
+    char addr[24], mtu[8];
+    struct in_addr in;
+    in.s_addr = htonl(g_conf.addr);
+    snprintf(addr, sizeof(addr), "%s/%d", inet_ntoa(in), g_conf.addr_plen);
+    snprintf(mtu, sizeof(mtu), "%d", g_conf.mtu ? g_conf.mtu : XS_MTU_DEF);
+    const char *a1[] = { "ip", "addr", "replace", addr, "dev", dev, NULL };
+    const char *a2[] = { "ip", "link", "set", "dev", dev, "mtu", mtu, "up", NULL };
+    if (run_quiet(a1) != 0)
+        fprintf(stderr, LOG_W "%s: адрес %s не встал — ядро сочтёт маршрут на это устройство "
+                        "непригодным для локально порождённых пакетов\n", dev, addr);
+    /* Одна команда на две настройки, поэтому и отказ один: он означает либо не принятый MTU,
+     * либо не поднявшееся устройство, и различить их снаружи нечем. Названы оба, потому что
+     * второе останавливает трафик целиком, а первое — только режет пакеты. */
+    if (run_quiet(a2) != 0)
+        fprintf(stderr, LOG_W "%s: устройство не поднялось или не принят MTU %s — хаб будет "
+                        "слушать, а трафик наружу не пойдёт\n", dev, mtu);
+    /* Маршруты к сетям пиров: без них ядро не знает, что ответы им идут через это
+     * устройство, и выход в интернет работал бы только в одну сторону. */
+    for (size_t i = 0; i < g_conf.peer_n; i++)
+        for (size_t a = 0; a < g_conf.peer[i].allowed_n; a++) {
+            if (!g_conf.peer[i].allowed[a].plen) continue;   /* 0.0.0.0/0 — не наш маршрут */
+            char pfx[24];
+            in.s_addr = htonl(g_conf.peer[i].allowed[a].net);
+            snprintf(pfx, sizeof(pfx), "%s/%d", inet_ntoa(in),
+                     g_conf.peer[i].allowed[a].plen);
+            const char *r[] = { "ip", "route", "replace", pfx, "dev", dev, NULL };
+            /* Названа СЕТЬ, а не только факт: пиров может быть много, и «маршрут не встал»
+             * без адреса не говорит, у кого именно связь окажется односторонней. */
+            if (run_quiet(r) != 0)
+                fprintf(stderr, LOG_W "%s: маршрут к %s не встал — с этой сетью связь будет "
+                                "в одну сторону\n", dev, pfx);
+        }
+}
+
 /* Зашифровать пакет для сессии и отправить. Открытый текст лежит по row + XS_HDR_ROOM —
  * ровно там, где он оказался после расшифровки входящего, поэтому пересылка пир↔пир
  * обходится без единой копии.
@@ -1664,27 +1710,7 @@ int cmd_xsteer_hub(const char *conf_path) {
             int tfl = fcntl(tq[q].fd, F_GETFL, 0);
             fcntl(tq[q].fd, F_SETFL, tfl | O_NONBLOCK);
         }
-        char addr[24], mtu[8];
-        struct in_addr in;
-        in.s_addr = htonl(g_conf.addr);
-        snprintf(addr, sizeof(addr), "%s/%d", inet_ntoa(in), g_conf.addr_plen);
-        snprintf(mtu, sizeof(mtu), "%d", g_conf.mtu ? g_conf.mtu : XS_MTU_DEF);
-        const char *a1[] = { "ip", "addr", "replace", addr, "dev", dev, NULL };
-        const char *a2[] = { "ip", "link", "set", "dev", dev, "mtu", mtu, "up", NULL };
-        run_quiet(a1);
-        run_quiet(a2);
-        /* Маршруты к сетям пиров: без них ядро не знает, что ответы им идут через это
-         * устройство, и выход в интернет работал бы только в одну сторону. */
-        for (size_t i = 0; i < g_conf.peer_n; i++)
-            for (size_t a = 0; a < g_conf.peer[i].allowed_n; a++) {
-                if (!g_conf.peer[i].allowed[a].plen) continue;   /* 0.0.0.0/0 — не наш маршрут */
-                char pfx[24];
-                in.s_addr = htonl(g_conf.peer[i].allowed[a].net);
-                snprintf(pfx, sizeof(pfx), "%s/%d", inet_ntoa(in),
-                         g_conf.peer[i].allowed[a].plen);
-                const char *r[] = { "ip", "route", "replace", pfx, "dev", dev, NULL };
-                run_quiet(r);
-            }
+        hub_dev_up(dev);
     }
 
 
