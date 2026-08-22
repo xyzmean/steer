@@ -29,6 +29,11 @@ int rule_deleted = 0;
 static char g_cmd[64][256];
 static int g_cmd_n;
 
+/* Заставить `ip route add default dev ...` отказать: устройство исчезло между
+ * проверкой и привязкой, таблица занята, нет прав. Подделать это можно только здесь —
+ * настоящего ядра у стенда нет. */
+int g_route_add_fails = 0;
+
 int run_quiet(const char *const argv[]) {
     if (!argv || !argv[0]) return -1;
     /* Ядро изображается ровно в одном: `ip rule del` удаляет ПО ОДНОМУ правилу и в
@@ -57,6 +62,9 @@ int run_quiet(const char *const argv[]) {
             if (!strcmp(argv[i + 1], "del")) rule_deleted++;
         }
     }
+    /* Отказывает только привязка к устройству: blackhole в ту же таблицу обязан
+     * пройти, иначе стенд проверял бы не то. */
+    if (g_route_add_fails && strstr(joined, "route add default dev")) return 2;
     return 0;
 }
 
@@ -298,6 +306,43 @@ int main(void) {
           cmd_seen("ip route add blackhole default table 300"), 0);
     check("мёртвый выход с запретом — таблица не сбрасывается",
           cmd_seen("ip route flush table 300"), 0);
+
+    /* 7. Привязка отказала (I-110). Устройство отвечает, имя сменилось — сторож зовёт
+     *    bind_device, тот делает `ip route flush table 300` и следом `ip route add default
+     *    dev lo table 300`, а он не проходит: устройство исчезло между проверкой и
+     *    привязкой, таблица занята, нет прав. Таблица остаётся ПУСТОЙ, а пустая таблица —
+     *    это не «нет пути», а «ищи дальше»: помеченный пакет проваливается в следующую
+     *    таблицу и уходит НАПРЯМУЮ, то есть ровно туда, куда его не пускали. Хуже того,
+     *    flush снял blackhole, который до этого поставил apply при on_fail=drop.
+     *    Ровно это решение уже принято в apply_routing (steer.c) — здесь оно обязано
+     *    совпадать. */
+    out_set("lo", FAIL_DROP);
+    state_write("active", "vl -\n");
+    g_route_add_fails = 1;
+    tick(RULES_WITH, "");
+    g_route_add_fails = 0;
+    check("отказ привязки при on_fail=drop — таблица не остаётся пустой",
+          cmd_seen("ip route add blackhole default table 300"), 1);
+
+    /* 8. Тот же отказ при on_fail=direct: запрет ставить НЕЛЬЗЯ — выход и объявлял, что
+     *    при неудаче трафик идёт напрямую. Проверяется, что правка не подменила
+     *    заявленный режим отказа заодно. */
+    out_set("lo", FAIL_DIRECT);
+    state_write("active", "vl -\n");
+    g_route_add_fails = 1;
+    tick(RULES_WITH, "");
+    g_route_add_fails = 0;
+    check("отказ привязки при on_fail=direct — запрет не ставится",
+          cmd_seen("ip route add blackhole default table 300"), 0);
+
+    /* 9. Привязка прошла — запрета быть не должно ни при каком on_fail. */
+    out_set("lo", FAIL_DROP);
+    state_write("active", "vl -\n");
+    tick(RULES_WITH, "");
+    check("успешная привязка — запрет не ставится",
+          cmd_seen("ip route add blackhole default table 300"), 0);
+    check("успешная привязка — маршрут поставлен",
+          cmd_seen("ip route add default dev lo table 300"), 1);
 
     /* Уборка: файлы состояния и папка. */
     {
