@@ -129,6 +129,58 @@ static int cmp_range(const void *x, const void *y) {
     return 0;
 }
 
+/* Поразрядная сортировка по lo — вместо qsort, и это не вкусовщина, а замер.
+ *
+ * qsort в musl это smoothsort, и на полумиллионе диапазонов он стоил 0,255 с против
+ * 0,058 с у glibc — то есть роутерная сборка платит за сортировку вчетверо больше, чем
+ * машина разработчика. Фазовый разбор `steer fit` на списке 518 394 строк (x86, musl,
+ * -Os) показал, что сортировка и есть единственная величина, которая имеет значение:
+ * чтение 0,038, СОРТИРОВКА 0,286, слияние 0,001, лестница 0,018, вывод 0,021.
+ *
+ * На MT7621 разрыв больше, а не меньше: массив 518k×8 это 4,1 МБ, на x86 он живёт в L2
+ * и L3, а на 24Kc кэша второго уровня нет вовсе — каждое сравнение smoothsort это
+ * косвенный вызов через указатель плюс два случайных обращения по ~150 нс. Поразрядная,
+ * наоборот, читает подряд и пишет в 256 корзин: 256 строк кэша это 8 КБ, влезает в L1.
+ *
+ * Почему хватает порядка ТОЛЬКО по lo: merge_sorted при пересечении берёт максимум hi
+ * (см. его тело), поэтому взаимный порядок равных lo на результат не влияет. Полное
+ * сравнение из cmp_range нужно было qsort'у как отношение, а не по существу задачи.
+ *
+ * Черновик статический и растёт по надобности: merge_lossless зовётся перед каждой
+ * попыткой подгонки и после каждой ступени, а выделять и отдавать четыре мегабайта на
+ * каждый вызов — это ровно та работа, которую мы здесь убираем. `steer fit` — процесс
+ * одноразовый, поэтому память возвращается его завершением. */
+static struct range *g_rsort;
+static size_t g_rsort_cap;
+
+static void sort_by_lo(struct range *v, size_t n) {
+    /* На коротких списках поразрядная не выигрывает: четыре прохода по массиву дороже
+     * одной сортировки на десятке элементов. Порог с запасом. */
+    if (n < 64) { qsort(v, n, sizeof(*v), cmp_range); return; }
+    if (g_rsort_cap < n) {
+        struct range *nb = realloc(g_rsort, n * sizeof(*nb));
+        if (!nb) { qsort(v, n, sizeof(*v), cmp_range); return; }  /* нет памяти — не беда */
+        g_rsort = nb;
+        g_rsort_cap = n;
+    }
+    struct range *src = v, *dst = g_rsort;
+    for (int shift = 0; shift < 32; shift += 8) {
+        size_t cnt[256] = {0};
+        for (size_t i = 0; i < n; i++) cnt[(src[i].lo >> shift) & 0xFF]++;
+        /* Проход можно пропустить целиком, когда все ключи в одной корзине: у списков
+         * префиксов старший байт часто однороден, и это снимает четверть работы. */
+        size_t nonzero = 0;
+        for (int b = 0; b < 256; b++) if (cnt[b]) nonzero++;
+        if (nonzero <= 1) continue;
+        size_t pos = 0;
+        for (int b = 0; b < 256; b++) { size_t c = cnt[b]; cnt[b] = pos; pos += c; }
+        for (size_t i = 0; i < n; i++) dst[cnt[(src[i].lo >> shift) & 0xFF]++] = src[i];
+        struct range *t = src; src = dst; dst = t;
+    }
+    /* Нечётное число выполненных проходов оставляет результат в черновике. */
+    if (src != v) memcpy(v, src, n * sizeof(*v));
+}
+
 /* Слияние соседей, когда список УЖЕ упорядочен по lo. Выход collapse_level
  * упорядочен по построению (обход идёт по возрастанию, и каждая ветка кладёт
  * lo не меньше предыдущего — пересечения возможны, порядок нет), а этому
@@ -153,7 +205,7 @@ static void merge_sorted(struct list *l) {
  * runs before every fit attempt and after every collapse level. */
 static void merge_lossless(struct list *l) {
     if (l->n == 0) return;
-    qsort(l->v, l->n, sizeof(*l->v), cmp_range);
+    sort_by_lo(l->v, l->n);
     merge_sorted(l);
 }
 
@@ -261,27 +313,79 @@ static uint64_t collapse_level(struct list *l, unsigned level, size_t min_count)
 }
 
 /* ---- output -------------------------------------------------------------- */
+/* Вывод без разбора форматной строки и без блокировки FILE на элемент.
+ *
+ * Замер на 441 451 выписанной строке: snprintf+fprintf стоили 347 нс на строку в сборке
+ * с musl (186 нс с glibc), свой форматтер в свой буфер — 10 нс. Тридцать пять раз, и
+ * причина ровно та, которую src/steer.c:466 уже назвал для emit_elements («fputs, а не
+ * fprintf: на списке в сотни тысяч элементов разбор форматной строки на каждый — это
+ * заметная доля времени apply»). Здесь этот вывод просто не был донесён.
+ *
+ * Второй источник — умолчание буфера musl в 1 КБ: 7,3 МБ текста уходили ~7100 вызовами
+ * write вместо ~110. Поэтому буфер свой и крупный, а не setvbuf: он же снимает
+ * блокировку FILE, которую stdio берёт на каждый из полумиллиона вызовов.
+ *
+ * Байты адреса — это три десятичных цифры, и записать их вручную дешевле, чем один раз
+ * разобрать "%u.%u.%u.%u". */
+/* Для отчёта — по-прежнему snprintf: он там вызывается один раз за прогон, и своя
+ * реализация ради одного вызова была бы дороже в чтении, чем в такте. */
 static void fmt_addr(uint32_t a, char *buf, size_t n) {
     snprintf(buf, n, "%u.%u.%u.%u", a >> 24, (a >> 16) & 255, (a >> 8) & 255, a & 255);
+}
+
+#define OUTBUF_SZ (64 * 1024)
+static char g_out[OUTBUF_SZ];
+static size_t g_out_n;
+
+static void out_flush(FILE *f) {
+    if (g_out_n) { fwrite(g_out, 1, g_out_n, f); g_out_n = 0; }
+}
+
+/* Место под самую длинную строку: два адреса, дефис и перевод строки — 32 байта с
+ * запасом. Сброс делается ДО записи, а не после, чтобы в буфере всегда было место. */
+static void out_reserve(FILE *f) {
+    if (g_out_n + 32 > OUTBUF_SZ) out_flush(f);
+}
+
+static char *put_addr(char *p, uint32_t a) {
+    for (int sh = 24; ; sh -= 8) {
+        unsigned v = (a >> sh) & 255;
+        if (v >= 100) { *p++ = (char)('0' + v / 100); v %= 100; *p++ = (char)('0' + v / 10); }
+        else if (v >= 10) { *p++ = (char)('0' + v / 10); }
+        *p++ = (char)('0' + v % 10);
+        if (!sh) break;
+        *p++ = '.';
+    }
+    return p;
+}
+
+static char *put_uint(char *p, unsigned v) {
+    char t[3];
+    int n = 0;
+    do { t[n++] = (char)('0' + v % 10); v /= 10; } while (v);
+    while (n) *p++ = t[--n];
+    return p;
 }
 
 /* A range as one CIDR when it happens to be aligned, else as "lo-hi". nft accepts
  * both in an interval set and stores either as ONE element, so this never trades
  * memory for looks. */
 static void emit_range(FILE *f, uint32_t lo, uint32_t hi) {
-    char a[16], b[16];
+    out_reserve(f);
+    char *p = g_out + g_out_n;
     uint64_t size = (uint64_t)hi - lo + 1;
     if ((size & (size - 1)) == 0 && (lo & (uint32_t)(size - 1)) == 0) {
         unsigned len = 32;
         while (((uint64_t)1 << (32 - len)) < size) len--;
-        fmt_addr(lo, a, sizeof(a));
-        if (len == 32) fprintf(f, "%s\n", a);
-        else fprintf(f, "%s/%u\n", a, len);
-        return;
+        p = put_addr(p, lo);
+        if (len != 32) { *p++ = '/'; p = put_uint(p, len); }
+    } else {
+        p = put_addr(p, lo);
+        *p++ = '-';
+        p = put_addr(p, hi);
     }
-    fmt_addr(lo, a, sizeof(a));
-    fmt_addr(hi, b, sizeof(b));
-    fprintf(f, "%s-%s\n", a, b);
+    *p++ = '\n';
+    g_out_n = (size_t)(p - g_out);
 }
 
 static void read_file(const char *path, struct list *l, unsigned long *bad) {
@@ -434,6 +538,9 @@ int aggregate_main(int argc, char **argv) {
     }
 
     for (size_t i = 0; i < l.n; i++) emit_range(stdout, l.v[i].lo, l.v[i].hi);
+    /* Свой буфер обязан быть сброшен явно: он не stdio, и его никто не допишет за нас
+     * ни на exit, ни на fclose. Один забытый сброс здесь — это молча урезанный список. */
+    out_flush(stdout);
 
     /* The ranges a collapse swallowed. The caller MUST route these ahead of the
      * fitted list, or the addresses it promised to keep direct ride the tunnel. */
@@ -442,6 +549,7 @@ int aggregate_main(int argc, char **argv) {
         FILE *pf = fopen(punch_path, "w");
         if (!pf) { fprintf(stderr, "steer aggregate: %s: %s\n", punch_path, strerror(errno)); return 2; }
         for (size_t i = 0; i < g_punch.n; i++) emit_range(pf, g_punch.v[i].lo, g_punch.v[i].hi);
+        out_flush(pf);
         fclose(pf);
     }
 
