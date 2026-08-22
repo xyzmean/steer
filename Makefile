@@ -26,7 +26,7 @@ $(BUILD)/steer: src/steer.c src/spec.c src/dnsd.c src/failover.c src/aggregate.c
 	$(CC) $(CFLAGS) $(DEFS) -o $@ src/steer.c src/spec.c src/dnsd.c src/failover.c \
 	      src/aggregate.c src/obfs.c src/cli.c
 
-test: all ext-syntax $(BUILD)/dnsmatch $(BUILD)/specmatch $(BUILD)/specmatch-ext $(BUILD)/xswirematch $(BUILD)/xsstreammatch $(BUILD)/tungromatch $(BUILD)/xsconfmatch $(BUILD)/xsroutematch $(BUILD)/chellomatch $(BUILD)/failovermatch $(BUILD)/h2match $(BUILD)/submatch $(BUILD)/fwmatch $(BUILD)/obfsmatch $(BUILD)/visionmatch $(BUILD)/diagsim
+test: all ext-syntax $(BUILD)/dnsmatch $(BUILD)/specmatch $(BUILD)/specmatch-ext $(BUILD)/xswirematch $(BUILD)/xsstreammatch $(BUILD)/tungromatch $(BUILD)/tunnamematch $(BUILD)/xsconfmatch $(BUILD)/xsroutematch $(BUILD)/chellomatch $(BUILD)/failovermatch $(BUILD)/h2match $(BUILD)/submatch $(BUILD)/fwmatch $(BUILD)/obfsmatch $(BUILD)/visionmatch $(BUILD)/diagsim
 	@sh tests/run.sh
 	@sh tests/gen.sh
 	@sh tests/climatch.sh
@@ -45,6 +45,7 @@ test: all ext-syntax $(BUILD)/dnsmatch $(BUILD)/specmatch $(BUILD)/specmatch-ext
 	@$(BUILD)/xswirematch
 	@$(BUILD)/xsstreammatch
 	@$(BUILD)/tungromatch
+	@$(BUILD)/tunnamematch
 	@$(BUILD)/xsconfmatch
 	@$(BUILD)/xsroutematch
 	@$(BUILD)/chellomatch
@@ -179,6 +180,16 @@ $(BUILD)/tungromatch: tests/tungromatch.c src/ext/tun.c src/ext/tun.h
 	@mkdir -p $(BUILD)
 	$(CC) $(CFLAGS) -Isrc -o $@ tests/tungromatch.c
 
+# Имя устройства: движок работает ровно с тем именем, о котором просил, — иначе отказ. Ядро
+# усекает имя длиннее 15 символов молча, и разошедшееся имя не видно ниоткуда: очереди
+# открыты, туннель жив, а адрес и зона firewall уезжают на несуществующее устройство (I-107).
+# Здесь нужно НАСТОЯЩЕЕ устройство (TUNSETIFF — единственный источник выбранного имени),
+# поэтому стенд требует CAP_NET_ADMIN и без него пропускается вслух с кодом 0. В make test он
+# всё равно входит: стенд, который надо позвать руками, не запускается никогда.
+$(BUILD)/tunnamematch: tests/tunnamematch.c src/ext/tun.c src/ext/tun.h
+	@mkdir -p $(BUILD)
+	$(CC) $(CFLAGS) -Isrc -o $@ tests/tunnamematch.c
+
 # Разбор конфигурации xsteer — единственное место, куда в движок попадает текст, который
 # человек написал руками, поэтому разбор строгий, а стенд перечисляет каждый отказ.
 # Отдельно проверяется, что приватный ключ не попадает в вывод: обещание держится на том,
@@ -212,7 +223,7 @@ $(BUILD)/chellomatch: tests/chellomatch.c tests/chello-frozen.h src/ext/chello.c
 clean:
 	rm -rf $(BUILD)/steer $(BUILD)/steer-* $(BUILD)/dnsmatch $(BUILD)/specmatch $(BUILD)/specmatch-ext \
 	       $(BUILD)/failovermatch $(BUILD)/h2match $(BUILD)/submatch $(BUILD)/fwmatch $(BUILD)/obfsmatch \
-	       $(BUILD)/visionmatch $(BUILD)/xswirematch $(BUILD)/xsstreammatch $(BUILD)/xsepochmatch $(BUILD)/tungromatch $(BUILD)/xsconfmatch $(BUILD)/xsroutematch $(BUILD)/chellomatch $(BUILD)/hellofreeze $(BUILD)/xsloop $(BUILD)/xsbench \
+	       $(BUILD)/visionmatch $(BUILD)/xswirematch $(BUILD)/xsstreammatch $(BUILD)/xsepochmatch $(BUILD)/tungromatch $(BUILD)/tunnamematch $(BUILD)/xsconfmatch $(BUILD)/xsroutematch $(BUILD)/chellomatch $(BUILD)/hellofreeze $(BUILD)/xsloop $(BUILD)/xsbench \
 	       $(BUILD)/steer-hub $(BUILD)/steer-ext \
 	       $(BUILD)/diagsim $(BUILD)/libmbed-*.a \
 	       $(BUILD)/*.err $(BUILD)/pkg $(BUILD)/scripts out

@@ -69,7 +69,9 @@ typedef char vnet_hdr_size_check[sizeof(struct vnet_hdr) == VNET_HDR_LEN ? 1 : -
  * а причина нужна именно от ПЕРВОЙ — она отвечает на вопрос «почему устройства нет вовсе»,
  * тогда как последняя расскажет лишь про отказ от последнего украшения. */
 static int g_open_errno;
-static int g_open_stage;      /* 1 — не открылся /dev/net/tun, 2 — отказал TUNSETIFF */
+static int g_open_stage;      /* 1 — не открылся /dev/net/tun, 2 — отказал TUNSETIFF,
+                                 3 — ядро создало устройство с другим именем */
+static char g_open_got[IFNAMSIZ];   /* имя, которое вернуло ядро при stage 3 */
 
 static int queue_open(const char *name, short flags) {
     int fd = open("/dev/net/tun", O_RDWR);
@@ -83,6 +85,27 @@ static int queue_open(const char *name, short flags) {
     ifr.ifr_flags = flags;
     if (ioctl(fd, TUNSETIFF, &ifr) < 0) {
         if (!g_open_errno) { g_open_errno = errno; g_open_stage = 2; }
+        close(fd);
+        return -1;
+    }
+    /* Ядро возвращает в ifr_name имя, которое СОЗДАЛО, и оно не обязано совпадать с
+     * запрошенным: длиннее IFNAMSIZ-1 усекается молча (измерено: xs-abcdefghijklm ->
+     * xs-abcdefghijkl). Не прочитав поле обратно, движок продолжал работать с именем из
+     * настроек, которого в системе нет: очереди открыты и туннель жив, а tun_bring_up и
+     * bind_device адресуют несуществующее устройство — три `ip` через run_quiet, три
+     * проглоченных отказа, «интерфейс поднят, трафика нет» (I-107).
+     *
+     * Отказ, а не «взять имя ядра». Имя устройства знает не только движок: на него заведены
+     * зона firewall, таблица маршрутизации и обработчик netifd, и всё это создано управляющим
+     * слоем по имени из настроек. Приняв другое имя, движок разошёлся бы не с ядром, а с ними
+     * — то есть та же тишина, только на шаг дальше. Реализация на Go читает имя обратно
+     * (tun/tun_linux.go) и теперь так же отказывается, если оно не то. */
+    if (strncmp(ifr.ifr_name, name, IFNAMSIZ) != 0) {
+        if (!g_open_errno) {
+            g_open_errno = ENAMETOOLONG;
+            g_open_stage = 3;
+            snprintf(g_open_got, sizeof(g_open_got), "%.*s", IFNAMSIZ - 1, ifr.ifr_name);
+        }
         close(fd);
         return -1;
     }
@@ -128,6 +151,9 @@ int tun_open(struct tun_dev *d, int max_queues, const char *name) {
         if (order[i].multi) flags |= IFF_MULTI_QUEUE;
 
         int fd = queue_open(name, flags);
+        /* Другое имя — не про набор флагов: следующая попытка получит то же усечение. Выходим
+         * сразу, иначе устройство создаётся и удаляется четыре раза подряд впустую. */
+        if (fd < 0 && g_open_stage == 3) break;
         if (fd < 0) continue;
         d[0].fd = fd;
         d[0].gso = order[i].gso;
@@ -157,6 +183,13 @@ int tun_open(struct tun_dev *d, int max_queues, const char *name) {
         fprintf(stderr, "steer[warn] tunnel: нет /dev/net/tun (%s) — не установлен kmod-tun\n",
                 strerror(g_open_errno));
         return TUN_ENODEV;
+    }
+    if (g_open_stage == 3) {
+        fprintf(stderr, "steer[warn] tunnel: ядро создало устройство с другим именем: "
+                "просили %s, получили %s%s\n", name, g_open_got,
+                strlen(name) >= IFNAMSIZ
+                    ? " — имя длиннее предела ядра (IFNAMSIZ, 15 значащих символов)" : "");
+        return TUN_ESETUP;
     }
     fprintf(stderr, "steer[warn] tunnel: устройство %s не создалось: %s (%s)\n", name,
             strerror(g_open_errno ? g_open_errno : EINVAL),
