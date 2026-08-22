@@ -42,4 +42,25 @@ build() {  # СУФФИКС ДОП_ФЛАГИ
 build plain "-DSTEER_NO_AES_ACCEL"
 build aesce ""
 build aesce-big "-DMBEDTLS_GCM_LARGE_TABLE"
+
+# Разложение выбранного шифра на составляющие — отдельным бинарником и одним вариантом
+# конфигурации: он отвечает не «какой шифр», а «что внутри дорого», и три сборки ему ни к
+# чему. Нужен там, где потолок ставит ChaCha20: на MT7621 замерено 26,1 МБ/с у потока шифра
+# против 60,6 у Poly1305, то есть ускорять имело бы смысл первое, а не второе.
+work=/tmp/bench-split
+mkdir -p "$work"
+cd "$work"
+for f in /opt/mbedtls/library/*.c; do
+    m=$(basename "$f" .c)
+    case "$m" in net_sockets|debug|timing) continue ;; esac
+    zig cc -target "$TARGET" -mcpu="$MCPU" -O2 -c \
+        -I"$MBED_INC" -I"$EXT_INC" \
+        -DMBEDTLS_CONFIG_FILE='"steer_mbedtls_config.h"' \
+        "$f" -o "$m.o" 2>/dev/null || true
+done
+zig cc -target "$TARGET" -mcpu="$MCPU" -static -O2 \
+    -I"$MBED_INC" -I"$EXT_INC" \
+    -DMBEDTLS_CONFIG_FILE='"steer_mbedtls_config.h"' \
+    -o "$OUT-split" /src/tests/aead-split.c "$work"/*.o
+
 ls -la "$OUT"-*

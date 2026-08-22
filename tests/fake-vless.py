@@ -193,15 +193,22 @@ def main():
     ap.add_argument("--port", type=int, default=10800)
     ap.add_argument("--uuid", required=True)
     ap.add_argument("--mb", type=int, default=20, help="сколько мегабайт отдавать в ответ")
+    # Адрес слушателя — параметром, а не константой 127.0.0.1.
+    #
+    # Движок отвергает узел на петле как «отвечать некому» (sub.c, host_leads_nowhere):
+    # панели пишут туда заглушки, и человеку полезнее внятная причина, чем ошибка TLS.
+    # Стенду от этого доставалось заодно — туннель не поднимался вовсе, — поэтому сервер
+    # стенда слушает на обычном адресе, который туннель считает законным узлом.
+    ap.add_argument("--bind", default="127.0.0.1", help="адрес слушателя")
     a = ap.parse_args()
 
-    srv = Server(("127.0.0.1", a.port), Handler)
+    srv = Server((a.bind, a.port), Handler)
     srv.uuid = bytes.fromhex(a.uuid.replace("-", ""))
     srv.body_n = a.mb * 1024 * 1024
     # Наполнитель фиксированный: содержимое стенду безразлично, а генерация 64 КБ на
     # каждую порцию упиралась в питон, а не в туннель.
     srv.filler = bytes(i * 131 % 251 for i in range(64 * 1024))
-    print("fake-vless: 127.0.0.1:%d, отдаёт %d МБ" % (a.port, a.mb), flush=True)
+    print("fake-vless: %s:%d, отдаёт %d МБ" % (a.bind, a.port, a.mb), flush=True)
     try:
         srv.serve_forever()
     except KeyboardInterrupt:
