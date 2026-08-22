@@ -2742,8 +2742,9 @@ static int load_nodes(const char *spec_path, const char *out_name, struct output
     size_t n = fread(raw, 1, sizeof(raw) - 1, f);
     raw[n] = '\0';
     fclose(f);
-    const char *text = raw;
-    if (!strstr(raw, "://")) { b64_decode(raw, n, dec, sizeof(dec)); text = dec; }
+    /* Какой это формат — решает sub.c: там же, где формат и разбирается, и там же, где это
+     * можно проверить стендом. */
+    const char *text = vless_sub_text(raw, n, dec, sizeof(dec));
 
     *cnt = vless_parse_sub(text, g_nodes, MAX_NODES, st);
     return 0;

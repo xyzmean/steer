@@ -103,6 +103,9 @@ static void set_field(char *dst, size_t n, const char *src, size_t len) {
     dst[len] = '\0';
 }
 
+/* Пригодность разобранного узла — общее правило для обоих путей разбора; тело ниже. */
+static int node_usable(struct vless_node *n);
+
 /* vless://UUID@host:port?params#name
  *
  * Возвращает 0, если ссылка разобрана и узел ПРИГОДЕН. Непригодный узел — это не ошибка
@@ -169,6 +172,19 @@ int vless_parse_url(const char *url, struct vless_node *n) {
      * сети или за уже защищённым каналом, и отбрасывать его вместе с неподдержанными
      * транспортами было бы ошибкой — причины у них разные. Пустое поле security означает
      * то же самое: в ссылке его просто опускают. */
+    return node_usable(n);
+}
+
+/* Пригоден ли РАЗОБРАННЫЙ узел. 0 — да, 1 — нет, причина в n->skip_reason.
+ *
+ * Отдельной функцией, потому что путей разбора теперь два: ссылка vless:// и конфиг Xray в
+ * подписке (см. parse_xray ниже). Правило пригодности у них обязано быть одно — иначе узел,
+ * непригодный в одном виде, окажется пригодным в другом, и человек получит «узлов два,
+ * туннель не работает, сказать нечего» ровно там, где мы этого и добивались избежать.
+ *
+ * Поля, которых во ссылке не было, к этому моменту уже заполнены умолчаниями: делает это
+ * первая же строка. */
+static int node_usable(struct vless_node *n) {
     if (!n->security[0]) snprintf(n->security, sizeof(n->security), "none");
 
     /* Идентификатор пользователя. Проверяется ЗДЕСЬ по той же причине, что и всё
@@ -262,6 +278,7 @@ int vless_parse_url(const char *url, struct vless_node *n) {
         return 1;
     }
     return 0;
+    return 0;
 }
 
 /* Отнести непригодный узел к его причине. Единственное место, где растёт skipped:
@@ -286,6 +303,259 @@ static void skip_note(struct vless_sub_stats *st, const struct vless_node *n,
     s->count = 1;
 }
 
+/* ---- подписка в виде конфига Xray -------------------------------------------
+ *
+ * ЗАЧЕМ ЭТО ВООБЩЕ ЕСТЬ. Панели с привязкой к устройствам выбирают формат ответа по
+ * User-Agent, и списка ссылок vless:// среди вариантов может не быть НИ ОДНОГО. Замерено на
+ * живой подписке: незнакомому клиенту (steer, curl, sing-box, Nekoray) отдаётся заглушка из
+ * ссылок ss:// на localhost:1234 с именами «Неправильный клиент» и «Подключись через Happ»;
+ * Happ, v2rayNG и Streisand получают конфиг Xray в JSON; Clash — свой YAML; SFI — конфиг
+ * sing-box. То есть подписка, у которой узлы совершенно исправны (проверено пробой: восемь
+ * из девяти отвечают), для движка выглядела как «ни одного пригодного узла».
+ *
+ * Притворяться чужим клиентом — не выход, и не из принципа: JSON приезжает и Happ-у, значит
+ * читать его пришлось бы всё равно. Поэтому читаем.
+ *
+ * ЧТО ИМЕННО ЧИТАЕТСЯ. Массив конфигов `[{...},{...}]` или один конфиг `{...}`; в каждом
+ * берутся `outbounds`, а из них — те, у которых `protocol` равен `vless`. Всё остальное
+ * (dns, routing, inbounds, freedom, blackhole) пропускается: это настройки клиента, к
+ * которому подписка обращается, а не описание узла.
+ *
+ * Разборщик свой и намеренно маленький — как и в spec.c, он не общий парсер JSON, а обход
+ * ровно той формы, которую ждём. Переиспользовать тот из spec.c нельзя: он статический, а
+ * стенд подписки (tests/submatch.c) компилируется в одиночку, без spec.c и без mbedtls, и
+ * это его главное свойство — чужой текст из интернета проверяется без сети и без docker.
+ */
+struct sj { const char *p; };
+
+static void sj_ws(struct sj *j) {
+    while (*j->p == ' ' || *j->p == '\t' || *j->p == '\n' || *j->p == '\r') j->p++;
+}
+
+/* Строка в buf. Экранирование понимается ровно настолько, чтобы \" не оборвала строку: имена
+ * узлов приходят из панели и содержат что угодно, а \uXXXX в них не встречается — панели
+ * пишут UTF-8 как есть. Непонятая последовательность попадает в buf буквально, и это лучше,
+ * чем отказ: имя — единственное поле, которому позволено быть любым. */
+static int sj_str(struct sj *j, char *buf, size_t n) {
+    sj_ws(j);
+    if (*j->p != '"') return -1;
+    j->p++;
+    size_t i = 0;
+    while (*j->p && *j->p != '"') {
+        if (*j->p == '\\' && j->p[1]) j->p++;
+        if (i + 1 < n) buf[i++] = *j->p;
+        j->p++;
+    }
+    if (*j->p != '"') return -1;
+    j->p++;
+    if (n) buf[i] = '\0';
+    return 0;
+}
+
+/* Пропустить одно значение любого типа. Нужен там же, где в spec.c: чтобы незнакомый ключ
+ * не толковался молча, а именно пропускался. */
+static void sj_skip(struct sj *j) {
+    sj_ws(j);
+    if (*j->p == '"') { char t[8]; sj_str(j, t, sizeof(t)); return; }
+    if (*j->p == '{' || *j->p == '[') {
+        char open = *j->p, close = open == '{' ? '}' : ']';
+        int depth = 0;
+        do {
+            if (*j->p == '"') { char t[8]; sj_str(j, t, sizeof(t)); continue; }
+            if (*j->p == open) depth++;
+            else if (*j->p == close) depth--;
+            j->p++;
+        } while (*j->p && depth > 0);
+        return;
+    }
+    while (*j->p && *j->p != ',' && *j->p != '}' && *j->p != ']') j->p++;
+}
+
+/* Войти в объект и отдавать его ключи по одному. 0 — ключ в key, 1 — объект кончился,
+ * -1 — это не объект. Значение читает вызывающий; не прочитал — обязан позвать sj_skip. */
+static int sj_obj_key(struct sj *j, int *first, char *key, size_t key_n) {
+    sj_ws(j);
+    if (*first) {
+        if (*j->p != '{') return -1;
+        j->p++;
+        *first = 0;
+    } else {
+        sj_ws(j);
+        if (*j->p == ',') j->p++;
+    }
+    sj_ws(j);
+    if (*j->p == '}') { j->p++; return 1; }
+    if (sj_str(j, key, key_n) != 0) return -1;
+    sj_ws(j);
+    if (*j->p != ':') return -1;
+    j->p++;
+    return 0;
+}
+
+/* Тот же приём для массива: 0 — элемент начинается здесь, 1 — массив кончился. */
+static int sj_arr_next(struct sj *j, int *first) {
+    sj_ws(j);
+    if (*first) {
+        if (*j->p != '[') return -1;
+        j->p++;
+        *first = 0;
+    } else {
+        sj_ws(j);
+        if (*j->p == ',') j->p++;
+    }
+    sj_ws(j);
+    if (*j->p == ']') { j->p++; return 1; }
+    return 0;
+}
+
+/* streamSettings: транспорт, security и всё, что зависит от них. */
+static void xray_stream(struct sj *j, struct vless_node *n) {
+    int first = 1;
+    char k[64];
+    while (sj_obj_key(j, &first, k, sizeof(k)) == 0) {
+        if (!strcmp(k, "network")) sj_str(j, n->type, sizeof(n->type));
+        else if (!strcmp(k, "security")) sj_str(j, n->security, sizeof(n->security));
+        else if (!strcmp(k, "realitySettings") || !strcmp(k, "tlsSettings")) {
+            /* Оба объекта несут serverName и fingerprint; publicKey и shortId бывают только
+             * у reality. Разбирать их одним куском можно потому, что имена полей не спорят:
+             * узел объявляет ровно один из двух. */
+            int f2 = 1;
+            char k2[64];
+            while (sj_obj_key(j, &f2, k2, sizeof(k2)) == 0) {
+                if (!strcmp(k2, "serverName")) sj_str(j, n->sni, sizeof(n->sni));
+                else if (!strcmp(k2, "fingerprint")) sj_str(j, n->fp, sizeof(n->fp));
+                else if (!strcmp(k2, "publicKey")) sj_str(j, n->pbk, sizeof(n->pbk));
+                else if (!strcmp(k2, "shortId")) sj_str(j, n->sid, sizeof(n->sid));
+                else sj_skip(j);
+            }
+        } else if (!strcmp(k, "grpcSettings")) {
+            int f2 = 1;
+            char k2[64];
+            while (sj_obj_key(j, &f2, k2, sizeof(k2)) == 0) {
+                if (!strcmp(k2, "serviceName")) sj_str(j, n->service, sizeof(n->service));
+                else sj_skip(j);
+            }
+        } else if (!strcmp(k, "xhttpSettings") || !strcmp(k, "splithttpSettings")) {
+            /* splithttpSettings — прежнее имя того же транспорта; панели с ним ещё живут. */
+            int f2 = 1;
+            char k2[64];
+            while (sj_obj_key(j, &f2, k2, sizeof(k2)) == 0) {
+                if (!strcmp(k2, "path")) sj_str(j, n->path, sizeof(n->path));
+                else if (!strcmp(k2, "mode")) sj_str(j, n->mode, sizeof(n->mode));
+                else sj_skip(j);
+            }
+        } else sj_skip(j);
+    }
+}
+
+/* settings исходящего vless: vnext[0] — адрес, порт и первый пользователь.
+ *
+ * Именно первый и только он: подписка описывает узел для ОДНОГО человека, и второго
+ * пользователя в ней не бывает. Появится — возьмём первого и не станем притворяться, что
+ * умеем больше. */
+static void xray_settings(struct sj *j, struct vless_node *n) {
+    int first = 1;
+    char k[64];
+    while (sj_obj_key(j, &first, k, sizeof(k)) == 0) {
+        if (strcmp(k, "vnext") != 0) { sj_skip(j); continue; }
+        int fa = 1, taken = 0;
+        while (sj_arr_next(j, &fa) == 0) {
+            if (taken) { sj_skip(j); continue; }
+            taken = 1;
+            int fo = 1;
+            char k2[64];
+            while (sj_obj_key(j, &fo, k2, sizeof(k2)) == 0) {
+                if (!strcmp(k2, "address")) sj_str(j, n->host, sizeof(n->host));
+                else if (!strcmp(k2, "port")) {
+                    sj_ws(j);
+                    char num[16];
+                    size_t i = 0;
+                    while (*j->p >= '0' && *j->p <= '9' && i + 1 < sizeof(num))
+                        num[i++] = *j->p++;
+                    num[i] = '\0';
+                    n->port = (uint16_t)atoi(num);
+                } else if (!strcmp(k2, "users")) {
+                    int fu = 1, u_taken = 0;
+                    while (sj_arr_next(j, &fu) == 0) {
+                        if (u_taken) { sj_skip(j); continue; }
+                        u_taken = 1;
+                        int fu2 = 1;
+                        char k3[64];
+                        while (sj_obj_key(j, &fu2, k3, sizeof(k3)) == 0) {
+                            if (!strcmp(k3, "id")) sj_str(j, n->uuid, sizeof(n->uuid));
+                            else if (!strcmp(k3, "flow")) sj_str(j, n->flow, sizeof(n->flow));
+                            else sj_skip(j);
+                        }
+                    }
+                } else sj_skip(j);
+            }
+        }
+    }
+}
+
+/* Один outbound. 1 — это узел vless и он записан в n, 0 — не наш. */
+static int xray_outbound(struct sj *j, struct vless_node *n) {
+    memset(n, 0, sizeof(*n));
+    int first = 1, is_vless = 0;
+    char k[64], proto[32] = "";
+    /* Порядок ключей в JSON не задан, поэтому protocol может оказаться ПОСЛЕ settings.
+     * Значит читаем всё, а решаем в конце: разбор чужого исходящего в свободные поля никому
+     * не вредит, потому что узел всё равно не будет взят. */
+    while (sj_obj_key(j, &first, k, sizeof(k)) == 0) {
+        if (!strcmp(k, "protocol")) sj_str(j, proto, sizeof(proto));
+        else if (!strcmp(k, "tag")) sj_str(j, n->name, sizeof(n->name));
+        else if (!strcmp(k, "settings")) xray_settings(j, n);
+        else if (!strcmp(k, "streamSettings")) xray_stream(j, n);
+        else sj_skip(j);
+    }
+    is_vless = !strcmp(proto, "vless");
+    return is_vless;
+}
+
+/* Конфиг целиком: массив конфигов или один. Возвращает число ПРИГОДНЫХ узлов. */
+static size_t parse_xray(const char *text, struct vless_node *out, size_t max,
+                         struct vless_sub_stats *st) {
+    struct sj j = { text };
+    size_t n = 0;
+    sj_ws(&j);
+    /* Один конфиг заворачивается в массив из одного: дальше путь общий. */
+    int wrapped = (*j.p == '{');
+    int fa = 1;
+    if (wrapped) fa = 0;                    /* массива нет — сразу разбираем объект */
+    for (;;) {
+        if (!wrapped) {
+            int r = sj_arr_next(&j, &fa);
+            if (r != 0) break;
+        }
+        /* Тело одного конфига: нужен только outbounds. */
+        int fc = 1;
+        char k[64];
+        int seen_ob = 0;
+        while (sj_obj_key(&j, &fc, k, sizeof(k)) == 0) {
+            if (strcmp(k, "outbounds") != 0) { sj_skip(&j); continue; }
+            seen_ob = 1;
+            int fo = 1;
+            while (sj_arr_next(&j, &fo) == 0) {
+                struct vless_node node;
+                const char *before = j.p;
+                if (!xray_outbound(&j, &node)) continue;
+                if (j.p == before) break;               /* разбор не двинулся — уходим */
+                if (n >= max) {
+                    /* Мест больше нет. Считаем как пропущенный, а не теряем молча: то же
+                     * обещание, что у списка ссылок — арифметика обязана сходиться. */
+                    skip_note(st, &node, "узлов больше, чем помещается");
+                    continue;
+                }
+                if (node_usable(&node) == 0) out[n++] = node;
+                else skip_note(st, &node, node.skip_reason);
+            }
+        }
+        (void)seen_ob;
+        if (wrapped) break;
+    }
+    return n;
+}
+
 /* Разобрать текст подписки (уже декодированный из base64) в массив узлов.
  * Возвращает число ПРИГОДНЫХ; остальное — в st (может быть NULL). */
 size_t vless_parse_sub(const char *text, struct vless_node *out, size_t max,
@@ -293,6 +563,13 @@ size_t vless_parse_sub(const char *text, struct vless_node *out, size_t max,
     size_t n = 0;
     if (st) memset(st, 0, sizeof(*st));
     const char *p = text;
+    /* Форма определяется ПЕРВЫМ непробельным знаком, а не поиском подстроки: '[' или '{'
+     * бывает только у JSON, а список ссылок с них не начинается никогда. Прежнее правило в
+     * tunnel.c искало «://» и на конфиге Xray срабатывало случайно — там «https://» лежит
+     * внутри настроек DNS. Случайность в распознавании чужого формата — это отказ, который
+     * появится ровно тогда, когда панель уберёт одну строчку из своего конфига. */
+    while (*p == ' ' || *p == '\t' || *p == '\n' || *p == '\r') p++;
+    if (*p == '[' || *p == '{') return parse_xray(p, out, max, st);
     while (*p && n < max) {
         while (*p == '\n' || *p == '\r' || *p == ' ' || *p == '\t') p++;
         if (!*p) break;
@@ -376,4 +653,25 @@ size_t vless_parse_sub(const char *text, struct vless_node *out, size_t max,
         p = e;
     }
     return n;
+}
+
+/* Привести прочитанный файл подписки к тексту, который понимает vless_parse_sub.
+ *
+ * Три вида, и различаются они первым непробельным знаком, а не догадкой:
+ *   '[' или '{'  — конфиг Xray в JSON, отдаётся как есть;
+ *   есть «://»   — список ссылок, отдаётся как есть;
+ *   иначе        — base64, раскодируется в dec.
+ *
+ * Раньше это решение жило в tunnel.c одной строкой `if (!strstr(raw, "://"))`, и на конфиге
+ * Xray оно срабатывало ПО СЛУЧАЙНОСТИ: «://» там есть внутри настроек DNS. Здесь оно потому,
+ * что здесь его можно проверить стендом — tunnel.c требует и сети, и TUN, и mbedtls.
+ *
+ * Возвращает raw или dec; ни то, ни другое не освобождается — буферы вызывающего. */
+const char *vless_sub_text(const char *raw, size_t raw_n, char *dec, size_t dec_n) {
+    const char *p = raw;
+    while (*p == ' ' || *p == '\t' || *p == '\n' || *p == '\r') p++;
+    if (*p == '[' || *p == '{') return raw;
+    if (strstr(raw, "://")) return raw;
+    b64_decode(raw, raw_n, dec, dec_n);
+    return dec;
 }

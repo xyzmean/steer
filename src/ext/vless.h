@@ -69,6 +69,10 @@ struct vless_sub_stats {
 };
 
 /* st допускает NULL: подъёму туннеля счётчики не нужны. */
+/* Привести прочитанный файл подписки к тексту для vless_parse_sub: конфиг Xray и список
+ * ссылок отдаются как есть, base64 раскодируется в dec. Подробности — в sub.c. */
+const char *vless_sub_text(const char *raw, size_t raw_n, char *dec, size_t dec_n);
+
 size_t vless_parse_sub(const char *text, struct vless_node *out, size_t max,
                        struct vless_sub_stats *st);
 

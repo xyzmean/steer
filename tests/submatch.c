@@ -462,6 +462,104 @@ int main(void) {
         check_n("подписка: сумма сходится", 3, (long)(n + st.skipped + st.foreign));
     }
 
+    {
+        /* ---- подписка конфигом Xray ----------------------------------------------
+         *
+         * Форма взята с ЖИВОЙ панели, а не придумана: она выбирает формат по User-Agent, и
+         * незнакомому клиенту списка ссылок не даёт вовсе. Проверяется то, что от разбора
+         * действительно нужно: узел собирается из вложенных объектов целиком, чужие
+         * исходящие (freedom, blackhole) не считаются узлами, а порядок ключей значения
+         * не имеет — protocol в JSON законно стоит и после settings. */
+        struct vless_node nodes[16];
+        struct vless_sub_stats st;
+        const char *cfg =
+            "[{\"dns\":{\"servers\":[{\"address\":\"https://dns.google/dns-query\"}]},"
+            " \"outbounds\":["
+            "  {\"tag\":\"ch01_tcp\",\"protocol\":\"vless\","
+            "   \"settings\":{\"vnext\":[{\"address\":\"179.237.82.105\",\"port\":443,"
+            "     \"users\":[{\"id\":\"11111111-2222-3333-4444-555555555555\","
+            "                 \"flow\":\"xtls-rprx-vision\",\"encryption\":\"none\"}]}]},"
+            "   \"streamSettings\":{\"network\":\"tcp\",\"security\":\"reality\","
+            "     \"realitySettings\":{\"serverName\":\"ch01.example.org\","
+            "       \"fingerprint\":\"chrome\",\"publicKey\":\"PBK123\",\"shortId\":\"a1b2\"}}},"
+            "  {\"tag\":\"direct\",\"protocol\":\"freedom\",\"settings\":{}},"
+            "  {\"tag\":\"block\",\"protocol\":\"blackhole\",\"settings\":{}}"
+            " ]},"
+            " {\"outbounds\":["
+            "  {\"settings\":{\"vnext\":[{\"address\":\"87.120.126.31\",\"port\":2087,"
+            "     \"users\":[{\"id\":\"11111111-2222-3333-4444-555555555555\"}]}]},"
+            "   \"streamSettings\":{\"network\":\"grpc\",\"security\":\"reality\","
+            "     \"grpcSettings\":{\"serviceName\":\"svc\"},"
+            "     \"realitySettings\":{\"serverName\":\"de01.example.org\",\"publicKey\":\"PBK456\"}},"
+            "   \"protocol\":\"vless\",\"tag\":\"de01_grpc\"}"
+            " ]}]";
+        size_t n = vless_parse_sub(cfg, nodes, 16, &st);
+        check_n("конфиг Xray: взято узлов", 2, (long)n);
+        check("конфиг Xray: имя из tag", "ch01_tcp", nodes[0].name);
+        check("конфиг Xray: адрес", "179.237.82.105", nodes[0].host);
+        check_n("конфиг Xray: порт", 443, (long)nodes[0].port);
+        check("конфиг Xray: транспорт", "tcp", nodes[0].type);
+        check("конфиг Xray: security", "reality", nodes[0].security);
+        check("конфиг Xray: sni из realitySettings", "ch01.example.org", nodes[0].sni);
+        check("конфиг Xray: pbk", "PBK123", nodes[0].pbk);
+        check("конфиг Xray: sid", "a1b2", nodes[0].sid);
+        check("конфиг Xray: отпечаток", "chrome", nodes[0].fp);
+        check("конфиг Xray: flow", "xtls-rprx-vision", nodes[0].flow);
+        check("конфиг Xray: второй конфиг тоже прочитан", "de01_grpc", nodes[1].name);
+        check("конфиг Xray: grpc serviceName", "svc", nodes[1].service);
+        check_n("конфиг Xray: порт второго", 2087, (long)nodes[1].port);
+        check_n("конфиг Xray: freedom и blackhole не узлы", 0, (long)st.skipped);
+        check_n("конфиг Xray: чужих протоколов не считаем", 0, (long)st.foreign);
+    }
+    {
+        /* Один конфиг, а не массив: панели отдают и так. */
+        struct vless_node nodes[16];
+        struct vless_sub_stats st;
+        const char *cfg =
+            "{\"outbounds\":[{\"protocol\":\"vless\",\"tag\":\"one\","
+            "  \"settings\":{\"vnext\":[{\"address\":\"1.2.3.4\",\"port\":443,"
+            "    \"users\":[{\"id\":\"11111111-2222-3333-4444-555555555555\"}]}]},"
+            "  \"streamSettings\":{\"network\":\"tcp\",\"security\":\"reality\","
+            "    \"realitySettings\":{\"serverName\":\"a.example\",\"publicKey\":\"P\"}}}]}";
+        size_t n = vless_parse_sub(cfg, nodes, 16, &st);
+        check_n("конфиг Xray: одиночный объект", 1, (long)n);
+        check("конфиг Xray: одиночный — имя", "one", nodes[0].name);
+    }
+    {
+        /* Непригодный узел в конфиге объясняется так же, как непригодная ссылка: правило
+         * пригодности у обоих путей одно (node_usable). Здесь — заглушка панели, которую
+         * она отдаёт клиенту без идентификатора устройства. */
+        struct vless_node nodes[16];
+        struct vless_sub_stats st;
+        const char *cfg =
+            "[{\"outbounds\":[{\"protocol\":\"vless\",\"tag\":\"Неправильный клиент\","
+            "  \"settings\":{\"vnext\":[{\"address\":\"0.0.0.0\",\"port\":1,"
+            "    \"users\":[{\"id\":\"00000000-0000-0000-0000-000000000000\"}]}]},"
+            "  \"streamSettings\":{\"network\":\"tcp\",\"security\":\"none\"}}]}]";
+        size_t n = vless_parse_sub(cfg, nodes, 16, &st);
+        check_n("конфиг Xray: заглушка не пригодна", 0, (long)n);
+        check_n("конфиг Xray: заглушка посчитана", 1, (long)st.skipped);
+        check("конфиг Xray: причина заглушки названа",
+              "0.0.0.0: отвечать некому", st.reasons[0].reason);
+        check("конфиг Xray: пример доносит сообщение панели",
+              "Неправильный клиент", st.reasons[0].example);
+    }
+    {
+        /* Форма подписки распознаётся первым знаком, а не поиском «://». У конфига Xray
+         * «://» встречается внутри настроек DNS, и прежнее правило срабатывало случайно. */
+        char dec[256];
+        const char *json = "  [{\"dns\":{\"servers\":[\"https://x/y\"]},\"outbounds\":[]}]";
+        check("форма: конфиг отдаётся как есть", json,
+              vless_sub_text(json, strlen(json), dec, sizeof(dec)));
+        const char *links = "vless://a@h:443#n\n";
+        check("форма: список ссылок отдаётся как есть", links,
+              vless_sub_text(links, strlen(links), dec, sizeof(dec)));
+        /* base64 от «vless://a@h:443» */
+        const char *b64 = "dmxlc3M6Ly9hQGg6NDQz";
+        const char *got = vless_sub_text(b64, strlen(b64), dec, sizeof(dec));
+        check("форма: base64 раскодирован", "vless://a@h:443", got);
+    }
+
     printf("\n%d проверок пройдено", g_pass);
     if (g_fail) {
         printf(", %d ПРОВАЛЕНО\n", g_fail);
