@@ -953,6 +953,164 @@ int main(void) {
         g_decoy_live = 0;
     }
 
+    /* ---- «не наш» опознан ПОЗЖЕ разбора: накопленное всё равно доезжает (I-124) ----
+     *
+     * Развилок «не наш» в hs_step три, и до сих пор присланное доходило до прикрытия только
+     * на первой — «рукопожатие не разобралось». Две другие лежат ЗА успешным
+     * xs_hs_server_read: «нет такого пира» и «повтор msg1». Накопленное очищалось сразу за
+     * разбором, то есть до них, и прикрытие на этих двух развилках получало ПУСТОТУ: имя из
+     * SNI не разбиралось (звонок уходил в постоянный DecoyDest вместо названного прибором), а
+     * сам ClientHello не уходил вовсе — открытое соединение, в котором никто ничего не сказал,
+     * и прибор, ждущий ответа, которого не будет.
+     *
+     * Кому это видно: тому, у кого есть наш ОТКРЫТЫЙ ключ, — своей паре ключей хватает, чтобы
+     * дойти до «нет такого пира». То есть разница в ответе достаётся ровно тому, кто уже
+     * подозревает, что здесь не сайт. Ту же правку в реализации на Go сделал H-098.
+     *
+     * Hello здесь собирается на месте настоящим клиентским рукопожатием, а не берётся из
+     * заморозки: обе развилки лежат за успешным разбором, а заморозку с чужими ключами разбор
+     * не проходит. */
+    printf("\n== хаб: неопознанный, опознанный за успешным разбором ==\n");
+    {
+        static struct worker w;
+        struct sess *s = &g_sess[0];
+        static uint8_t hello[4096];
+        size_t hn = 0;
+        struct xs_secrets peer_sec;
+        struct xs_hs chs;
+        uint8_t hub_pub[32], peer_pub[32];
+
+        /* Ключи постоянные, чтобы стенд не зависел от источника случайности; эфемерный ключ
+         * рукопожатия всё равно свежий на каждом вызове. Подрезка обязательна: скалярное
+         * умножение на кривой 25519 принимает только скаляр нужной формы, и без неё вывод
+         * публичной половины отказывает, а не даёт другой ключ. */
+        memset(&g_sec, 0, sizeof(g_sec));
+        memset(&peer_sec, 0, sizeof(peer_sec));
+        for (int i = 0; i < 32; i++) {
+            g_sec.priv[i]   = (uint8_t)(0x11 + i);
+            peer_sec.priv[i] = (uint8_t)(0x71 + i);
+        }
+        g_sec.priv[0] &= 248;    g_sec.priv[31] &= 127;    g_sec.priv[31] |= 64;
+        peer_sec.priv[0] &= 248; peer_sec.priv[31] &= 127; peer_sec.priv[31] |= 64;
+        g_sec.has_priv = peer_sec.has_priv = 1;
+        check("статические ключи стенда выведены", 0,
+              xc_x25519_public(g_sec.priv, hub_pub) |
+              xc_x25519_public(peer_sec.priv, peer_pub));
+        memset(&chs, 0, sizeof(chs));
+        check("настоящий msg1 собран", 0,
+              xs_hs_client_hello(&chs, &peer_sec, hub_pub, "www.example.com", 1420, 0,
+                                 hello, sizeof(hello), &hn));
+        check("и он не влезает в один сегмент — придёт частями", 1, hn > 1200);
+        /* Состояние клиентского рукопожатия дальше не нужно — только собранные байты. Затираем
+         * сразу: в нём живёт контекст шифра, и без этого стенд течёт под ASan. */
+        xs_hs_wipe(&chs);
+
+        struct { const char *name; size_t peers; } forks[2] = {
+            { "нет такого пира", 0 },
+            { "повтор msg1",     1 },
+        };
+        for (int f = 0; f < 2; f++) {
+            printf("  развилка «%s»:\n", forks[f].name);
+
+            int srv = socket(AF_INET, SOCK_STREAM, 0);
+            struct sockaddr_in sa;
+            socklen_t sl = sizeof(sa);
+            memset(&sa, 0, sizeof(sa));
+            sa.sin_family = AF_INET;
+            sa.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+            if (srv < 0 || bind(srv, (struct sockaddr *)&sa, sizeof(sa)) != 0 ||
+                listen(srv, 4) != 0 || getsockname(srv, (struct sockaddr *)&sa, &sl) != 0) {
+                printf("нет петлевого сокета — проверка невозможна\n");
+                return 1;
+            }
+            {
+                int sfl = fcntl(srv, F_GETFL, 0);
+                fcntl(srv, F_SETFL, sfl | O_NONBLOCK);
+            }
+
+            memset(&g_conf, 0, sizeof(g_conf));
+            g_conf.listen_port = 443;
+            g_conf.decoy = XS_DECOY_PROXY;
+            /* Постоянное прикрытие ведёт ТУДА, ГДЕ НИКТО НЕ СЛУШАЕТ: выбор по имени работает
+             * только по разобранному Hello, и на пустом буфере дорожка ушла бы сюда — это
+             * будет видно провалом, а не спрячется за успехом. */
+            snprintf(g_conf.decoy_dest, sizeof(g_conf.decoy_dest), "127.0.0.2");
+            g_conf.decoy_port = ntohs(sa.sin_port);
+            memset(g_decoy_map, 0, sizeof(g_decoy_map));
+            snprintf(g_decoy_map[0].name, XS_DECOY_SNI_LEN, "www.example.com");
+            g_decoy_map[0].addr = inet_addr("127.0.0.1");
+            g_decoy_map_n = 1;
+
+            /* Развилка выбирается таблицей пиров: пустая даёт «нет такого пира», а таблица с
+             * этим самым ключом и уже виденной меткой времени — «повтор msg1». */
+            g_conf.peer_n = forks[f].peers;
+            memset(g_last_stamp, 0, sizeof(g_last_stamp));
+            if (forks[f].peers) {
+                memcpy(g_conf.peer[0].pub, peer_pub, 32);
+                g_last_stamp[0] = (uint64_t)1 << 62;   /* заведомо новее присланной */
+            }
+
+            memset(&w, 0, sizeof(w));
+            w.listen_port = 443; w.rx = -1; w.tx0 = -1; w.base = 0; w.cap = 1;
+            xs_sidx_reset(&w.idx);
+            memset(s, 0, sizeof(*s));
+            s->phase = PH_SYN; s->peer = -1; s->conn_id = -1; s->up_fd = -1;
+            s->conn.fd = wire_open(); s->conn.sport = 443; s->conn.dport = 40000;
+            s->conn.daddr = htonl(0x0A000001u);
+            g_decoy_live = 0;
+            wire_drain();
+
+            /* Hello приходит ДВУМЯ сегментами — как в бою. Половина, оставленная в буфере
+             * прежним порядком очистки, была бы именно этим вторым сегментом. */
+            struct obfs_seg seg;
+            memset(&seg, 0, sizeof(seg));
+            seg.flags = 0x18;
+            seg.sport = 40000;
+            seg.saddr = htonl(0x0A000001u);
+            seg.payload = hello;
+            seg.plen = hn / 2;
+            hs_step(&w, s, &seg, 443, 1000);
+            check("  на первой половине хаб ещё молчит и ждёт продолжения",
+                  (long)PH_SYN, (long)s->phase);
+            seg.payload = hello + hn / 2;
+            seg.plen = hn - hn / 2;
+            hs_step(&w, s, &seg, 443, 1000);
+
+            check("  сессия на дорожке прикрытия", (long)PH_PROXY, (long)s->phase);
+            check("  прибору не ушло ни байта отказа", -1, wire_take(NULL, NULL));
+            check("  позвонили по имени из SNI, а не в DecoyDest",
+                  (long)inet_addr("127.0.0.1"), (long)s->up_addr);
+
+            struct pollfd wait_fd = { srv, POLLIN, 0 };
+            poll(&wait_fd, 1, 2000);
+            int up = accept(srv, NULL, NULL);
+            check("  прикрытие, названное именем, приняло соединение", 1, up >= 0);
+            decoy_event(&w, s, POLLOUT, 1010);
+            check("  присланное отдано прикрытию целиком", 1, (long)s->up_ready);
+            {
+                static uint8_t got[4096];
+                size_t gn = 0;
+                while (up >= 0 && gn < hn) {
+                    struct pollfd pf = { up, POLLIN, 0 };
+                    if (poll(&pf, 1, 1000) <= 0) break;
+                    ssize_t r = recv(up, got + gn, sizeof(got) - gn, 0);
+                    if (r <= 0) break;
+                    gn += (size_t)r;
+                }
+                check("  прикрытию ушёл ВЕСЬ Hello, а не последний его сегмент",
+                      (long)hn, (long)gn);
+                check("  байт в байт", 0, gn == hn ? memcmp(got, hello, hn) : 1);
+            }
+            if (up >= 0) close(up);
+            sess_free(&w, s);
+            close(srv);
+            g_decoy_map_n = 0;
+            g_decoy_live = 0;
+        }
+        memset(&g_sec, 0, sizeof(g_sec));
+        memset(&peer_sec, 0, sizeof(peer_sec));
+    }
+
     /* ---- вытеснение сессий: живую забираем, только если она почти мертва (R-067, I-082) ----
      *
      * Комментарий в sess_alloc обещал, что подтверждённую сессию может забрать только другая
