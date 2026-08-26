@@ -129,7 +129,13 @@ stop_service() {
     for t in $(awk '{print $3}' /var/lib/steer/registry 2>/dev/null); do
         ip route flush table "$t" 2>/dev/null
     done
+    # Правило снимается В ОБЕИХ ФОРМАХ: с маской (как ставит движок с R-094) и прежнюю
+    # без неё — она осталась в ядре, если пакет обновили, а сервис с тех пор не
+    # перезапускали. Маска здесь литералом, а не из движка: init-скрипт зовут и тогда,
+    # когда бинарника уже нет (удаление пакета), а число объявлено в контракте
+    # (docs/contract-v1.md, STEER_MARK_MASK в src/spec.h) и меняться не должно.
     for m in $(awk '{print $2}' /var/lib/steer/registry 2>/dev/null); do
+        while ip rule del fwmark "0x$m/0x0ff00000" 2>/dev/null; do :; done
         while ip rule del fwmark "0x$m" 2>/dev/null; do :; done
     done
 }

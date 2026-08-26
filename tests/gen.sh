@@ -37,6 +37,15 @@ EOF
 
 out="$("$BIN" apply --dry-run --spec "$tmp/spec.json" $S)"
 
+# Метка ставится ЧТЕНИЕМ-МОДИФИКАЦИЕЙ, а не перезаписью слова. Проверяется отдельно от
+# золотого текста, потому что расхождение в нём говорит «что-то изменилось», а нужно
+# «сохраняются ли чужие биты»: слово метки общее с mwan3 (маска 0x3F00), pbr и sqm, и
+# перезапись выключала их политику молча, а чужая перезапись — нашу (I-135).
+check "метка ставится без затирания чужих бит" "1" \
+    "$(printf '%s\n' "$out" | grep -c 'meta mark set mark and 0xf00fffff or 0x00100000')"
+check "перезаписи слова метки не осталось" "0" \
+    "$(printf '%s\n' "$out" | grep -cE 'meta mark set 0x')"
+
 # The whole ruleset, once: a diff here is a behaviour change, which is exactly what
 # a golden test is for.
 want="$(cat <<'EOF'
@@ -56,7 +65,7 @@ table inet steer {
     chain prerouting_mark {
         type filter hook prerouting priority mangle + 1; policy accept;
         ip saddr { 192.168.1.0/24 } ip daddr @direct_ip counter return comment "steer:direct_ip"
-        ip saddr { 192.168.1.0/24 } ip daddr @vpn_ip meta mark set 0x00100000 counter return comment "steer:vpn_ip"
+        ip saddr { 192.168.1.0/24 } ip daddr @vpn_ip meta mark set mark and 0xf00fffff or 0x00100000 counter return comment "steer:vpn_ip"
     }
 
     chain postrouting_down {
@@ -104,7 +113,7 @@ cat > "$tmp/bin/nft" <<'NFT'
 # Порядок нарочно обратный порядку каналов в спеке: перенос обязан идти по имени.
 case "$*" in
 *prerouting_mark*)
-    echo '  ip saddr { 192.168.1.0/24 } ip daddr @vpn_ip meta mark set 0x00100000 counter packets 7 bytes 700 return comment "steer:vpn_ip"'
+    echo '  ip saddr { 192.168.1.0/24 } ip daddr @vpn_ip meta mark set meta mark & 0xf01fffff | 0x00100000 counter packets 7 bytes 700 return comment "steer:vpn_ip"'
     echo '  ip saddr { 192.168.1.0/24 } ip daddr @direct_ip counter packets 3 bytes 300 return comment "steer:direct_ip"'
     ;;
 esac

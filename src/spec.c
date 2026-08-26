@@ -11,7 +11,9 @@
 /* Marks and tables live well away from what splify (0x40000/0x80000, tables
  * 200/202) and mwan3 use, so both can run on one box while the migration is in
  * progress. One bit per output keeps `nft` output readable. */
-#define MARK_BASE   0x00100000u
+/* База метки и число бит — в spec.h: их знает не только распорядитель, но и тот, кто
+ * ставит правило и генерирует ruleset, а маска выводится из них же. */
+#define MARK_BASE   STEER_MARK_BASE
 #define TABLE_BASE  300
 
 
@@ -786,12 +788,13 @@ void registry_assign(void) {
     for (size_t i = 0; i < g_out_n; i++)
         if (g_out[i].mark) {
             unsigned b = 0;
-            while ((MARK_BASE << b) < g_out[i].mark && b < 8) b++;
+            while ((MARK_BASE << b) < g_out[i].mark && b < STEER_MARK_BITS) b++;
             if (b + 1 > next_bit) next_bit = b + 1;
         }
     for (size_t i = 0; i < g_out_n; i++) {
         if (g_out[i].kind == OUT_DIRECT || g_out[i].mark) continue;
-        if (next_bit >= 8) die("out of mark bits for output %s", g_out[i].name);
+        if (next_bit >= STEER_MARK_BITS)
+            die("out of mark bits for output %s", g_out[i].name);
         g_out[i].mark = MARK_BASE << next_bit;
         g_out[i].table = TABLE_BASE + (int)next_bit;
         next_bit++;

@@ -598,7 +598,15 @@ static void generate(FILE *f) {
         fprintf(f, "        ");
         emit_from(f, g);
         if (g->files_n || g->domains) fprintf(f, "ip daddr @%s ", g->name);
-        if (out_has_device(o)) fprintf(f, "meta mark set 0x%08x ", o->mark);
+        /* НАШИ биты, а не всё слово: `mark and ~маска or метка`. Перезапись стирала метку
+         * mwan3/pbr/sqm молча, а их перезапись — нашу, и тогда помеченный пакет уходил по
+         * таблице main, минуя запрет on_fail=drop (I-135). Диапазон объявлен в spec.h и в
+         * контракте. Ядро при выводе канонизирует выражение (оно само выставляет в маске
+         * бит, который следующий `or` всё равно поднимает) — на поведение это не влияет,
+         * проверено на живом роутере. */
+        if (out_has_device(o))
+            fprintf(f, "meta mark set mark and 0x%08x or 0x%08x ",
+                    ~STEER_MARK_MASK, o->mark);
         /* `return` and not `accept`: it ends OUR chain, letting the rest of the
          * firewall proceed, while making the first matching group the winner. */
         emit_counter(f, g->name, 0);
@@ -980,11 +988,9 @@ static void cleanup_stale_routing(void) {
                 break;
             }
         if (live) continue;
-        char mark[24], table[16];
-        snprintf(mark, sizeof(mark), "0x%08x", g_oldreg[i].mark);
+        char table[16];
         snprintf(table, sizeof(table), "%d", g_oldreg[i].table);
-        const char *del[] = { "ip", "rule", "del", "fwmark", mark, "table", table, NULL };
-        while (run(del) == 0) ;
+        rule_drop(g_oldreg[i].mark, g_oldreg[i].table);
         const char *flush[] = { "ip", "route", "flush", "table", table, NULL };
         run(flush);
     }
@@ -996,13 +1002,10 @@ static void cleanup_stale_routing(void) {
 static void apply_routing(void) {
     for (size_t i = 0; i < g_out_n; i++) {
         if (!out_has_device(&g_out[i])) continue;
-        char mark[24], table[16];
-        snprintf(mark, sizeof(mark), "0x%08x", g_out[i].mark);
+        char table[16];
         snprintf(table, sizeof(table), "%d", g_out[i].table);
-        const char *del[] = { "ip", "rule", "del", "fwmark", mark, "table", table, NULL };
-        while (run(del) == 0) ;                       /* drain older copies */
-        const char *add[] = { "ip", "rule", "add", "fwmark", mark, "table", table, NULL };
-        run(add);
+        rule_drop(g_out[i].mark, g_out[i].table);     /* обе формы, включая копии */
+        rule_add(g_out[i].mark, g_out[i].table);
         const char *flush[] = { "ip", "route", "flush", "table", table, NULL };
         run(flush);
         const char *route[] = { "ip", "route", "add", "default", "dev", g_out[i].device,

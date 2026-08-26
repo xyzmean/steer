@@ -240,15 +240,45 @@ static int zapret_running(void) {
     return found;
 }
 
+/* ---- правило маршрутизации выхода: одно место на четыре вызывающих ---------------
+ *
+ * Зачем функциями, а не строками на месте: команд четыре пары (apply, уборка мёртвых
+ * правил, отказ выхода, привязка устройства), и добавление маски строками означало бы
+ * четыре шанса забыть её в одном месте. Почему маска вообще — в spec.h у STEER_MARK_MASK.
+ */
+void rule_add(unsigned mark, int table) {
+    char m[32], t[16];
+    snprintf(m, sizeof(m), "0x%08x/0x%08x", mark, STEER_MARK_MASK);
+    snprintf(t, sizeof(t), "%d", table);
+    const char *add[] = { "ip", "rule", "add", "fwmark", m, "table", t, NULL };
+    run_quiet(add);
+}
+
+void rule_drop(unsigned mark, int table) {
+    char m[32], legacy[24], t[16];
+    snprintf(m, sizeof(m), "0x%08x/0x%08x", mark, STEER_MARK_MASK);
+    snprintf(legacy, sizeof(legacy), "0x%08x", mark);
+    snprintf(t, sizeof(t), "%d", table);
+    /* В цикле, потому что `ip rule add` дубликаты не проверяет и копий может быть
+     * несколько; до отказа — он и означает «больше таких нет». */
+    const char *del[] = { "ip", "rule", "del", "fwmark", m, "table", t, NULL };
+    while (run_quiet(del) == 0) ;
+    /* Прежняя форма БЕЗ маски: она осталась в ядре от версии до R-094. Снять её обязан
+     * тот же вызов — иначе на одну метку легли бы два правила, и какое из них поймает
+     * пакет, решал бы приоритет, а не замысел. Через несколько версий строку можно
+     * убрать; пока роутеры обновляются, она и есть весь механизм перехода. */
+    const char *dell[] = { "ip", "rule", "del", "fwmark", legacy, "table", t, NULL };
+    while (run_quiet(dell) == 0) ;
+}
+
 /* announce=0 — то же самое приведение состояния в порядок, но без объявления отказа:
  * сторож зовёт apply_failed не только когда выход ТОЛЬКО ЧТО отказал, но и когда отказ
  * длится, а состояние в ядре с тех пор разъехалось (см. сверку ниже). Строку «живых
  * устройств нет» в этом случае печатает вызывающий, и печатает вместе с причиной
  * расхождения — иначе журнал раз в минуту повторял бы одно и то же без новостей. */
 static void apply_failed(struct output *o, int announce) {
-    char tbl[16], mark[24];
+    char tbl[16];
     snprintf(tbl, sizeof(tbl), "%d", o->table);
-    snprintf(mark, sizeof(mark), "0x%08x", o->mark);
     const char *flush[] = { "ip", "route", "flush", "table", tbl, NULL };
     run_quiet(flush);
 
@@ -264,10 +294,8 @@ static void apply_failed(struct output *o, int announce) {
          * то самое, от чего on_fail=drop и защищает. А снять правило было кому:
          * прежний отказ мог случиться в режиме direct/zapret (ниже), и режим меняют
          * в интерфейсе, не перезапуская ничего. */
-        const char *rd[] = { "ip", "rule", "del", "fwmark", mark, "table", tbl, NULL };
-        while (run_quiet(rd) == 0) ;
-        const char *ra[] = { "ip", "rule", "add", "fwmark", mark, "table", tbl, NULL };
-        run_quiet(ra);
+        rule_drop(o->mark, o->table);
+        rule_add(o->mark, o->table);
         if (announce)
             fprintf(stderr, LOG_W "выход %s: живых устройств нет, трафик остановлен "
                             "(on_fail=drop)\n", o->name);
@@ -275,8 +303,7 @@ static void apply_failed(struct output *o, int announce) {
     }
 
     /* direct и zapret: снимаем правило, чтобы помеченный трафик шёл обычным путём. */
-    const char *rd[] = { "ip", "rule", "del", "fwmark", mark, "table", tbl, NULL };
-    while (run_quiet(rd) == 0) ;
+    rule_drop(o->mark, o->table);
 
     if (!announce) return;
     if (o->on_fail == FAIL_ZAPRET && !zapret_running())
@@ -297,14 +324,11 @@ static void apply_failed(struct output *o, int announce) {
  * закончил работу, то есть уже после apply. Одна функция вместо второй копии тех же
  * трёх команд — иначе привязка «от клиента» и «от сторожа» разъехались бы. */
 void bind_device(struct output *o, const char *dev) {
-    char tbl[16], mark[24];
+    char tbl[16];
     snprintf(tbl, sizeof(tbl), "%d", o->table);
-    snprintf(mark, sizeof(mark), "0x%08x", o->mark);
 
-    const char *rd[] = { "ip", "rule", "del", "fwmark", mark, "table", tbl, NULL };
-    while (run_quiet(rd) == 0) ;
-    const char *ra[] = { "ip", "rule", "add", "fwmark", mark, "table", tbl, NULL };
-    run_quiet(ra);
+    rule_drop(o->mark, o->table);
+    rule_add(o->mark, o->table);
     const char *flush[] = { "ip", "route", "flush", "table", tbl, NULL };
     run_quiet(flush);
     const char *rt[] = { "ip", "route", "add", "default", "dev", dev, "table", tbl, NULL };
@@ -437,10 +461,23 @@ static struct route_facts route_facts_of(const char *rules, const char *routes,
         if (!fm) continue;
         char *stop = NULL;
         unsigned long got = strtoul(fm + 7, &stop, 16);
-        /* Метка с МАСКОЙ — не наша: свою мы ставим без маски, а `fwmark 0x100000/0xff`
-         * поймает не тот трафик, и считать её своей значило бы согласиться с чужим
-         * правилом вместо того, чтобы поставить своё. */
-        if (!stop || *stop == '/') continue;
+        if (!stop) continue;
+        /* Маска обязана быть НАШЕЙ, и это проверка в обе стороны.
+         *
+         * Чужая маска (`fwmark 0x100000/0xff`) поймает не тот трафик: согласиться с таким
+         * правилом значило бы не поставить своё. Отсутствие маски — тоже не наше, хотя
+         * раньше было единственной нашей формой: правило без маски осталось в ядре от
+         * версии до R-094, и если считать его верным, сторож не тронет его никогда, то
+         * есть обновление не доедет. Считая его чужим, сторож пересоздаёт привязку, а
+         * rule_drop снимает обе формы — и через минуту после обновления в ядре остаётся
+         * только правило с маской.
+         *
+         * Ядро печатает маску без ведущих нулей (`0x100000/0xff00000`) — форма проверена
+         * на живом роутере, см. RULES_WITH в tests/failovermatch.c. */
+        if (*stop != '/') continue;
+        char *mstop = NULL;
+        unsigned long msk = strtoul(stop + 1, &mstop, 16);
+        if ((uint32_t)msk != STEER_MARK_MASK) continue;
         if ((uint32_t)got != mark) continue;
         /* Куда правило смотрит. Номер таблицы iproute2 печатает как есть, но может
          * напечатать и ИМЯ, если оно заведено в /etc/iproute2/rt_tables кем-то ещё.
