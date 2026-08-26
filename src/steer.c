@@ -168,6 +168,16 @@ struct group {
     /* Сколько доменных списков в группе. Нужно только чтобы сказать это человеку в status:
      * набор у них общий, а вот «сколько списков» он спрашивает про правило. */
     size_t dfiles_n;
+    /* Все адресные списки группы оказались непрочитанными — набор и правило остаются, но
+     * набор пуст.
+     *
+     * Почему не выбросить группу совсем: правило без `ip daddr @набор` это «весь трафик
+     * этих клиентов в туннель», то есть пропавший список молча превратил бы узкий канал в
+     * полный туннель. Почему не оставить как было (die на первом непрочитанном файле):
+     * тогда не появляется НИ ОДНОГО правила, и напрямую идёт весь роутер, включая каналы,
+     * чьи списки на месте (I-136). Пустой набор — единственный вариант, при котором
+     * пропавший список уносит ровно свои адреса и ничего больше. */
+    int emptied;
     /* Which channels fed it — reported so a counter still has names behind it. */
     const char *members[MAX_CHANNELS];
     size_t members_n;
@@ -403,6 +413,27 @@ static void count_list(const char *path, size_t *total, size_t *bad,
 static void check_address_lists(void) {
     for (size_t i = 0; i < g_grp_n; i++) {
         struct group *g = &g_grp[i];
+        /* Непрочитанный файл выбрасывается из группы ЗДЕСЬ, до подсчёта и до генерации:
+         * дальше по коду его отсутствие уже не отличить от «списка не было», а разница
+         * важна — про пропажу надо сказать. Причина почти всегда одна: обновление образа
+         * сохранило спеку (она в keep.d) и не сохранило каталог списков — он там не
+         * объявлен намеренно, это решение владельца (splicicd#6). */
+        for (size_t k = 0; k < g->files_n; ) {
+            FILE *probe = fopen(g->files[k], "r");
+            if (probe) { fclose(probe); k++; continue; }
+            fprintf(stderr, LOG_W "%s: список канала не читается (%s) — его адреса в набор "
+                            "не попадут\n", g->files[k], strerror(errno));
+            for (size_t m = k + 1; m < g->files_n; m++) g->files[m - 1] = g->files[m];
+            g->files_n--;
+        }
+        if (!g->files_n && !g->domains && !g->all) {
+            /* Ни одного читаемого адресного списка, доменов нет. Канал остаётся пустым —
+             * почему именно так, сказано у поля `emptied`. */
+            g->emptied = 1;
+            fprintf(stderr, LOG_W "канал «%s»: ни один из его списков не читается — правило "
+                            "остаётся, но не совпадает ни с чем\n",
+                    g->members_n ? g->members[0] : g->name);
+        }
         /* Раньше здесь стоял пропуск доменных групп целиком. Теперь у группы могут быть и
          * адресные файлы: пропускать её значило бы не заметить пустой или сломанный список. */
         for (size_t k = 0; k < g->files_n; k++) {
@@ -447,7 +478,13 @@ static void check_address_lists(void) {
 
 static size_t emit_elements(FILE *f, const char *path, size_t already) {
     FILE *in = fopen(path, "r");
-    if (!in) die("%s: cannot read a channel's list", path);
+    /* Не die: читаемость всех файлов уже проверена (check_address_lists), и попасть сюда
+     * можно только гонкой — список удалили между проверкой и генерацией. Ронять из-за неё
+     * весь набор правил незачем: пропадут адреса одного списка, и про это будет сказано. */
+    if (!in) {
+        fprintf(stderr, LOG_W "%s: список исчез во время сборки набора правил\n", path);
+        return 0;
+    }
     /* 512, а не 128: строка длиннее просто обрезалась бы посередине, и в набор уехал бы
      * обломок адреса — то есть тихо не тот адрес. */
     char line[512];
@@ -554,7 +591,9 @@ static void generate(FILE *f) {
     fprintf(f, "table inet steer {\n");
     for (size_t i = 0; i < g_grp_n; i++) {
         struct group *g = &g_grp[i];
-        if (!g->files_n && !g->domains) continue;      /* an `any` group has no set */
+        /* `any`-группе набор не нужен; опустевшей — нужен, иначе её правило потеряет
+         * `ip daddr` и станет безусловным (см. поле `emptied`). */
+        if (!g->files_n && !g->domains && !g->emptied) continue;
         if (g->domains) {
             /* timeout — из-за резолвера: он кладёт адреса с TTL ответа, и адрес, который CDN
              * перестал отдавать, истекает сам, а не копится вечно.
@@ -579,11 +618,17 @@ static void generate(FILE *f) {
              * in the kernel is cheaper than rewriting the text. */
             fprintf(f, "    set %s {\n        type ipv4_addr\n"
                        "        flags interval\n        auto-merge\n", g->name);
-            fprintf(f, "        elements = { ");
-            size_t written = 0;
-            for (size_t k = 0; k < g->files_n; k++)
-                written += emit_elements(f, g->files[k], written);
-            fprintf(f, " }\n    }\n");
+            /* Пустой набор объявляется БЕЗ строки elements: `elements = {  }` nft не примет,
+             * а объявление без элементов — обычное дело (так же начинают жизнь доменные
+             * наборы, которые наполняет резолвер). */
+            if (g->files_n) {
+                fprintf(f, "        elements = { ");
+                size_t written = 0;
+                for (size_t k = 0; k < g->files_n; k++)
+                    written += emit_elements(f, g->files[k], written);
+                fprintf(f, " }\n");
+            }
+            fprintf(f, "    }\n");
         }
     }
 
@@ -597,7 +642,7 @@ static void generate(FILE *f) {
         if (!o) die("channel group %s points at a missing output", g->name);
         fprintf(f, "        ");
         emit_from(f, g);
-        if (g->files_n || g->domains) fprintf(f, "ip daddr @%s ", g->name);
+        if (g->files_n || g->domains || g->emptied) fprintf(f, "ip daddr @%s ", g->name);
         /* НАШИ биты, а не всё слово: `mark and ~маска or метка`. Перезапись стирала метку
          * mwan3/pbr/sqm молча, а их перезапись — нашу, и тогда помеченный пакет уходил по
          * таблице main, минуя запрет on_fail=drop (I-135). Диапазон объявлен в spec.h и в

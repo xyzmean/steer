@@ -565,5 +565,60 @@ check "adding an output keeps the existing marks" "$before" \
 check "and gives the new one its own" "1" \
     "$(grep -c '^extra ' "$tmp/state/registry")"
 
+# ---- пропавший список канала не рушит ВЕСЬ набор правил -----------------------
+# Так выглядит роутер после обновления образа: спека выжила (она в keep.d), а каталог
+# списков нет — он в архив не берётся намеренно, это решение владельца (splicicd#6): десятки
+# файлов и сотни килобайт, а списки восстанавливаются по расписанию. Обоснование опиралось
+# на «отсутствующий список не мешает применению», и это оказалось неверно: apply умирал на
+# первом же непрочитанном файле (код возврата 2), таблицы не появлялось вовсе, и весь трафик
+# роутера шёл напрямую — включая каналы, чьи списки были на месте (I-136).
+#
+# Правильное поведение: пропавший список убирает из набора СВОИ адреса и ничего больше.
+# Канал при этом обязан остаться в наборе правил ПУСТЫМ, а не исчезнуть: правило без
+# `ip daddr @набор` — это «весь трафик этих клиентов в туннель», то есть пропавший список
+# молча превратил бы узкий канал в полный туннель.
+printf '198.51.100.5\n' > "$tmp/keep2.lst"
+spec <<'EOF'
+{ "schema": 1,
+  "from_default": ["192.168.1.0/24"],
+  "outputs": {
+    "direct": { "kind": "direct" },
+    "vpn":    { "kind": "interface", "device": "wg0" }
+  },
+  "channels": [
+    { "name": "цел",    "match": { "prefixes_file": "TMP/keep2.lst" }, "out": "direct" },
+    { "name": "пропал", "match": { "prefixes_file": "TMP/gone.lst" },  "out": "vpn" }
+  ] }
+EOF
+gout="$("$BIN" apply --dry-run --spec "$tmp/spec.json" --state-dir "$tmp/state-gone" 2>"$tmp/gerr")"
+check "пропавший список: apply не умирает" "0" "$?"
+check "пропавший список: назван в предупреждении" "1" \
+    "$(grep -c 'gone.lst' "$tmp/gerr")"
+check "пропавший список: уцелевший канал на месте" "1" \
+    "$(printf '%s\n' "$gout" | grep -c 'elements = { 198.51.100.5 }')"
+check "пропавший список: его канал остался ПУСТЫМ, а не исчез" "1" \
+    "$(printf '%s\n' "$gout" | grep -c 'ip daddr @vpn_ip')"
+check "пропавший список: правило не стало безусловным" "0" \
+    "$(printf '%s\n' "$gout" | grep 'steer:vpn_ip' | grep -vc 'ip daddr')"
+check "пропавший список: набор объявлен" "1" \
+    "$(printf '%s\n' "$gout" | grep -c 'set vpn_ip {')"
+
+# Второй случай: у канала два списка, один пропал. Уцелевший обязан доехать — иначе правка
+# лечила бы «весь роутер напрямую» ценой «канал молча стал пустым».
+printf '203.0.113.0/24\n' > "$tmp/half.lst"
+spec <<'EOF'
+{ "schema": 1,
+  "from_default": ["192.168.1.0/24"],
+  "outputs": { "vpn": { "kind": "interface", "device": "wg0" } },
+  "channels": [
+    { "name": "две половины",
+      "match": { "prefixes_files": ["TMP/half.lst", "TMP/gone.lst"] }, "out": "vpn" }
+  ] }
+EOF
+hout="$("$BIN" apply --dry-run --spec "$tmp/spec.json" --state-dir "$tmp/state-half" 2>/dev/null)"
+check "один из двух списков пропал: уцелевший доехал" "1" \
+    "$(printf '%s\n' "$hout" | grep -c 'elements = { 203.0.113.0/24 }')"
+
 printf '\n%s passed, %s failed\n' "$pass" "$fail"
 [ "$fail" -eq 0 ]
+
