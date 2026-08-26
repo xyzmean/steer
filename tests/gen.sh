@@ -43,6 +43,15 @@ out="$("$BIN" apply --dry-run --spec "$tmp/spec.json" $S)"
 # перезапись выключала их политику молча, а чужая перезапись — нашу (I-135).
 check "метка ставится без затирания чужих бит" "1" \
     "$(printf '%s\n' "$out" | grep -c 'meta mark set mark and 0xf00fffff or 0x00100000')"
+# Метка СОЕДИНЕНИЯ рядом с меткой пакета. Без неё запись conntrack не связана с выходом
+# вообще (в дампе mark=0), и сделать с уже установленным соединением нельзя ничего: ни
+# понять, каким выходом оно идёт, ни снять его при смене маршрута. Замер на роутере показал,
+# зачем это нужно: при включённой выгрузке потоков (flow_offloading) наша цепочка видит
+# 2-7 пакетов соединения вместо одиннадцати тысяч, то есть решение о маршруте для
+# установленного соединения больше не пересматривается, и запрет on_fail=drop до него не
+# доходит (R-096).
+check "метка соединения ставится рядом с меткой пакета" "1" \
+    "$(printf '%s\n' "$out" | grep -c 'ct mark set mark')"
 check "перезаписи слова метки не осталось" "0" \
     "$(printf '%s\n' "$out" | grep -cE 'meta mark set 0x')"
 
@@ -65,7 +74,7 @@ table inet steer {
     chain prerouting_mark {
         type filter hook prerouting priority mangle + 1; policy accept;
         ip saddr { 192.168.1.0/24 } ip daddr @direct_ip counter return comment "steer:direct_ip"
-        ip saddr { 192.168.1.0/24 } ip daddr @vpn_ip meta mark set mark and 0xf00fffff or 0x00100000 counter return comment "steer:vpn_ip"
+        ip saddr { 192.168.1.0/24 } ip daddr @vpn_ip meta mark set mark and 0xf00fffff or 0x00100000 ct mark set mark counter return comment "steer:vpn_ip"
     }
 
     chain postrouting_down {
