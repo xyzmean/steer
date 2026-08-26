@@ -161,9 +161,12 @@ for spec in $ISAS; do
     root="build/pkg/$arch"
     rm -rf "$root"
     mkdir -p "$root/usr/sbin" "$root/etc/init.d" "$root/etc/steer/lists" \
-             "$root/lib/upgrade/keep.d"
+             "$root/lib/upgrade/keep.d" "$root/etc/hotplug.d/iface"
     cp "build/steer-$arch" "$root/usr/sbin/steer"
     cp files/etc/init.d/steer "$root/etc/init.d/steer"
+    # Реакция на события сети: подъём и падение интерфейса доходят до сторожа сразу, а не
+    # через минуту опроса. Файл невелик, но без него правка I-137 существует только в дереве.
+    cp files/etc/hotplug.d/iface/95-steer "$root/etc/hotplug.d/iface/95-steer"
     # Настройки объявляются системе, иначе их не существует для sysupgrade и для «Создать
     # архив» в LuCI: список файлов там собирается из /etc/sysupgrade.conf и
     # /lib/upgrade/keep.d/*, и всё, чего в нём нет, обновление прошивки «с сохранением
@@ -172,7 +175,8 @@ for spec in $ISAS; do
     # Файл кладётся В ПОЛЕЗНУЮ НАГРУЗКУ, а не в скрипт установки: он обязан исчезнуть вместе
     # с пакетом и принадлежать ему, как init-скрипт.
     cp files/lib/upgrade/keep.d/steer "$root/lib/upgrade/keep.d/steer"
-    chmod 0755 "$root/usr/sbin/steer" "$root/etc/init.d/steer"
+    chmod 0755 "$root/usr/sbin/steer" "$root/etc/init.d/steer" \
+               "$root/etc/hotplug.d/iface/95-steer"
     chmod 0644 "$root/lib/upgrade/keep.d/steer"
 
     # OUTSIDE the package root: anything inside it ships as a FILE, so a
@@ -205,15 +209,17 @@ EOF
         eroot="build/pkg/$arch-ext"
         rm -rf "$eroot"
         mkdir -p "$eroot/usr/sbin" "$eroot/etc/init.d" "$eroot/etc/steer/lists" \
-                 "$eroot/lib/upgrade/keep.d"
+                 "$eroot/lib/upgrade/keep.d" "$eroot/etc/hotplug.d/iface"
         cp "build/steer-ext-$arch" "$eroot/usr/sbin/steer"
         cp files/etc/init.d/steer "$eroot/etc/init.d/steer"
+        cp files/etc/hotplug.d/iface/95-steer "$eroot/etc/hotplug.d/iface/95-steer"
         # Тот же файл, что и в базовом пакете: расширенный ставится ВМЕСТО базового
         # (provides/replaces), и без своей копии keep.d замена пакета молча снимала бы
         # объявление настроек — то есть возвращала бы I-037 на ровно том пакете, который
         # ставит большинство.
         cp files/lib/upgrade/keep.d/steer "$eroot/lib/upgrade/keep.d/steer"
-        chmod 0755 "$eroot/usr/sbin/steer" "$eroot/etc/init.d/steer"
+        chmod 0755 "$eroot/usr/sbin/steer" "$eroot/etc/init.d/steer" \
+                   "$eroot/etc/hotplug.d/iface/95-steer"
         chmod 0644 "$eroot/lib/upgrade/keep.d/steer"
         docker run --rm -v "$PWD":/w -w /w alpine:latest sh -c \
             "apk add --no-cache apk-tools >/dev/null 2>&1; apk mkpkg \

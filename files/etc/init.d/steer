@@ -7,8 +7,9 @@
 START=94
 STOP=11
 USE_PROCD=1
-EXTRA_COMMANDS="reload_dnsd"
-EXTRA_HELP="	reload_dnsd	Перезапустить только резолвер, не снимая правил"
+EXTRA_COMMANDS="reload_dnsd reapply"
+EXTRA_HELP="	reload_dnsd	Перезапустить только резолвер, не снимая правил
+	reapply		Пересобрать и применить правила, не трогая резолвер"
 
 SPEC=/etc/steer/spec.json
 # Как часто проверять устройства. Пинг с таймаутом 3с на кандидата, так что минута
@@ -173,6 +174,30 @@ reload_service() {
     reload_dnsd
 }
 
+# Пересобрать и применить правила — и только это. Нужна триггеру ниже: смена настройки
+# сети может сдвинуть lan_device и подсети клиентов (from_default читается из адреса
+# lan_device), то есть ruleset обязан быть перегенерирован. Полный `reload` для этого не
+# годится: он вдобавок перезапускает резолвер, а это провал DNS на секунды — за настройку,
+# которая резолвера не касается.
+reapply() {
+    [ -f "$SPEC" ] || return 0
+    steer apply --spec "$SPEC" || echo "steer: apply failed — see the message above"
+}
+
 service_triggers() {
-    procd_add_reload_trigger "steer"
+    # Прежде здесь стояло `procd_add_reload_trigger "steer"` — подписка на изменение
+    # /etc/config/steer. Такого файла пакет не кладёт и никто не создаёт: настройка живёт в
+    # /etc/steer/spec.json. То есть триггер не срабатывал ни разу за всю историю, а
+    # выглядел работающим механизмом (I-137).
+    #
+    # Настоящая подписка — на /etc/config/network: он меняется, когда правят интерфейсы и
+    # мост локальной сети, а из адреса lan_device выводятся подсети клиентов. Команда узкая
+    # (reapply, а не reload) по причине, записанной у неё же.
+    #
+    # Подъём и падение интерфейсов приходят не сюда, а в /etc/hotplug.d/iface/95-steer:
+    # событие «интерфейс поднялся» это не изменение настройки, и обрабатывать его перезапуском
+    # правил незачем — там нужен проход сторожа.
+    procd_open_trigger
+    procd_add_config_trigger "config.change" "network" /etc/init.d/steer reapply
+    procd_close_trigger
 }
