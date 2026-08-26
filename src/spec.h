@@ -155,6 +155,9 @@ extern size_t g_from_default_n;
 extern char g_lan_device[32];
 extern int g_traceroute_hops;
 extern const char *g_state_dir;
+/* Каталог, куда пишутся ИМЕНА таблиц маршрутизации для iproute2. Швом, а не литералом, по
+ * той же причине, что g_state_dir: стенду нужно писать в свой каталог, а не в системный. */
+extern const char *g_rt_tables_d;
 
 /* The port `steer dnsd` listens on and the redirect points at. One constant, so
  * the two halves cannot disagree about where DNS is being steered. */

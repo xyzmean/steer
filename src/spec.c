@@ -35,6 +35,9 @@ char g_lan_device[32] = "br-lan";
  * legible-but-wrong hops into no hops at all. */
 int g_traceroute_hops;
 const char *g_state_dir = "/var/lib/steer";
+/* Имена таблиц для iproute2. Каталог, а не сам rt_tables: файл принадлежит пакету iproute2,
+ * и дописывать в него значило бы править чужое; rt_tables.d для этого и существует. */
+const char *g_rt_tables_d = "/etc/iproute2/rt_tables.d";
 
 void die(const char *fmt, const char *a) {
     fprintf(stderr, "steer: ");
@@ -768,6 +771,8 @@ void load_spec(const char *path) {
 /* Persisted, because an output must keep its mark across restarts: a reboot that
  * reshuffles marks leaves stale `ip rule` entries pointing at the wrong table,
  * and the symptom is traffic silently taking someone else's path. */
+static void rt_tables_write(void);
+
 void registry_assign(void) {
     char path[512];
     snprintf(path, sizeof(path), "%s/registry", g_state_dir);
@@ -824,6 +829,63 @@ void registry_assign(void) {
     mkdir(g_state_dir, 0755);
     f = fopen(path, "w");
     if (!f) return;             /* best effort: apply still works, next boot re-assigns */
+    fwrite(want, 1, wn, f);
+    fclose(f);
+    rt_tables_write();
+}
+
+/* Объявить имена таблиц маршрутизации системе.
+ *
+ * ЗАЧЕМ. Номера таблиц (300, 301, ...) не говорят ничего: `ip route show table 300` требует
+ * помнить, какой выход это был, а `ip rule show` печатает номер. iproute2 умеет имена —
+ * для этого и существует /etc/iproute2/rt_tables.d, — и тогда диагностика становится
+ * обычной: `ip route show table steer_vpn`. Проверено на живом роутере (10.8.1.87,
+ * OpenWrt 25.12 с ip-full): имя из rt_tables.d принимается и в add, и в show.
+ *
+ * ПОЧЕМУ КАТАЛОГ, А НЕ САМ rt_tables. Файл rt_tables принадлежит пакету iproute2;
+ * дописывать в чужой файл значило бы драться с его обновлением. Каталог .d для этого и
+ * заведён.
+ *
+ * ПОЧЕМУ СРАВНЕНИЕ ПЕРЕД ЗАПИСЬЮ. registry_assign зовут все подкоманды, включая status,
+ * который интерфейс опрашивает каждые пять секунд, — это та же причина, по которой не
+ * перезаписывается сам реестр (см. выше): безусловная запись означала бы ~17 тысяч записей
+ * файла в сутки с неизменным содержимым.
+ *
+ * Отказ здесь ничего не ломает: имена — удобство диагностики, номера работают и без них.
+ * Поэтому молча, без предупреждений: на busybox-ip имён нет вовсе, и жаловаться было бы не
+ * на что. */
+static void rt_tables_write(void) {
+    char path[512];
+    snprintf(path, sizeof(path), "%s/steer.conf", g_rt_tables_d);
+
+    char want[1024];
+    size_t wn = 0;
+    for (size_t i = 0; i < g_out_n && wn < sizeof(want); i++) {
+        if (g_out[i].kind == OUT_DIRECT || !g_out[i].table) continue;
+        /* Имя с приставкой: таблица принадлежит выходу, но пространство имён общее для всей
+         * коробки, и «vpn» там заняли бы и mwan3, и человек руками. */
+        int w = snprintf(want + wn, sizeof(want) - wn, "%d steer_%s\n",
+                         g_out[i].table, g_out[i].name);
+        if (w < 0 || (size_t)w >= sizeof(want) - wn) break;
+        wn += (size_t)w;
+    }
+
+    FILE *f = fopen(path, "r");
+    if (f) {
+        char have[sizeof(want) + 1];
+        size_t hn = fread(have, 1, sizeof(have), f);
+        fclose(f);
+        if (hn == wn && memcmp(have, want, wn) == 0) return;
+    }
+    /* Каталога может не быть: iproute2 создаёт его не всегда, а на busybox-сборке его нет
+     * вовсе. mkdir по одному уровню — родителя (/etc/iproute2) тоже может не быть. */
+    char parent[512];
+    snprintf(parent, sizeof(parent), "%s", g_rt_tables_d);
+    char *slash = strrchr(parent, '/');
+    if (slash && slash != parent) { *slash = '\0'; mkdir(parent, 0755); }
+    mkdir(g_rt_tables_d, 0755);
+    f = fopen(path, "w");
+    if (!f) return;
     fwrite(want, 1, wn, f);
     fclose(f);
 }

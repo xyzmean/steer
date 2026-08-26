@@ -543,6 +543,78 @@ int main(void) {
         check_str("out_kind_name: interface", "interface", out_kind_name(OUT_INTERFACE));
     }
 
+    /* ---- имена таблиц маршрутизации объявляются системе ------------------------
+     *
+     * Номер таблицы (300) в `ip rule show` и в `ip route show table` не говорит ничего:
+     * какой это выход, надо помнить. iproute2 умеет имена через /etc/iproute2/rt_tables.d, и
+     * с ними диагностика становится обычной. Проверяется здесь и содержимое, и то, что файл
+     * НЕ перезаписывается без нужды: registry_assign зовут все подкоманды, включая status,
+     * который интерфейс опрашивает каждые пять секунд. */
+    {
+        char sdir[] = "/tmp/specmatch-state-XXXXXX";
+        char rdir[] = "/tmp/specmatch-rt-XXXXXX";
+        if (!mkdtemp(sdir) || !mkdtemp(rdir)) { perror("mkdtemp"); return 1; }
+        const char *saved_state = g_state_dir, *saved_rt = g_rt_tables_d;
+        g_state_dir = sdir;
+        g_rt_tables_d = rdir;
+
+        reset_globals();
+        const char *s2 = SPEC(
+            "\"outputs\":{\"direct\":{\"kind\":\"direct\"},"
+            "\"vpn\":{\"kind\":\"interface\",\"device\":\"wg0\"},"
+            "\"alt\":{\"kind\":\"interface\",\"device\":\"wg1\"}},"
+            "\"channels\":[]}");
+        check("спека с двумя туннелями загрузилась", 0, load_from_str(s2));
+        registry_assign();
+
+        char path[512];
+        snprintf(path, sizeof(path), "%s/steer.conf", rdir);
+        char have[512] = {0};
+        FILE *f = fopen(path, "r");
+        size_t hn = f ? fread(have, 1, sizeof(have) - 1, f) : 0;
+        if (f) fclose(f);
+        have[hn] = 0;
+        check("имена таблиц записаны", 1, hn > 0);
+        /* Прямой выход в файл не попадает: таблицы у него нет. Приставка обязательна —
+         * пространство имён таблиц общее на всю коробку. */
+        check("имя первого выхода на месте", 1, strstr(have, "steer_vpn") != NULL);
+        check("имя второго выхода на месте", 1, strstr(have, "steer_alt") != NULL);
+        check("прямой выход не назван", 0, strstr(have, "steer_direct") != NULL);
+        check("номер таблицы рядом с именем", 1, strstr(have, "300 steer_") != NULL);
+
+        /* Повторный вызов при том же составе выходов файл трогать не должен. */
+        struct stat st1, st2;
+        stat(path, &st1);
+        registry_assign();
+        stat(path, &st2);
+        check("повторный вызов файл не перезаписывает",
+              1, st1.st_mtime == st2.st_mtime && st1.st_size == st2.st_size);
+
+        /* Выход исчез из спеки — исчезает и его имя: файл собирается целиком, а не
+         * дописывается, иначе имена мёртвых выходов копились бы вечно. */
+        reset_globals();
+        const char *s3 = SPEC(
+            "\"outputs\":{\"vpn\":{\"kind\":\"interface\",\"device\":\"wg0\"}},"
+            "\"channels\":[]}");
+        check("спека с одним туннелем загрузилась", 0, load_from_str(s3));
+        registry_assign();
+        memset(have, 0, sizeof(have));
+        f = fopen(path, "r");
+        hn = f ? fread(have, 1, sizeof(have) - 1, f) : 0;
+        if (f) fclose(f);
+        have[hn] = 0;
+        check("имя исчезнувшего выхода убрано", 0, strstr(have, "steer_alt") != NULL);
+        check("имя оставшегося выхода на месте", 1, strstr(have, "steer_vpn") != NULL);
+
+        unlink(path);
+        rmdir(rdir);
+        snprintf(path, sizeof(path), "%s/registry", sdir);
+        unlink(path);
+        rmdir(sdir);
+        g_state_dir = saved_state;
+        g_rt_tables_d = saved_rt;
+    }
+
     printf("\n%s\n", fails ? "ЕСТЬ ПРОВАЛЫ" : "все проверки прошли");
     return fails ? 1 : 0;
 }
