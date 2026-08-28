@@ -163,4 +163,23 @@ $CC -O2 -w -Isrc $MBED_INC "$PRIV" -o "$BUILD/devupmatch" tests/devupmatch.c \
 	src/spec.c $MBED_LIB -lpthread
 "$BUILD/devupmatch"
 
+# probe — активное зондирование настоящим openssl s_client. Здесь, а не отдельной целью
+# Makefile: определение mbedtls уже сделано выше, а второй экземпляр этого определения
+# разошёлся бы с первым. Стенд требует root и сетевых пространств и без них ГРОМКО
+# пропускается, поэтому в ext-test он безопасен.
+#
+# Бинарник СЕРВЕРНЫЙ (-DSTEER_SERVER): хаб живёт только в нём, у роутерной сборки подкоманда
+# xsteer-hub — штатная заглушка «ставится из архива steer-hub». Список исходников повторяет
+# серверную половину из build/build-ext.sh; расходиться им негде — оба списка про один бинарник,
+# и стенд упадёт на неразрешённом имени, если половины разъедутся.
+echo "ext-test: собираю серверный бинарник для стенда зондирования..."
+$CC -O1 -w -Isrc $MBED_INC "$PRIV" -DSTEER_SERVER -o "$BUILD/steer-hub-native" \
+	src/steer.c src/spec.c src/dnsd.c src/failover.c src/aggregate.c src/obfs.c src/cli.c \
+	src/ext/xswire.c src/ext/xsconf.c src/ext/xsroute.c src/ext/chello.c src/ext/xshake.c \
+	src/ext/xsconn.c src/ext/xsstream.c src/ext/xsepoch.c src/ext/tls13.c src/ext/reality.c \
+	src/ext/tun.c src/ext/h2.c src/ext/xsadmin.c src/ext/xshub.c \
+	$MBED_LIB -lpthread
+echo "ext-test: прогоняю probe (зондирование порта хаба)..."
+BUILD="$BUILD" sh tests/probe.sh
+
 echo "ext-test: все стенды прошли на mbedtls ${MBED_VER:-?}"
