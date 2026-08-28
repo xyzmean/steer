@@ -184,6 +184,39 @@ jobs:
             git push
           fi
 
+      - name: Выложить пакеты роутера в ветку dist
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          DIST: dist
+        run: |
+          set -eu
+          # ЗАЧЕМ ВТОРАЯ ВЫКЛАДКА, КОГДА ЕСТЬ РЕЛИЗ. splify2#15: провайдер закрывает не
+          # GitHub, а `githubusercontent.com` — и целиком: `raw.`, `objects.` и
+          # `release-assets.` стоят на одних адресах Fastly (185.199.108-111.133). Прямая
+          # ссылка релиза перенаправляет как раз на `release-assets`, поэтому у такого
+          # человека движок нельзя ни поставить, ни обновить — ни install.sh, ни кнопкой в
+          # splify2. Хосты самого GitHub (`api.` и `codeload.`, сеть 140.82.121.x) работают,
+          # и оба умеют отдать файл из ветки: поштучно через contents API и архивом.
+          #
+          # Только пакеты роутера. Сборки для VPS (`steer-hub-*`, `steer-obfs-*`) сюда не
+          # едут: их ставят на сервер, у которого этой беды нет, а в архиве ветки они
+          # стоили бы ещё 700 КБ каждому роутеру, который до архива дойдёт.
+          #
+          # Ветка сиротская и переписывается каждым релизом: это канал выкладки, а не
+          # история. Иначе архив рос бы каждым выпуском, а качает его роутер целиком.
+          rm -rf /tmp/dist
+          mkdir -p /tmp/dist
+          cp out/*.apk out/*.ipk /tmp/dist/
+          echo "$VERSION" > /tmp/dist/VERSION
+          cd /tmp/dist
+          git init -q -b "$DIST"
+          git config user.name 'github-actions[bot]'
+          git config user.email 'github-actions[bot]@users.noreply.github.com'
+          git add -A
+          git commit -q -m "Пакеты ${VERSION}"
+          git push -q --force \
+            "https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}" "$DIST:$DIST"
+
       - name: Опубликовать релиз
         uses: softprops/action-gh-release@v2
         with:
