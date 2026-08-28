@@ -7,7 +7,7 @@ steer решает, какой трафик уходит в туннель, а �
 Написан под нижнюю границу домашних роутеров: одно ядро, десятки мегабайт памяти, overlay-раздел
 на 6-7 МБ. Это движок и только движок: он не скачивает списки и не имеет веб-интерфейса. Если
 нужен интерфейс с готовым каталогом сервисов и автообновлением списков — смотрите
-[splify2](https://github.com/xyzmean/splify2), он управляет этим движком.
+[splify2](https://gitlab.com/xyzmean/splify2), он управляет этим движком.
 
 [![Telegram](https://img.shields.io/badge/Telegram-chat-2CA5E0?style=flat&logo=telegram)](https://t.me/ssplify)
 [![Поддержать проект](https://img.shields.io/badge/%D0%9F%D0%BE%D0%B4%D0%B4%D0%B5%D1%80%D0%B6%D0%B0%D1%82%D1%8C-%D0%BF%D1%80%D0%BE%D0%B5%D0%BA%D1%82-f5365c?style=flat)](https://www.donationalerts.com/r/yo1nkxxd)
@@ -34,7 +34,10 @@ steer решает, какой трафик уходит в туннель, а �
 
 ## Установка
 
-Возьмите пакет своей архитектуры со страницы [релизов](https://github.com/xyzmean/steer/releases).
+Возьмите пакет своей архитектуры из ветки [dist](https://gitlab.com/xyzmean/steer/-/tree/dist) или
+со страницы [релизов](https://github.com/xyzmean/steer/releases). Содержимое одинаковое; ветка
+на зеркале нужна тем, у кого провайдер закрыл `githubusercontent.com` — прямая ссылка релиза
+ведёт именно туда и не откроется.
 Архитектура в имени файла — та же, что показывает `DISTRIB_ARCH` в `/etc/openwrt_release`.
 
 ```sh
@@ -345,4 +348,4 @@ make test                 # весь набор стендов, офлайн: б
 
 ---
 *Нужен готовый интерфейс с каталогом сервисов и автообновлением списков —
-[splify2](https://github.com/xyzmean/splify2).*
+[splify2](https://gitlab.com/xyzmean/splify2).*
