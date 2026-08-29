@@ -19,7 +19,14 @@
  * routing is concerned. Read as several files rather than concatenated into one by
  * the caller: on a box with 6MB of overlay, duplicating list bytes to express "and"
  * is a cost with nothing to show for it. */
-#define MAX_FILES    16
+/* Списков одного вида в правиле. Шестнадцати не хватало на очевидное желание: в каталоге
+ * splify2 под сорок записей, и «отправить в туннель всё» упиралось в `too many entries in
+ * list` уже на восьмом сервисе. Шестьдесят четыре покрывают весь каталог с запасом.
+ *
+ * Расти этому числу стало дёшево: пути больше не лежат в правиле массивом по 256 байт на
+ * каждый (это было 8 КБ на правило и полмегабайта на все), а хранятся указателями на копии
+ * строк. Шестьдесят четыре указателя на два вида — килобайт на правило. */
+#define MAX_FILES    64
 
 /* Вид выхода.
  *
@@ -115,9 +122,12 @@ struct output {
 struct channel {
     char name[32];
     char out[32];
-    char prefixes_files[MAX_FILES][256];
+    /* Пути — указатели на копии строк, живущие до конца процесса: спека разбирается один
+     * раз, освобождать их некому и незачем. Массив фиксированных буферов стоил бы 32 КБ на
+     * правило при нынешнем пределе. */
+    const char *prefixes_files[MAX_FILES];
     size_t prefixes_n;
-    char domains_files[MAX_FILES][256];
+    const char *domains_files[MAX_FILES];
     size_t domains_n;
     /* fake-IP (default) or real-IP for a domain channel. See dnsd.c: fake-IP is
      * precise per domain but makes every traceroute hop show the fake address,
