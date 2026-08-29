@@ -216,10 +216,21 @@ static void js_skip(struct js *j) {
     while (*j->p && *j->p != ',' && *j->p != '}' && *j->p != ']') j->p++;
 }
 
-/* Same as str_array but for the 256-byte path arrays. Kept separate rather than
- * templated: two element widths in C means two functions, and a void*+stride version
- * would trade a compiler-checked bound for a runtime one. */
-static size_t str_list(struct js *j, char dst[][256], size_t max) {
+/* Копия строки на всю жизнь процесса. Спека разбирается один раз, а живёт разобранной до
+ * конца работы — освобождать эти строки некому и незачем; отказ malloc здесь равносилен
+ * «спеку не прочитать», поэтому громкий. */
+static const char *keep(const char *s) {
+    size_t n = strlen(s) + 1;
+    char *p = malloc(n);
+    if (!p) die("out of memory reading the spec", NULL);
+    memcpy(p, s, n);
+    return p;
+}
+
+/* Списки путей. От str_array отличается тем, что хранит УКАЗАТЕЛИ, а не буферы: путей в
+ * правиле теперь до шестидесяти четырёх, и массив фиксированных буферов по 256 байт стоил бы
+ * 32 КБ на правило. */
+static size_t str_list(struct js *j, const char **dst, size_t max) {
     if (js_lit(j, '[') != 0) return 0;
     size_t n = 0;
     js_ws(j);
@@ -228,7 +239,7 @@ static size_t str_list(struct js *j, char dst[][256], size_t max) {
         char t[256];
         if (js_str(j, t, sizeof(t)) != 0) return n;
         if (n >= max) die("too many entries in list", NULL);
-        snprintf(dst[n++], 256, "%s", t);
+        dst[n++] = keep(t);
         js_ws(j);
         if (*j->p == ',') {
             /* Trailing comma (`[...,]`) раньше уходил в continue, js_str на ']' возвращал
@@ -559,9 +570,17 @@ static void parse_channels(struct js *j) {
                     /* Singular is shorthand for a one-element list, so a spec written
                      * before this stayed valid. */
                     if (!strcmp(mk, "prefixes_file")) {
-                        if (js_str(j, c.prefixes_files[0], 256) == 0) c.prefixes_n = 1;
+                        char one[256];
+                        if (js_str(j, one, sizeof(one)) == 0) {
+                            c.prefixes_files[0] = keep(one);
+                            c.prefixes_n = 1;
+                        }
                     } else if (!strcmp(mk, "domains_file")) {
-                        if (js_str(j, c.domains_files[0], 256) == 0) c.domains_n = 1;
+                        char one[256];
+                        if (js_str(j, one, sizeof(one)) == 0) {
+                            c.domains_files[0] = keep(one);
+                            c.domains_n = 1;
+                        }
                     } else if (!strcmp(mk, "prefixes_files")) {
                         c.prefixes_n = str_list(j, c.prefixes_files, MAX_FILES);
                     } else if (!strcmp(mk, "domains_files")) {

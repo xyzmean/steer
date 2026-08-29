@@ -163,8 +163,11 @@ struct group {
     /* ТОЛЬКО адресные файлы: их элементы уходят в набор при компиляции. Доменные читает
      * резолвер сам, из спеки, поэтому здесь их держать незачем — а держали, и из-за этого
      * группа не могла быть смешанной. */
-    const char *files[MAX_CHANNELS * MAX_FILES];
-    size_t files_n;
+    /* Адресные списки группы. Вектор, а не массив на MAX_CHANNELS*MAX_FILES: с пределом в
+     * шестьдесят четыре файла на правило такой массив стоил бы 32 КБ на группу и два
+     * мегабайта на все — при том, что обычная группа держит один-два файла. */
+    const char **files;
+    size_t files_n, files_cap;
     /* Сколько доменных списков в группе. Нужно только чтобы сказать это человеку в status:
      * набор у них общий, а вот «сколько списков» он спрашивает про правило. */
     size_t dfiles_n;
@@ -184,6 +187,19 @@ struct group {
 };
 
 static struct group g_grp[MAX_CHANNELS];
+
+/* Дописать адресный список в группу, растя вектор вдвое. Отказ памяти здесь — это «правила
+ * не собрать», поэтому громкий: тихо потерянный список превратил бы узкий канал в широкий. */
+static void group_add_file(struct group *g, const char *path) {
+    if (g->files_n == g->files_cap) {
+        size_t cap = g->files_cap ? g->files_cap * 2 : 8;
+        const char **p = realloc(g->files, cap * sizeof(*p));
+        if (!p) die("out of memory building channel groups", NULL);
+        g->files = p;
+        g->files_cap = cap;
+    }
+    g->files[g->files_n++] = path;
+}
 static size_t g_grp_n;
 
 static int same_from(const struct channel *c, const struct group *g) {
@@ -248,9 +264,7 @@ static void build_groups(void) {
             g->domains = 1;
             g->dfiles_n += c->domains_n;
         }
-        for (size_t f = 0; f < c->prefixes_n &&
-                           g->files_n < (sizeof(g->files) / sizeof(g->files[0])); f++)
-            g->files[g->files_n++] = c->prefixes_files[f];
+        for (size_t f = 0; f < c->prefixes_n; f++) group_add_file(g, c->prefixes_files[f]);
         if (g->members_n < MAX_CHANNELS) g->members[g->members_n++] = c->name;
     }
     /* Окончательные имена. Группа с доменами — всегда _dom, потому что имя набора резолвер

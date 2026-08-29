@@ -275,35 +275,40 @@ int main(void) {
         }
     }
     {
-        /* Пограничный случай: ровно MAX_FILES (16) domains_files принимается.
-         * Это НЕ тест на I-001 (переполнение 17+) — он будет добавлен отдельно как
-         * красный тест к хотфиксу. Здесь проверяем, что граница «16 ещё работает». */
-        char big[16384];
+        /* Пограничный случай: ровно MAX_FILES списков принимается.
+         *
+         * Предел вырос с шестнадцати до шестидесяти четырёх: в каталоге splify2 под сорок
+         * записей, и «отправить в туннель всё» упиралось в `too many entries in list` уже на
+         * восьмом сервисе. Числа здесь взяты из MAX_FILES, а не вписаны: следующий, кто его
+         * подвинет, не должен править ещё и стенд, чтобы тот остался про границу. */
+        char big[65536];
         char *p = big;
         p += sprintf(p, "%s\"outputs\":{\"direct\":{\"kind\":\"direct\"}},"
                         "\"channels\":[{\"name\":\"many\",\"out\":\"direct\",\"match\":{"
                         "\"domains_files\":[", SPEC_OPEN);
-        for (int i = 0; i < 16; i++) {
-            p += sprintf(p, "\"/tmp/d%d.lst\"", i);
-            if (i < 15) p += sprintf(p, ",");
+        for (size_t i = 0; i < MAX_FILES; i++) {
+            p += sprintf(p, "\"/tmp/d%zu.lst\"", i);
+            if (i + 1 < MAX_FILES) p += sprintf(p, ",");
         }
         p += sprintf(p, "]}}]}");
-        check("ровно 16 domains_files: принимается", 0, load_from_str(big));
-        check("ровно 16 domains_files: domains_n=16", 16, (int)g_ch[0].domains_n);
+        check("ровно MAX_FILES domains_files: принимается", 0, load_from_str(big));
+        check("ровно MAX_FILES domains_files: сосчитаны все", (int)MAX_FILES, (int)g_ch[0].domains_n);
     }
     {
-        /* I-001: Больше MAX_FILES domains_files вызывает отказ, а не тихое обрезание */
-        char big[16384];
+        /* I-001: на один больше — отказ, а не тихое обрезание. Тихое обрезание здесь хуже
+         * отказа вдвойне: канал остался бы, а часть списков молча выпала — и узкое правило
+         * стало бы шире, чем человек написал. */
+        char big[65536];
         char *p = big;
         p += sprintf(p, "%s\"outputs\":{\"direct\":{\"kind\":\"direct\"}},"
                         "\"channels\":[{\"name\":\"many\",\"out\":\"direct\",\"match\":{"
                         "\"domains_files\":[", SPEC_OPEN);
-        for (int i = 0; i < 17; i++) {
-            p += sprintf(p, "\"/tmp/d%d.lst\"", i);
-            if (i < 16) p += sprintf(p, ",");
+        for (size_t i = 0; i <= MAX_FILES; i++) {
+            p += sprintf(p, "\"/tmp/d%zu.lst\"", i);
+            if (i < MAX_FILES) p += sprintf(p, ",");
         }
         p += sprintf(p, "]}}]}");
-        check("больше 16 domains_files: отказ (I-001)", 2, load_from_str(big));
+        check("больше MAX_FILES domains_files: отказ (I-001)", 2, load_from_str(big));
     }
     {
         /* I-001: Больше MAX_FROM from вызывает отказ */
