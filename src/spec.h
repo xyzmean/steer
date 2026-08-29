@@ -14,6 +14,10 @@
 #define MAX_CHANNELS 64
 #define MAX_OUTPUTS  16
 #define MAX_FROM     16
+/* Локальных устройств в спеке. Столько же, сколько адресных записей в `from_default`, и по
+ * той же причине: это две формы одного ответа на «кто наши клиенты», и разные пределы у них
+ * означали бы, что один способ описать сеть богаче другого без всякого основания. */
+#define MAX_LAN_DEV  16
 /* Several lists can feed ONE channel. Enabling "youtube" and "google" must not force
  * two channels with two rules and two sets — they are one destination as far as
  * routing is concerned. Read as several files rather than concatenated into one by
@@ -162,7 +166,21 @@ extern struct channel g_ch[MAX_CHANNELS];
 extern size_t g_ch_n;
 extern char g_from_default[MAX_FROM][64];
 extern size_t g_from_default_n;
-extern char g_lan_device[32];
+/* Локальные устройства: те, с которых движок забирает трафик клиентов.
+ *
+ * СПИСОК, А НЕ СТРОКА, потому что роутер бывает выходной точкой не только для своего моста:
+ * у splify2 просили маршрутизировать ещё и хостов из Tailscale/ZeroTier, для которых он
+ * шлюз (splify2#16). В спеке это `lan_devices`; прежнее `lan_device` осталось сокращением
+ * для списка из одного элемента — той же парой, что `device`/`devices` у выхода.
+ *
+ * ПОЧЕМУ ВЫБОР ПО УСТРОЙСТВУ, А НЕ ПО ПОДСЕТИ. Раньше движок выводил подсеть клиентов из
+ * адреса единственного устройства. Для Tailscale это не работает в принципе: у tailscale0
+ * на роутере адрес обычно /32, и выведенная из него «подсеть» — сам роутер. Имя устройства
+ * отвечает на тот же вопрос точнее и там, где адрес не отвечает вовсе: заодно в правило
+ * попадают клиенты за вторым роутером в LAN, у которых адреса чужой подсети, а интерфейс
+ * тот же. */
+extern char g_lan_dev[MAX_LAN_DEV][64];
+extern size_t g_lan_dev_n;
 extern int g_traceroute_hops;
 extern const char *g_state_dir;
 /* Каталог, куда пишутся ИМЕНА таблиц маршрутизации для iproute2. Швом, а не литералом, по

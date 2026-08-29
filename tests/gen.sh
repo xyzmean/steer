@@ -527,6 +527,97 @@ check "дубликат устройства отвергается" "2" "$?"
 msg="$("$BIN" apply --dry-run --spec "$tmp/loop.json" --state-dir "$tmp/state-g" 2>&1 | tail -1)"
 check "и объясняет, что не так" "1" "$(printf '%s' "$msg" | grep -c 'br-lan')"
 
+# ---- клиенты не только из br-lan (splify2#16) --------------------------------
+# Роутер бывает выходной точкой не только для своего моста: у человека к домашним
+# устройствам добавились хосты из Tailscale/ZeroTier, для которых он шлюз. Клиенты таких
+# сетей выбираются ПО УСТРОЙСТВУ, а не по подсети, и это не стилистика: у tailscale0 адрес
+# на роутере /32, то есть выведенная из него «подсеть» — сам роутер, и адресный способ здесь
+# не работает в принципе.
+# Выходов два, а не один: адресный и доменный канал в ОДИН выход для одних клиентов
+# сливаются в одну группу (это отдельное свойство компилятора), и имена наборов зависели бы
+# от порядка. Разными выходами группы гарантированно две — vpn_ip и geo_dom.
+cat > "$tmp/lan.json" <<EOF
+{ "schema": 1, "lan_devices": ["br-lan", "tailscale0", "ztrq4abcde"],
+  "outputs": { "vpn": { "kind": "interface", "device": "wg0" },
+               "geo": { "kind": "interface", "device": "tun0" } },
+  "channels": [ { "name": "списки", "match": { "prefixes_files": ["$tmp/a.lst"] }, "out": "vpn" },
+                { "name": "домены", "match": { "domains_files": ["$tmp/d.lst"] }, "out": "geo" } ] }
+EOF
+lout="$("$BIN" apply --dry-run --spec "$tmp/lan.json" --state-dir "$tmp/state-lan")"
+check "правило канала висит на всех перечисленных устройствах" "1" \
+    "$(printf '%s\n' "$lout" | grep 'steer:vpn_ip' |
+       grep -c 'iifname { "br-lan", "tailscale0", "ztrq4abcde" }')"
+# Встречный путь — это тот же клиент, но ПОЛУЧАТЕЛЬ: там устройство исходящее.
+check "встречное правило висит на них же, но как oifname" "1" \
+    "$(printf '%s\n' "$lout" | grep 'steer-down:vpn_ip' |
+       grep -c 'oifname { "br-lan", "tailscale0", "ztrq4abcde" }')"
+# Одно правило на оба семейства: пометки nfproto нет, потому что имя устройства одинаково
+# верно и для IPv4, и для IPv6 — прежняя асимметрия (IPv4 по адресу, IPv6 по устройству)
+# держалась только на том, что подсеть была единственным способом сказать «наши».
+check "DNS заворачивается по устройствам одним правилом" "1" \
+    "$(printf '%s\n' "$lout" |
+       grep -c 'iifname { "br-lan", "tailscale0", "ztrq4abcde" } udp dport 53 counter redirect')"
+check "и без пометки семейства" "0" \
+    "$(printf '%s\n' "$lout" | grep 'udp dport 53' | grep -c 'nfproto')"
+# Ровно одно правило на канал, а не два: «или» внутри правила nft не выражается, и добавлять
+# второе значило бы менять смысл уже написанного from_default (см. отказ ниже).
+check "правило у канала одно" "1" \
+    "$(printf '%s\n' "$lout" | grep -c 'comment "steer:vpn_ip"')"
+
+# Одиночная форма остаётся сокращением для списка из одного, и текст правила у неё прежний:
+# без фигурных скобок, ровно так, как печатает сам nft.
+cat > "$tmp/lan1.json" <<EOF
+{ "schema": 1, "lan_device": "br-lan",
+  "outputs": { "vpn": { "kind": "interface", "device": "wg0" } },
+  "channels": [ { "name": "списки", "match": { "prefixes_files": ["$tmp/a.lst"] }, "out": "vpn" } ] }
+EOF
+l1="$("$BIN" apply --dry-run --spec "$tmp/lan1.json" --state-dir "$tmp/state-lan1")"
+check "одно устройство печатается без скобок" "1" \
+    "$(printf '%s\n' "$l1" | grep 'steer:vpn_ip' | grep -c 'iifname "br-lan" ip daddr')"
+
+# Петля проверяется по ВСЕМУ списку: выход в tailscale0, с которого мы забираем клиентов,
+# закольцуется ровно так же, как выход в br-lan, и отличать одно от другого нечем.
+sed 's/"device": "wg0"/"device": "tailscale0"/' "$tmp/lan.json" > "$tmp/lanloop.json"
+"$BIN" apply --dry-run --spec "$tmp/lanloop.json" --state-dir "$tmp/state-lan" >/dev/null 2>&1
+check "выход в любое из локальных устройств отвергается" "2" "$?"
+
+# Обе формы сразу — противоречие, а не обогащение: молча взять одну значило бы, что половина
+# написанного человеком не действует, и понять это было бы нечем.
+cat > "$tmp/lanboth.json" <<EOF
+{ "schema": 1, "lan_device": "br-lan", "lan_devices": ["br-lan", "tailscale0"],
+  "outputs": { "vpn": { "kind": "interface", "device": "wg0" } },
+  "channels": [ { "name": "с", "match": { "prefixes_files": ["$tmp/a.lst"] }, "out": "vpn" } ] }
+EOF
+"$BIN" apply --dry-run --spec "$tmp/lanboth.json" --state-dir "$tmp/state-lan" >/dev/null 2>&1
+check "lan_device и lan_devices вместе отвергаются" "2" "$?"
+
+sed 's/"br-lan", "tailscale0", "ztrq4abcde"/"br-lan", "br-lan"/' "$tmp/lan.json" > "$tmp/landup.json"
+"$BIN" apply --dry-run --spec "$tmp/landup.json" --state-dir "$tmp/state-lan" >/dev/null 2>&1
+check "дубликат в списке устройств отвергается" "2" "$?"
+
+sed 's/"br-lan", "tailscale0", "ztrq4abcde"/"br lan"/' "$tmp/lan.json" > "$tmp/lanbad.json"
+"$BIN" apply --dry-run --spec "$tmp/lanbad.json" --state-dir "$tmp/state-lan" >/dev/null 2>&1
+check "негодное имя устройства отвергается" "2" "$?"
+
+# from_default вместе с НЕСКОЛЬКИМИ устройствами — отказ, и это главное решение всей правки.
+# Взять только подсети значило бы, что человек добавил tailscale0 и ничего не изменилось.
+# Взять и то, и другое — хуже: from_default пишут, чтобы клиентов ОГРАНИЧИТЬ (гостевая
+# подсеть на том же мосту нарочно вне списка), и правило по iifname молча забрало бы её.
+sed 's/"schema": 1,/"schema": 1, "from_default": ["192.168.1.0\/24"],/' "$tmp/lan.json" \
+    > "$tmp/lanboth2.json"
+"$BIN" apply --dry-run --spec "$tmp/lanboth2.json" --state-dir "$tmp/state-lan" >/dev/null 2>&1
+check "from_default вместе с несколькими устройствами отвергается" "2" "$?"
+msg="$("$BIN" apply --dry-run --spec "$tmp/lanboth2.json" --state-dir "$tmp/state-lan" 2>&1 | tail -1)"
+check "и объясняет, что убрать" "1" "$(printf '%s' "$msg" | grep -c 'from_default')"
+
+# ...а с ОДНИМ устройством — законно и значит ровно то, что значило: так написаны все спеки,
+# сделанные до появления перечня, и ломать их нельзя.
+sed 's/"schema": 1,/"schema": 1, "from_default": ["192.168.1.0\/24"],/' "$tmp/lan1.json" \
+    > "$tmp/lanold.json"
+lold="$("$BIN" apply --dry-run --spec "$tmp/lanold.json" --state-dir "$tmp/state-lan")"
+check "старая форма (подсети плюс один мост) работает как раньше" "1" \
+    "$(printf '%s\n' "$lold" | grep 'steer:vpn_ip' | grep -c 'ip saddr { 192.168.1.0/24 }')"
+
 # ---- failover ----------------------------------------------------------------
 # devices — это приоритет, и единственное число остаётся сокращением для одного,
 # чтобы прежние спеки не сломались.

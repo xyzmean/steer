@@ -61,9 +61,9 @@ static void check_str(const char *what, const char *want, const char *got) {
 }
 
 /* Полный сброс глобалов парсера. g_out_n/g_ch_n нарастают между вызовами load_spec
- * (g_out[g_out_n++] = o), и без сброса второй тест увидит выходы первого. g_lan_device
- * возвращается к умолчанию «br-lan», g_traceroute_hops — к 0. g_state_dir оставляем
- * как есть: registry_assign в этих тестах не вызывается. */
+ * (g_out[g_out_n++] = o), и без сброса второй тест увидит выходы первого. Список локальных
+ * устройств возвращается к умолчанию «один br-lan», g_traceroute_hops — к 0. g_state_dir
+ * оставляем как есть: registry_assign в этих тестах не вызывается. */
 static void reset_globals(void) {
     g_out_n = 0;
     g_ch_n = 0;
@@ -71,7 +71,9 @@ static void reset_globals(void) {
     memset(g_out, 0, sizeof(g_out));
     memset(g_ch, 0, sizeof(g_ch));
     memset(g_from_default, 0, sizeof(g_from_default));
-    strcpy(g_lan_device, "br-lan");
+    memset(g_lan_dev, 0, sizeof(g_lan_dev));
+    strcpy(g_lan_dev[0], "br-lan");
+    g_lan_dev_n = 1;
     g_traceroute_hops = 0;
 }
 

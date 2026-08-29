@@ -28,10 +28,15 @@ size_t g_ch_n;
 char g_from_default[MAX_FROM][64];
 size_t g_from_default_n;
 
-/* Needed for the IPv6 DNS redirect: a LAN IPv6 prefix is dynamic (a ULA plus a
- * delegated global one that changes), so there is no stable `ip6 saddr` to write
- * and the rule has to match the device instead. */
-char g_lan_device[32] = "br-lan";
+/* Устройства, с которых движок забирает трафик клиентов. Умолчание — один `br-lan`: спека,
+ * написанная до появления списка, обязана значить ровно то же, что значила.
+ *
+ * Именем, а не адресом, по двум причинам сразу. У локального префикса IPv6 стабильного
+ * адреса нет (ULA плюс делегированный глобальный, который меняется), поэтому писать
+ * `ip6 saddr` не во что. А у туннельных устройств вроде tailscale0 адрес на роутере обычно
+ * /32, и подсеть пиров из него не выводится — там имя устройства единственный ответ. */
+char g_lan_dev[MAX_LAN_DEV][64] = { "br-lan" };
+size_t g_lan_dev_n = 1;
 /* Opt-in, because it cannot work without a firewall rule the engine does not own —
  * see the comment on the generated chain in steer.c. Defaulting it on would turn
  * legible-but-wrong hops into no hops at all. */
@@ -49,16 +54,18 @@ void die(const char *fmt, const char *a) {
 }
 
 /* Состав идентификатора, пришедшего из спеки: имя выхода, имя устройства, имя канала,
- * lan_device.
+ * записи lan_devices.
  *
  * Заслон стоит В ПАРСЕРЕ, а не у каждого вызова оболочки, и это принципиально. Имена
- * отсюда подставляются в командные строки в четырёх разных местах — `ip -4 -o addr show
- * %s` ниже, `pgrep -f 'steer obfs %s'` и `nft list chain … o_%s` в diag, имя набора в
- * set_count, — и проверять их по месту значит проверять четыре раза и забыть в пятом.
- * Забыли: спека с lan_device вида «x;id>/tmp/pwned;#» выполняла эту команду от root, и
- * срабатывало это у ЛЮБОЙ команды, читающей спеку, потому что автоопределение подсети
- * включается штатно — когда from_default не задан. Имя выхода с кавычкой давало то же
- * самое через diag, а diag дёргает rpcd интерфейса.
+ * отсюда подставляются в командные строки в нескольких разных местах — `pgrep -f 'steer
+ * obfs %s'` и `nft list chain … o_%s` в diag, имя набора в set_count, — и проверять их по
+ * месту значит проверять по разу в каждом и забыть в следующем. Забыли: спека с lan_device
+ * вида «x;id>/tmp/pwned;#» уезжала в `ip -4 -o addr show %s` через popen и выполняла это от
+ * root, причём у ЛЮБОЙ команды, читающей спеку, потому что автоопределение подсети
+ * включалось штатно. Того вызова больше нет (клиенты выбираются по имени устройства, а не
+ * по выведенной подсети), но проверка от этого не менее нужна: имя устройства теперь уходит
+ * в текст правил nftables. Имя выхода с кавычкой давало то же самое через diag, а diag
+ * дёргает rpcd интерфейса.
  *
  * Проверенное однажды при загрузке имя безопасно везде и навсегда, включая места,
  * которых ещё нет. Это то же решение, что с адресом в explain: там проверка формы стоит
@@ -644,6 +651,10 @@ void load_spec(const char *path) {
 
     struct js j = { buf };
     long schema = -1;
+    /* Какой из двух форм записано локальное устройство. Нужно, чтобы отличить «поля нет» от
+     * «поле задано» и поймать спеку, где заданы обе: молча взять одну значило бы, что
+     * половина написанного человеком не действует, и понять это было бы нечем. */
+    int lan_one = 0, lan_many = 0;
     if (js_lit(&j, '{') != 0) die("spec: expected an object", NULL);
     js_ws(&j);
     while (*j.p && *j.p != '}') {
@@ -655,59 +666,75 @@ void load_spec(const char *path) {
         else if (!strcmp(key, "channels")) parse_channels(&j);
         else if (!strcmp(key, "from_default")) str_array(&j, g_from_default, MAX_FROM, &g_from_default_n);
         else if (!strcmp(key, "lan_device")) {
-            js_str(&j, g_lan_device, sizeof(g_lan_device));
-            /* Самая дорогая из проверок этого набора: именно отсюда имя уходило в
-             * `ip -4 -o addr show %s` через popen, у любой команды, читающей спеку. */
-            if (!name_ok(g_lan_device))
-                die("lan_device: негодный состав имени (%s)", g_lan_device);
+            /* Одиночная форма — сокращение для списка из одного элемента, ровно как
+             * `device` у выхода. Дальше по коду путь один. */
+            js_str(&j, g_lan_dev[0], sizeof(g_lan_dev[0]));
+            g_lan_dev_n = 1;
+            lan_one = 1;
+        }
+        else if (!strcmp(key, "lan_devices")) {
+            if (str_array(&j, g_lan_dev, MAX_LAN_DEV, &g_lan_dev_n) != 0)
+                die("lan_devices: ожидался массив строк", NULL);
+            lan_many = 1;
         }
         else if (!strcmp(key, "traceroute_hops")) { js_ws(&j); g_traceroute_hops = (*j.p == 't'); js_skip(&j); }
         else js_skip(&j);
         js_ws(&j);
         if (*j.p == ',') { j.p++; js_ws(&j); }
     }
+    if (lan_one && lan_many)
+        die("задано и lan_device, и lan_devices — оставьте одно", NULL);
+    /* Пустой список — это «клиентов нет», а правило без условия «кто» забирает ВЕСЬ транзит
+     * роутера, включая путь из интернета внутрь. Отказ дешевле такой находки на живом
+     * роутере. */
+    if (!g_lan_dev_n)
+        die("lan_devices: пустой список — некому адресовать правила", NULL);
+    for (size_t i = 0; i < g_lan_dev_n; i++) {
+        /* Самая дорогая из проверок этого набора: имя уходит и в текст правил nftables, и
+         * в командные строки popen у любой команды, читающей спеку. */
+        if (!name_ok(g_lan_dev[i]))
+            die("lan_devices: негодный состав имени (%s)", g_lan_dev[i]);
+        for (size_t k = i + 1; k < g_lan_dev_n; k++)
+            if (!strcmp(g_lan_dev[i], g_lan_dev[k]))
+                die("lan_devices: устройство %s указано дважды", g_lan_dev[i]);
+    }
+    /* Клиентов по умолчанию описывают ЛИБО подсети, либо устройства. Оба сразу — не
+     * обогащение, а противоречие, и молчаливого разрешения у него нет ни в одну сторону.
+     *
+     * Взять только подсети значило бы, что человек добавил tailscale0 и ничего не
+     * изменилось: перечень интерфейсов стал бы дорогим украшением, а понять это было бы
+     * нечем — отказа нет, правила есть, трафик идёт мимо. Взять и то, и другое (вторым
+     * правилом по `iifname`) — хуже: `from_default` пишут, чтобы клиентов ОГРАНИЧИТЬ,
+     * гостевая подсеть на том же мосту нарочно остаётся вне списка, и второе правило молча
+     * забрало бы её тоже. То есть добавление интерфейса меняло бы смысл строки, написанной
+     * когда-то совсем про другое.
+     *
+     * Отказ узкий намеренно: одно устройство рядом с `from_default` — это спека, написанная
+     * до появления перечня, и она обязана значить ровно то, что значила. Отвергается только
+     * НОВАЯ возможность, применённая вместе со старой. */
+    if (g_from_default_n && g_lan_dev_n > 1)
+        die("клиенты описаны дважды: и from_default, и несколько lan_devices. "
+            "Уберите from_default — устройства опишут клиентов точнее", NULL);
     /* Refusing an unknown major is the whole point of having the field: guessing
      * would mean compiling a config we do not understand into firewall rules. */
     if (schema != 1) {
         fprintf(stderr, "steer: spec schema %ld is not supported (this build speaks 1)\n", schema);
         exit(2);
     }
-    /* Auto-detect the LAN subnet when from_default is not set.
+    /* ЗДЕСЬ БЫЛО АВТООПРЕДЕЛЕНИЕ ПОДСЕТИ. Движок читал адрес lan_device через popen и
+     * выводил из него `from_default`, когда тот не задан. Нужно это было ради одной вещи:
+     * без `from_default` не появлялось правило DNS-перенаправления, клиенты уходили к
+     * dnsmasq напрямую, и fake-IP молча не работал — «с роутера работает, с устройств нет»
+     * при синтаксически целой цепочке.
      *
-     * Without this, every new install ships with no IPv4 DNS redirect: the rule is
-     * generated from from_default, an empty field makes no rule, and clients querying
-     * IPv4 go straight to dnsmasq — fake-IP silently does nothing. The symptom is
-     * "works from the router but not from devices", with no error, because the chain
-     * is syntactically fine, just missing a rule.
+     * Теперь на тот же вопрос отвечает имя устройства, и отвечает точнее. Выведенная
+     * подсеть была ДОГАДКОЙ: у tailscale0 адрес на роутере /32, и догадка давала «клиент
+     * один, и это сам роутер»; у клиентов за вторым роутером в LAN адреса чужой подсети, и
+     * догадка их теряла. `iifname` не гадает вовсе. Заодно из загрузки спеки ушёл запуск
+     * оболочки — тот самый, через который имя устройства однажды уезжало в popen.
      *
-     * The spec author should not have to know the LAN subnet: the engine has the box
-     * in front of it. Reads the lan_device's address, derives the network, same as
-     * OpenWrt's own uci. Overridable by setting from_default explicitly. */
-    if (!g_from_default_n) {
-        char cmd[128];
-        snprintf(cmd, sizeof(cmd), "ip -4 -o addr show %s 2>/dev/null", g_lan_device);
-        FILE *pf = popen(cmd, "r");
-        if (pf) {
-            char line[256];
-            while (g_from_default_n < MAX_FROM && fgets(line, sizeof(line), pf)) {
-                char ifname[32], addr[64];
-                if (sscanf(line, "%*d: %31s inet %63s", ifname, addr) != 2) continue;
-                char *slash = strchr(addr, '/');
-                if (!slash) continue;
-                int plen = atoi(slash + 1);
-                *slash = '\0';
-                unsigned a, b, c, d;
-                if (sscanf(addr, "%u.%u.%u.%u", &a, &b, &c, &d) != 4) continue;
-                unsigned ip = (a << 24) | (b << 16) | (c << 8) | d;
-                unsigned mask = plen ? (0xFFFFFFFFu << (32 - plen)) : 0;
-                ip &= mask;
-                snprintf(g_from_default[g_from_default_n], 64, "%u.%u.%u.%u/%u",
-                         (ip >> 24) & 255, (ip >> 16) & 255, (ip >> 8) & 255, ip & 255, plen);
-                g_from_default_n++;
-            }
-            pclose(pf);
-        }
-    }
+     * Явный `from_default` при этом остался и значит ровно то же, что значил: он и выбирает
+     * клиентов, а устройства тогда не участвуют (см. emit_from в steer.c). */
     /* Пустая спека законна, и отказ на ней запирал настройку наглухо: чтобы завести
      * канал, нужен выход, а сохранить выход без каналов движок не давал — тупик, из
      * которого нельзя выйти изнутри интерфейса.
@@ -732,15 +759,18 @@ void load_spec(const char *path) {
         struct output *o = &g_out[i];
         if (!out_has_device(o)) continue;
 
-        /* Выход в локальный мост — это петля: помеченный пакет получает маршрут
-         * обратно в ту же сеть, откуда пришёл. */
-        if (!strcmp(o->device, g_lan_device)) {
-            char msg[160];
-            snprintf(msg, sizeof(msg),
-                     "выход %s ведёт в %s — это локальная сеть, трафик закольцуется",
-                     o->name, g_lan_device);
-            die("%s", msg);
-        }
+        /* Выход в локальное устройство — это петля: помеченный пакет получает маршрут
+         * обратно в ту же сеть, откуда пришёл. Проверяется ВЕСЬ список: выход в
+         * tailscale0, с которого мы забираем клиентов, закольцуется ровно так же, как
+         * выход в br-lan, и отличать одно от другого нечем. */
+        for (size_t d = 0; d < g_lan_dev_n; d++)
+            if (!strcmp(o->device, g_lan_dev[d])) {
+                char msg[160];
+                snprintf(msg, sizeof(msg),
+                         "выход %s ведёт в %s — это локальная сеть, трафик закольцуется",
+                         o->name, g_lan_dev[d]);
+                die("%s", msg);
+            }
 
         /* Дубликат устройства внутри одного выхода делает failover бессмысленным:
          * второй кандидат ничем не отличается от первого. */

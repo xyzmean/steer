@@ -333,10 +333,44 @@ static void emit_who(FILE *f, const struct group *g, int reverse) {
     fprintf(f, " } ");
 }
 
-static void emit_from(FILE *f, const struct group *g) { emit_who(f, g, 0); }
+/* «Кто» по устройству: клиенты, которых мы узнаём по интерфейсу, а не по адресу.
+ *
+ * ИМЕНЕМ (`iifname`), А НЕ НОМЕРОМ (`iif`). Разница не косметическая: `iif` ядро разрешает
+ * в индекс в момент ЗАГРУЗКИ правила и на отсутствующем устройстве отказывает всей
+ * транзакции. А tailscale0 и zt* появляются позже сети и пропадают при перезапуске своего
+ * демона — то есть на `iif` перезагрузка роутера оставляла бы человека вообще без правил.
+ * `iifname` сверяется по имени в момент прохода пакета: правило спокойно грузится на
+ * отсутствующее устройство и начинает работать само, когда оно поднимется.
+ *
+ * Один элемент печатается без фигурных скобок: так вывод `--dry-run` у обычной
+ * конфигурации остаётся тем же текстом, что и раньше, и nft печатает его так же. */
+static void emit_ifs(FILE *f, int reverse) {
+    const char *kw = reverse ? "oifname" : "iifname";
+    if (g_lan_dev_n == 1) { fprintf(f, "%s \"%s\" ", kw, g_lan_dev[0]); return; }
+    fprintf(f, "%s { ", kw);
+    for (size_t i = 0; i < g_lan_dev_n; i++)
+        fprintf(f, "%s\"%s\"", i ? ", " : "", g_lan_dev[i]);
+    fprintf(f, " } ");
+}
+
+/* «Кто» у правила группы. Способ ровно один, и это принципиально: адреса ИЛИ устройства, а
+ * не то и другое сразу.
+ *
+ * ПОЧЕМУ НЕ ОБА. Соблазн был — добавлять правило по устройствам вдобавок к адресному, чтобы
+ * перечень интерфейсов действовал всегда. Но `from_default` пишут в спеке, чтобы клиентов
+ * ОГРАНИЧИТЬ: гостевая подсеть на том же мосту нарочно остаётся за пределами списка. Второе
+ * правило по `iifname "br-lan"` молча забрало бы и её — то есть добавление интерфейса меняло
+ * бы смысл давно написанной строки. Поэтому явный `from_default` значит ровно то, что
+ * написано, а противоречие «клиенты описаны и подсетями, и несколькими устройствами»
+ * отвергается при загрузке спеки (см. load_spec), а не разрешается движком на свой вкус. */
+static void emit_from(FILE *f, const struct group *g) {
+    if (g->from_n) emit_who(f, g, 0); else emit_ifs(f, 0);
+}
 
 /* То же «кто», но на встречном пути: там наш клиент — это ПОЛУЧАТЕЛЬ. */
-static void emit_to(FILE *f, const struct group *g) { emit_who(f, g, 1); }
+static void emit_to(FILE *f, const struct group *g) {
+    if (g->from_n) emit_who(f, g, 1); else emit_ifs(f, 1);
+}
 
 /* Elements come straight from the list files: the fitter (steer-aggregate) has
  * already decided what fits, and re-parsing them here would only add a second place
@@ -751,15 +785,22 @@ static void generate(FILE *f) {
          * that server, so an IPv4-only redirect catches almost nothing — measured on a
          * real client, 15 of its DNS packets went over IPv6 against 20 over IPv4.
          * TCP/53 stays with the system resolver: this daemon is UDP-only, so
-         * redirecting TCP would break the truncated-answer retry. */
+         * redirecting TCP would break the truncated-answer retry.
+         *
+         * Форм у правила две, и выбирает между ними то же, что выбирает «кто» у каналов.
+         * Заданы подсети — забираем IPv4 по адресу, а IPv6 по устройству, потому что
+         * стабильного `ip6 saddr` у локального префикса нет; это ровно то, что было.
+         * Подсетей нет — забираем по устройству ОБА семейства одним правилом: пометка
+         * семейства там не нужна, а без неё уходит и прежняя асимметрия. */
         fprintf(f, "    chain prerouting_dns {\n"
                    "        type nat hook prerouting priority dstnat; policy accept;\n");
         for (size_t i = 0; i < g_from_default_n; i++)
             fprintf(f, "        ip saddr %s udp dport 53 counter redirect to :%d\n",
                     g_from_default[i], DNS_PORT);
-        if (g_lan_device[0])
-            fprintf(f, "        meta nfproto ipv6 iifname \"%s\" udp dport 53 counter redirect to :%d\n",
-                    g_lan_device, DNS_PORT);
+        fprintf(f, "        ");
+        if (g_from_default_n) fprintf(f, "meta nfproto ipv6 ");
+        emit_ifs(f, 0);
+        fprintf(f, "udp dport 53 counter redirect to :%d\n", DNS_PORT);
         fprintf(f, "    }\n");
     }
     fprintf(f, "}\n");
@@ -955,7 +996,7 @@ static void report_traceroute_dep(void) {
                         "packets was found — ICMP time-exceeded will be dropped by the "
                         "firewall and hops will show as asterisks. Needed once, in the "
                         "firewall (not here): accept ct state untracked icmp type "
-                        "time-exceeded towards %s\n", g_lan_device);
+                        "time-exceeded towards %s\n", g_lan_dev[0]);
 }
 
 static void report_output_deps(void) {
@@ -1164,7 +1205,13 @@ static int cmd_status(const char *spec) {
     load_spec(spec);
     registry_assign();
     build_groups();
-    printf("{\"schema\":1,\"outputs\":{");
+    /* Локальные устройства — первым полем: интерфейс показывает, с чего забирается трафик, и
+     * без этого поля ему пришлось бы читать спеку вторым источником, то есть однажды
+     * показать не то, что применено. */
+    printf("{\"schema\":1,\"lan_devices\":[");
+    for (size_t i = 0; i < g_lan_dev_n; i++)
+        printf("%s\"%s\"", i ? "," : "", g_lan_dev[i]);
+    printf("],\"outputs\":{");
     for (size_t i = 0; i < g_out_n; i++) {
         char devpath[128];
         int up = 0;
@@ -1522,6 +1569,29 @@ static int cmd_diag(const char *spec) {
         } else {
             snprintf(what, sizeof(what), "канал %.48s: адресов в ядре %ld", g->name, n);
             diag("set", "ok", what, "");
+        }
+    }
+
+    /* 3a. Локальные устройства. Правила по ним грузятся и на отсутствующее устройство —
+     *     `iifname` сверяется по имени в момент прохода пакета, — и это правильно: zt* и
+     *     tailscale0 появляются позже сети. Но «правило есть, а устройства нет» означает
+     *     «правило не сработает ни разу», и молчать об этом нельзя: у человека, опечатавшегося
+     *     в имени, ровно та же картина, что у исправной настройки.
+     *
+     *     Спрашиваем /sys/class/net, а не спеку: спека описывает намерение, а вопрос здесь
+     *     про роутер. warn, а не fail — остальные устройства при этом работают. */
+    for (size_t i = 0; i < g_lan_dev_n; i++) {
+        char devpath[128], what[160];
+        snprintf(devpath, sizeof(devpath), "/sys/class/net/%.63s", g_lan_dev[i]);
+        if (access(devpath, F_OK) == 0) {
+            snprintf(what, sizeof(what), "трафик забирается с %.64s", g_lan_dev[i]);
+            diag("lan_device", "ok", what, "");
+        } else {
+            snprintf(what, sizeof(what), "%.64s перечислен, но такого устройства на роутере нет",
+                     g_lan_dev[i]);
+            diag("lan_device", "warn", what,
+                 "правила по нему не сработают: проверьте имя или поднимите интерфейс "
+                 "(у Tailscale и ZeroTier устройство появляется вместе со своим демоном)");
         }
     }
 
