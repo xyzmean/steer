@@ -297,7 +297,9 @@ N` (номер таблицы — в `/var/lib/steer/registry`): в таблиц
 ## Обфускация: WireGuard поверх TCP
 
 Для сетей, где UDP режут. Клиентская половина — в движке, серверная ставится на VPS из архива
-`steer-obfs-<версия>-<арх>.tar.gz` со страницы релизов:
+`steer-obfs-<версия>-<арх>.tar.gz` со страницы релизов или из ветки
+[dist-vps](https://gitlab.com/xyzmean/steer/-/tree/dist-vps) — она нужна там, где закрыт
+`githubusercontent.com`, ровно как ветка `dist` для пакетов роутера:
 
 ```sh
 tar xzf steer-obfs-<версия>-x86_64.tar.gz

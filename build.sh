@@ -96,13 +96,25 @@ mkdir -p "$OUT" build/pkg
 IPKG=build/ipkg-build
 if [ ! -x "$IPKG" ]; then
     echo "качаю ipkg-build из OpenWrt"
+    # ДВА ИСТОЧНИКА, а не один, и по той же причине, по которой пакеты выкладываются в
+    # ветку dist (splify2#15): `raw.githubusercontent.com` у части провайдеров закрыт
+    # целиком, а хосты самого GitHub — другая сеть и работают. `api.github.com` с
+    # заголовком `Accept: application/vnd.github.raw` отдаёт тот же файл байтами, никуда не
+    # перенаправляя. Это машина сборщика, а не роутер, но человек с закрытым доменом не мог
+    # собрать пакеты вовсе, и сообщение об этом ничем не отличалось от «сеть отвалилась».
+    RAW=https://raw.githubusercontent.com/openwrt/openwrt/master/scripts/ipkg-build
+    API='https://api.github.com/repos/openwrt/openwrt/contents/scripts/ipkg-build?ref=master'
+    ACCEPT='Accept: application/vnd.github.raw'
     # curl или wget: на машине сборщика бывает любой из двух, а требовать конкретный
     # значит уронить сборку там, где всё для неё есть.
-    URL=https://raw.githubusercontent.com/openwrt/openwrt/master/scripts/ipkg-build
     if command -v curl >/dev/null 2>&1; then
-        curl -fsSL "$URL" -o "$IPKG" || { echo "не удалось скачать ipkg-build"; exit 1; }
+        curl -fsSL "$RAW" -o "$IPKG" ||
+        curl -fsSL -H "$ACCEPT" "$API" -o "$IPKG" ||
+            { echo "не удалось скачать ipkg-build ни из $RAW, ни из $API"; exit 1; }
     elif command -v wget >/dev/null 2>&1; then
-        wget -qO "$IPKG" "$URL" || { echo "не удалось скачать ipkg-build"; exit 1; }
+        wget -qO "$IPKG" "$RAW" ||
+        wget -qO "$IPKG" --header="$ACCEPT" "$API" ||
+            { echo "не удалось скачать ipkg-build ни из $RAW, ни из $API"; exit 1; }
     else
         echo "нужен curl или wget, чтобы взять ipkg-build"; exit 1
     fi

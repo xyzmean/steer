@@ -33,7 +33,23 @@ PARAMS="$CONFDIR/params"
 ENVFILE=/etc/default/steer-xsteer-hub
 UNIT=/etc/systemd/system/steer-xsteer-hub.service
 NATUNIT=/etc/systemd/system/steer-xsteer-nat.service
+# ОТКУДА БЕРЁТСЯ БИНАРНИК ХАБА. Три источника, и это не запас на всякий случай.
+#
+# Прямая ссылка релиза перенаправляет на release-assets.githubusercontent.com, а у части
+# аудитории провайдер закрыл githubusercontent целиком — и не по одному хосту, а по адресам:
+# raw., objects. и release-assets. стоят на одной сети Fastly (185.199.108-111.133).
+# Обнаружилось это на роутерах (splify2#15), но здесь ровно та же ссылка и ровно та же беда;
+# VPS у людей бывает и российский, и тогда хаб не поставить и не обновить, а сообщение об
+# этом ничем не отличается от «сервер релизов лежит».
+#
+# Хосты САМОГО GitHub — другая сеть (140.82.121.x) и работают. Поэтому второй источник —
+# ветка dist-vps через contents API: `Accept: application/vnd.github.raw` отдаёт байты прямо
+# с api.github.com, никуда не перенаправляя. Третий — то же самое на зеркале GitLab, на
+# случай, когда закрыт и сам GitHub.
 RELEASES=https://github.com/xyzmean/steer/releases/latest/download
+DIST_BRANCH=dist-vps
+DIST_API=https://api.github.com/repos/xyzmean/steer/contents
+DIST_MIRROR=https://gitlab.com/xyzmean/steer/-/raw/$DIST_BRANCH
 
 # Спросить с приглашением и значением по умолчанию.
 #
@@ -108,6 +124,30 @@ function initialCheck() {
 	checkNft
 }
 
+# Скачать файл, пробуя источники по очереди. Печатает, откуда взялось: молчаливый успех со
+# второй ступени неотличим от успеха с первой, а разница между ними — это ответ на вопрос
+# «у меня закрыт githubusercontent или у вас лежит сервер».
+#
+# Отдельной функцией, чтобы её можно было проверить стендом: tests/vpsfetch.sh подсовывает
+# свой curl и смотрит, все ли ступени пройдены и названы ли они в отказе.
+function fetchArtifact() { # fetchArtifact ИМЯ_ФАЙЛА КУДА
+	local name="$1" out="$2" src
+	for src in \
+		"$RELEASES/$name" \
+		"$DIST_API/$name?ref=$DIST_BRANCH" \
+		"$DIST_MIRROR/$name"; do
+		# Заголовок нужен только второй ступени, но безвреден для остальных: contents API без
+		# него отдал бы JSON с полем download_url, ведущим на raw.githubusercontent, — то есть
+		# ровно туда, откуда мы уходим.
+		if curl -fsSL -H 'Accept: application/vnd.github.raw' "$src" -o "$out"; then
+			echo "взято: $src"
+			return 0
+		fi
+		echo -e "${ORANGE}не отдал${NC}: $src"
+	done
+	return 1
+}
+
 # Бинарник хаба: три способа, все ведут к одному файлу. Компилятор не нужен ни в одном.
 function getHubBinary() {
 	local here
@@ -136,13 +176,22 @@ function getHubBinary() {
 		;;
 	esac
 
+	# Без curl ни одна ступень не сработает, и отказ выглядел бы как «все три источника
+	# молчат» — то есть обвинял бы сеть в том, чего на машине просто нет.
+	if ! command -v curl >/dev/null 2>&1; then
+		echo -e "${RED}нужен curl${NC}: поставьте его (apt install curl / dnf install curl)"
+		echo "или возьмите архив steer-hub вручную и положите рядом с этим скриптом."
+		exit 1
+	fi
+
 	echo "скачиваю steer-hub для $arch..."
 	local tmp
 	tmp="$(mktemp -d)"
-	if ! curl -fsSL "$RELEASES/steer-hub-$arch.tar.gz" -o "$tmp/h.tar.gz"; then
-		echo -e "${RED}не скачалось${NC}: $RELEASES/steer-hub-$arch.tar.gz"
-		echo "Возьмите архив со страницы релизов вручную, распакуйте и запустите xs_install.sh"
-		echo "из распакованного каталога."
+	if ! fetchArtifact "steer-hub-$arch.tar.gz" "$tmp/h.tar.gz"; then
+		echo -e "${RED}не скачалось ни из одного источника${NC} — все три названы выше."
+		echo "Так выглядит закрытый githubusercontent.com: прямая ссылка релиза ведёт именно"
+		echo "туда. Возьмите архив со страницы релизов или из ветки $DIST_BRANCH вручную,"
+		echo "распакуйте и запустите xs_install.sh из распакованного каталога."
 		rm -rf "$tmp"
 		exit 1
 	fi
@@ -644,11 +693,16 @@ function manageMenu() {
 	esac
 }
 
-initialCheck
-if [ -e "$PARAMS" ]; then
-	# shellcheck source=/dev/null
-	source "$PARAMS"
-	manageMenu
-else
-	installHub
+# Шов для стенда: `XS_INSTALL_LIB=1 source xs_install.sh` даёт функции без установки.
+# Проверять лестницу источников иначе нечем — она сетевая, а весь остальной скрипт
+# интерактивен и требует root.
+if [ "${XS_INSTALL_LIB:-}" != "1" ]; then
+	initialCheck
+	if [ -e "$PARAMS" ]; then
+		# shellcheck source=/dev/null
+		source "$PARAMS"
+		manageMenu
+	else
+		installHub
+	fi
 fi

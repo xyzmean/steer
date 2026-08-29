@@ -198,9 +198,9 @@ jobs:
           # splify2. Хосты самого GitHub (`api.` и `codeload.`, сеть 140.82.121.x) работают,
           # и оба умеют отдать файл из ветки: поштучно через contents API и архивом.
           #
-          # Только пакеты роутера. Сборки для VPS (`steer-hub-*`, `steer-obfs-*`) сюда не
-          # едут: их ставят на сервер, у которого этой беды нет, а в архиве ветки они
-          # стоили бы ещё 700 КБ каждому роутеру, который до архива дойдёт.
+          # Только пакеты роутера. Сборки для VPS (`steer-hub-*`, `steer-obfs-*`) едут в
+          # СВОЮ ветку соседним шагом: эту роутер качает архивом ЦЕЛИКОМ, и лишние два
+          # мегабайта платил бы каждый роутер, который до архива дойдёт.
           #
           # Ветка сиротская и переписывается каждым релизом: это канал выкладки, а не
           # история. Иначе архив рос бы каждым выпуском, а качает его роутер целиком.
@@ -216,6 +216,38 @@ jobs:
           git commit -q -m "Пакеты ${VERSION}"
           git push -q --force \
             "https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}" "$DIST:$DIST"
+
+      - name: Выложить сборки VPS в ветку dist-vps
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          DIST_VPS: dist-vps
+        run: |
+          set -eu
+          # То же обещание, что у ветки dist, но для серверной половины. Раньше считалось,
+          # что VPS этой беды не знает: «сервер стоит там, где не блокируют». Это неправда
+          # для российского VPS, а он у людей обычный — и `server/xs_install.sh` качал хаб
+          # ровно по той ссылке, что перенаправляет на release-assets.githubusercontent.com.
+          # То есть у половины аудитории серверная часть не ставилась по той же причине, по
+          # которой не ставилась роутерная, и отличить это от «сервер релизов лежит» было
+          # нельзя: источник был один, и отказ звучал одинаково.
+          #
+          # СВОЯ ВЕТКА, А НЕ ТА ЖЕ. Ветку dist роутер качает архивом целиком (codeload), и
+          # архивы для VPS весом под мегабайт каждый платил бы каждый такой роутер, ничего
+          # не получая взамен. Установщик на VPS, наоборот, берёт ОДИН файл поштучно через
+          # contents API, и размер ветки его не касается.
+          rm -rf /tmp/dist-vps
+          mkdir -p /tmp/dist-vps
+          cp out/steer-hub-*.tar.gz /tmp/dist-vps/
+          cp out/steer-obfs-*.tar.gz /tmp/dist-vps/
+          echo "$VERSION" > /tmp/dist-vps/VERSION
+          cd /tmp/dist-vps
+          git init -q -b "$DIST_VPS"
+          git config user.name 'github-actions[bot]'
+          git config user.email 'github-actions[bot]@users.noreply.github.com'
+          git add -A
+          git commit -q -m "Сборки VPS ${VERSION}"
+          git push -q --force \
+            "https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}" "$DIST_VPS:$DIST_VPS"
 
       - name: Опубликовать релиз
         uses: softprops/action-gh-release@v2

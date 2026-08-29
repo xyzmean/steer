@@ -33,6 +33,7 @@ test: all ext-syntax $(BUILD)/dnsmatch $(BUILD)/specmatch $(BUILD)/specmatch-ext
 	@sh tests/dnsproxy.sh
 	@sh tests/diagmatch.sh
 	@sh tests/buildmatch.sh
+	@sh tests/vpsfetch.sh
 	@$(BUILD)/dnsmatch
 	@$(BUILD)/specmatch
 	@$(BUILD)/specmatch-ext
