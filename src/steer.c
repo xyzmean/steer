@@ -1152,6 +1152,11 @@ static int cmd_apply(const char *spec, int dry) {
     registry_snapshot();
     registry_assign();
     build_groups();
+    /* Устройство выхода — то, что несёт трафик сейчас, а не первое в списке кандидатов.
+     * Иначе применение настройки уводило бы таблицу с работающего запасного устройства на
+     * неработающее основное, а при on_fail=drop ещё и ставило запрет — то есть каждое
+     * сохранение в интерфейсе роняло бы пул до следующего прохода сторожа (до минуты). */
+    outputs_adopt_active();
     /* Проверка списков — ДО генерации и до dry-run.
      *
      * До dry-run намеренно: интерфейс проверяет спеку именно им, перед записью на диск.
@@ -1210,6 +1215,10 @@ static int cmd_status(const char *spec) {
     load_spec(spec);
     registry_assign();
     build_groups();
+    /* О том же устройстве, к которому apply привязал таблицу, — см. outputs_adopt_active.
+     * Без этого пул, уведённый сторожем на запасное устройство, отдавался бы интерфейсу
+     * основным устройством с `up: false`: рабочий выход, нарисованный сломанным. */
+    outputs_adopt_active();
     /* Локальные устройства — первым полем: интерфейс показывает, с чего забирается трафик, и
      * без этого поля ему пришлось бы читать спеку вторым источником, то есть однажды
      * показать не то, что применено. */
@@ -1244,7 +1253,13 @@ static int cmd_status(const char *spec) {
              * Поля нет вовсе, когда сказать нечего (устройство есть, файла нет, он устарел
              * или писавший процесс мёртв) — «не знаем» не должно читаться как «плохо». */
             if (!up) {
-                struct probe_status pr = probe_read(g_out[i].name);
+                /* Ход подъёма спрашивается у ВЛАДЕЛЬЦА устройства, а не у выхода, который
+                 * его назвал: запись перебора узлов пишет клиент vless под своим именем, и
+                 * пул, ждущий этот туннель, иначе отдавал бы «устройства нет» вместо
+                 * «проверяю узлы, 3 из 26» — то же враньё, ради снятия которого перебор и
+                 * стал виден (I-100). */
+                struct probe_status pr =
+                    probe_read(out_for_device(&g_out[i], g_out[i].device)->name);
                 if (pr.state == PROBE_RUNNING)
                     printf(",\"probe\":{\"state\":\"probing\",\"node\":%d,\"total\":%d}",
                            pr.node, pr.total);
@@ -1543,6 +1558,9 @@ static int cmd_diag(const char *spec) {
     load_spec(spec);
     registry_assign();
     build_groups();
+    /* Приговор выносится тому устройству, которое несёт трафик, — тому же, о котором
+     * рассказывает status и к которому привязал таблицу apply (outputs_adopt_active). */
+    outputs_adopt_active();
     printf("{\"schema\":1,\"checks\":[");
 
     /* 1. Таблица. Без неё всё остальное бессмысленно: apply не применялся или его снесли. */
@@ -1734,7 +1752,10 @@ static int cmd_diag(const char *spec) {
              * PROBE_NONE — «не знаем»: файла нет, он устарел или писавший процесс мёртв.
              * Тогда ветка прежняя, слово в слово: отсутствие данных не повод менять
              * приговор. */
-            struct probe_status pr = probe_read(g_out[i].name);
+            /* У владельца устройства, а не у назвавшего его выхода: см. ту же строку в
+             * cmd_status. */
+            const struct output *po = out_for_device(&g_out[i], g_out[i].device);
+            struct probe_status pr = probe_read(po->name);
             if (pr.state == PROBE_RUNNING) {
                 snprintf(what, sizeof(what), "выход %.40s: проверяю узлы, %d из %d",
                          g_out[i].name, pr.node, pr.total);
@@ -1772,8 +1793,8 @@ static int cmd_diag(const char *spec) {
             snprintf(what, sizeof(what), "выход %.40s: устройства %.24s нет",
                      g_out[i].name, g_out[i].device);
             snprintf(why, sizeof(why), "туннель не поднят — %s",
-                     out_engine_managed(&g_out[i]) ? "смотрите журнал движка"
-                                                   : "проверьте настройку интерфейса");
+                     out_engine_managed(po) ? "смотрите журнал движка"
+                                            : "проверьте настройку интерфейса");
             diag("output", "fail", what, why);
             continue;
         }

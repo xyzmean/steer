@@ -452,6 +452,68 @@ int main(void) {
     check("мёртвый пул получает запрет",
           cmd_seen("ip route add blackhole default table 301"), 1);
 
+    /* 12. Какое устройство выхода считать НЫНЕШНИМ вне процесса сторожа.
+     *
+     * Поле `device` объявлено активным устройством, но заполнял его только сторож и только
+     * у себя внутри. apply, status и diag читают спеку своим процессом, и там в `device`
+     * лежал первый кандидат — предпочтение, а не факт. Итог был виден у пула: сторож увёл
+     * трафик на запасное устройство, а интерфейс рисовал основное с «up: false» и «выход
+     * pool: устройства nodev0 нет», то есть поломку на работающем выходе; apply при этом
+     * возвращал таблицу на неработающее устройство и при on_fail=drop ставил запрет.
+     *
+     * Проверяется здесь именно порядок ответа, потому что ошибиться можно в каждой из трёх
+     * ступеней по отдельности. */
+    {
+        memset(g_out, 0, sizeof(g_out));
+        g_out_n = 1;
+        snprintf(g_out[0].name, sizeof(g_out[0].name), "%s", "pool");
+        g_out[0].kind = OUT_INTERFACE;
+        g_out[0].on_fail = FAIL_DROP;
+        snprintf(g_out[0].devices[0], sizeof(g_out[0].devices[0]), "%s", "nodev0");
+        snprintf(g_out[0].devices[1], sizeof(g_out[0].devices[1]), "%s", "lo");
+        g_out[0].devices_n = 2;
+        g_out[0].mark = 0x100000;
+        g_out[0].table = 300;
+
+        /* Запись сторожа названа кандидатом и устройство на месте — берётся она. */
+        snprintf(g_out[0].device, sizeof(g_out[0].device), "%s", "nodev0");
+        state_write("active", "pool lo\n");
+        outputs_adopt_active();
+        check("активное устройство берётся из записи сторожа",
+              strcmp(g_out[0].device, "lo"), 0);
+
+        /* Записи нет вовсе: сторож ещё не проходил. Первый СУЩЕСТВУЮЩИЙ кандидат — то же
+         * самое, к чему привяжет таблицу apply, и рассказывать надо о нём. */
+        {
+            char path[160];
+            snprintf(path, sizeof(path), "%s/active", g_dir);
+            unlink(path);
+        }
+        snprintf(g_out[0].device, sizeof(g_out[0].device), "%s", "nodev0");
+        outputs_adopt_active();
+        check("без записи — первый существующий кандидат",
+              strcmp(g_out[0].device, "lo"), 0);
+
+        /* Запись устарела: названное устройство больше не кандидат этого выхода (человек
+         * переписал список). Идти по ней значило бы привязать таблицу к устройству, которого
+         * в настройке нет вовсе. */
+        snprintf(g_out[0].device, sizeof(g_out[0].device), "%s", "nodev0");
+        state_write("active", "pool lo0old\n");
+        outputs_adopt_active();
+        check("устаревшая запись не берётся",
+              strcmp(g_out[0].device, "lo"), 0);
+
+        /* Отказ выхода записан как «-»: активного устройства нет. Существующих кандидатов
+         * тоже нет — оставляем как было, и apply честно доложит отказ, а при on_fail=drop
+         * поставит запрет. Гадать тут нечем и незачем. */
+        snprintf(g_out[0].devices[1], sizeof(g_out[0].devices[1]), "%s", "nodev1");
+        snprintf(g_out[0].device, sizeof(g_out[0].device), "%s", "nodev0");
+        state_write("active", "pool -\n");
+        outputs_adopt_active();
+        check("живых кандидатов нет — устройство не подменяется",
+              strcmp(g_out[0].device, "nodev0"), 0);
+    }
+
     /* Уборка: файлы состояния и папка. */
     {
         char path[160];

@@ -315,6 +315,46 @@ check "пул: masquerade не требуется" "0" \
 check "владелец устройства: masquerade не требуется" "1" \
       "$(printf '%s' "$outp" | grep -c '"what":"выход loc: устройство lo в зоне"')"
 
+# ---- пул судится по устройству, которое НЕСЁТ ТРАФИК, а не по первому в списке ----
+#
+# Тот же пул, но кандидатов два, и основной на роутере отсутствует: сторож увёл трафик на
+# запасное устройство и записал это в `active`. Без чтения этой записи diag выносил приговор
+# первому кандидату — «выход pool: устройства nodev0 нет», fail, — то есть рисовал поломку
+# на работающем выходе, а вместе с ней и вечное «нет masquerade» из-за того, что владелец
+# спрашивался про не то устройство.
+mkdir -p "$tmp/state"
+cat > "$tmp/pool2.json" <<EOF
+{
+  "schema": 1,
+  "lan_devices": ["zt7bcxxxxx"],
+  "from_default": ["192.168.1.0/24"],
+  "outputs": {
+    "loc": { "kind": "vless", "sub_file": "/etc/steer/sub.json", "device": "lo" },
+    "pool": { "kind": "interface", "devices": ["nodev0", "lo"], "on_fail": "drop" },
+    "direct": { "kind": "direct" }
+  },
+  "channels": [
+    { "name": "cloudflare", "match": { "prefixes_files": ["$tmp/cf.lst"] }, "out": "pool" }
+  ]
+}
+EOF
+printf 'pool lo\n' > "$tmp/state/active"
+outp2="$($DIAG diag --spec "$tmp/pool2.json" --state-dir "$tmp/state" 2>/dev/null)"
+check "пул: приговор про активное устройство" "1" \
+      "$(printf '%s' "$outp2" | grep -c '"what":"выход pool: устройство lo в зоне"')"
+check "пул: про отсутствующий первый кандидат молчим" "0" \
+      "$(printf '%s' "$outp2" | grep -c 'устройства nodev0 нет')"
+check "пул: masquerade не требуется и здесь" "0" \
+      "$(printf '%s' "$outp2" | grep -c 'нет masquerade')"
+
+# Записи сторожа нет вовсе (он ещё не проходил): берётся первый СУЩЕСТВУЮЩИЙ кандидат — то
+# же самое устройство, к которому привяжет таблицу apply. Связывать выход с отсутствующим
+# устройством, когда рядом есть существующее, незачем ни в маршрутизации, ни в отчёте.
+rm -f "$tmp/state/active"
+outp3="$($DIAG diag --spec "$tmp/pool2.json" --state-dir "$tmp/state" 2>/dev/null)"
+check "пул без записи сторожа: первый существующий кандидат" "1" \
+      "$(printf '%s' "$outp3" | grep -c '"what":"выход pool: устройство lo в зоне"')"
+
 printf '\n%d проверок пройдено' "$pass"
 if [ "$fail" -gt 0 ]; then printf ', %d ПРОВАЛЕНО\n' "$fail"; exit 1; fi
 printf '\nвсе проверки прошли\n'
