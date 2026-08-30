@@ -1019,8 +1019,13 @@ static void report_output_deps(void) {
          * переходят к хабу внутри туннеля, где транслировать их нечем. Там NAT не просто
          * не нужен, а вреден — он скрывает, от какой пира пришёл пакет, и ломает
          * обратный поиск по AllowedIPs. Условие поэтому одно (out_self_natting), а
-         * объяснения в diag разные: см. ветку про masquerade в cmd_diag. */
-        else if (out_self_natting(&g_out[i])) {
+         * объяснения в diag разные: см. ветку про masquerade в cmd_diag.
+         *
+         * Спрашивается ВЛАДЕЛЕЦ устройства, а не выход, который его назвал (out_for_device):
+         * в пуле kind=interface активным может быть устройство VLESS-туннеля, и вопрос «нужен
+         * ли ему masquerade» решает то, чем устройство является, а не то, кто его перечислил.
+         * Иначе — постоянная жалоба на исправной настройке. */
+        else if (out_self_natting(out_for_device(&g_out[i], g_out[i].device))) {
             /* нечего проверять */
         }
         else if (!c.masqueraded)
@@ -1252,6 +1257,20 @@ static int cmd_status(const char *spec) {
             printf("],\"on_fail\":\"%s\"",
                    g_out[i].on_fail == FAIL_DROP ? "drop" :
                    g_out[i].on_fail == FAIL_ZAPRET ? "zapret" : "direct");
+            /* Выбранные узлы подписки — рядом с devices, потому что это то же самое: список
+             * кандидатов выхода, только у vless кандидаты называются номерами узлов.
+             * Печатается ВСЕГДА, в том числе пустым, и это главное здесь: незнакомый ключ
+             * спеки движок пропускает молча (js_skip), поэтому интерфейс, записавший `nodes`
+             * в старый движок, получил бы применённую спеку и трафик через узел, которого не
+             * выбирал. Наличие поля в status — единственный способ узнать движок, который
+             * `nodes` понимает, до того как их писать. Тем же приёмом узнаётся движок с
+             * lan_devices. */
+            if (g_out[i].kind == OUT_VLESS) {
+                printf(",\"nodes\":[");
+                for (size_t d = 0; d < g_out[i].nodes_n; d++)
+                    printf("%s%d", d ? "," : "", g_out[i].nodes[d]);
+                printf("]");
+            }
             /* Обфускация — поле, а не отдельный вид выхода, поэтому и в статусе она
              * поле. Признак живости здесь не печатается намеренно: status опрашивают
              * раз в пять секунд, а pgrep — это запуск процесса; приговор о живости
@@ -1759,12 +1778,17 @@ static int cmd_diag(const char *spec) {
             continue;
         }
         struct fwcheck c = fw_check(g_out[i].device);
+        /* Нужен ли masquerade — свойство УСТРОЙСТВА, а не выхода, который его назвал: в пуле
+         * kind=interface активным бывает устройство VLESS-туннеля или хаба xsteer, и вопрос
+         * решает его владелец. Без этого исправно собранный пул получал бы вечное «нет
+         * masquerade» — ту самую жёлтую метку, из-за которой перестают смотреть на проверки. */
+        const struct output *nat_o = out_for_device(&g_out[i], g_out[i].device);
         if (!c.in_firewall) {
             snprintf(what, sizeof(what), "выход %.40s: %.24s вне зоны фаервола",
                      g_out[i].name, g_out[i].device);
             diag("output", "fail", what,
                  "фаервол отбросит ответы — добавьте устройство в зону");
-        } else if (!c.masqueraded && !out_self_natting(&g_out[i])) {
+        } else if (!c.masqueraded && !out_self_natting(nat_o)) {
             /* Только для kind=interface. Выходу vless masquerade не нужен: он завершает TCP
              * сам и наружу идёт от своего имени, адреса клиентов границу не переходят. Жалоба
              * на исправной системе — это постоянная жёлтая метка, которая учит не смотреть на
@@ -1790,7 +1814,7 @@ static int cmd_diag(const char *spec) {
             snprintf(what, sizeof(what), "выход %.40s: устройство %.24s в зоне",
                      g_out[i].name, g_out[i].device);
             diag("output", "ok", what,
-                 g_out[i].kind == OUT_XSTEER
+                 nat_o->kind == OUT_XSTEER
                      ? "masquerade не нужен и вреден: адреса клиентов уходят к хабу, а NAT "
                        "скрыл бы, от какой пира пришёл пакет"
                      : "masquerade не нужен: туннель завершает TCP сам, адреса клиентов "

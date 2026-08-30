@@ -2844,8 +2844,13 @@ int cmd_vless_nodes(const char *spec_path, const char *out_name) {
     json_str(out_name);
     printf(",\"sub_file\":");
     json_str(o->sub_file);
-    printf(",\"node\":%d,\"usable\":%zu,\"skipped\":%zu,\"foreign\":%zu,\"nodes\":[",
-           o->node_index, cnt, st.skipped, st.foreign);
+    /* `node` — прежнее поле: один выбранный номер либо -1. Выбор из нескольких узлов оно
+     * выразить не может, поэтому при нём печатается -1, а сам выбор лежит в `chosen`. Старый
+     * потребитель этого поля читает то же, что читал: «узел не назначен, ищем рабочий». */
+    printf(",\"node\":%d,\"chosen\":[", o->nodes_n == 1 ? o->nodes[0] : -1);
+    for (size_t i = 0; i < o->nodes_n; i++) printf("%s%d", i ? "," : "", o->nodes[i]);
+    printf("],\"usable\":%zu,\"skipped\":%zu,\"foreign\":%zu,\"nodes\":[",
+           cnt, st.skipped, st.foreign);
     for (size_t i = 0; i < cnt; i++) {
         if (i) putchar(',');
         node_json(&g_nodes[i], (int)i);
@@ -2882,17 +2887,30 @@ int cmd_vless_probe(const char *spec_path, const char *out_name, int node, int t
         return 1;
     }
 
-    size_t from = node >= 0 ? (size_t)node : 0;
-    size_t to = node >= 0 ? (size_t)node + 1 : cnt;
+    /* node < 0 — «как поднимется выход», а поднимется он по кандидатам из спеки: при
+     * выбранном подмножестве перебор идёт по нему и в его порядке. Той же функцией, что и
+     * подъём, — иначе диагностика показывала бы порядок, которого не будет. */
+    static int sel[MAX_NODES];
+    size_t sel_n = 0;
+    if (node >= 0) { sel[0] = node; sel_n = 1; }
+    else {
+        sel_n = out_node_list(o, cnt, sel, MAX_NODES);
+        if (!sel_n) {
+            printf("{\"ok\":false,\"error\":\"выбранных узлов нет в подписке, "
+                   "пригодных всего %zu\"}\n", cnt);
+            return 1;
+        }
+    }
     int found = -1;
     printf("{\"output\":");
     json_str(out_name);
     printf(",\"results\":[");
-    for (size_t i = from; i < to; i++) {
+    for (size_t k = 0; k < sel_n; k++) {
+        size_t i = (size_t)sel[k];
         char why[256] = "";
         int hs = -1, ttfb = -1;
         int pr = vless_probe_timed(&g_nodes[i], timeout_s, why, sizeof(why), &hs, &ttfb);
-        if (i > from) putchar(',');
+        if (k) putchar(',');
         printf("{\"index\":%zu,\"name\":", i);
         json_str(g_nodes[i].name);
         printf(",\"type\":");
@@ -2932,15 +2950,28 @@ int cmd_vless(const char *spec_path, const char *out_name) {
     }
     fprintf(stderr, LOG_I2 "узлов %zu (пропущено %zu, чужих %zu)\n", cnt, st.skipped, st.foreign);
 
-    /* Выбор узла. node=-1 означает «первый рабочий», и это умолчание не из лени: номер
-     * узла в подписке меняется при её обновлении, а проверка находит живой сама. */
+    /* Кандидаты в порядке предпочтения. Пустой `nodes` (и прежнее `node: -1`) означает «вся
+     * подписка», выбранное подмножество — только его узлы и только в написанном порядке. Одна
+     * функция на подъём и на `vless-probe`: покажи диагностика другой порядок, она объясняла
+     * бы не тот перебор, который случится (см. out_node_list в spec.c). */
+    static int sel[MAX_NODES];
+    size_t sel_n = out_node_list(o, cnt, sel, MAX_NODES);
+    if (!sel_n) {
+        /* Сюда попадают только выборы, целиком уехавшие за пределы подписки: она обновилась,
+         * узлов стало меньше. Перебирать вместо выбранного что попало нельзя — это увело бы
+         * трафик в локацию, которую человек не выбирал, и молча. */
+        probe_report(out_name, PROBE_FAILED, 0, 0);
+        fprintf(stderr, LOG_W2 "выбранных узлов нет в подписке (пригодных всего %zu) — "
+                        "проверьте nodes\n", cnt);
+        return 1;
+    }
+    if (sel_n < o->nodes_n)
+        fprintf(stderr, LOG_W2 "узлов выбрано %zu, в подписке есть %zu — остальные номера "
+                        "вне подписки\n", o->nodes_n, sel_n);
+
     int chosen = -1;
-    if (o->node_index >= 0) {
-        if ((size_t)o->node_index >= cnt) {
-            fprintf(stderr, LOG_W2 "узла %d нет (всего %zu)\n", o->node_index, cnt);
-            return 1;
-        }
-        chosen = o->node_index;
+    if (sel_n == 1) {
+        chosen = sel[0];
         /* Узел назван номером — перебора нет, и объяснять нечего. Прежняя запись снимается:
          * она осталась бы от предыдущей настройки и рассказывала бы про перебор, которого
          * больше не будет. */
@@ -2950,20 +2981,24 @@ int cmd_vless(const char *spec_path, const char *out_name) {
          * после выбора, а до тех пор его нет, и раньше это выглядело как отказ: одинаково с
          * «ни один узел не ответил» и с «выход не настроен» (I-100). Номер проверяемого узла
          * пишется ПЕРЕД проверкой: она длится до восьми секунд, и всё это время строка
-         * состояния обязана называть то, что происходит сейчас. */
-        for (size_t i = 0; i < cnt; i++) {
+         * состояния обязана называть то, что происходит сейчас.
+         *
+         * Счёт идёт по КАНДИДАТАМ, а не по подписке: при `nodes: [6,7,12]` человек ждёт «2 из
+         * 3», а не «2 из 26» — перебираться будут три, и обещать двадцать шесть значило бы
+         * назвать чужое ожидание. */
+        for (size_t i = 0; i < sel_n; i++) {
             char why[256];
-            probe_report(out_name, PROBE_RUNNING, (int)i + 1, (int)cnt);
-            if (vless_probe(&nodes[i], 8, why, sizeof(why)) == 0) {
-                fprintf(stderr, LOG_I2 "выбран %s (%s)\n", nodes[i].name, why);
-                chosen = (int)i;
+            probe_report(out_name, PROBE_RUNNING, (int)i + 1, (int)sel_n);
+            if (vless_probe(&nodes[sel[i]], 8, why, sizeof(why)) == 0) {
+                fprintf(stderr, LOG_I2 "выбран %s (%s)\n", nodes[sel[i]].name, why);
+                chosen = sel[i];
                 break;
             }
-            fprintf(stderr, LOG_I2 "%s — %s\n", nodes[i].name, why);
+            fprintf(stderr, LOG_I2 "%s — %s\n", nodes[sel[i]].name, why);
         }
     }
     if (chosen < 0) {
-        probe_report(out_name, PROBE_FAILED, 0, (int)cnt);
+        probe_report(out_name, PROBE_FAILED, 0, (int)sel_n);
         fprintf(stderr, LOG_W2 "ни один узел подписки не отвечает\n");
         return 1;
     }

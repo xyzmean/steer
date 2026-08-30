@@ -163,9 +163,11 @@ static int device_healthy(const char *dev) {
     return ok;
 }
 
-/* Живо ли устройство ДЛЯ КОНКРЕТНОГО ВЫХОДА.
+/* Живо ли устройство. Выход передаётся, но решает не он: чем проверять, определяет вид
+ * ВЛАДЕЛЬЦА устройства (см. device_owner ниже), и только у устройства без владельца это
+ * совпадает с видом выхода, который его назвал.
  *
- * Вид выхода решает, чем проверять. Для kind=interface (wireguard, openvpn и т.п.)
+ * Для kind=interface (wireguard, openvpn и т.п.)
  * ICMP годится: ядро проксирует его вместе с TCP/UDP. Для kind=vless ICMP НЕ проходит
  * вовсе — туннель завершает TCP у себя и наружу соединяется сокетом, поэтому пинг к
  * внешнему адресу через VLESS-устройство всегда теряется. Та же самая «не отвечает» на
@@ -177,8 +179,30 @@ static int device_healthy(const char *dev) {
 #define TCP_PROBE_PORT 80
 #define TCP_PROBE_TIMEOUT 4
 
+/* Владелец устройства. Объяснение — у объявления в spec.h; там же сказано, почему функция
+ * объявлена рядом со спекой, а живёт здесь (тот же случай, что bind_device). */
+const struct output *device_owner(const char *dev) {
+    for (size_t i = 0; i < g_out_n; i++) {
+        const struct output *c = &g_out[i];
+        if (!out_engine_managed(c)) continue;
+        if (!strcmp(c->device, dev)) return c;
+        for (size_t k = 0; k < c->devices_n; k++)
+            if (!strcmp(c->devices[k], dev)) return c;
+    }
+    return NULL;
+}
+
+const struct output *out_for_device(const struct output *o, const char *dev) {
+    const struct output *owner = device_owner(dev);
+    return owner ? owner : o;
+}
+
 static int device_healthy_for(const struct output *o, const char *dev) {
     if (!device_present(dev)) return 0;
+    /* Мера здоровья принадлежит УСТРОЙСТВУ, а не виду выхода, который его назвал: у
+     * устройства с владельцем спрашиваем так, как спросил бы владелец. Для выхода,
+     * владеющего своим устройством сам, это тот же ответ, что и раньше. */
+    o = out_for_device(o, dev);
     /* xsteer НЕ проверяется ни PROBE_TARGETS, ни пробой TCP, и это не недоделка.
      *
      * PROBE_TARGETS — публичные адреса, то есть проверка интернета У ХАБА. Хаб полной
@@ -727,8 +751,14 @@ static int revive(const struct output *o, const char *dev, int verbose) {
      * Падение процесса ловит procd (init-скрипт ставит respawn), и подъём заново выбирает
      * рабочий узел (vless) или заново здоровается с хабом (xsteer) сам. У сторожа здесь
      * одна задача: сообщить, что туннель молчит, и подождать — кому именно ждать, тот
-     * поднимется сам. */
-    if (out_engine_managed(o)) {
+     * поднимется сам.
+     *
+     * Вопрос задаётся УСТРОЙСТВУ, а не выходу, который его назвал, по той же причине, что и
+     * проба здоровья (см. device_owner): в пуле разнородных туннелей устройство vless
+     * названо выходом kind=interface, и решение по виду НАЗВАВШЕГО дало бы здесь ifdown/ifup
+     * по устройству, которым netifd не управляет, — «Interface … not found» раз в минуту и
+     * ничего больше. */
+    if (out_engine_managed(o) || device_owner(dev)) {
         fprintf(stderr, LOG_W "%s: не отвечает — процесс туннеля должен подняться "
                         "заново через procd; жду\n", dev);
         for (int i = 0; i < 10; i++) {

@@ -87,6 +87,12 @@ static FILE *test_popen(const char *cmd, const char *mode) {
 #define popen(cmd, mode) test_popen(cmd, mode)
 #define pclose(f) fclose(f)
 
+/* Ожидание подъёма подменено пустышкой. revive ждёт десятью секундными шагами, и настоящий
+ * sleep стоил бы десять секунд на каждую проверку этой ветки, не добавляя к ней ничего:
+ * устройства в стенде по ходу прохода не появляются и не исчезают. */
+static unsigned test_sleep(unsigned n) { (void)n; return 0; }
+#define sleep(n) test_sleep(n)
+
 #include "../src/spec.h"
 
 /* Mock globals */
@@ -100,6 +106,7 @@ void registry_assign(void) {}
 
 #undef popen
 #undef pclose
+#undef sleep
 
 static int g_fail;
 
@@ -209,6 +216,36 @@ static void out_set(const char *dev, enum on_fail of) {
     g_out[0].devices_n = 1;
     g_out[0].mark = 0x100000;
     g_out[0].table = 300;
+}
+
+/* Пул разнородных выходов: устройство создаёт и обслуживает выход-владелец (здесь
+ * kind=xsteer — его проба не требует ни сети, ни root), а НАЗЫВАЕТ его в своём `devices`
+ * другой выход, kind=interface, собирающий локацию подписки, wireguard и хаб в один список
+ * с порядком предпочтения. Так пул собирает интерфейс splify2, и так его пишут руками.
+ *
+ * Пул стоит ПЕРВЫМ намеренно: revive не чаще раза в RESTART_COOLDOWN на устройство, и если
+ * бы владелец шёл первым, он забирал бы попытку себе — проверка ниже проходила бы, ничего
+ * не проверяя. */
+static void out_set_pool(const char *dev) {
+    memset(g_out, 0, sizeof(g_out));
+    g_out_n = 2;
+
+    snprintf(g_out[0].name, sizeof(g_out[0].name), "%s", "pool");
+    g_out[0].kind = OUT_INTERFACE;
+    g_out[0].on_fail = FAIL_DROP;
+    snprintf(g_out[0].devices[0], sizeof(g_out[0].devices[0]), "%s", dev);
+    g_out[0].devices_n = 1;
+    g_out[0].mark = 0x200000;
+    g_out[0].table = 301;
+
+    snprintf(g_out[1].name, sizeof(g_out[1].name), "%s", "hub");
+    g_out[1].kind = OUT_XSTEER;
+    g_out[1].on_fail = FAIL_DROP;
+    snprintf(g_out[1].device, sizeof(g_out[1].device), "%s", dev);
+    snprintf(g_out[1].devices[0], sizeof(g_out[1].devices[0]), "%s", dev);
+    g_out[1].devices_n = 1;
+    g_out[1].mark = 0x100000;
+    g_out[1].table = 300;
 }
 
 static void tick(const char *rules, const char *routes) {
@@ -384,10 +421,42 @@ int main(void) {
     check("целое состояние — соединения не снимаются",
           cmd_seen("conntrack -D"), 0);
 
+    /* 10. Мера здоровья принадлежит УСТРОЙСТВУ, а не виду выхода, который его назвал.
+     *
+     * Устройство туннеля, названное в `devices` выхода kind=interface, проверялось пробой
+     * назвавшего — то есть ICMP. Через VLESS-туннель ICMP не проходит принципиально, и
+     * живая локация в пуле объявлялась мёртвой на первом же проходе: трафик уходил к
+     * следующему кандидату или, при on_fail=drop по умолчанию, в blackhole — на полностью
+     * исправном туннеле и молча. Регресса этой правки не видно ни в одной другой проверке:
+     * стенду настоящий пинг подменён моком, который всегда отвечает «дошло», поэтому здесь
+     * проверяется не приговор, а то, что ICMP для такого устройства НЕ ЗАПРАШИВАЛСЯ вовсе. */
+    out_set_pool("lo");
+    state_write("active", "hub lo\n");
+    tick(RULES_WITH, "default dev lo scope link\n");
+    check("устройство туннеля в пуле не проверяется пингом", cmd_seen("ping"), 0);
+    check("устройство туннеля в пуле не заводит правило пробы", cmd_seen("table 299"), 0);
+    check("пул привязан к устройству владельца",
+          cmd_seen("ip route add default dev lo table 301"), 1);
+    check("живой пул не получает запрет",
+          cmd_seen("ip route add blackhole default table 301"), 0);
+
+    /* 11. То же для оживления. Устройство vless и xsteer создаёт наш процесс, netifd про
+     *     него не знает, и ifdown/ifup по нему — «Interface … not found» раз в минуту и
+     *     ничего больше. Решение по виду НАЗВАВШЕГО выхода приводило сюда ровно этот
+     *     холостой цикл, от которого выход kind=vless уже избавлен. */
+    out_set_pool("nodev1");
+    state_write("active", "pool -\nhub -\n");
+    tick(RULES_WITH, "blackhole default\n");
+    check("мёртвое устройство туннеля в пуле не перезапускается через ifdown",
+          cmd_seen("ifdown"), 0);
+    check("мёртвый пул получает запрет",
+          cmd_seen("ip route add blackhole default table 301"), 1);
+
     /* Уборка: файлы состояния и папка. */
     {
         char path[160];
-        const char *names[] = { "active", "restart-nodev0", "restart-lo", NULL };
+        const char *names[] = { "active", "restart-nodev0", "restart-nodev1",
+                                "restart-lo", NULL };
         for (int i = 0; names[i]; i++) {
             snprintf(path, sizeof(path), "%s/%s", g_dir, names[i]);
             unlink(path);

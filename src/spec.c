@@ -288,6 +288,36 @@ static int str_array(struct js *j, char dst[][64], size_t max, size_t *n) {
     return js_lit(j, ']');
 }
 
+/* Массив целых. Отдельно от str_array, потому что js_num на не-числе НЕ ПРОДВИГАЕТ указатель
+ * (strtol возвращает 0 и e == p), и цикл, не проверяющий этого, встал бы навсегда на
+ * `"nodes": ["6"]`. Проверка сделана здесь, у единственного места, где числа читаются
+ * массивом. */
+static int num_array(struct js *j, int *dst, size_t max, size_t *n) {
+    if (js_lit(j, '[') != 0) return -1;
+    *n = 0;
+    js_ws(j);
+    if (*j->p == ']') { j->p++; return 0; }
+    for (;;) {
+        js_ws(j);
+        const char *before = j->p;
+        long v = js_num(j);
+        if (j->p == before) return -1;          /* не число: строка, объект, мусор */
+        if (*n >= max) die("too many entries in array", NULL);
+        if (v < 0 || v > 100000) return -1;
+        dst[(*n)++] = (int)v;
+        js_ws(j);
+        if (*j->p == ',') {
+            /* См. str_list: trailing comma → громкий отказ. */
+            j->p++;
+            js_ws(j);
+            if (*j->p == ']') die("array: trailing comma (expected a number)", NULL);
+            continue;
+        }
+        break;
+    }
+    return js_lit(j, ']');
+}
+
 /* «адрес:порт» → адрес и порт. Живёт здесь, а не в obfs.c, потому что нужен обоим:
  * парсеру спеки при чтении и обфускатору при разборе своих аргументов, а линкуются
  * они всегда вместе. Порт по последнему двоеточию — чтобы форма не мешала будущему
@@ -392,7 +422,11 @@ static void parse_outputs(struct js *j) {
     if (*j->p == '}') { j->p++; return; }
     for (;;) {
         struct output o = {0};
-        o.node_index = -1;                  /* по умолчанию: первый рабочий узел */
+        /* Какой из двух форм записан выбор узлов. Нужно, чтобы отличить «поля нет» от «поле
+         * задано» и поймать выход, где заданы обе: молча взять одну значило бы, что половина
+         * написанного человеком не действует, и понять это было бы нечем (тот же приём, что
+         * у lan_device/lan_devices в load_spec). */
+        int node_one = 0, node_many = 0;
         if (js_str(j, o.name, sizeof(o.name)) != 0) die("outputs: expected a name", NULL);
         /* Состав имени — см. name_ok(). Оно уходит в командную строку через diag и в имя
          * набора, поэтому проверяется здесь, один раз, а не у каждого вызова. */
@@ -448,7 +482,21 @@ static void parse_outputs(struct js *j) {
              * либо true, либо false, и разбирать его полноценным разбором JSON незачем. */
             else if (!strcmp(key, "stream")) { js_ws(j); o.xs_stream = (*j->p == 't'); js_skip(j); }
             else if (!strcmp(key, "stream_port")) o.xs_stream_port = (int)js_num(j);
-            else if (!strcmp(key, "node")) o.node_index = (int)js_num(j);
+            /* `node` — сокращение для списка из одного узла, `nodes` — сам список. Дальше по
+             * коду путь один, ровно как у `device`/`devices`. Прежнее `-1` («первый рабочий»)
+             * записывается пустым списком: это то же самое умолчание, только выраженное
+             * отсутствием кандидатов, а не отрицательным номером. */
+            else if (!strcmp(key, "node")) {
+                long v = js_num(j);
+                node_one = 1;
+                if (v >= 0) { o.nodes[0] = (int)v; o.nodes_n = 1; }
+                else o.nodes_n = 0;
+            }
+            else if (!strcmp(key, "nodes")) {
+                if (num_array(j, o.nodes, MAX_NODE_SEL, &o.nodes_n) != 0)
+                    die("outputs.%s: nodes — массив номеров узлов подписки", o.name);
+                node_many = 1;
+            }
             else if (!strcmp(key, "on_fail")) {
                 char m[16];
                 js_str(j, m, sizeof(m));
@@ -530,6 +578,21 @@ static void parse_outputs(struct js *j) {
          * поле молча значило бы сказать «настроено», не настроив ничего. */
         if ((o.xs_stream || o.xs_stream_port) && o.kind != OUT_XSTEER)
             die("outputs.%s: stream есть только у kind=xsteer", o.name);
+        if (node_one && node_many)
+            die("outputs.%s: задано и node, и nodes — оставьте одно", o.name);
+        /* Выбор узлов есть только у подписки. Отвергается ТОЛЬКО новая форма: `nodes` не
+         * может стоять в спеке, написанной до этой версии, а `node` там стоять мог — и у
+         * чужого вида выхода он и раньше ничего не делал. Отказать на нём сейчас значило бы
+         * сломать применение спеки, которая работала, ради поля, которое ничего не меняет. */
+        if (node_many && o.kind != OUT_VLESS)
+            die("outputs.%s: nodes есть только у kind=vless — это номера узлов подписки",
+                o.name);
+        /* Дубликат номера делает перебор бессмысленным ровно так же, как дубликат устройства
+         * в devices: второй кандидат ничем не отличается от первого. */
+        for (size_t a = 0; a < o.nodes_n; a++)
+            for (size_t b = a + 1; b < o.nodes_n; b++)
+                if (o.nodes[a] == o.nodes[b])
+                    die("outputs.%s: узел подписки указан в nodes дважды", o.name);
         if (g_out_n >= MAX_OUTPUTS) die("too many outputs", NULL);
         g_out[g_out_n++] = o;
         js_ws(j);
@@ -944,6 +1007,21 @@ static void rt_tables_write(void) {
 struct output *out_by_name(const char *n) {
     for (size_t i = 0; i < g_out_n; i++) if (!strcmp(g_out[i].name, n)) return &g_out[i];
     return NULL;
+}
+
+/* Порядок перебора узлов подписки. Объяснение — у объявления в spec.h. */
+size_t out_node_list(const struct output *o, size_t usable, int *dst, size_t max) {
+    size_t n = 0;
+    if (!o->nodes_n) {
+        /* Кандидатов не выбирали — кандидаты все, в порядке подписки. Это прежнее
+         * поведение `node: -1` и умолчание, которое рекомендует интерфейс: номер узла
+         * меняется при обновлении подписки, а проверка находит живой сама. */
+        for (size_t i = 0; i < usable && n < max; i++) dst[n++] = (int)i;
+        return n;
+    }
+    for (size_t i = 0; i < o->nodes_n && n < max; i++)
+        if (o->nodes[i] >= 0 && (size_t)o->nodes[i] < usable) dst[n++] = o->nodes[i];
+    return n;
 }
 
 

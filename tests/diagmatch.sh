@@ -212,6 +212,24 @@ check "status несёт и отказ" "1" \
 rm -f "$tmp/state/probe-vpn"
 check "нечего сказать — поля нет вовсе" "0" "$(st | grep -c '"probe"')"
 
+# ---- выбранные узлы подписки в status ----------------------------------------
+#
+# Поле обязано печататься ВСЕГДА у kind=vless, в том числе пустым, и это здесь главное.
+# Незнакомый ключ спеки движок пропускает молча (js_skip), поэтому интерфейс, записавший
+# `nodes` в движок, который их не понимает, получил бы применённую спеку и трафик через узел,
+# которого не выбирал. Наличие поля в status — единственный способ отличить такой движок, не
+# применяя спеку; ровно тем же приёмом отличается движок с lan_devices.
+check "status: выбор узлов есть и пустым" "1" \
+      "$(st | grep -c '"nodes":\[\]')"
+sed 's/"on_fail": "drop"/"on_fail": "drop", "nodes": [6, 7, 12]/' \
+    "$tmp/vless.json" > "$tmp/vless-nodes.json"
+check "status: выбранные узлы в порядке предпочтения" "1" \
+      "$($DIAG status --spec "$tmp/vless-nodes.json" 2>/dev/null | grep -c '"nodes":\[6,7,12\]')"
+# У выхода без подписки поля нет вовсе: кандидаты kind=interface — устройства, и пустой
+# `nodes` рядом с ними читался бы как «узлы есть, но не выбраны».
+check "status: у выхода-интерфейса поля нет" "0" \
+      "$($DIAG status --spec "$tmp/iface.json" 2>/dev/null | grep -c '"nodes"')"
+
 # ---- локальные устройства: перечислено одно, а на роутере его нет (splify2#16) -----
 #
 # Правило по `iifname` грузится и на отсутствующее устройство — так и задумано, иначе
@@ -249,6 +267,53 @@ check "отсутствие устройства — не поломка" "0" \
 # И то же поле в status: интерфейсу нужно знать, с чего забирается трафик, не читая спеку.
 check "status перечисляет локальные устройства" "1" \
       "$($DIAG status --spec "$tmp/lan.json" 2>/dev/null | grep -c '"lan_devices":\["lo","zt7bcxxxxx"\]')"
+
+# ---- masquerade в пуле: приговор по ВЛАДЕЛЬЦУ устройства ----------------------
+#
+# Пул разнородных туннелей — это выход kind=interface, в devices которого названо устройство,
+# созданное выходом kind=vless или kind=xsteer. Приговор «нужен ли masquerade» брался по виду
+# выхода, который устройство НАЗВАЛ, поэтому на исправно собранном пуле висело вечное «нет
+# masquerade»: жёлтая метка, от которой перестают смотреть на проверки вовсе. Той же болезнью
+# болел device_healthy_for, там она стоила дороже (пул уходил в blackhole).
+#
+# Фикстура требует УСТРОЙСТВА, которое существует: до fw_check диагностика не доходит, пока
+# устройства нет в /sys/class/net. Поэтому и туннель, и пул смотрят в `lo`, а фаервол
+# подменён так, чтобы устройство было в зоне и masquerade у него НЕ БЫЛО, — иначе проверка
+# уходила бы в ветку «NAT есть» и не значила бы ничего. Блок последний в файле: подменённый
+# nft здесь другой, и восстанавливать его больше некому.
+cat > "$tmp/bin/nft" <<'EOF'
+#!/bin/sh
+echo "table inet steer {"
+echo "  chain prerouting_mark { }"
+echo "  chain postrouting_down { }"
+echo "}"
+echo "table inet fw4 {"
+echo "  chain forward_lan { oifname \"lo\" accept }"
+echo "}"
+EOF
+cat > "$tmp/pool.json" <<EOF
+{
+  "schema": 1,
+  "lan_devices": ["zt7bcxxxxx"],
+  "from_default": ["192.168.1.0/24"],
+  "outputs": {
+    "loc": { "kind": "vless", "sub_file": "/etc/steer/sub.json", "device": "lo" },
+    "pool": { "kind": "interface", "devices": ["lo"], "on_fail": "drop" },
+    "direct": { "kind": "direct" }
+  },
+  "channels": [
+    { "name": "cloudflare", "match": { "prefixes_files": ["$tmp/cf.lst"] }, "out": "pool" }
+  ]
+}
+EOF
+outp="$($DIAG diag --spec "$tmp/pool.json" 2>/dev/null)"
+check "пул: устройство туннеля в зоне" "1" \
+      "$(printf '%s' "$outp" | grep -c '"what":"выход pool: устройство lo в зоне"')"
+check "пул: masquerade не требуется" "0" \
+      "$(printf '%s' "$outp" | grep -c 'у lo нет masquerade')"
+# Приговор владельца при этом остаётся его собственным: у выхода vless он был верен и раньше.
+check "владелец устройства: masquerade не требуется" "1" \
+      "$(printf '%s' "$outp" | grep -c '"what":"выход loc: устройство lo в зоне"')"
 
 printf '\n%d проверок пройдено' "$pass"
 if [ "$fail" -gt 0 ]; then printf ', %d ПРОВАЛЕНО\n' "$fail"; exit 1; fi
