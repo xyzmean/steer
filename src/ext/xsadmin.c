@@ -11,6 +11,7 @@
 #include <arpa/inet.h>
 
 #include "xsconf.h"
+#include "xslink.h"
 #include "xswire.h"
 #include "reality.h"
 
@@ -38,7 +39,11 @@ static void check_report(const char *path, const char *role, const struct xs_con
     if (c->sni[0]) printf("SNI %s\n", c->sni);
     /* Названо явно, потому что ключ принят, а поведения за ним нет: молчание здесь читалось
      * бы как «DNS настроен». */
-    if (c->dns_n) printf("DNS: %d адр. — приняты, но на роутере НЕ применяются\n", c->dns_n);
+    if (c->dns_n) {
+        printf("DNS: ");
+        for (int i = 0; i < c->dns_n; i++) printf("%s%s", i ? ", " : "", c->dns[i]);
+        printf(" — приняты, но на роутере НЕ применяются\n");
+    }
     if (c->device[0]) printf("устройство %s\n", c->device);
     printf("пиров %zu:\n", c->peer_n);
     for (size_t i = 0; i < c->peer_n; i++) {
@@ -70,7 +75,11 @@ int cmd_xsteer_check(const char *conf_path) {
     /* Пробуем как пир, потом как хаб. Печатаем ту ошибку, которая относится к делу: если
      * файл не годен ни в одной роли, человеку полезнее объяснение для той роли, к которой он
      * ближе, — а ближе он к пиру, пока в нём нет ListenPort. */
-    if (xs_conf_load(conf_path, XS_ROLE_SPOKE, &c, &sec, err, sizeof(err)) == 0) {
+    /* Принимается и ссылка, и «-»: проверить присланную ссылку до того, как класть её в
+     * настройки, — ровно то же действие, что проверить файл, и требовать сначала превратить её в
+     * файл значило бы отправить человека делать шаг, который эта команда и должна была избавить
+     * от нужды делать. */
+    if (xs_conf_load_any(conf_path, XS_ROLE_SPOKE, &c, &sec, NULL, 0, NULL, err, sizeof(err)) == 0) {
         /* Секреты затираются ДО печати, а не после: так «в выводе нет приватного ключа»
          * становится свойством порядка операций, а не обещанием. Тот же приём, что в
          * cmd_xsteer_peers. */
@@ -78,13 +87,69 @@ int cmd_xsteer_check(const char *conf_path) {
         check_report(conf_path, "пир", &c);
         return 0;
     }
-    if (xs_conf_load(conf_path, XS_ROLE_HUB, &c, &sec, err2, sizeof(err2)) == 0) {
+    if (xs_conf_load_any(conf_path, XS_ROLE_HUB, &c, &sec, NULL, 0, NULL, err2, sizeof(err2)) == 0) {
         xs_conf_wipe(&sec);
         check_report(conf_path, "хаб", &c);
         return 0;
     }
     fprintf(stderr, "steer: %s\n", strstr(err, "ListenPort") ? err2 : err);
     return 2;
+}
+
+/* Ссылка из конфигурации и конфигурация из ссылки.
+ *
+ * НАПРАВЛЕНИЕ ВЫБИРАЕТСЯ ПО ВХОДУ, а не отдельным ключом, и это не экономия на флагах: человек
+ * здесь всегда хочет «дай мне другой вид того же самого», и спрашивать его, какой именно, значило
+ * бы заставлять называть то, что уже видно из аргумента. Ошибиться нечем: файл и ссылка
+ * различаются первыми знаками.
+ *
+ * Роль пробуется ТОЛЬКО пирская. Хабовая конфигурация ссылкой не выражается (у неё список пиров), и
+ * попытка разобрать её как пира дала бы отказ не про то — поэтому про хаб сказано прямо, отдельной
+ * строкой, тем же приёмом, что в xs_link_parse. */
+int cmd_xsteer_link(const char *what, const char *name) {
+    struct xs_conf c;
+    struct xs_secrets sec;
+    char err[384], from_link[XS_LINK_NAME_MAX] = "";
+    if (!what) {
+        fprintf(stderr, "steer: нужен файл, ссылка xs:// или «-» (позиционным аргументом "
+                        "или --config)\n");
+        return 2;
+    }
+    int was_link = 0;
+    if (xs_conf_load_any(what, XS_ROLE_SPOKE, &c, &sec, from_link, sizeof(from_link),
+                         &was_link, err, sizeof(err)) != 0) {
+        /* Хабовую конфигурацию узнаём по её же отказу: ListenPort в файле есть, а пиром он не
+         * бывает. Сказать «это хаб» полезнее, чем перечислить, чем файл не годится для пира. */
+        if (strstr(err, "ListenPort"))
+            fprintf(stderr, "steer: это конфигурация хаба — ссылка описывает доступ ОДНОГО пира, "
+                            "а у хаба список пиров. Ссылку выдают из конфигурации пира.\n");
+        else
+            fprintf(stderr, "steer: %s\n", err);
+        return 2;
+    }
+    char out[XS_URI_MAX];
+    int rc;
+    if (was_link) {
+        /* Пришла ссылка — печатаем файл. Имя из фрагмента при этом ТЕРЯЕТСЯ, и это не потеря:
+         * поля «имя» в конфигурации нет вовсе, а выдумывать под него ключ значило бы завести в
+         * формате файла то, чего в нём нет. Кто хочет сохранить имя, держит его снаружи — так же,
+         * как имя интерфейса. */
+        rc = xs_conf_render(&c, &sec, out, sizeof(out), err, sizeof(err));
+    } else {
+        rc = xs_link_render(&c, &sec, name && *name ? name : NULL, out, sizeof(out),
+                            err, sizeof(err));
+    }
+    /* Секреты живут ровно до печати и ни мгновением дольше — но затереть их можно только ПОСЛЕ
+     * печати: приватный ключ и есть то, что печатается. Отсюда порядок: напечатали, затёрли. */
+    if (rc != 0) {
+        xs_conf_wipe(&sec);
+        fprintf(stderr, "steer: %s\n", err);
+        return 2;
+    }
+    printf("%s\n", out);
+    memset(out, 0, sizeof(out));
+    xs_conf_wipe(&sec);
+    return 0;
 }
 
 int cmd_xsteer_key(void) {

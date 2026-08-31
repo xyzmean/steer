@@ -101,6 +101,7 @@ static int cmd_sub_hwid(void) { return no_vless(); }
 #if defined(STEER_EXTENDED) || defined(STEER_SERVER)
 int cmd_xsteer_key(void);
 int cmd_xsteer_check(const char *conf);
+int cmd_xsteer_link(const char *what, const char *name);
 #else
 static int no_xsteer_admin(void) {
     fprintf(stderr, "steer: служебные команды xsteer в этой сборке отсутствуют — "
@@ -109,6 +110,9 @@ static int no_xsteer_admin(void) {
 }
 static int cmd_xsteer_key(void) { return no_xsteer_admin(); }
 static int cmd_xsteer_check(const char *conf) { (void)conf; return no_xsteer_admin(); }
+static int cmd_xsteer_link(const char *what, const char *name) {
+    (void)what; (void)name; return no_xsteer_admin();
+}
 #endif
 
 #ifdef STEER_EXTENDED
@@ -1328,7 +1332,7 @@ static void status_emit(FILE *out) {
      * нулевой, и это тот же контракт, а не особый случай. */
     fprintf(out, "{\"schema\":1,\"at\":%ld,"
                  "\"features\":[\"lan_devices\",\"nodes\",\"pool\",\"active_device\","
-                 "\"status_cache\"]",
+                 "\"status_cache\",\"xslink\",\"xsteer_state\"]",
             (long)time(NULL));
     /* Локальные устройства — следом: интерфейс показывает, с чего забирается трафик, и
      * без этого поля ему пришлось бы читать спеку вторым источником, то есть однажды
@@ -2356,6 +2360,10 @@ int main(int argc, char **argv) {
     if (!strcmp(cmd, "xsteer-peers")) return cmd_xsteer_peers(spec, arg, a.config);
     if (!strcmp(cmd, "xsteer-key")) return cmd_xsteer_key();
     if (!strcmp(cmd, "xsteer-check")) return cmd_xsteer_check(a.config);
+    /* Источник — позиционный аргумент, а если его нет, то --config: команда одинаково удобна и
+     * в конвейере («steer xsteer-link -»), и там, где путь уже назван флагом, как у соседей. */
+    if (!strcmp(cmd, "xsteer-link"))
+        return cmd_xsteer_link(a.npos > 0 ? a.pos[0] : a.config, a.name);
     /* Хаб живёт на VPS: спека ему не нужна и не читается — там ни выходов, ни каналов, а
      * есть конфигурация звезды и порт. Прецедент тот же, что у obfs-server. */
     if (!strcmp(cmd, "xsteer-hub")) return cmd_xsteer_hub(a.config);

@@ -53,6 +53,7 @@
 #include "chello.h"
 #include "xsconn.h"
 #include "xsconf.h"
+#include "xslink.h"
 #include "xshake.h"
 #include "xsroute.h"
 #include "tun.h"
@@ -1827,7 +1828,11 @@ static void *worker_loop(void *arg) {
 int cmd_xsteer_hub(const char *conf_path) {
     const char *path = conf_path ? conf_path : "/etc/steer/xsteer/hub.conf";
     char err[256];
-    if (xs_conf_load(path, XS_ROLE_HUB, &g_conf, &g_sec, err, sizeof(err)) != 0) {
+    /* «-» здесь тоже принимается: конфигурацию хаба удобно подавать конвейером в контейнере, где
+     * файла нет вовсе. Ссылку хабу подать нельзя, и об этом скажет сам разбор — ссылка описывает
+     * доступ ОДНОГО пира. */
+    if (xs_conf_load_any(path, XS_ROLE_HUB, &g_conf, &g_sec, NULL, 0, NULL,
+                         err, sizeof(err)) != 0) {
         fprintf(stderr, LOG_W "%s\n", err);
         return 2;
     }

@@ -126,7 +126,7 @@ fi
 # настоящему TCP и ратчет эпох нужны обеим сторонам звезды, и держать их у одной значило бы,
 # что вторую придётся писать заново — то есть двумя способами ошибиться в формате, который
 # обязан совпадать до байта.
-XS_COMMON="/src/src/ext/xswire.c /src/src/ext/xsconf.c /src/src/ext/xsroute.c \
+XS_COMMON="/src/src/ext/xswire.c /src/src/ext/xsconf.c /src/src/ext/xslink.c /src/src/ext/xsroute.c \
            /src/src/ext/chello.c /src/src/ext/xshake.c /src/src/ext/xsconn.c \
            /src/src/ext/xsstream.c /src/src/ext/xsepoch.c \
            /src/src/ext/tls13.c /src/src/ext/reality.c /src/src/ext/tun.c /src/src/ext/h2.c \

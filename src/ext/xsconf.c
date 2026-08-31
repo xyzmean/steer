@@ -124,7 +124,10 @@ static const char *KNOWN[] = {
 };
 #define KNOWN_N (sizeof(KNOWN) / sizeof(KNOWN[0]))
 
-static int lev(const char *a, const char *b) {
+/* Не static: тем же расстоянием подсказывает по опечатке разбор ссылки (xslink.c). Своя копия
+ * там означала бы две меры близости на один проект — и однажды разные подсказки на одну
+ * опечатку. */
+int xs_lev(const char *a, const char *b) {
     size_t la = strlen(a), lb = strlen(b);
     if (la > 32 || lb > 32) return 99;
     int prev[33], cur[33];
@@ -147,7 +150,7 @@ static const char *did_you_mean(const char *key) {
     const char *best = NULL;
     int bd = 99;
     for (size_t i = 0; i < KNOWN_N; i++) {
-        int d = lev(key, KNOWN[i]);
+        int d = xs_lev(key, KNOWN[i]);
         if (d < bd) { bd = d; best = KNOWN[i]; }
     }
     return bd <= 3 ? best : NULL;
@@ -337,12 +340,40 @@ int xs_conf_parse(const char *text, size_t n, enum xs_role role,
                  * пойдут в туннель. Поэтому ключ запоминается счётчиком, а сказать о нём
                  * ОДИН РАЗ при подъёме — дело того, кто поднимает (xsclient.c): разбор здесь
                  * чистая функция и в журнал не пишет. */
-                /* Считаем АДРЕСА, а не строки: в файле их пишут через запятую, и «DNS: 1
-                 * адр.» на строке из двух означало бы, что разбор понял её не так, как
-                 * человек. Значения не хранятся — считать нечего, кроме их числа. */
-                c->dns_n++;
-                for (const char *q = val; *q; q++)
-                    if (*q == ',') c->dns_n++;
+                /* Разбираются АДРЕСА, а не строка целиком: в файле их пишут через запятую, и
+                 * «DNS: 1 адр.» на строке из двух означало бы, что разбор понял её не так, как
+                 * человек.
+                 *
+                 * КАЖДЫЙ ПРОВЕРЯЕТСЯ как литерал IPv4 — так же, как это делает половина на Go.
+                 * Прежде здесь считались запятые и больше ничего, и «DNS = не-адрес» проходил
+                 * тут и отвергался там: тот самый случай, когда «настроено» зависит от того,
+                 * куда файл положили. */
+                {
+                    const char *q = val;
+                    while (*q) {
+                        while (*q == ' ' || *q == '\t' || *q == ',') q++;
+                        if (!*q) break;
+                        const char *e = q;
+                        while (*e && *e != ',') e++;
+                        size_t n2 = (size_t)(e - q);
+                        while (n2 > 0 && (q[n2 - 1] == ' ' || q[n2 - 1] == '\t')) n2--;
+                        if (n2 == 0) { q = e; continue; }
+                        if (c->dns_n >= XS_DNS_MAX)
+                            FAIL("строка %d: адресов DNS больше %d", line_no, XS_DNS_MAX);
+                        if (n2 >= sizeof(c->dns[0]))
+                            FAIL("строка %d: адрес DNS длиннее %zu знаков", line_no,
+                                 sizeof(c->dns[0]) - 1);
+                        char one[16];
+                        memcpy(one, q, n2);
+                        one[n2] = '\0';
+                        struct in_addr din;
+                        if (inet_pton(AF_INET, one, &din) != 1)
+                            FAIL("строка %d: DNS «%s» — нужен адрес IPv4", line_no, one);
+                        memcpy(c->dns[c->dns_n], one, n2 + 1);
+                        c->dns_n++;
+                        q = e;
+                    }
+                }
             } else if (ieq(key, "Decoy")) {
                 /* Режим называется словом, а не числом: в журнале и в файле должно стоять то
                  * же слово, что в документации и в ключе --decoy реализации на Go. */

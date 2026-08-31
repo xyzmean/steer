@@ -103,7 +103,7 @@ if [ ! -f "$WORK/.so-done" ]; then
     touch "$WORK/.so-done"
 fi
 
-XS_COMMON="$SRC/src/ext/xswire.c $SRC/src/ext/xsconf.c $SRC/src/ext/xsroute.c \
+XS_COMMON="$SRC/src/ext/xswire.c $SRC/src/ext/xsconf.c $SRC/src/ext/xslink.c $SRC/src/ext/xsroute.c \
            $SRC/src/ext/chello.c $SRC/src/ext/xshake.c $SRC/src/ext/xsconn.c \
            $SRC/src/ext/xsstream.c $SRC/src/ext/xsepoch.c \
            $SRC/src/ext/tls13.c $SRC/src/ext/reality.c $SRC/src/ext/tun.c $SRC/src/ext/h2.c \

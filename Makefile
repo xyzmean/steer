@@ -26,7 +26,7 @@ $(BUILD)/steer: src/steer.c src/spec.c src/dnsd.c src/failover.c src/aggregate.c
 	$(CC) $(CFLAGS) $(DEFS) -o $@ src/steer.c src/spec.c src/dnsd.c src/failover.c \
 	      src/aggregate.c src/obfs.c src/cli.c
 
-test: all ext-syntax $(BUILD)/dnsmatch $(BUILD)/specmatch $(BUILD)/specmatch-ext $(BUILD)/xswirematch $(BUILD)/xsconnmatch $(BUILD)/xsstreammatch $(BUILD)/tungromatch $(BUILD)/tunnamematch $(BUILD)/xsconfmatch $(BUILD)/xsroutematch $(BUILD)/chellomatch $(BUILD)/failovermatch $(BUILD)/h2match $(BUILD)/submatch $(BUILD)/subfetchmatch $(BUILD)/fwmatch $(BUILD)/obfsmatch $(BUILD)/visionmatch $(BUILD)/diagsim
+test: all ext-syntax $(BUILD)/dnsmatch $(BUILD)/specmatch $(BUILD)/specmatch-ext $(BUILD)/xswirematch $(BUILD)/xsconnmatch $(BUILD)/xsstreammatch $(BUILD)/tungromatch $(BUILD)/tunnamematch $(BUILD)/xsconfmatch $(BUILD)/xslinkmatch $(BUILD)/xsroutematch $(BUILD)/chellomatch $(BUILD)/failovermatch $(BUILD)/h2match $(BUILD)/submatch $(BUILD)/subfetchmatch $(BUILD)/fwmatch $(BUILD)/obfsmatch $(BUILD)/visionmatch $(BUILD)/diagsim
 	@sh tests/run.sh
 	@sh tests/gen.sh
 	@sh tests/climatch.sh
@@ -51,6 +51,7 @@ test: all ext-syntax $(BUILD)/dnsmatch $(BUILD)/specmatch $(BUILD)/specmatch-ext
 	@$(BUILD)/tungromatch
 	@$(BUILD)/tunnamematch
 	@$(BUILD)/xsconfmatch
+	@$(BUILD)/xslinkmatch
 	@$(BUILD)/xsroutematch
 	@$(BUILD)/chellomatch
 
@@ -220,6 +221,15 @@ $(BUILD)/xsconfmatch: tests/xsconfmatch.c src/ext/xsconf.c src/ext/xsconf.h src/
 	@mkdir -p $(BUILD)
 	$(CC) $(CFLAGS) -o $@ tests/xsconfmatch.c
 
+# Ссылка xs:// — второе представление той же настройки, и оно ПЕРЕДАЁТСЯ между людьми и между
+# половинами звезды. Расхождение здесь не падает: ссылка «принялась», а туннель молчит, потому что
+# маска оказалась другой или keepalive включился сам. Поэтому стенд держит те же векторы, что
+# xsteer/conf/link_cross_test.go на стороне Go, и сверяет печать ПОБАЙТОВО.
+$(BUILD)/xslinkmatch: tests/xslinkmatch.c src/ext/xslink.c src/ext/xslink.h \
+                  src/ext/xsconf.c src/ext/xsconf.h src/ext/xswire.h
+	@mkdir -p $(BUILD)
+	$(CC) $(CFLAGS) -o $@ tests/xslinkmatch.c
+
 # Куда отдать пакет. Ошибка здесь не видна снаружи: канал работает, счётчик растёт, а
 # пакеты приходят не тому пиру. Три утверждения, без которых звезда небезопасна, стоят
 # именно тут — самое длинное совпадение, «нет пира — отбросить» (а не «отдать первому»,
@@ -244,7 +254,7 @@ $(BUILD)/chellomatch: tests/chellomatch.c tests/chello-frozen.h src/ext/chello.c
 clean:
 	rm -rf $(BUILD)/steer $(BUILD)/steer-* $(BUILD)/dnsmatch $(BUILD)/specmatch $(BUILD)/specmatch-ext \
 	       $(BUILD)/failovermatch $(BUILD)/h2match $(BUILD)/submatch $(BUILD)/subfetchmatch $(BUILD)/fwmatch $(BUILD)/obfsmatch \
-	       $(BUILD)/visionmatch $(BUILD)/xswirematch $(BUILD)/xsconnmatch $(BUILD)/xsstreammatch $(BUILD)/xsepochmatch $(BUILD)/tungromatch $(BUILD)/tunnamematch $(BUILD)/xsconfmatch $(BUILD)/xsroutematch $(BUILD)/chellomatch $(BUILD)/hellofreeze $(BUILD)/xsloop $(BUILD)/xsbench \
+	       $(BUILD)/visionmatch $(BUILD)/xswirematch $(BUILD)/xsconnmatch $(BUILD)/xsstreammatch $(BUILD)/xsepochmatch $(BUILD)/tungromatch $(BUILD)/tunnamematch $(BUILD)/xsconfmatch $(BUILD)/xslinkmatch $(BUILD)/xsroutematch $(BUILD)/chellomatch $(BUILD)/hellofreeze $(BUILD)/xsloop $(BUILD)/xsbench \
 	       $(BUILD)/steer-hub $(BUILD)/steer-ext \
 	       $(BUILD)/diagsim $(BUILD)/libmbed-*.a \
 	       $(BUILD)/*.err $(BUILD)/pkg $(BUILD)/scripts out

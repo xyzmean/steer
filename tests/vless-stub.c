@@ -73,6 +73,11 @@ int cmd_xsteer_peers(const char *spec_path, const char *out_name, const char *co
  * нет. Поэтому заглушки нужны и здесь. */
 int cmd_xsteer_key(void);
 int cmd_xsteer_check(const char *conf);
+int cmd_xsteer_link(const char *what, const char *name);
 
 int cmd_xsteer_key(void) { return stub("xsteer-key"); }
 int cmd_xsteer_check(const char *conf) { (void)conf; return stub("xsteer-check"); }
+int cmd_xsteer_link(const char *what, const char *name) {
+    (void)what; (void)name;
+    return stub("xsteer-link");
+}

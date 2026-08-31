@@ -38,6 +38,7 @@
 #include "../spec.h"
 #include "xsconn.h"
 #include "xsconf.h"
+#include "xslink.h"
 #include "xsepoch.h"
 #include "xshake.h"
 #include "xsroute.h"
@@ -125,6 +126,15 @@ struct spoke {
     uint32_t hub_addr;
     int hub_port;
     long long handshake_at;
+    /* Сколько раз это соединение поднималось ЗАНОВО за жизнь процесса, и почему в последний раз.
+     *
+     * ЗАЧЕМ СЧИТАТЬ. Восстановление туннеля после обрыва теперь происходит само и быстро — и
+     * ровно поэтому снаружи его не видно: человек смотрит на работающий туннель и не знает, что
+     * он за час переподнялся сорок раз. Один счётчик отличает «работает» от «работает, потому что
+     * его чинят каждую минуту», а второй говорит, что именно чинят. Без них разбор жалобы «иногда
+     * тормозит» начинается с догадок. */
+    unsigned resets;
+    const char *last_down;
     unsigned long long up_pkts, down_pkts, up_bytes, down_bytes, dropped;
     long long last_drop_warn;
     /* ---- согласование MTU (см. xswire.h) --------------------------------------
@@ -230,11 +240,33 @@ static void state_write(struct spoke *s) {
         if (g_sp[i].up) any_up = 1;
         if (g_sp[i].handshake_at > hs_at) hs_at = g_sp[i].handshake_at;
     }
+    /* Разгрузка сегментации: что УДАЛОСЬ договориться с ядром, а не что просили.
+     *
+     * ЗАЧЕМ ЭТО СНАРУЖИ. Разгрузка — самая крупная прибавка к скорости из всего, что здесь есть
+     * (на отдаче в устройство 3920 нс на пакет против 269 в склеенном кадре), и она НЕОБЯЗАТЕЛЬНА:
+     * устройство без multi_queue, ядро без TUNSETOFFLOAD, переменная STEER_TUN_NOGSO в окружении —
+     * и туннель работает ровно так же, только в разы медленнее. Отличить «медленно, потому что
+     * канал» от «медленно, потому что разгрузка не встала» изнутри интерфейса иначе нечем: оба
+     * состояния выглядят как работающий туннель.
+     *
+     * Берётся у ПЕРВОЙ очереди: флаги у всех очередей одни (tun_open открывает их одним набором),
+     * а очередь ноль есть всегда. */
+    const struct tun_dev *t0 = &g_sp[0].tun;
+    unsigned long long resets = 0;
+    const char *last_down = NULL;
+    for (int i = 0; i < g_conns; i++) {
+        resets += g_sp[i].resets;
+        /* Причина берётся у соединения 0: их несколько, а вопрос у человека один — «почему рвётся».
+         * Складывать причины разных соединений в одно поле значило бы отвечать не на него. */
+    }
+    last_down = g_sp[0].last_down;
     fprintf(f, "{\"schema\":1,\"out\":\"%s\",\"up\":%s,\"mtu\":%d,\"conns\":%d"
                ",\"hub\":\"%s:%d\""
                ",\"hub_key\":\"%s\",\"handshake_age\":%lld"
+               ",\"stream\":%s,\"offload\":{\"gso\":%s,\"gro\":%s,\"rx\":%s}"
+               ",\"mtu_confirmed\":%d,\"resets\":%llu"
                ",\"tx_packets\":%llu,\"tx_bytes\":%llu"
-               ",\"rx_packets\":%llu,\"rx_bytes\":%llu,\"dropped\":%llu}\n",
+               ",\"rx_packets\":%llu,\"rx_bytes\":%llu,\"dropped\":%llu",
             s->out_name, any_up ? "true" : "false", s->mtu, g_conns,
             s->conf->peer[0].endpoint,
             /* Порт называется ТОТ, к которому мы на самом деле подключены: в режиме потока он
@@ -242,7 +274,15 @@ static void state_write(struct spoke *s) {
              * способ искать причину не там. */
             s->stream && s->stream_port ? s->stream_port : s->conf->peer[0].endpoint_port, fp,
             hs_at ? (xs_now_ms() - hs_at) / 1000 : -1,
+            s->stream ? "true" : "false",
+            t0->gso ? "true" : "false", t0->gro ? "true" : "false",
+            t0->rx_gso ? "true" : "false",
+            s->mtu_confirmed, resets,
             tp, tb2, rp, rb, dr);
+    /* Причина последнего обрыва — только если он был. Пустая строка вместо отсутствия поля
+     * читалась бы как «обрыв был, причина неизвестна», а это другое утверждение. */
+    if (last_down) fprintf(f, ",\"last_down\":\"%s\"", last_down);
+    fprintf(f, "}\n");
     fclose(f);
     /* Переименование, а не запись на месте: читатель не должен увидеть половину файла.
      * Секретов в файле нет — печатает его тот же код, что xs_conf_json, и приватного ключа
@@ -563,7 +603,15 @@ static void probe_done(struct spoke *s, const char *dev, long long now) {
  * (worker_give_up). Мерено стендом tests/spokematch.c под LeakSanitizer.
  *
  * Условие лишнее и без этого: tls13_keys_free сам выходит на !ctx_ready. */
-static void session_down(struct spoke *s) {
+/* why — короткая причина для файла состояния; NULL оставляет прежнюю. Строка ЛИТЕРАЛЬНАЯ (хранится
+ * указателем): причин конечное число, они названы в коде рядом с местом, где случились, и копировать
+ * их в буфер значило бы завести второе место, где они пишутся. */
+static void session_down_why(struct spoke *s, const char *why) {
+    /* Считаем ПАДЕНИЯ поднятой сессии, а не попытки подъёма: попытка, не дошедшая до рукопожатия,
+     * ничего не роняла, и складывать её с обрывом значило бы получить число, которое ничего не
+     * означает. */
+    if (s->up) s->resets++;
+    if (why) s->last_down = why;
     tls13_keys_free(&s->tx);
     tls13_keys_free(&s->rx);
     memset(&s->tx, 0, sizeof(s->tx));
@@ -571,6 +619,8 @@ static void session_down(struct spoke *s) {
     s->up = 0;
     xs_conn_close(&s->conn);
 }
+
+static void session_down(struct spoke *s) { session_down_why(s, NULL); }
 
 /* Общий цикл обеих ролей вынесен, чтобы «поднять для выхода спеки» и «поднять на готовом
  * устройстве» отличались ровно тем, чем отличаются: владением устройством и маршрутизацией.
@@ -601,7 +651,11 @@ int cmd_xsteer(const char *spec_path, const char *out_name, const char *conf_pat
             return 2;
         }
         char err2[256];
-        if (xs_conf_load(conf_path, XS_ROLE_SPOKE, &g_cf, &g_sc, err2, sizeof(err2)) != 0) {
+        /* load_any, а не load: --config принимает и ссылку xs://, и «-». Ровно то же делает
+         * половина на Go (conf.LoadAny во всех её подкомандах), и разница здесь означала бы, что
+         * ссылку, поднимающую туннель на десктопе, роутер не понимает. */
+        if (xs_conf_load_any(conf_path, XS_ROLE_SPOKE, &g_cf, &g_sc, NULL, 0, NULL,
+                             err2, sizeof(err2)) != 0) {
             fprintf(stderr, LOG_W "%s\n", err2);
             return 2;
         }
@@ -637,7 +691,8 @@ static int cmd_xsteer_spec(const char *spec_path, const char *out_name, const ch
     s.stream_port = stream_port ? stream_port : o->xs_stream_port;
     char err[256];
     const char *path = conf_path ? conf_path : o->xs_conf;
-    if (xs_conf_load(path, XS_ROLE_SPOKE, &g_cf, &g_sc, err, sizeof(err)) != 0) {
+    if (xs_conf_load_any(path, XS_ROLE_SPOKE, &g_cf, &g_sc, NULL, 0, NULL,
+                         err, sizeof(err)) != 0) {
         fprintf(stderr, LOG_W "%s\n", err);
         return 2;
     }
@@ -858,7 +913,11 @@ static void spoke_frame_cb(void *ctx, const uint8_t *f, size_t n) {
 
 /* Отдать поток и ключи. Отдельно от session_down: там закрывается поддельное соединение,
  * которого здесь нет вовсе. */
-static void stream_down(struct spoke *s) {
+static void stream_down_why(struct spoke *s, const char *why) {
+    /* Счётчик и причина — те же, что у поддельного TCP, и по тем же основаниям: снаружи режим
+     * транспорта не виден, а «сколько раз чинилось» человек спрашивает одинаково про оба. */
+    if (s->up) s->resets++;
+    if (why) s->last_down = why;
     /* Без оглядки на s->up — по той же причине, что в session_down. */
     tls13_keys_free(&s->tx);
     tls13_keys_free(&s->rx);
@@ -875,6 +934,8 @@ static void stream_down(struct spoke *s) {
         s->st = NULL;
     }
 }
+
+static void stream_down(struct spoke *s) { stream_down_why(s, NULL); }
 
 /* Порт хаба для потока: назван ключом или тот же, что у поддельного TCP.
  *
@@ -1243,7 +1304,7 @@ static void *stream_main(struct spoke *s) {
                      * TCP, здесь невозможно. */
                     fprintf(stderr, LOG_W "поток закрылся%s\n",
                             rc == -2 ? ": пришла не запись xsteer" : "");
-                    stream_down(s);
+                    stream_down_why(s, rc == -2 ? "в потоке не запись xsteer" : "поток закрылся");
                     break;
                 }
                 uint8_t *ct = (uint8_t *)(uintptr_t)body;
@@ -1287,7 +1348,7 @@ static void *stream_main(struct spoke *s) {
         if (last_tx > s->stream_rx && now - s->stream_rx >= XSC_DEAD_MS) {
             fprintf(stderr, LOG_W "поток молчит %d мс при активной отправке — поднимаю "
                                   "соединение заново\n", XSC_DEAD_MS);
-            stream_down(s);
+            stream_down_why(s, "поток молчит");
             continue;
         }
         /* Keepalive: пустая запись. Пир за NAT обязана поддерживать отображение живым, потому
@@ -1398,13 +1459,13 @@ static void *worker_main(void *arg) {
                                       "хаб не запущен, порт закрыт, или у хаба не встало "
                                       "правило против RST собственного ядра\n",
                         s->conf->peer[0].endpoint, s->hub_port, XSC_SYN_RETRIES);
-                session_down(s);
+                session_down_why(s, "хаб не ответил на SYN");
                 if (!s->conn_id) state_write(s);
                 if (worker_give_up(s)) return (void *)1;
                 continue;
             }
             if (do_handshake(s) != 0) {
-                session_down(s);
+                session_down_why(s, "рукопожатие не прошло");
                 if (!s->conn_id) state_write(s);
                 if (worker_give_up(s)) return (void *)1;
                 continue;
@@ -1519,7 +1580,7 @@ static void *worker_main(void *arg) {
                          * сокет — то есть исправление не исправляло бы ничего. */
                         fprintf(stderr, LOG_W "путь наружу пропал (%s) — поднимаю соединение "
                                               "заново, когда он вернётся\n", strerror(gone));
-                        session_down(s);
+                        session_down_why(s, "путь наружу пропал");
                     }
                     if (sent_off < segs) {
                         s->dropped += (unsigned long long)frames;
@@ -1536,7 +1597,7 @@ static void *worker_main(void *arg) {
             }
             if (s->up && xs_retire_due(xs_conn_rel_next(&s->conn), now - s->conn.born)) {
                 fprintf(stderr, LOG_I "смена ключей: поднимаю соединение заново\n");
-                session_down(s);
+                session_down_why(s, "смена ключей");
             }
         }
 
@@ -1651,7 +1712,7 @@ static void *worker_main(void *arg) {
         if (xs_conn_tick(&s->conn, now, s->conn.last_tx > s->conn.last_rx)) {
             fprintf(stderr, LOG_W "путь молчит %d мс при активной отправке — поднимаю "
                                   "соединение заново\n", XSC_DEAD_MS);
-            session_down(s);
+            session_down_why(s, "путь молчит");
             continue;
         }
         /* Обратная связь по сборке: если у НАС не собираются записи, сказать об этом обязаны мы —
@@ -1712,7 +1773,7 @@ int cmd_xsteer_peers(const char *spec_path, const char *out_name, const char *co
     struct xs_secrets sec;
     char err[256];
     const char *path = conf_path ? conf_path : o->xs_conf;
-    if (xs_conf_load(path, XS_ROLE_SPOKE, &c, &sec, err, sizeof(err)) != 0) {
+    if (xs_conf_load_any(path, XS_ROLE_SPOKE, &c, &sec, NULL, 0, NULL, err, sizeof(err)) != 0) {
         fprintf(stderr, LOG_W "%s\n", err);
         return 2;
     }
