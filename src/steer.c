@@ -55,6 +55,9 @@ void aggregate_usage_flags(FILE *out);
 int cmd_vless(const char *spec_path, const char *out_name);
 int cmd_vless_nodes(const char *spec_path, const char *out_name);
 int cmd_vless_probe(const char *spec_path, const char *out_name, int node, int timeout_s);
+/* Скачивание и обработка подписки. Объявления — в src/ext/subfetch.h, там же и рассказ,
+ * почему это работа движка, а не управляющего слоя. */
+#include "ext/subfetch.h"
 #else
 /* ПОДСТРОКУ «steer-extended» ЗДЕСЬ ЧИТАЮТ СНАРУЖИ — это контракт, а не просто текст.
  * splify2 определяет вид установленного пакета так:
@@ -80,6 +83,15 @@ static int cmd_vless_probe(const char *spec_path, const char *out_name,
     (void)spec_path; (void)out_name; (void)node; (void)timeout_s;
     return no_vless();
 }
+static int cmd_sub_fetch(const char *url, const char *out_path, const char *info_path) {
+    (void)url; (void)out_path; (void)info_path;
+    return no_vless();
+}
+static int cmd_sub_quota(const char *url, const char *info_path) {
+    (void)url; (void)info_path;
+    return no_vless();
+}
+static int cmd_sub_hwid(void) { return no_vless(); }
 #endif
 
 /* Клиент и хаб xsteer. Клиент — расширенная сборка, хаб — серверная: на роутере хабу делать
@@ -2325,6 +2337,9 @@ int main(int argc, char **argv) {
     if (!strcmp(cmd, "vless")) return cmd_vless(spec, arg);
     if (!strcmp(cmd, "vless-nodes")) return cmd_vless_nodes(spec, arg);
     if (!strcmp(cmd, "vless-probe")) return cmd_vless_probe(spec, arg, a.node, a.timeout);
+    if (!strcmp(cmd, "sub-fetch")) return cmd_sub_fetch(arg, a.out_file, a.info_file);
+    if (!strcmp(cmd, "sub-quota")) return cmd_sub_quota(arg, a.info_file);
+    if (!strcmp(cmd, "sub-hwid")) return cmd_sub_hwid();
     if (!strcmp(cmd, "obfs")) {
         load_spec(spec);
         struct output *o = out_by_name(arg);

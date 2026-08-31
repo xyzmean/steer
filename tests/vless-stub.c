@@ -38,6 +38,22 @@ int cmd_vless_probe(const char *spec_path, const char *out_name, int node, int t
     return stub("vless-probe");
 }
 
+/* Скачивание подписки — тоже расширенная часть: она считает идентификатор устройства через
+ * SHA-256 из mbedtls и разбирает узлы тем же кодом, что подъём туннеля. diag её не зовёт. */
+int cmd_sub_fetch(const char *url, const char *out_path, const char *info_path);
+int cmd_sub_quota(const char *url, const char *info_path);
+int cmd_sub_hwid(void);
+
+int cmd_sub_fetch(const char *url, const char *out_path, const char *info_path) {
+    (void)url; (void)out_path; (void)info_path;
+    return stub("sub-fetch");
+}
+int cmd_sub_quota(const char *url, const char *info_path) {
+    (void)url; (void)info_path;
+    return stub("sub-quota");
+}
+int cmd_sub_hwid(void) { return stub("sub-hwid"); }
+
 int cmd_xsteer(const char *spec_path, const char *out_name, const char *conf,
                const char *device);
 int cmd_xsteer_peers(const char *spec_path, const char *out_name, const char *conf);

@@ -23,6 +23,7 @@ build/specmatch
 build/failovermatch
 build/h2match
 build/submatch
+build/subfetchmatch
 build/fwmatch
 build/obfsmatch
 build/visionmatch

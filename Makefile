@@ -26,7 +26,7 @@ $(BUILD)/steer: src/steer.c src/spec.c src/dnsd.c src/failover.c src/aggregate.c
 	$(CC) $(CFLAGS) $(DEFS) -o $@ src/steer.c src/spec.c src/dnsd.c src/failover.c \
 	      src/aggregate.c src/obfs.c src/cli.c
 
-test: all ext-syntax $(BUILD)/dnsmatch $(BUILD)/specmatch $(BUILD)/specmatch-ext $(BUILD)/xswirematch $(BUILD)/xsstreammatch $(BUILD)/tungromatch $(BUILD)/tunnamematch $(BUILD)/xsconfmatch $(BUILD)/xsroutematch $(BUILD)/chellomatch $(BUILD)/failovermatch $(BUILD)/h2match $(BUILD)/submatch $(BUILD)/fwmatch $(BUILD)/obfsmatch $(BUILD)/visionmatch $(BUILD)/diagsim
+test: all ext-syntax $(BUILD)/dnsmatch $(BUILD)/specmatch $(BUILD)/specmatch-ext $(BUILD)/xswirematch $(BUILD)/xsstreammatch $(BUILD)/tungromatch $(BUILD)/tunnamematch $(BUILD)/xsconfmatch $(BUILD)/xsroutematch $(BUILD)/chellomatch $(BUILD)/failovermatch $(BUILD)/h2match $(BUILD)/submatch $(BUILD)/subfetchmatch $(BUILD)/fwmatch $(BUILD)/obfsmatch $(BUILD)/visionmatch $(BUILD)/diagsim
 	@sh tests/run.sh
 	@sh tests/gen.sh
 	@sh tests/climatch.sh
@@ -41,6 +41,7 @@ test: all ext-syntax $(BUILD)/dnsmatch $(BUILD)/specmatch $(BUILD)/specmatch-ext
 	@$(BUILD)/failovermatch
 	@$(BUILD)/h2match
 	@$(BUILD)/submatch
+	@$(BUILD)/subfetchmatch
 	@$(BUILD)/fwmatch
 	@$(BUILD)/obfsmatch
 	@$(BUILD)/visionmatch
@@ -156,6 +157,16 @@ $(BUILD)/submatch: tests/submatch.c src/ext/sub.c src/ext/vless.h \
 	@mkdir -p $(BUILD)
 	$(CC) $(CFLAGS) -o $@ tests/submatch.c
 
+# Скачивание и обработка подписки. Стенд включает исходник и подставляет три вещи: свой
+# SHA-256 (проверяется РЕЦЕПТУРА идентификатора устройства, а не значение хеша — библиотека
+# считает его сама), свой run_quiet и поддельный curl в PATH. Поэтому ни сети, ни mbedtls, ни
+# docker он не требует и входит в обычный make test — при том что до переноса вся эта работа
+# жила в оболочке объекта rpcd и не проверялась ничем.
+$(BUILD)/subfetchmatch: tests/subfetchmatch.c src/ext/subfetch.c src/ext/subfetch.h \
+                  src/ext/sub.c src/ext/vless.h src/ext/vless_proto.c src/ext/vless_proto.h
+	@mkdir -p $(BUILD)
+	$(CC) $(CFLAGS) -Itests/stub -o $@ tests/subfetchmatch.c
+
 # Арифметика провода xsteer: заголовок записи, вывод nonce, окно приёма, пределы
 # соединения. Всё, что она считает, ломается МОЛЧА — пакет отбрасывается стеком той
 # стороны, или не расшифровывается, или отвергается как повтор, и ни одного сообщения об
@@ -224,7 +235,7 @@ $(BUILD)/chellomatch: tests/chellomatch.c tests/chello-frozen.h src/ext/chello.c
 # только артефакты: то, что здесь же и собирается, плюс упаковка из build.sh.
 clean:
 	rm -rf $(BUILD)/steer $(BUILD)/steer-* $(BUILD)/dnsmatch $(BUILD)/specmatch $(BUILD)/specmatch-ext \
-	       $(BUILD)/failovermatch $(BUILD)/h2match $(BUILD)/submatch $(BUILD)/fwmatch $(BUILD)/obfsmatch \
+	       $(BUILD)/failovermatch $(BUILD)/h2match $(BUILD)/submatch $(BUILD)/subfetchmatch $(BUILD)/fwmatch $(BUILD)/obfsmatch \
 	       $(BUILD)/visionmatch $(BUILD)/xswirematch $(BUILD)/xsstreammatch $(BUILD)/xsepochmatch $(BUILD)/tungromatch $(BUILD)/tunnamematch $(BUILD)/xsconfmatch $(BUILD)/xsroutematch $(BUILD)/chellomatch $(BUILD)/hellofreeze $(BUILD)/xsloop $(BUILD)/xsbench \
 	       $(BUILD)/steer-hub $(BUILD)/steer-ext \
 	       $(BUILD)/diagsim $(BUILD)/libmbed-*.a \

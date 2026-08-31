@@ -189,6 +189,22 @@ ext_marker "splify2: vless-probe --node -1 --timeout 6 доходит до ко�
     "$BIN" vless-probe v --node -1 --timeout 6 --spec "$tmp/spec.json"
 ext_marker "splify2: vless-probe --node 0 доходит до команды" -- \
     "$BIN" vless-probe v --node 0 --timeout 6 --spec "$tmp/spec.json"
+# Подписка: те же вызовы, какими её зовёт splify2. Проверяется, что разбор аргументов их
+# ПРОПУСКАЕТ и отказ приходит от самой команды: --out и --info — новые флаги, и опечатка в
+# их имени выглядела бы как «подписка не скачалась», причём молча.
+ext_marker "splify2: sub-fetch <ссылка> --out --info доходит до команды" -- \
+    "$BIN" sub-fetch https://p.example/s --out "$tmp/sub.txt" --info "$tmp/sub.userinfo"
+ext_marker "splify2: sub-fetch без --info доходит до команды" -- \
+    "$BIN" sub-fetch https://p.example/s --out "$tmp/sub.txt"
+ext_marker "splify2: sub-quota <ссылка> --info доходит до команды" -- \
+    "$BIN" sub-quota https://p.example/s --info "$tmp/sub.userinfo"
+ext_marker "splify2: sub-hwid доходит до команды" -- "$BIN" sub-hwid
+# Флаги подписки чужим командам не даются: список флагов команды — это данные, по которым
+# растут и справка, и разбор, и разойтись им негде.
+code "sub-fetch не принимает --spec" 2 -- "$BIN" sub-fetch https://p.example/s --spec /dev/null
+code "status не принимает --out" 2 -- "$BIN" status --out /dev/null
+code "sub-fetch без ссылки — отказ разбора" 2 -- "$BIN" sub-fetch --out "$tmp/sub.txt"
+
 # Пустое имя выхода: rpcd зовёт именно `steer vless ''`. Пустая строка обязана считаться
 # позиционным аргументом, а не пропущенным, — иначе разбор отвергнет вызов раньше, чем
 # движок успеет назвать пакет, и определение сборки сломается.
