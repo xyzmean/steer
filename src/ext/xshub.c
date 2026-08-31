@@ -186,6 +186,35 @@ XS_STATIC_ASSERT(XS_IP_HDR + XS_TCP_HDR + XSH_MAX_SEG_CEIL == XS_LINK_MAX, hub_s
 
 int run_quiet(const char *const argv[]);
 
+/* ---- ВРЕМЕННЫЕ МЕТКИ, КОТОРЫЕ ЧИТАЕТ ЧУЖОЙ ПОТОК, — ТРИДЦАТИДВУХБИТНЫЕ -------
+ *
+ * И это не экономия памяти, а условие того, что на роутере они не стоят замка.
+ *
+ * XSH_LOAD/XSH_STORE (ниже) — это __atomic_load_n/__atomic_store_n. На 32-битной цели
+ * (mipsel_24kc, а это самая частая наша цель) атомарная операция над 64-битным словом не
+ * выражается одной командой, и компилятор превращает её в вызов libatomic — то есть в захват
+ * ГЛОБАЛЬНОГО замка. Для last_auth, которая пишется на КАЖДЫЙ подтверждённый кадр, это замок на
+ * пакет.
+ *
+ * Обнаружилось при сборке тулчейном OpenWrt SDK: gcc потребовал -latomic там, где раньше
+ * собиралось молча (zig подставляет эти вызовы сам). То есть цена была и до того, просто её никто
+ * не видел.
+ *
+ * Тридцати двух бит на миллисекунды хватает на 49,7 суток, после чего счётчик заворачивается.
+ * Сравнения здесь — РАЗНОСТИ на секундах, поэтому заворот безвреден, если считать его знаковой
+ * разностью: тот же приём и по той же причине, что у номеров последовательности TCP в этом же
+ * движке (xswire.h).
+ *
+ * НОЛЬ ОСТАЁТСЯ ПРИЗНАКОМ «НЕ БЫЛО», поэтому записываемая метка принудительно делается нечётной:
+ * цена — одна миллисекунда неточности, выигрыш — что признак не сталкивается со значением раз в
+ * 49,7 суток. */
+typedef uint32_t xsh_ms;
+static inline xsh_ms xsh_ms_of(long long now) { return (xsh_ms)now | 1u; }
+/* Насколько метка в прошлом: положительное — прошло столько миллисекунд. */
+static inline long xsh_ms_since(long long now, xsh_ms then) {
+    return (long)(int32_t)((xsh_ms)now - then);
+}
+
 /* PH_PROXY — не наша сессия вовсе: её байты переливаются настоящему серверу и обратно
  * (см. Decoy ниже). Ключей у неё нет и никогда не будет, поэтому ни один путь данных пиров её
  * не касается: send_to отправляет только в PH_EST, а привязка пир→сессия ей не выдаётся. */
@@ -221,7 +250,7 @@ struct sess {
      * применился к половине пакетов пачки» здесь возможно. Порт правки из реализации на Go
      * (I-093), где то же место помечал детектор гонок. */
     int      batch_max;
-    long long cool_until;
+    xsh_ms   cool_until;
     long long last_report, last_grow, keep_next;
     int16_t  peer;                 /* индекс пира или -1, пока не опознан */
     int8_t   conn_id;              /* номер соединения этой пира (0..XS_CONNS_MAX-1) */
@@ -248,8 +277,8 @@ struct sess {
      * roam_check — «пир поднялся заново, проверь, ведёт ли ты ещё куда-нибудь». Ставит чужой
      * воркер, разбирается владелец (см. sess_roam_start и обслуживание). Остальные три поля —
      * счётчики пробы, только владельца. */
-    long long last_auth;
-    long long roam_check;
+    xsh_ms   last_auth;
+    xsh_ms   roam_check;
     int      roam_sent;
     long long roam_next, roam_first;
     unsigned long long up_pkts, down_pkts;
@@ -456,26 +485,30 @@ static void sess_roam_start(int peer, int self_idx, long long now) {
         int16_t idx = g_peer_sess[peer][c];
         if (idx < 0 || idx == (int16_t)self_idx) continue;
         struct sess *o = &g_sess[idx];
-        if (now - XSH_LOAD(o->last_auth) < XSH_ROAM_PROBE_MS) continue;
-        if (XSH_LOAD(o->roam_check) == 0) XSH_STORE(o->roam_check, now);
+        xsh_ms la = XSH_LOAD(o->last_auth);
+        if (la && xsh_ms_since(now, la) < XSH_ROAM_PROBE_MS) continue;
+        if (XSH_LOAD(o->roam_check) == 0) XSH_STORE(o->roam_check, xsh_ms_of(now));
     }
 }
 
-/* sess_quiet_since — с какого момента сессия молчит.
+/* sess_quiet_ms — СКОЛЬКО МИЛЛИСЕКУНД сессия молчит.
  *
- * Для ПОДТВЕРЖДЁННОЙ считается по последнему кадру, у которого сошёлся тег (last_auth); для
+ * Возвращает длительность, а не момент, и это следствие тридцатидвухбитной метки (см. xsh_ms):
+ * абсолютное время из неё не восстановить, а разность — ровно то, что нужно всем вызывающим.
+ *
+ * Для ПОДТВЕРЖДЁННОЙ сессии считается по последнему кадру, у которого сошёлся тег (last_auth); для
  * остальных — по последнему принятому сегменту, потому что подтверждённого трафика у них ещё не
  * было по построению. Зачем именно так — в объяснении к полю last_auth.
  *
  * Разница не теоретическая: пока простой считался по conn.last_rx, сессию, в которую пир давно не
  * пишет, держал живой любой сканерный шум в её четвёрку — а слот в наборе соединений пира она при
  * этом занимала, то есть часть его трафика уезжала в никуда. */
-static long long sess_quiet_since(const struct sess *s) {
+static long sess_quiet_ms(const struct sess *s, long long now) {
     if (s->phase == PH_EST) {
-        long long t = XSH_LOAD(s->last_auth);
-        if (t) return t;
+        xsh_ms t = XSH_LOAD(s->last_auth);
+        if (t) return xsh_ms_since(now, t);
     }
-    return s->conn.last_rx;
+    return (long)(now - s->conn.last_rx);
 }
 
 /* Кого забрать при полной таблице — и забирать ли вообще.
@@ -496,7 +529,7 @@ static long long sess_quiet_since(const struct sess *s) {
 static struct sess *sess_evict_pick(struct worker *w, struct sess *oldest_raw,
                                     struct sess *oldest, long long now) {
     if (oldest_raw) return oldest_raw;
-    if (oldest && now - sess_quiet_since(oldest) > XSH_EVICT_QUIET_MS) return oldest;
+    if (oldest && sess_quiet_ms(oldest, now) > XSH_EVICT_QUIET_MS) return oldest;
     /* Отказали. Сказать об этом обязательно: снаружи молчаливый отказ выглядит как «пир не
      * подключается», и причину — «таблица воркера полна живыми сессиями» — не видно ниоткуда.
      * Ограничитель обязателен по той же причине, что и у соседей: сюда добирается кто угодно из
@@ -523,7 +556,8 @@ static struct sess *sess_alloc(struct worker *w, const struct obfs_seg *seg, int
      * между потоками и брать замок на каждый пакет. */
     for (int i = w->base; i < w->base + w->cap; i++) {
         if (g_sess[i].phase == PH_FREE) { free_slot = &g_sess[i]; break; }
-        if (!oldest || sess_quiet_since(&g_sess[i]) < sess_quiet_since(oldest))
+        /* Самая давно молчащая: сравниваем ДЛИТЕЛЬНОСТИ, поэтому больше — значит давнее. */
+        if (!oldest || sess_quiet_ms(&g_sess[i], now) > sess_quiet_ms(oldest, now))
             oldest = &g_sess[i];
         /* Отдельно — самая давняя из НЕ дошедших до подтверждения. */
         if (g_sess[i].phase != PH_EST &&
@@ -1177,7 +1211,7 @@ static void hs_confirm(struct worker *w, struct sess *s, const struct obfs_seg *
      * убирает СВОЙ владелец в своём же обслуживании (см. цикл обслуживания ниже): признак —
      * привязка пир→сессия указывает не на неё. Трафика она не несёт с этой секунды, потому
      * что пир в неё больше не отправляет. */
-    XSH_STORE(s->last_auth, now);
+    XSH_STORE(s->last_auth, xsh_ms_of(now));
     pthread_mutex_lock(&g_ctl);
     g_last_stamp[s->peer] = peer_stamp;
     g_peer_sess[s->peer][conn_id] = (int16_t)(s - g_sess);
@@ -1315,7 +1349,7 @@ static void hub_frame(struct worker *w, struct sess *s, const uint8_t *pt, size_
         int lost = xs_loss_value(pt, pn);
         if (lost > 0) {
             XSH_STORE(s->batch_max, 1);
-            XSH_STORE(s->cool_until, now + XSH_REASM_COOL_MS);
+            XSH_STORE(s->cool_until, xsh_ms_of(now + XSH_REASM_COOL_MS));
             unsigned long long held = 0;
             if (xs_ratelog(&w->rl_reasm, now, XS_LOG_EVERY_MS, &held)) {
                 char tail[64];
@@ -1459,7 +1493,8 @@ static struct sess *sess_on_syn(struct worker *w, struct sess *s, const struct o
          * заставить хаб отправить пиру три пустые записи. Пир на них ответит, проба это увидит,
          * сессия останется. Подделка стоит нападающему одного пакета, а нам — трёх пустых записей;
          * это несравнимо дешевле того, что прежнее решение стоило настоящему пиру. */
-        if (s->phase == PH_EST && XSH_LOAD(s->roam_check) == 0) XSH_STORE(s->roam_check, now);
+        if (s->phase == PH_EST && XSH_LOAD(s->roam_check) == 0)
+            XSH_STORE(s->roam_check, xsh_ms_of(now));
         /* Строку вызывает пришедший из сети пакет, значит её частоту выбирает не хозяин
          * хаба — отсюда ограничитель, как у неопознанного пира выше. */
         unsigned long long held = 0;
@@ -1596,7 +1631,7 @@ static void *worker_loop(void *arg) {
                 xs_win_commit(&s->win, rel);
                 /* Живость сессии отмечается ЗДЕСЬ, а не на приёме сегмента: доказательством служит
                  * сошедшийся тег, а не сам факт, что в четвёрку кто-то написал. См. last_auth. */
-                XSH_STORE(s->last_auth, now);
+                XSH_STORE(s->last_auth, xsh_ms_of(now));
                 size_t pn = body_n - XS_TAG;
                 struct hub_fctx fc = { w, s, now };
                 if (pn && ct[0] == XS_CTL_BATCH) {
@@ -1625,7 +1660,8 @@ static void *worker_loop(void *arg) {
             int frames = 0;
             for (int i = 0; i < XSH_BATCH * XS_BATCH_FRAMES_MAX; i++) {
                 int max = dst ? XSH_LOAD(dst->batch_max) : XS_BATCH_FRAMES_MAX;
-                if (dst && now < XSH_LOAD(dst->cool_until)) max = 1;
+                xsh_ms cu = dst ? XSH_LOAD(dst->cool_until) : 0;
+                if (cu && xsh_ms_since(now, cu) < 0) max = 1;
                 if (frames >= max) break;
                 if (frames > 0 && off + 2 + XS_MTU_DEF + XS_TAG > XS_MAX_RECORD) break;
                 ssize_t r = tun_read_packet(&w->tun, pay + off + 2, XS_MTU_DEF);
@@ -1704,7 +1740,7 @@ static void *worker_loop(void *arg) {
              * есть через секунды. Мерить пробу подтверждённым трафиком значило бы объявлять
              * мёртвым живое соединение на покое. Слабее это ничего не делает: посторонний,
              * бьющий в четвёрку, мог держать сессию живой против XSC_DEAD_MS и до правки. А
-             * уборка по простою считается по подтверждённому — см. sess_quiet_since. */
+             * уборка по простою считается по подтверждённому — см. sess_quiet_ms. */
             if (s->phase == PH_EST && XSH_LOAD(s->roam_check) != 0) {
                 if (s->roam_sent > 0 && s->conn.last_rx >= s->roam_first) {
                     /* Ответила — путь жив. Счётчики обнуляются ОБА: следующая проба обязана
@@ -1739,7 +1775,7 @@ static void *worker_loop(void *arg) {
                     s->roam_next = now + XSH_ROAM_PROBE_MS;
                 }
             }
-            if (now - sess_quiet_since(s) > XSH_IDLE_MS) { sess_free(w, s); continue; }
+            if (sess_quiet_ms(s, now) > XSH_IDLE_MS) { sess_free(w, s); continue; }
             /* Смещённая сессия: пир пересоединился с другого порта, привязка пир→сессия
              * указывает уже не на нас. Убирает её именно ВЛАДЕЛЕЦ — тот, в чьём индексе лежит
              * её запись; сделать это из чужого потока значило бы править чужую таблицу. */
