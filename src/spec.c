@@ -1024,6 +1024,11 @@ size_t out_node_list(const struct output *o, size_t usable, int *dst, size_t max
     return n;
 }
 
+/* Назван ли узел человеком. Объяснение — у объявления в spec.h. */
+int out_node_named(const struct output *o) {
+    return o->nodes_n == 1;
+}
+
 
 /* ---- подъём выхода vless: ход перебора узлов --------------------------------------------
  *
