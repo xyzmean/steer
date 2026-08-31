@@ -269,6 +269,7 @@ uint8_t *xs_conn_ahead(struct xs_conn *c, uint8_t *row, size_t plen, size_t *seg
 
 int xs_conn_on_seg(struct xs_conn *c, const struct obfs_seg *s, long long now) {
     c->last_rx = now;
+    c->stall = 0;
     if (s->flags & TH_RST) return -1;
     if (c->state == XSC_SYN_SENT) {
         if ((s->flags & (TH_SYN | TH_ACK)) != (TH_SYN | TH_ACK)) return 0;
@@ -306,6 +307,13 @@ int xs_conn_on_seg(struct xs_conn *c, const struct obfs_seg *s, long long now) {
 }
 
 int xs_conn_tick(struct xs_conn *c, long long now, int sending) {
+    /* Сколько времени за текущую тишину не работали МЫ. Считается здесь, потому что tick — это и
+     * есть тот самый цикл: если его не вызывали, значит поток не исполнялся. */
+    if (c->tick_at) {
+        long long gap = now - c->tick_at;
+        if (gap > XSC_STALL_GAP_MS) c->stall += gap;
+    }
+    c->tick_at = now;
     if (c->state == XSC_SYN_SENT) {
         if (now - c->last_tx >= XSC_SYN_RETRY_MS) {
             if (c->syn_tries >= XSC_SYN_RETRIES) return 1;
@@ -325,6 +333,6 @@ int xs_conn_tick(struct xs_conn *c, long long now, int sending) {
     /* Мёртвый путь считается ТОЛЬКО при активной отправке: молчание на покое — это покой, а
      * не поломка, и поднимать из-за него соединение заново значило бы дёргать туннель на
      * простое. */
-    if (sending && now - c->last_rx > XSC_DEAD_MS) return 1;
+    if (sending && now - c->last_rx - c->stall > XSC_DEAD_MS) return 1;
     return 0;
 }

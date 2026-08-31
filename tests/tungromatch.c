@@ -12,9 +12,16 @@
  * одну датаграмму, поэтому видно и СКОЛЬКО было записей, и какими именно байтами. Настоящий
  * TUN потребовал бы прав root и не дал бы прочитать то, что мы написали.
  *
+ * ЗДЕСЬ ЖЕ ПРОВЕРЯЕТСЯ ОБРАТНАЯ ПОЛОВИНА — разбор склеенного, приехавшего ОТ ядра. Она парная
+ * этой и ошибается тем же способом: сегменты, отданные пути данных не такими, какими пришли бы без
+ * склейки, дают поток, которого не бывает, — а туннель при этом поднят и трафик идёт. Обе половины
+ * в одном стенде нарочно: главное их свойство в том, что они обратны друг другу, и проверять его
+ * надо на одном наборе пакетов, а не на двух похожих.
+ *
  * Ни mbedtls, ни сети: tun.c не касается ни того, ни другого, поэтому стенд подключает
  * исходник напрямую и входит в обычный make test — как xswirematch и xsstreammatch.
  */
+#include <errno.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -315,6 +322,253 @@ int main(void) {
     check("устройство без разгрузки: по записи на пакет", 2,
           drain(got, sizeof(got), &got_n));
     check("и без заголовка разгрузки в них", (long)(40 + SEG), (long)got_n);
+
+    /* ---- обратная половина: разбор склеенного, приехавшего ОТ ядра ------------
+     *
+     * ГЛАВНОЕ СВОЙСТВО: пакеты, полученные разбором супер-кадра, обязаны быть ПОБАЙТОВО теми же,
+     * что пришли бы без склейки. Иначе стек той стороны увидит поток, которого не бывает, — и это
+     * самый неуловимый класс отказов: туннель поднят, трафик идёт, часть соединений встаёт.
+     *
+     * Набор тот же, что у склейки выше: четыре полноразмерных сегмента и короткий хвост, PSH на
+     * последнем, идентификатор IP растёт на сегмент, метка времени у всех одна (ядро при нарезке
+     * копирует заголовок целиком). */
+    {
+        setup(1);
+        g_dev.rx_gso = 1;
+        const size_t gso = 1400;
+        size_t sizes[5] = { gso, gso, gso, gso, 617 };
+        static unsigned char want[5][2048];
+        size_t want_n[5];
+        uint32_t seq = 0x1000;
+        for (int i = 0; i < 5; i++) {
+            unsigned char fl = (i == 4) ? 0x18 : 0x10;
+            want_n[i] = mk(want[i], 40000, seq, 0x9000, 64000, sizes[i], fl, OPT_TS, 0xA0 + i, 7);
+            /* Идентификатор IP: у нарезки он растёт на сегмент. */
+            want[i][4] = (unsigned char)(100 >> 8);
+            want[i][5] = (unsigned char)(100 + i);
+            /* Суммы — настоящие: разбор считает их заново, и сверять надо с верными. */
+            want[i][10] = want[i][11] = 0;
+            uint16_t ick = csum_fin(csum_add(want[i], 20, 0));
+            want[i][10] = (unsigned char)(ick >> 8);
+            want[i][11] = (unsigned char)(ick & 0xFF);
+            want[i][20 + 16] = want[i][20 + 17] = 0;
+            uint16_t tck = seg_tcp_csum(want[i], want[i] + 20, want_n[i] - 20);
+            want[i][20 + 16] = (unsigned char)(tck >> 8);
+            want[i][20 + 17] = (unsigned char)(tck & 0xFF);
+            seq += (uint32_t)sizes[i];
+        }
+        /* Супер-кадр, как его отдаёт ядро: заголовок первого сегмента, вся нагрузка подряд,
+         * флаги последнего, длина IP по всему кадру и неполная сумма TCP в поле. */
+        static unsigned char frame[VNET_HDR_LEN + 16384];
+        size_t hdr_n = 20 + 20 + OPT_TS;
+        memset(frame, 0, sizeof(frame));
+        memcpy(frame + VNET_HDR_LEN, want[0], hdr_n);
+        size_t off = hdr_n;
+        size_t body = 0;
+        for (int i = 0; i < 5; i++) {
+            memcpy(frame + VNET_HDR_LEN + off, want[i] + hdr_n, sizes[i]);
+            off += sizes[i];
+            body += sizes[i];
+        }
+        unsigned char *pkt = frame + VNET_HDR_LEN;
+        pkt[33] = 0x18;                          /* PSH накоплен, как у ядра */
+        size_t tot = hdr_n + body;
+        pkt[2] = (unsigned char)(tot >> 8);
+        pkt[3] = (unsigned char)(tot & 0xFF);
+        pkt[10] = pkt[11] = 0;
+        uint16_t ick = csum_fin(csum_add(pkt, 20, 0));
+        pkt[10] = (unsigned char)(ick >> 8);
+        pkt[11] = (unsigned char)(ick & 0xFF);
+        struct vnet_hdr vh;
+        memset(&vh, 0, sizeof(vh));
+        vh.flags = VNET_F_NEEDS_CSUM;
+        vh.gso_type = VNET_GSO_TCPV4;
+        vh.hdr_len = (uint16_t)hdr_n;
+        vh.gso_size = (uint16_t)gso;
+        vh.csum_start = 20;
+        vh.csum_offset = 16;
+        memcpy(frame, &vh, sizeof(vh));
+        if (send(g_pair[1], frame, VNET_HDR_LEN + tot, 0) < 0) { perror("send"); exit(2); }
+
+        int same = 1, count = 0;
+        for (int i = 0; i < 5; i++) {
+            unsigned char got[2048];
+            ssize_t r = tun_read_packet(&g_dev, got, sizeof(got));
+            if (r <= 0) break;
+            count++;
+            if ((size_t)r != want_n[i] || memcmp(got, want[i], (size_t)r) != 0) {
+                same = 0;
+                printf("     сегмент %d разошёлся: %zd байт против %zu\n", i, r, want_n[i]);
+                for (size_t k = 0; k < (size_t)r && k < want_n[i]; k++)
+                    if (got[k] != want[i][k]) { printf("     первое расхождение в байте %zu\n", k); break; }
+            }
+        }
+        check("разбор склеенного: отдано пакетов", 5, count);
+        check("разбор склеенного: пакеты те же, что без склейки", 1, same);
+        check("разбор склеенного: ничего не отброшено", 0, (long)g_dev.rx_dropped);
+    }
+
+    /* Круг: склейка и разбор обратны друг другу. Проверяет обе половины разом и на том же наборе —
+     * пакеты уходят в устройство по одному, уезжают одним кадром, разбираются обратно и обязаны
+     * совпасть побайтово (кроме сумм: их склейка оставляет устройству, а разбор считает заново). */
+    {
+        setup(1);
+        static unsigned char pkts[4][2048], orig[4][2048];
+        size_t pn[4];
+        uint32_t seq = 0x5000;
+        for (int i = 0; i < 4; i++) {
+            pn[i] = mk(pkts[i], 40001, seq, 0x7000, 63000, 1200, i == 3 ? 0x18 : 0x10,
+                       OPT_TS, 0xB0 + i, 9);
+            seq += 1200;
+        }
+        /* СНИМОК ДО СКЛЕЙКИ: она правит заголовок первого пакета НА МЕСТЕ (длина кадра, неполная
+         * сумма, накопленный PSH) — так задумано, копий она не делает. Сравнивать разбор с уже
+         * поправленными исходниками значило бы сравнивать не с тем. */
+        for (int i = 0; i < 4; i++) memcpy(orig[i], pkts[i], pn[i]);
+        for (int i = 0; i < 4; i++) tun_gro_push(&g_dev, &g_gro, pkts[i], pn[i]);
+        tun_gro_flush(&g_dev, &g_gro);
+        unsigned char frame[65536];
+        size_t fn = 0;
+        int cnt = 0;
+        for (;;) {
+            ssize_t r = recv(g_pair[1], frame, sizeof(frame), MSG_DONTWAIT);
+            if (r <= 0) break;
+            fn = (size_t)r;
+            cnt++;
+        }
+        check("круг: склейка уехала одним кадром", 1, cnt);
+        /* Тот же кадр — обратно в разбор. Отдельное устройство: у первого уже своё состояние. */
+        struct tun_dev in;
+        memset(&in, 0, sizeof(in));
+        int pr[2];
+        if (socketpair(AF_UNIX, SOCK_DGRAM, 0, pr) != 0) { perror("socketpair"); exit(2); }
+        int big = 1 << 20;
+        setsockopt(pr[1], SOL_SOCKET, SO_SNDBUF, &big, sizeof(big));
+        in.fd = pr[0];
+        in.gso = 1;
+        in.rx_gso = 1;
+        if (send(pr[1], frame, fn, 0) < 0) { perror("send"); exit(2); }
+        int back = 0, same = 1;
+        for (int i = 0; i < 4; i++) {
+            unsigned char got[2048];
+            ssize_t r = tun_read_packet(&in, got, sizeof(got));
+            if (r <= 0) break;
+            back++;
+            /* Сравниваем всё, кроме полей сумм: склейка оставила их устройству, разбор посчитал
+             * заново, и совпадать с исходными они не обязаны. Зато обязаны СХОДИТЬСЯ — это
+             * проверяется ниже. */
+            unsigned char a[2048], b[2048];
+            memcpy(a, got, (size_t)r);
+            memcpy(b, orig[i], pn[i]);
+            /* Гасим то, что склейка с нарезкой законно меняют: обе суммы и ИДЕНТИФИКАТОР IP.
+             * Идентификатор при нарезке растёт на сегмент — так же, как в inet_gso_segment ядра, —
+             * поэтому у исходных пакетов (все с одним значением) он совпасть не обязан. Сходимость
+             * сумм проверяется отдельно, ниже. */
+            a[4] = a[5] = b[4] = b[5] = 0;
+            a[10] = a[11] = b[10] = b[11] = 0;
+            a[36] = a[37] = b[36] = b[37] = 0;
+            if ((size_t)r != pn[i] || memcmp(a, b, (size_t)r) != 0) {
+                same = 0;
+                printf("     круг: сегмент %d разошёлся (%zd против %zu)\n", i, r, pn[i]);
+                for (size_t k = 0; k < (size_t)r; k++)
+                    if (a[k] != b[k]) {
+                        printf("       байт %zu: %02x против %02x\n", k, a[k], b[k]);
+                        break;
+                    }
+            }
+            if (seg_tcp_csum(got, got + 20, (size_t)r - 20) != 0) {
+                same = 0;
+                printf("     круг: сегмент %d — сумма TCP не сошлась\n", i);
+            }
+        }
+        check("круг: разобрано столько же пакетов", 4, back);
+        check("круг: пакеты и суммы сошлись", 1, same);
+        close(pr[0]); close(pr[1]);
+    }
+
+    /* Неполная сумма на ОДИНОЧНОМ пакете: так ядро отдаёт пакеты своих сокетов, оставляя сумму
+     * устройству. Отправить такой пакет в туннель как есть значит отдать той стороне пакет,
+     * который её же стек молча выбросит. */
+    {
+        setup(1);
+        g_dev.rx_gso = 1;
+        unsigned char p[512];
+        size_t n = mk(p, 40002, 0x8000, 0x1000, 60000, 100, 0x18, 0, 0xC0, 0);
+        uint32_t sa, da;
+        memcpy(&sa, p + 12, 4);
+        memcpy(&da, p + 16, 4);
+        p[10] = p[11] = 0;
+        uint16_t ick = csum_fin(csum_add(p, 20, 0));
+        p[10] = (unsigned char)(ick >> 8);
+        p[11] = (unsigned char)(ick & 0xFF);
+        /* В поле — сумма ПСЕВДОЗАГОЛОВКА, тело не просуммировано: ровно так делает ядро. */
+        uint32_t ph = 0;
+        {
+            unsigned char pseudo[12];
+            memcpy(pseudo, p + 12, 4);
+            memcpy(pseudo + 4, p + 16, 4);
+            pseudo[8] = 0; pseudo[9] = 6;
+            pseudo[10] = (unsigned char)((n - 20) >> 8);
+            pseudo[11] = (unsigned char)((n - 20) & 0xFF);
+            ph = csum_add(pseudo, sizeof(pseudo), 0);
+        }
+        /* В поле кладётся свёрнутая сумма псевдозаголовка БЕЗ дополнения: именно её достраивает
+         * устройство, и именно так её кладёт ядро. Дополненная (csum_fin) означала бы, что стенд
+         * проверяет не тот вход, а «не сошлось» списали бы на код. */
+        uint16_t part = (uint16_t)~csum_fin(ph);
+        p[36] = (unsigned char)(part >> 8);
+        p[37] = (unsigned char)(part & 0xFF);
+        unsigned char frame[VNET_HDR_LEN + 512];
+        struct vnet_hdr vh;
+        memset(&vh, 0, sizeof(vh));
+        vh.flags = VNET_F_NEEDS_CSUM;
+        vh.gso_type = VNET_GSO_NONE;
+        vh.csum_start = 20;
+        vh.csum_offset = 16;
+        memcpy(frame, &vh, sizeof(vh));
+        memcpy(frame + VNET_HDR_LEN, p, n);
+        if (send(g_pair[1], frame, VNET_HDR_LEN + n, 0) < 0) { perror("send"); exit(2); }
+        unsigned char got[512];
+        ssize_t r = tun_read_packet(&g_dev, got, sizeof(got));
+        check("неполная сумма: пакет отдан целиком", (long)n, (long)r);
+        long ok = 0;
+        if (r > 20) ok = seg_tcp_csum(got, got + 20, (size_t)r - 20) == 0;
+        check("неполная сумма достроена до верной", 1, ok);
+    }
+
+    /* ---- живая проверка: ядро принимает просьбу отдавать склеенное -------------
+     *
+     * Векторы выше проверяют арифметику разбора, но не то, СОГЛАСИТСЯ ли ядро склеенное отдавать:
+     * TUNSETOFFLOAD может не пройти (старое ядро, сборка без TUN_F_TSO), и тогда rx_gso остаётся
+     * нулём и работает прежний путь. Проверить это можно только настоящим устройством — значит
+     * нужен root, и без него блок пропускается вслух, как в tunnamematch.
+     *
+     * Заодно проверяется, что включение разгрузки не сломало обычное чтение: пакет, записанный в
+     * устройство, ядро обязано принять (счётчик rx_packets растёт). */
+    {
+        struct tun_dev d[1];
+        memset(d, 0, sizeof(d));
+        int n = tun_open(d, 1, "xs-rxgso");
+        if (n < 1) {
+            printf("%-62s пропуск (нужен root и /dev/net/tun)\n", "живьём: ядро отдаёт склеенное");
+        } else {
+            check("живьём: устройство открылось с разгрузкой", 1, d[0].gso);
+            if (!d[0].gso) {
+                printf("     ядро не дало IFF_VNET_HDR — приём склеенного невозможен в принципе\n");
+            } else if (!d[0].rx_gso) {
+                printf("     TUNSETOFFLOAD не прошёл: работает прежний путь по одному пакету\n");
+                fails++;
+            } else {
+                check("живьём: ядро согласилось отдавать склеенное", 1, d[0].rx_gso);
+                /* Читать здесь НЕЛЬЗЯ: дескриптор устройства блокирующий (ожиданием распоряжается
+                 * poll в цикле данных), и чтение пустого устройства повисло бы навсегда. Первая
+                 * версия этого блока так и повисла. Что разбор делает с прочитанным, проверяют
+                 * векторы выше — им настоящее устройство не нужно. */
+            }
+            close(d[0].fd);
+            free(d[0].rx);
+        }
+    }
 
     printf(fails ? "\nПРОВАЛОВ: %d\n" : "\nвсе проверки прошли\n", fails);
     return fails ? 1 : 0;

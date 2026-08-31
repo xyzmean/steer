@@ -91,6 +91,9 @@ int obfs_server(int listen_port, const char *forward, int forward_port);
  * оба (`inet steer_obfs`, имя историческое), а цепочки разные, иначе выход из одного
  * процесса снимал бы правило другого. */
 int  obfs_raw_open(uint32_t daddr, uint32_t *saddr_out);
+/* То же, но с ЗАДАННЫМ адресом источника: хаб обязан отвечать пиру с того адреса, на который пир
+ * написал, а не с того, который ядро выберет для обратного маршрута. Подробности — у реализации. */
+int  obfs_raw_open_from(uint32_t daddr, uint32_t saddr_want, uint32_t *saddr_out);
 void obfs_filter_quad(int fd, uint32_t server_be, uint16_t sport, uint16_t dport);
 void obfs_filter_port(int fd, uint16_t port);
 /* Раскладка приёма по воркерам: только сегменты с (sport & mask) == id. Маска — степень

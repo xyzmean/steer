@@ -26,7 +26,7 @@ $(BUILD)/steer: src/steer.c src/spec.c src/dnsd.c src/failover.c src/aggregate.c
 	$(CC) $(CFLAGS) $(DEFS) -o $@ src/steer.c src/spec.c src/dnsd.c src/failover.c \
 	      src/aggregate.c src/obfs.c src/cli.c
 
-test: all ext-syntax $(BUILD)/dnsmatch $(BUILD)/specmatch $(BUILD)/specmatch-ext $(BUILD)/xswirematch $(BUILD)/xsstreammatch $(BUILD)/tungromatch $(BUILD)/tunnamematch $(BUILD)/xsconfmatch $(BUILD)/xsroutematch $(BUILD)/chellomatch $(BUILD)/failovermatch $(BUILD)/h2match $(BUILD)/submatch $(BUILD)/subfetchmatch $(BUILD)/fwmatch $(BUILD)/obfsmatch $(BUILD)/visionmatch $(BUILD)/diagsim
+test: all ext-syntax $(BUILD)/dnsmatch $(BUILD)/specmatch $(BUILD)/specmatch-ext $(BUILD)/xswirematch $(BUILD)/xsconnmatch $(BUILD)/xsstreammatch $(BUILD)/tungromatch $(BUILD)/tunnamematch $(BUILD)/xsconfmatch $(BUILD)/xsroutematch $(BUILD)/chellomatch $(BUILD)/failovermatch $(BUILD)/h2match $(BUILD)/submatch $(BUILD)/subfetchmatch $(BUILD)/fwmatch $(BUILD)/obfsmatch $(BUILD)/visionmatch $(BUILD)/diagsim
 	@sh tests/run.sh
 	@sh tests/gen.sh
 	@sh tests/climatch.sh
@@ -46,6 +46,7 @@ test: all ext-syntax $(BUILD)/dnsmatch $(BUILD)/specmatch $(BUILD)/specmatch-ext
 	@$(BUILD)/obfsmatch
 	@$(BUILD)/visionmatch
 	@$(BUILD)/xswirematch
+	@$(BUILD)/xsconnmatch
 	@$(BUILD)/xsstreammatch
 	@$(BUILD)/tungromatch
 	@$(BUILD)/tunnamematch
@@ -176,6 +177,13 @@ $(BUILD)/xswirematch: tests/xswirematch.c src/ext/xswire.c src/ext/xswire.h
 	@mkdir -p $(BUILD)
 	$(CC) $(CFLAGS) -o $@ tests/xswirematch.c
 
+# Стенд поддельного соединения: порог мёртвого пути и учёт своей незанятости. Входит в обычный
+# make test по той же причине, что xswirematch: ни сети, ни mbedtls — время приходит аргументом,
+# а сокета у соединения в стенде нет вовсе.
+$(BUILD)/xsconnmatch: tests/xsconnmatch.c src/ext/xsconn.c src/ext/xsconn.h src/obfs.c src/obfs.h
+	@mkdir -p $(BUILD)
+	$(CC) $(CFLAGS) -o $@ tests/xsconnmatch.c src/obfs.c src/spec.c
+
 # Рамка записей по настоящему потоку TCP: границы записей, смещения (они же nonce) и досылка
 # недописанного хвоста. Стенд входит в обычный make test по той же причине, что xswirematch:
 # xsstream.c не требует ни mbedtls, ни сети — обстановка делается из socketpair. Проверять это
@@ -236,7 +244,7 @@ $(BUILD)/chellomatch: tests/chellomatch.c tests/chello-frozen.h src/ext/chello.c
 clean:
 	rm -rf $(BUILD)/steer $(BUILD)/steer-* $(BUILD)/dnsmatch $(BUILD)/specmatch $(BUILD)/specmatch-ext \
 	       $(BUILD)/failovermatch $(BUILD)/h2match $(BUILD)/submatch $(BUILD)/subfetchmatch $(BUILD)/fwmatch $(BUILD)/obfsmatch \
-	       $(BUILD)/visionmatch $(BUILD)/xswirematch $(BUILD)/xsstreammatch $(BUILD)/xsepochmatch $(BUILD)/tungromatch $(BUILD)/tunnamematch $(BUILD)/xsconfmatch $(BUILD)/xsroutematch $(BUILD)/chellomatch $(BUILD)/hellofreeze $(BUILD)/xsloop $(BUILD)/xsbench \
+	       $(BUILD)/visionmatch $(BUILD)/xswirematch $(BUILD)/xsconnmatch $(BUILD)/xsstreammatch $(BUILD)/xsepochmatch $(BUILD)/tungromatch $(BUILD)/tunnamematch $(BUILD)/xsconfmatch $(BUILD)/xsroutematch $(BUILD)/chellomatch $(BUILD)/hellofreeze $(BUILD)/xsloop $(BUILD)/xsbench \
 	       $(BUILD)/steer-hub $(BUILD)/steer-ext \
 	       $(BUILD)/diagsim $(BUILD)/libmbed-*.a \
 	       $(BUILD)/*.err $(BUILD)/pkg $(BUILD)/scripts out

@@ -1500,13 +1500,26 @@ static void *worker_main(void *arg) {
                      * это дырка во внутреннем TCP, а теперь ещё и половина разрезанной записи.
                      * «Нет прогресса дважды подряд» считаем настоящей потерей — иначе один
                      * неотправляемый сегмент заклинил бы цикл навсегда. */
-                    int sent_off = 0, stuck = 0;
+                    int sent_off = 0, stuck = 0, gone = 0;
                     while (sent_off < segs) {
                         int sent = sendmmsg(s->conn.fd, &s->smm[sent_off],
                                             (unsigned)(segs - sent_off), 0);
                         if (sent > 0) { sent_off += sent; stuck = 0; continue; }
+                        /* ПУТИ НАРУЖУ БОЛЬШЕ НЕТ — это ответ ядра, а не неудача отправки: ждать
+                         * тишины XSC_DEAD_MS незачем, соединение надо поднимать заново. Прежде эта
+                         * ошибка была неотличима от прочих и лишь растила счётчик потерь, то есть
+                         * при пропавшем интернете пир молотил в мёртвый сокет весь порог. */
+                        if (xs_path_gone(errno)) { gone = errno; break; }
                         if (++stuck >= 3) break;
                         if (errno != EAGAIN && errno != ENOBUFS && errno != EINTR) break;
+                    }
+                    if (gone) {
+                        /* Снимаем сессию ТЕМ ЖЕ способом, что смена ключей ниже: break вышел бы
+                         * только из цикла добора кадров, и мы продолжили бы молотить в мёртвый
+                         * сокет — то есть исправление не исправляло бы ничего. */
+                        fprintf(stderr, LOG_W "путь наружу пропал (%s) — поднимаю соединение "
+                                              "заново, когда он вернётся\n", strerror(gone));
+                        session_down(s);
                     }
                     if (sent_off < segs) {
                         s->dropped += (unsigned long long)frames;

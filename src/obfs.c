@@ -450,6 +450,18 @@ void obfs_filter_none(int fd) {
  * сумме. Спрашивать адрес у интерфейса нельзя: их несколько, и правильный знает только
  * таблица маршрутизации. */
 int obfs_raw_open(uint32_t daddr, uint32_t *saddr_out) {
+    return obfs_raw_open_from(daddr, 0, saddr_out);
+}
+
+/* saddr_want — адрес, С КОТОРОГО обязаны уходить наши пакеты; 0 означает «выбери сам, ядро».
+ *
+ * ЗАЧЕМ ЕГО НАЗЫВАТЬ. Хаб отвечает пиру тем адресом, НА КОТОРЫЙ пир написал, а не тем, который
+ * ядро выберет для обратного маршрута. У хаба с одним адресом это одно и то же, у многоадресного —
+ * нет, и расхождение ломает туннель МОЛЧА: фильтр на сокете пира пропускает только сегменты с
+ * адреса хаба (obfs_filter_quad), и ответ с другого адреса ядро пира отбрасывает ещё до нашего
+ * кода. Найдено стендом переезда в реализации на Go (tests/roam.sh): пир, пришедший к тому же хабу
+ * другим путём, получал в ответ тишину. */
+int obfs_raw_open_from(uint32_t daddr, uint32_t saddr_want, uint32_t *saddr_out) {
     int fd = socket(AF_INET, SOCK_RAW, IPPROTO_TCP);
     if (fd < 0) return -1;
 
@@ -460,6 +472,16 @@ int obfs_raw_open(uint32_t daddr, uint32_t *saddr_out) {
     int buf = 1 << 20;
     setsockopt(fd, SOL_SOCKET, SO_RCVBUF, &buf, sizeof(buf));
     setsockopt(fd, SOL_SOCKET, SO_SNDBUF, &buf, sizeof(buf));
+
+    if (saddr_want) {
+        /* Отказ здесь НЕ отказ отправки: адрес мог уехать между приёмом сегмента и этой строкой, и
+         * тогда лучше ответить с того, который выберет ядро, чем не ответить вовсе. */
+        struct sockaddr_in me;
+        memset(&me, 0, sizeof(me));
+        me.sin_family = AF_INET;
+        me.sin_addr.s_addr = saddr_want;
+        (void)bind(fd, (struct sockaddr *)&me, sizeof(me));
+    }
 
     struct sockaddr_in to;
     memset(&to, 0, sizeof(to));

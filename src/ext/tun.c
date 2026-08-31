@@ -59,6 +59,9 @@ struct vnet_hdr {
 #define VNET_F_NEEDS_CSUM 1
 #define VNET_GSO_NONE     0
 #define VNET_GSO_TCPV4    1
+/* Признак ECN приезжает в старшем бите типа разгрузки: на сам разбор он не влияет, но сравнивать
+ * тип с ним нельзя — иначе склеенное с ECN мы бы отвергли как незнакомое. */
+#define VNET_GSO_ECN      0x80
 /* Раскладка обязана совпасть с ядерной побайтово: лишний байт выравнивания сдвинул бы
  * всё, и ядро прочитало бы gso_size там, где лежит csum_start. */
 typedef char vnet_hdr_size_check[sizeof(struct vnet_hdr) == VNET_HDR_LEN ? 1 : -1];
@@ -112,6 +115,16 @@ static int queue_open(const char *name, short flags) {
     return fd;
 }
 
+/* Попросить ядро отдавать нам СКЛЕЕННОЕ. Отказ — не отказ подъёма: без него работает прежний путь
+ * по одному пакету, только медленнее.
+ *
+ * TUN_F_CSUM обязателен: без него ядро не отдаёт ни склеенного, ни с неполной суммой, а TUN_F_TSO4
+ * без него не принимается вовсе. TSO6 не просим — см. объяснение у поля rx_gso. */
+static int queue_rx_gso(int fd) {
+    unsigned feat = TUN_F_CSUM | TUN_F_TSO4;
+    return ioctl(fd, TUNSETOFFLOAD, feat) == 0 ? 0 : -1;
+}
+
 int tun_open(struct tun_dev *d, int max_queues, const char *name) {
     /* IFF_NO_PI: без 4-байтного префикса протокола. Он нужен только тому, кто хочет
      * различать семейства на одном устройстве, а у нас IPv4 и разбор всё равно по
@@ -126,10 +139,9 @@ int tun_open(struct tun_dev *d, int max_queues, const char *name) {
      * одного. Ядро без той или иной поддержки не должно ронять туннель: остаться без
      * УСКОРЕНИЯ можно, остаться без туннеля нельзя.
      *
-     * TUNSETOFFLOAD мы НЕ вызываем, и это осознанно. Он описывает, что мы готовы принимать
-     * ОТ ядра, то есть включил бы приход суперпакетов и в обратную сторону — а для них
-     * пришлось бы всюду держать буферы по 64 КБ вместо 16. Отдача клиенту, где выигрыш и
-     * лежит, от него не зависит: разгрузку на запись включает сам vnet_hdr. */
+     * TUNSETOFFLOAD теперь вызывается — см. объяснение у поля rx_gso в tun.h. Коротко: буфер под
+     * склеенное нужен ОДИН на очередь и живёт внутри этого файла, а выигрыш на приёме измерен и
+     * оказался того же порядка, что на отдаче. */
     short base = IFF_TUN | IFF_NO_PI;
     /* STEER_TUN_NOGSO отключает разгрузку принудительно. Нужно для замеров: «стало быстрее»
      * без возможности вернуться на прежний путь одной переменной — это утверждение, которое
@@ -138,6 +150,8 @@ int tun_open(struct tun_dev *d, int max_queues, const char *name) {
     /* Склейка — отдельным переключателем от разгрузки: с ней сравнивают, а не отключают
      * вместе с заголовком vnet, иначе замер мешал бы два изменения в одно. */
     int want_gro = getenv("STEER_TUN_NOGRO") == NULL;
+    /* Приём склеенного — третьим переключателем, отдельно от первых двух: с ним сравнивают. */
+    int want_rx = getenv("STEER_TUN_NORXGSO") == NULL;
     if (max_queues < 1) max_queues = 1;
 
     static const struct { int gso, multi; } order[] = {
@@ -158,6 +172,7 @@ int tun_open(struct tun_dev *d, int max_queues, const char *name) {
         d[0].fd = fd;
         d[0].gso = order[i].gso;
         d[0].gro = order[i].gso && want_gro;
+        d[0].rx_gso = order[i].gso && want_rx && queue_rx_gso(fd) == 0;
 
         int n = 1;
         if (order[i].multi) {
@@ -169,6 +184,7 @@ int tun_open(struct tun_dev *d, int max_queues, const char *name) {
                 d[n].fd = extra;
                 d[n].gso = order[i].gso;
                 d[n].gro = order[i].gso && want_gro;
+                d[n].rx_gso = order[i].gso && want_rx && queue_rx_gso(extra) == 0;
                 n++;
             }
         }
@@ -197,15 +213,152 @@ int tun_open(struct tun_dev *d, int max_queues, const char *name) {
     return TUN_ESETUP;
 }
 
-ssize_t tun_read_packet(const struct tun_dev *d, unsigned char *buf, size_t cap) {
+/* Суммы определены ниже (там же, где их прежний потребитель), поэтому здесь — объявления: тащить
+ * их выше значило бы разлучить их с объяснением, ради экономии одной строки. */
+static uint32_t csum_add(const unsigned char *d, size_t n, uint32_t acc);
+static uint16_t csum_fin(uint32_t acc);
+
+/* Сумма сегмента TCP с псевдозаголовком, средствами ЭТОГО файла.
+ *
+ * Своя, а не obfs_tcp_csum: тянуть obfs.c ради одной функции значило бы притащить его в два стенда,
+ * которым он не нужен, и завести им заглушки внешних символов. Складываемые слова те же, проход тот
+ * же — здесь просто нет ничего, чего бы у этого файла уже не было. */
+static uint16_t seg_tcp_csum(const unsigned char *ip4, const unsigned char *th, size_t th_n) {
+    unsigned char ph[12];
+    memcpy(ph, ip4 + 12, 4);
+    memcpy(ph + 4, ip4 + 16, 4);
+    ph[8] = 0;
+    ph[9] = 6;                       /* IPPROTO_TCP */
+    ph[10] = (unsigned char)(th_n >> 8);
+    ph[11] = (unsigned char)(th_n & 0xFF);
+    return csum_fin(csum_add(th, th_n, csum_add(ph, sizeof(ph), 0)));
+}
+
+/* ---- разбор СКЛЕЕННОГО, приехавшего от ядра ---------------------------------
+ *
+ * Ядро отдаёт один кадр вместо сорока пяти: общие заголовки, вся нагрузка подряд и размер сегмента
+ * в метаданных. Наружу мы обязаны отдать ровно те пакеты, которые пришли бы без склейки, — иначе
+ * стек той стороны увидит поток, которого не бывает, а это худший класс отказов: туннель поднят,
+ * трафик идёт, часть соединений встаёт.
+ *
+ * Фиксовки повторяют tcp_gso_segment и inet_gso_segment ядра, и повторяют по причине, а не по
+ * симметрии: номер последовательности сдвигается на СМЕЩЕНИЕ В НАГРУЗКЕ, идентификатор IP растёт на
+ * сегмент, FIN и PSH достаются ТОЛЬКО последнему, обе суммы считаются заново. Оставить FIN на
+ * каждом сегменте значило бы закрыть соединение той стороны на первом же куске склейки. */
+static ssize_t seg_emit(struct tun_dev *d, unsigned char *buf, size_t cap) {
+    size_t i = (size_t)d->seg_i;
+    d->seg_i++;
+    size_t off = i * d->seg_gso;
+    size_t end = off + d->seg_gso;
+    if (end > d->seg_body) end = d->seg_body;
+    int last = d->seg_i >= d->seg_n;
+    size_t n = d->seg_hdr + (end - off);
+    if (n > cap) { d->rx_dropped++; return 0; }
+    unsigned char *pkt = d->rx + VNET_HDR_LEN;
+    memcpy(buf, pkt, d->seg_hdr);
+    memcpy(buf + d->seg_hdr, pkt + d->seg_hdr + off, end - off);
+
+    buf[2] = (unsigned char)(n >> 8);
+    buf[3] = (unsigned char)(n & 0xFF);
+    uint16_t id = (uint16_t)(d->seg_id + (uint16_t)i);
+    buf[4] = (unsigned char)(id >> 8);
+    buf[5] = (unsigned char)(id & 0xFF);
+    buf[10] = buf[11] = 0;
+    uint16_t ipck = csum_fin(csum_add(buf, 20, 0));
+    buf[10] = (unsigned char)(ipck >> 8);
+    buf[11] = (unsigned char)(ipck & 0xFF);
+
+    unsigned char *th = buf + 20;
+    uint32_t seq = d->seg_seq + (uint32_t)off;
+    th[4] = (unsigned char)(seq >> 24); th[5] = (unsigned char)(seq >> 16);
+    th[6] = (unsigned char)(seq >> 8);  th[7] = (unsigned char)(seq & 0xFF);
+    th[13] = last ? d->seg_flags : (unsigned char)(d->seg_flags & ~(unsigned char)0x09);
+    th[16] = th[17] = 0;
+    uint16_t tck = seg_tcp_csum(buf, th, n - 20);
+    th[16] = (unsigned char)(tck >> 8);
+    th[17] = (unsigned char)(tck & 0xFF);
+    return (ssize_t)n;
+}
+
+/* Разобрать только что прочитанный кадр: либо это одиночный пакет (возможно, с НЕПОЛНОЙ суммой,
+ * которую ядро оставило устройству, — её мы обязаны достроить), либо склеенный супер-кадр. */
+static void seg_take(struct tun_dev *d, size_t frame_n) {
+    const struct vnet_hdr *vh = (const struct vnet_hdr *)(const void *)d->rx;
+    unsigned char *pkt = d->rx + VNET_HDR_LEN;
+    size_t pkt_n = frame_n - VNET_HDR_LEN;
+    d->seg_i = d->seg_n = 0;
+    d->single = 0;
+
+    unsigned char gso_type = (unsigned char)(vh->gso_type & (unsigned char)~VNET_GSO_ECN);
+    if (gso_type == VNET_GSO_NONE) {
+        /* Неполная сумма: в поле лежит сумма псевдозаголовка, тело не просуммировано. Так ядро
+         * отдаёт пакеты СВОИХ сокетов. Отправить такой пакет в туннель как есть значит отдать той
+         * стороне пакет, который её же стек молча выбросит. Поле входит в считаемый отрезок, поэтому
+         * отдельного слагаемого не нужно — то же самое делает ядро в skb_checksum_help. */
+        if (vh->flags & VNET_F_NEEDS_CSUM) {
+            size_t st = vh->csum_start, of = vh->csum_offset;
+            if (st + of + 2 > pkt_n) { d->rx_dropped++; return; }
+            uint16_t ck = csum_fin(csum_add(pkt + st, pkt_n - st, 0));
+            pkt[st + of] = (unsigned char)(ck >> 8);
+            pkt[st + of + 1] = (unsigned char)(ck & 0xFF);
+        }
+        d->single = pkt_n;
+        return;
+    }
+    /* Склеенное. Принимаем только то, что умеем разложить: TSO6 мы у ядра не просили, и всё
+     * прочее — в счётчик, а не наугад. */
+    if (gso_type != VNET_GSO_TCPV4) { d->rx_dropped++; return; }
+    size_t hdr_n = vh->hdr_len, gso = vh->gso_size;
+    if (!gso || hdr_n < 40 || hdr_n > pkt_n) { d->rx_dropped++; return; }
+    if (pkt[0] != 0x45 || pkt[9] != 6) { d->rx_dropped++; return; }
+    size_t doff = (size_t)(pkt[32] >> 4) * 4;
+    if (doff < 20 || 20 + doff != hdr_n) { d->rx_dropped++; return; }
+    d->seg_hdr = hdr_n;
+    d->seg_body = pkt_n - hdr_n;
+    d->seg_gso = gso;
+    d->seg_n = (int)((d->seg_body + gso - 1) / gso);
+    if (d->seg_n <= 0) { d->rx_dropped++; d->seg_n = 0; return; }
+    uint32_t sq;
+    memcpy(&sq, pkt + 24, 4);
+    d->seg_seq = ntohl(sq);
+    d->seg_id = (uint16_t)(((uint16_t)pkt[4] << 8) | pkt[5]);
+    d->seg_flags = pkt[33];
+}
+
+ssize_t tun_read_packet(struct tun_dev *d, unsigned char *buf, size_t cap) {
     if (!d->gso) return read(d->fd, buf, cap);
-    /* Заголовок разгрузки приезжает и на чтении — он нам не нужен (без TUNSETOFFLOAD ядро
-     * отдаёт обычные пакеты), но снять его обязаны, иначе разбор поедет на десять байт. */
-    struct vnet_hdr vh;
-    struct iovec iov[2] = { { &vh, sizeof(vh) }, { buf, cap } };
-    ssize_t r = readv(d->fd, iov, 2);
-    if (r <= (ssize_t)sizeof(vh)) return r <= 0 ? r : 0;
-    return r - (ssize_t)sizeof(vh);
+    if (!d->rx_gso) {
+        /* Заголовок разгрузки приезжает и на чтении — он нам не нужен (без TUNSETOFFLOAD ядро
+         * отдаёт обычные пакеты), но снять его обязаны, иначе разбор поедет на десять байт. */
+        struct vnet_hdr vh;
+        struct iovec iov[2] = { { &vh, sizeof(vh) }, { buf, cap } };
+        ssize_t r = readv(d->fd, iov, 2);
+        if (r <= (ssize_t)sizeof(vh)) return r <= 0 ? r : 0;
+        return r - (ssize_t)sizeof(vh);
+    }
+    /* Буфер выделяется ЛЕНИВО: очередей бывает до четырёх, и 64 КБ на каждую там, где склейка не
+     * пригодилась, — впустую. Не выделился — работаем прежним путём, а не падаем. */
+    if (!d->rx) {
+        d->rx = malloc(VNET_HDR_LEN + TUN_FRAME_MAX);
+        if (!d->rx) { d->rx_gso = 0; return tun_read_packet(d, buf, cap); }
+    }
+    for (;;) {
+        if (d->single) {
+            size_t n = d->single;
+            d->single = 0;
+            if (n > cap) { d->rx_dropped++; continue; }
+            memcpy(buf, d->rx + VNET_HDR_LEN, n);
+            return (ssize_t)n;
+        }
+        if (d->seg_i < d->seg_n) {
+            ssize_t n = seg_emit(d, buf, cap);
+            if (n > 0) return n;
+            continue;
+        }
+        ssize_t r = read(d->fd, d->rx, VNET_HDR_LEN + TUN_FRAME_MAX);
+        if (r <= (ssize_t)VNET_HDR_LEN) return r <= 0 ? r : 0;
+        seg_take(d, (size_t)r);
+    }
 }
 
 /* ---- разбор IP-заголовка --------------------------------------------------- */
@@ -605,7 +758,16 @@ void tun_gro_push(const struct tun_dev *d, struct tun_gro *g, unsigned char *pkt
             g->next_seq = seq + (uint32_t)pay_n;
             /* Короткий кусок закрывает набор: за ним нарезка уже не сойдётся. То же и с
              * PSH — ядро ставит его только на последний кусок, значит он и должен быть
-             * последним. */
+             * последним.
+             *
+             * PSH ПРИ ЭТОМ НАКАПЛИВАЕТСЯ В ЗАГОЛОВКЕ НАБОРА, и это не мелочь. Заголовок
+             * склеенного кадра берётся у ПЕРВОГО пакета, а флаг стоял у последнего — значит без
+             * этой строки он терялся, и получатель не видел «конец записи приложения» вовсе.
+             * Нарезка (у нас и в ядре) отдаёт флаги последнему куску, поэтому накопленный здесь
+             * PSH там же и окажется. Ровно так поступает GRO ядра, и то же делает реализация на
+             * Go. Найдено круговым стендом: склейка с разбором обязаны быть обратны, а на этом
+             * флаге они расходились. */
+            g->first[33] |= (unsigned char)(pkt[33] & 0x08);
             if (pay_n < g->seg || (pkt[33] & 0x08)) tun_gro_flush(d, g);
             return;
         }
