@@ -67,6 +67,11 @@ struct cli_args {
     const char *pos[CLI_MAXPOS];
     int npos;
     int dry_run, verbose, obfs, node, timeout, listen;
+    /* --fast: отдать запомненный ответ, ничего не пересчитывая. Пока это только `status`
+     * (см. комментарий про снимок состояния в steer.c), но флаг общий нарочно: «отдай, что
+     * помнишь» — это свойство ответа, а не одной команды, и второе имя для того же смысла у
+     * следующей команды разошлось бы с первым. */
+    int fast;
 };
 
 const struct cli_cmd *cli_lookup(const char *name);

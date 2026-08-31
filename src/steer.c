@@ -26,6 +26,7 @@
 #include <netinet/in.h>
 #include <arpa/inet.h>
 #include <sys/time.h>
+#include <time.h>
 
 #include "spec.h"
 #include "obfs.h"
@@ -38,6 +39,10 @@
 #define LOG_W "steer[warn] apply: "
 
 int dnsd_main(int argc, char **argv);
+
+/* Путь снимка состояния. Объявлен здесь потому, что apply его СНИМАЕТ (см. там же), а сам
+ * снимок живёт ниже, рядом с тем, что его пишет. */
+static void status_snap_path(char *buf, size_t n);
 int cmd_failover(const char *spec, int verbose);
 /* Свои флаги эти двое печатают сами — см. комментарии у объявлений. Справка по ним
  * склеивается из таблицы (что команда делает) и этих строк (чем ей управляют). */
@@ -1201,6 +1206,15 @@ static int cmd_apply(const char *spec, int dry) {
     unlink(tmp);
     apply_routing();
     cleanup_stale_routing();
+    /* Снимок состояния СНИМАЕТСЯ: он описывает то, что было применено до этой транзакции, и
+     * `status --fast` отдавал бы его как нынешнее — то есть прежние выходы и прежние каналы
+     * ровно в тот момент, когда человек нажал «Применить» и смотрит, подействовало ли.
+     * Пересобрать его здесь нельзя честно: правила уже стоят, а вот таблицы маршрутизации
+     * привязывают к своим устройствам сами процессы выходов, и снимок, снятый сейчас, врал
+     * бы в другую сторону. Пустое место `--fast` переживает — он тогда считает всё сам. */
+    char snap[256];
+    status_snap_path(snap, sizeof snap);
+    unlink(snap);
     report_output_deps();
     report_traceroute_dep();
     printf("steer: applied %zu channel(s), %zu output(s)\n", g_ch_n, g_out_n);
@@ -1211,14 +1225,69 @@ static int cmd_apply(const char *spec, int dry) {
 /* Counters come from the live chain, matched by the comment each rule carries —
  * which is why generation puts the channel name there. Without it the numbers
  * exist but belong to nobody. */
-static int cmd_status(const char *spec) {
-    load_spec(spec);
-    registry_assign();
-    build_groups();
-    /* О том же устройстве, к которому apply привязал таблицу, — см. outputs_adopt_active.
-     * Без этого пул, уведённый сторожем на запасное устройство, отдавался бы интерфейсу
-     * основным устройством с `up: false`: рабочий выход, нарисованный сломанным. */
-    outputs_adopt_active();
+
+/* СНИМОК СОСТОЯНИЯ: зачем движок помнит свой последний ответ.
+ *
+ * Полный ответ стоит работы: разбор спеки, обход выходов с чтением /sys, чтение счётчиков
+ * из живой цепочки nft. Замерено на стенде (mipsel 24kc, 880 МГц): 91 мс на вызов, из них
+ * основное — запуск и разбор вывода nft. Пока на это смотрел только круг опроса раз в пять
+ * секунд, цена была не видна; но ровно этот ответ нужен ПЕРВЫМ при открытии окна splify2, и
+ * там он складывается со всем остальным, что страница спрашивает в тот же миг, — человек
+ * ждёт на пустом экране.
+ *
+ * Поэтому движок пишет свой ответ рядом с остальным состоянием и умеет отдать запомненное
+ * немедленно (`--fast`). Снимок обновляют двое: любой полный `status` (то есть каждый круг
+ * опроса открытой страницы) и отдельный экземпляр procd раз в пять минут — чтобы на только
+ * что открытой странице лежало не вчерашнее.
+ *
+ * ЧЕСТНОСТЬ ЗДЕСЬ ГЛАВНОЕ. Запомненный ответ отдаётся с двумя полями: `at` — когда его
+ * собрали, `cached: true` — что это не измерение, а память. Без них интерфейс нарисовал бы
+ * запомненное как живое, и «Работает» стояло бы на упавшем туннеле; в проекте это уже
+ * стоило отдельного признака `stale` в самом интерфейсе, и повторять ту же ошибку на
+ * ступень ниже незачем.
+ *
+ * Устаревший снимок при этом НЕ отвергается: смысл `--fast` в том, чтобы показать хоть
+ * что-то сразу, а решение «это слишком старо, чтобы показывать» принимает тот, кто
+ * спрашивает, — у него есть `at`. Снимка нет вовсе — команда считает всё честно, то есть
+ * `--fast` никогда не отвечает пустотой.
+ */
+static void status_snap_path(char *buf, size_t n) {
+    snprintf(buf, n, "%s/status.json", g_state_dir);
+}
+
+/* Снимок больше этого не бывает: сотня выходов и сотня каналов — это единицы килобайт.
+ * Предел стоит потому, что файл читается в буфер на стеке, а писать его мог не только
+ * движок. */
+#define STATUS_SNAP_MAX 262144
+
+/* Отдать запомненное. 0 — отдали, -1 — снимка нет или он не похож на наш ответ.
+ *
+ * `cached` дописывается ПЕРЕД закрывающей скобкой, а не в начало: так порядок полей ответа
+ * остаётся тем же, каким его видят все нынешние читатели, и `{"schema":1,...` по-прежнему
+ * первое, что стоит в строке. */
+static int status_from_snapshot(void) {
+    char snap[256];
+    status_snap_path(snap, sizeof snap);
+    FILE *f = fopen(snap, "r");
+    if (!f) return -1;
+    static char buf[STATUS_SNAP_MAX];
+    size_t n = fread(buf, 1, sizeof buf, f);
+    int truncated = !feof(f);
+    fclose(f);
+    if (truncated) return -1;   /* не влез — значит это не наш снимок */
+    while (n && (buf[n - 1] == '\n' || buf[n - 1] == ' ')) n--;
+    /* Проверка формы, а не доверие имени файла: оборванная запись оставила бы обрубок,
+     * и отдать его значило бы выдать половину JSON за ответ движка. */
+    if (n < 3 || buf[0] != '{' || buf[n - 1] != '}') return -1;
+    fwrite(buf, 1, n - 1, stdout);
+    fputs(",\"cached\":true}\n", stdout);
+    return 0;
+}
+
+/* Сам ответ. Поток параметром, потому что печатается он ДВАЖДЫ в разные места: в снимок на
+ * диске и человеку (точнее, тому, кто позвал). Считать его два раза было бы вдвое дороже
+ * ровно того, ради чего снимок и заведён. */
+static void status_emit(FILE *out) {
     /* УМЕНИЯ ДВИЖКА — перечнем имён и верхним уровнем.
      *
      * Зачем вообще. Незнакомый ключ спеки движок пропускает МОЛЧА (js_skip) — это и есть
@@ -1240,14 +1309,22 @@ static int cmd_status(const char *spec) {
      * по-прежнему нечем, кроме косвенных признаков. Набор имён может и расти, и сокращаться
      * между версиями: потребитель обязан терпеть незнакомые имена и не должен требовать
      * наличия какого-либо конкретного. */
-    printf("{\"schema\":1,\"features\":[\"lan_devices\",\"nodes\",\"pool\",\"active_device\"]");
+    /* КОГДА СОБРАН ЭТОТ ОТВЕТ. Печатается всегда, а не только в снимке, и это не
+     * избыточность: ответ движка теперь бывает запомненным, и различить измерение от памяти
+     * по одному лишь `cached` было бы нечем — интерфейсу нужен возраст, чтобы сказать
+     * человеку «данные такой-то давности», а не рисовать их живыми. У живого ответа возраст
+     * нулевой, и это тот же контракт, а не особый случай. */
+    fprintf(out, "{\"schema\":1,\"at\":%ld,"
+                 "\"features\":[\"lan_devices\",\"nodes\",\"pool\",\"active_device\","
+                 "\"status_cache\"]",
+            (long)time(NULL));
     /* Локальные устройства — следом: интерфейс показывает, с чего забирается трафик, и
      * без этого поля ему пришлось бы читать спеку вторым источником, то есть однажды
      * показать не то, что применено. */
-    printf(",\"lan_devices\":[");
+    fprintf(out, ",\"lan_devices\":[");
     for (size_t i = 0; i < g_lan_dev_n; i++)
-        printf("%s\"%s\"", i ? "," : "", g_lan_dev[i]);
-    printf("],\"outputs\":{");
+        fprintf(out, "%s\"%s\"", i ? "," : "", g_lan_dev[i]);
+    fprintf(out, "],\"outputs\":{");
     for (size_t i = 0; i < g_out_n; i++) {
         char devpath[128];
         int up = 0;
@@ -1260,11 +1337,11 @@ static int cmd_status(const char *spec) {
                 fclose(df);
             }
         }
-        printf("%s\"%s\":{\"kind\":\"%s\"", i ? "," : "", g_out[i].name,
+        fprintf(out, "%s\"%s\":{\"kind\":\"%s\"", i ? "," : "", g_out[i].name,
                out_kind_name(g_out[i].kind));
         if (out_has_device(&g_out[i])) {
             struct fwcheck c = fw_check(g_out[i].device);
-            printf(",\"device\":\"%s\",\"up\":%s,\"mark\":\"0x%08x\",\"table\":%d"
+            fprintf(out, ",\"device\":\"%s\",\"up\":%s,\"mark\":\"0x%08x\",\"table\":%d"
                    ",\"in_firewall\":%s,\"nat\":%s",
                    g_out[i].device, up ? "true" : "false", g_out[i].mark, g_out[i].table,
                    c.in_firewall ? "true" : "false", c.masqueraded ? "true" : "false");
@@ -1283,15 +1360,15 @@ static int cmd_status(const char *spec) {
                 struct probe_status pr =
                     probe_read(out_for_device(&g_out[i], g_out[i].device)->name);
                 if (pr.state == PROBE_RUNNING)
-                    printf(",\"probe\":{\"state\":\"probing\",\"node\":%d,\"total\":%d}",
+                    fprintf(out, ",\"probe\":{\"state\":\"probing\",\"node\":%d,\"total\":%d}",
                            pr.node, pr.total);
                 else if (pr.state == PROBE_FAILED)
-                    printf(",\"probe\":{\"state\":\"failed\",\"total\":%d}", pr.total);
+                    fprintf(out, ",\"probe\":{\"state\":\"failed\",\"total\":%d}", pr.total);
             }
-            printf(",\"devices\":[");
+            fprintf(out, ",\"devices\":[");
             for (size_t d = 0; d < g_out[i].devices_n; d++)
-                printf("%s\"%s\"", d ? "," : "", g_out[i].devices[d]);
-            printf("],\"on_fail\":\"%s\"",
+                fprintf(out, "%s\"%s\"", d ? "," : "", g_out[i].devices[d]);
+            fprintf(out, "],\"on_fail\":\"%s\"",
                    g_out[i].on_fail == FAIL_DROP ? "drop" :
                    g_out[i].on_fail == FAIL_ZAPRET ? "zapret" : "direct");
             /* Выбранные узлы подписки — рядом с devices, потому что это то же самое: список
@@ -1303,44 +1380,87 @@ static int cmd_status(const char *spec) {
              * `nodes` понимает, до того как их писать. Тем же приёмом узнаётся движок с
              * lan_devices. */
             if (g_out[i].kind == OUT_VLESS) {
-                printf(",\"nodes\":[");
+                fprintf(out, ",\"nodes\":[");
                 for (size_t d = 0; d < g_out[i].nodes_n; d++)
-                    printf("%s%d", d ? "," : "", g_out[i].nodes[d]);
-                printf("]");
+                    fprintf(out, "%s%d", d ? "," : "", g_out[i].nodes[d]);
+                fprintf(out, "]");
             }
             /* Обфускация — поле, а не отдельный вид выхода, поэтому и в статусе она
              * поле. Признак живости здесь не печатается намеренно: status опрашивают
              * раз в пять секунд, а pgrep — это запуск процесса; приговор о живости
              * даёт diag, который спрашивают по нажатию. */
             if (g_out[i].obfs.on)
-                printf(",\"obfs\":{\"mode\":\"wg-over-tcp\",\"server\":\"%s:%d\""
+                fprintf(out, ",\"obfs\":{\"mode\":\"wg-over-tcp\",\"server\":\"%s:%d\""
                        ",\"listen\":\"%s:%d\"}",
                        g_out[i].obfs.server, g_out[i].obfs.server_port,
                        g_out[i].obfs.listen, g_out[i].obfs.listen_port);
         }
-        printf("}");
+        fprintf(out, "}");
     }
-    printf("},\"channels\":[");
+    fprintf(out, "},\"channels\":[");
 
     counters_load();
     for (size_t i = 0; i < g_grp_n; i++) {
         unsigned long up_p = 0, up_b = 0, dn_p = 0, dn_b = 0;
         int live = counter_find(g_grp[i].name, 0, &up_p, &up_b) == 0;
         int dn = counter_find(g_grp[i].name, 1, &dn_p, &dn_b) == 0;
-        printf("%s{\"name\":\"%s\",\"out\":\"%s\",\"kind\":\"%s\",\"live\":%s",
+        fprintf(out, "%s{\"name\":\"%s\",\"out\":\"%s\",\"kind\":\"%s\",\"live\":%s",
                i ? "," : "", g_grp[i].name, g_grp[i].out,
                g_grp[i].domains ? "domains" : "prefixes", live ? "true" : "false");
-        if (live) printf(",\"packets\":%lu,\"bytes\":%lu", up_p, up_b);
+        if (live) fprintf(out, ",\"packets\":%lu,\"bytes\":%lu", up_p, up_b);
         /* Отдельными именами, а не вторым «bytes»: старое имя значило «наружу» и в таком
          * значении уже разошлось по установленным версиям splify2. Переопределить его
          * значило бы, что новый движок со старым интерфейсом молча показывает не то. */
-        if (dn) printf(",\"down_packets\":%lu,\"down_bytes\":%lu", dn_p, dn_b);
-        printf(",\"lists\":%zu,\"channels\":[", g_grp[i].files_n + g_grp[i].dfiles_n);
+        if (dn) fprintf(out, ",\"down_packets\":%lu,\"down_bytes\":%lu", dn_p, dn_b);
+        fprintf(out, ",\"lists\":%zu,\"channels\":[", g_grp[i].files_n + g_grp[i].dfiles_n);
         for (size_t m = 0; m < g_grp[i].members_n; m++)
-            printf("%s\"%s\"", m ? "," : "", g_grp[i].members[m]);
-        printf("]}");
+            fprintf(out, "%s\"%s\"", m ? "," : "", g_grp[i].members[m]);
+        fprintf(out, "]}");
     }
-    printf("]}\n");
+    fprintf(out, "]}\n");
+}
+
+/* Полный ответ: посчитать, запомнить и напечатать.
+ *
+ * Снимок пишется через временный файл и rename, как и всё прочее состояние: оборванная
+ * запись поверх прежнего снимка оставила бы обрубок, а `--fast` тогда отдавал бы половину
+ * ответа. Не записалось (нет места, каталог только для чтения) — печатаем и молчим об этом:
+ * снимок это УСКОРЕНИЕ, и терять из-за него сам ответ было бы обменом наоборот.
+ *
+ * Печатается ФАЙЛ, а не второй проход печати: обход выходов читает /sys, а счётчики — живую
+ * цепочку nft, и второй проход дал бы в снимке и на экране два разных мгновения. */
+static int cmd_status(const char *spec, int fast) {
+    /* Запомненное — раньше разбора спеки: смысл `--fast` в том, чтобы не делать работу
+     * вовсе. Спека при этом не читается, то есть негодная спека `--fast` не ломает — он
+     * отвечает тем, что было применено, пока она была годной. */
+    if (fast && status_from_snapshot() == 0) return 0;
+
+    load_spec(spec);
+    registry_assign();
+    build_groups();
+    /* О том же устройстве, к которому apply привязал таблицу, — см. outputs_adopt_active.
+     * Без этого пул, уведённый сторожем на запасное устройство, отдавался бы интерфейсу
+     * основным устройством с `up: false`: рабочий выход, нарисованный сломанным. */
+    outputs_adopt_active();
+
+    char snap[256], tmp[288];
+    status_snap_path(snap, sizeof snap);
+    snprintf(tmp, sizeof tmp, "%s.new", snap);
+    mkdir(g_state_dir, 0755);
+    FILE *f = fopen(tmp, "w");
+    if (!f) { status_emit(stdout); return 0; }
+    status_emit(f);
+    if (fclose(f) != 0 || rename(tmp, snap) != 0) {
+        unlink(tmp);
+        status_emit(stdout);
+        return 0;
+    }
+    f = fopen(snap, "r");
+    if (!f) { status_emit(stdout); return 0; }
+    char buf[8192];
+    size_t n;
+    while ((n = fread(buf, 1, sizeof buf, f)) > 0) fwrite(buf, 1, n, stdout);
+    fclose(f);
     return 0;
 }
 
@@ -2153,7 +2273,7 @@ int main(int argc, char **argv) {
     const char *spec = a.spec, *arg = a.npos ? a.pos[0] : NULL;
 
     if (!strcmp(cmd, "apply")) return cmd_apply(spec, a.dry_run);
-    if (!strcmp(cmd, "status")) return cmd_status(spec);
+    if (!strcmp(cmd, "status")) return cmd_status(spec, a.fast);
     if (!strcmp(cmd, "diag")) return cmd_diag(spec);
     if (!strcmp(cmd, "failover")) return cmd_failover(spec, a.verbose);
     if (!strcmp(cmd, "explain")) {
