@@ -2754,20 +2754,13 @@ static struct vless_node g_nodes[MAX_NODES];
 /* Найти выход и разобрать его подписку. Одно место на все три команды: иначе «как
  * читается подписка» разошлось бы между подъёмом, списком и проверкой — а расхождение
  * здесь означало бы, что человек выбирает в интерфейсе не тот узел, который поднимется. */
-static int load_nodes(const char *spec_path, const char *out_name, struct output **out,
-                      size_t *cnt, struct vless_sub_stats *st) {
-    load_spec(spec_path);
-    struct output *o = out_by_name(out_name);
-    if (!o) { fprintf(stderr, LOG_W2 "выхода %s нет в спеке\n", out_name); return 2; }
-    if (o->kind != OUT_VLESS) {
-        fprintf(stderr, LOG_W2 "выход %s не vless (kind другой)\n", out_name);
-        return 2;
-    }
-    *out = o;
-
+/* Узлы подписки из ФАЙЛА, без выхода. Вынесено отдельно ради `vless-nodes /путь`: управляющему
+ * слою нужно показать локации подписки ДО того, как на неё заведён хоть один выход — иначе
+ * человек собирает выход из подписки, локаций которой не видит. */
+static int load_nodes_file(const char *path, size_t *cnt, struct vless_sub_stats *st) {
     /* Подписка читается с диска: скачивание — дело управляющего слоя. */
-    FILE *f = fopen(o->sub_file, "r");
-    if (!f) { fprintf(stderr, LOG_W2 "%s не читается\n", o->sub_file); return 2; }
+    FILE *f = fopen(path, "r");
+    if (!f) { fprintf(stderr, LOG_W2 "%s не читается\n", path); return 2; }
     static char raw[262144], dec[262144];
     size_t n = fread(raw, 1, sizeof(raw) - 1, f);
     raw[n] = '\0';
@@ -2778,6 +2771,19 @@ static int load_nodes(const char *spec_path, const char *out_name, struct output
 
     *cnt = vless_parse_sub(text, g_nodes, MAX_NODES, st);
     return 0;
+}
+
+static int load_nodes(const char *spec_path, const char *out_name, struct output **out,
+                      size_t *cnt, struct vless_sub_stats *st) {
+    load_spec(spec_path);
+    struct output *o = out_by_name(out_name);
+    if (!o) { fprintf(stderr, LOG_W2 "выхода %s нет в спеке\n", out_name); return 2; }
+    if (o->kind != OUT_VLESS) {
+        fprintf(stderr, LOG_W2 "выход %s не vless (kind другой)\n", out_name);
+        return 2;
+    }
+    *out = o;
+    return load_nodes_file(o->sub_file, cnt, st);
 }
 
 /* Строка JSON с экранированием. Имена узлов приходят из подписки и содержат что угодно —
@@ -2837,18 +2843,24 @@ int cmd_vless_nodes(const char *spec_path, const char *out_name) {
     struct output *o = NULL;
     size_t cnt = 0;
     struct vless_sub_stats st;
-    int rc = load_nodes(spec_path, out_name, &o, &cnt, &st);
+    /* Аргумент с косой чертой — путь к файлу подписки, а не имя выхода: имена выходов
+     * состоят из [A-Za-z0-9_.-] (см. name_ok), и косая черта в них невозможна, так что
+     * спутать нечего. Тогда спека не нужна вовсе, а `chosen` пуст: выбора ещё не было. */
+    int by_file = out_name && out_name[0] == '/';
+    int rc = by_file ? load_nodes_file(out_name, &cnt, &st)
+                     : load_nodes(spec_path, out_name, &o, &cnt, &st);
     if (rc) return rc;
 
     printf("{\"output\":");
-    json_str(out_name);
+    json_str(by_file ? "" : out_name);
     printf(",\"sub_file\":");
-    json_str(o->sub_file);
+    json_str(by_file ? out_name : o->sub_file);
     /* `node` — прежнее поле: один выбранный номер либо -1. Выбор из нескольких узлов оно
      * выразить не может, поэтому при нём печатается -1, а сам выбор лежит в `chosen`. Старый
      * потребитель этого поля читает то же, что читал: «узел не назначен, ищем рабочий». */
-    printf(",\"node\":%d,\"chosen\":[", o->nodes_n == 1 ? o->nodes[0] : -1);
-    for (size_t i = 0; i < o->nodes_n; i++) printf("%s%d", i ? "," : "", o->nodes[i]);
+    size_t chosen_n = o ? o->nodes_n : 0;
+    printf(",\"node\":%d,\"chosen\":[", chosen_n == 1 ? o->nodes[0] : -1);
+    for (size_t i = 0; i < chosen_n; i++) printf("%s%d", i ? "," : "", o->nodes[i]);
     printf("],\"usable\":%zu,\"skipped\":%zu,\"foreign\":%zu,\"nodes\":[",
            cnt, st.skipped, st.foreign);
     for (size_t i = 0; i < cnt; i++) {
