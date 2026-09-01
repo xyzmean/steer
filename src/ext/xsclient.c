@@ -708,7 +708,14 @@ static int cmd_xsteer_spec(const char *spec_path, const char *out_name, const ch
         return 2;
     }
     s.hub_addr = hin.s_addr;
-    s.mtu = g_cf.mtu ? g_cf.mtu : XS_MTU_DEF;
+    /* Через xs_mtu_clamp, а не как есть. Разбор конфигурации принимает MTU до XS_LINK_MAX
+     * (1500) — это предел КАНАЛА, — а здесь число означает MTU ТУННЕЛЯ, у которого потолок
+     * XS_MTU_DEF (1439): по нему считается предельный сегмент (mtu + XS_OVERHEAD - 40), и при
+     * 1500 в файле он выходил 1521 байт, то есть больше кадра канала. Большие пакеты при этом
+     * пропадали молча. «MTU канала вместо MTU туннеля» — обычная описка, и разбор её не ловит;
+     * остальные входы MTU через эту функцию уже идут (строки с dev_mtu, mtu_apply и вторым
+     * подъёмом), а этот — главный путь `steer xsteer <выход>` — остался. */
+    s.mtu = xs_mtu_clamp(g_cf.mtu);
     snprintf(s.state_path, sizeof(s.state_path), "%s/xsteer-%.40s.json",
              g_state_dir, o->name);
 
