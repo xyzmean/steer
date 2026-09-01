@@ -101,17 +101,40 @@ case "$TARGET" in
     x86_64-*) AESNI_FLAGS="-maes -mpclmul -msse4.1" ;;
 esac
 
+# ОШИБКА КОМПИЛЯЦИИ МОДУЛЯ НЕ ГЛУШИТСЯ. Прежде строка кончалась на `2>/dev/null || true`, и
+# провал модуля был неотличим от его отсутствия в наборе: stderr выброшен, код возврата
+# подавлен. Модуль доживал до компоновки и превращался там в неопределённую ссылку на символ —
+# а строка, объясняющая почему, была стёрта на предыдущем шаге. «Собираем всё» не требует
+# «молчим обо всём»: компилируется по-прежнему вся библиотека, но каждый отказ называется на
+# месте, вместе с текстом компилятора.
+#
+# Формулировка отказа содержит «не удалась» осознанно: ровно это слово читает барьер релиза
+# (.github/workflows/release.yml грепает build.log по 'FAILED|не удалась|packaging failed'),
+# поэтому релиз с недособранной криптографией остановится сам, а локальная сборка идёт дальше
+# до компоновки, как и раньше.
 if [ ! -f .done ]; then
+    mb_failed=
     for f in /opt/mbedtls/library/*.c; do
         m=$(basename "$f" .c)
         case "$m" in net_sockets|debug|timing) continue ;; esac
         extra=
         [ "$m" = aesni ] && extra="$AESNI_FLAGS"
         # shellcheck disable=SC2086
-        zig cc -target "$TARGET" ${MCPU:+-mcpu=$MCPU} $OPT $extra -c \
-            -I"$MBED_INC" -I"$EXT_INC" $CFG "$f" -o "$m.o" 2>/dev/null || true
+        if ! zig cc -target "$TARGET" ${MCPU:+-mcpu=$MCPU} $OPT $extra -c \
+            -I"$MBED_INC" -I"$EXT_INC" $CFG "$f" -o "$m.o" 2>"$m.err"; then
+            mb_failed="$mb_failed $m"
+            echo "mbedtls: сборка модуля $m не удалась ($TARGET):" >&2
+            sed 's/^/    /' "$m.err" >&2
+        fi
+        rm -f "$m.err"
     done
-    touch .done
+    # Метка .done ставится ТОЛЬКО на полном наборе: иначе один сбойный модуль запоминался бы
+    # навсегда, и следующая сборка в том же /tmp пропускала цикл целиком.
+    if [ -n "$mb_failed" ]; then
+        echo "mbedtls: сборка не удалась у модулей:$mb_failed — компоновка ниже упрётся в неопределённые ссылки" >&2
+    else
+        touch .done
+    fi
 fi
 
 # shellcheck disable=SC2086

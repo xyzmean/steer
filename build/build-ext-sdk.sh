@@ -58,15 +58,28 @@ mkdir -p "$WORK"
 
 # mbedtls компилируется ЦЕЛИКОМ: линковщик возьмёт только используемое. Причина та же, что в
 # build-ext.sh — ручной отбор модулей превращается в игру «кто кого тянет».
+# Ошибка компиляции модуля называется на месте, а не глушится, — см. пояснение в
+# build/build-ext.sh: молчаливый провал доезжал до компоновки неопределённой ссылкой.
 if [ ! -f "$WORK/.done" ]; then
     echo "собираю mbedtls тулчейном SDK ($OPT)"
+    mb_failed=
     for f in "$MBED"/library/*.c; do
         m=$(basename "$f" .c)
         case "$m" in net_sockets|debug|timing) continue ;; esac
         # shellcheck disable=SC2086
-        "$CC" $OPT -w -c -I"$MBED/include" -I"$SRC/src/ext" $CFG "$f" -o "$WORK/$m.o" 2>/dev/null || true
+        if ! "$CC" $OPT -w -c -I"$MBED/include" -I"$SRC/src/ext" $CFG "$f" -o "$WORK/$m.o" \
+                2>"$WORK/$m.err"; then
+            mb_failed="$mb_failed $m"
+            echo "mbedtls: сборка модуля $m не удалась (SDK):" >&2
+            sed 's/^/    /' "$WORK/$m.err" >&2
+        fi
+        rm -f "$WORK/$m.err"
     done
-    touch "$WORK/.done"
+    if [ -n "$mb_failed" ]; then
+        echo "mbedtls: сборка не удалась у модулей:$mb_failed — компоновка ниже упрётся в неопределённые ссылки" >&2
+    else
+        touch "$WORK/.done"
+    fi
 fi
 
 XS_COMMON="$SRC/src/ext/xswire.c $SRC/src/ext/xsconf.c $SRC/src/ext/xslink.c $SRC/src/ext/xsroute.c \

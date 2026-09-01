@@ -91,12 +91,20 @@ if [ ! -f "$WORK/.so-done" ]; then
     # теневая копия ещё и ближе к настоящей.
     SOOPT="-O2 -mips32r2 -mtune=24kc -fPIC"
     echo "собираю теневую $SONAME для связывания ($SOOPT)"
+    # Ошибка компиляции модуля называется на месте — см. пояснение в build/build-ext.sh.
+    mb_failed=
     for f in "$MBED"/library/*.c; do
         m=$(basename "$f" .c)
         case "$m" in net_sockets|debug|timing|ssl_*|x509*|pkcs7) continue ;; esac
         # shellcheck disable=SC2086
-        "$CC" $SOOPT -w -c -I"$MBED/include" "$f" -o "$WORK/$m.o" 2>/dev/null || true
+        if ! "$CC" $SOOPT -w -c -I"$MBED/include" "$f" -o "$WORK/$m.o" 2>"$WORK/$m.err"; then
+            mb_failed="$mb_failed $m"
+            echo "mbedtls: сборка модуля $m не удалась (теневая $SONAME):" >&2
+            sed 's/^/    /' "$WORK/$m.err" >&2
+        fi
+        rm -f "$WORK/$m.err"
     done
+    [ -z "$mb_failed" ] || echo "mbedtls: сборка не удалась у модулей:$mb_failed" >&2
     # shellcheck disable=SC2086
     "$CC" $SOOPT -shared -Wl,-soname,"$SONAME" -o "$WORK/$SONAME" "$WORK"/*.o -lpthread
     ln -sf "$SONAME" "$WORK/libmbedcrypto.so"

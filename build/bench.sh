@@ -17,14 +17,19 @@ build() {  # СУФФИКС ДОП_ФЛАГИ
     work="/tmp/bench-$suffix"
     mkdir -p "$work"
     cd "$work"
+    # Ошибка компиляции модуля называется на месте — см. пояснение в build/build-ext.sh.
     for f in /opt/mbedtls/library/*.c; do
         m=$(basename "$f" .c)
         case "$m" in net_sockets|debug|timing) continue ;; esac
         # shellcheck disable=SC2086
-        zig cc -target "$TARGET" -mcpu="$MCPU" -O2 -c \
+        if ! zig cc -target "$TARGET" -mcpu="$MCPU" -O2 -c \
             -I"$MBED_INC" -I"$EXT_INC" \
             -DMBEDTLS_CONFIG_FILE='"steer_mbedtls_config.h"' $extra \
-            "$f" -o "$m.o" 2>/dev/null || true
+            "$f" -o "$m.o" 2>"$m.err"; then
+            echo "mbedtls: сборка модуля $m не удалась ($suffix):" >&2
+            sed 's/^/    /' "$m.err" >&2
+        fi
+        rm -f "$m.err"
     done
     # shellcheck disable=SC2086
     zig cc -target "$TARGET" -mcpu="$MCPU" -static -O2 \
@@ -53,10 +58,14 @@ cd "$work"
 for f in /opt/mbedtls/library/*.c; do
     m=$(basename "$f" .c)
     case "$m" in net_sockets|debug|timing) continue ;; esac
-    zig cc -target "$TARGET" -mcpu="$MCPU" -O2 -c \
+    if ! zig cc -target "$TARGET" -mcpu="$MCPU" -O2 -c \
         -I"$MBED_INC" -I"$EXT_INC" \
         -DMBEDTLS_CONFIG_FILE='"steer_mbedtls_config.h"' \
-        "$f" -o "$m.o" 2>/dev/null || true
+        "$f" -o "$m.o" 2>"$m.err"; then
+        echo "mbedtls: сборка модуля $m не удалась (split):" >&2
+        sed 's/^/    /' "$m.err" >&2
+    fi
+    rm -f "$m.err"
 done
 zig cc -target "$TARGET" -mcpu="$MCPU" -static -O2 \
     -I"$MBED_INC" -I"$EXT_INC" \
