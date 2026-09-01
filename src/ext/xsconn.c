@@ -168,6 +168,7 @@ int xs_conn_split_mm(struct xs_conn *c, const uint8_t *rec, size_t rec_len, size
     }
     c->seq += (uint32_t)rec_len;
     c->last_tx = now;
+    if (rec_len) c->last_data_tx = now;
     c->last_ack = now;
     c->unacked = 0;
     return (int)segs;
@@ -192,7 +193,7 @@ int xs_conn_open(struct xs_conn *c, uint32_t daddr, int dport, int shard) {
     c->seq = c->isn_tx;
     c->wrnd = (uint64_t)c->isn_tx * 6364136223846793005ULL + 1442695040888963407ULL;
     c->win = (uint16_t)(XSC_WIN_FLOOR + (c->wrnd >> 33) % (XSC_WIN_CEIL - XSC_WIN_FLOOR));
-    c->born = c->last_rx = c->last_tx = xs_now_ms();
+    c->born = c->last_rx = c->last_tx = c->last_data_tx = xs_now_ms();
 
     c->fd = obfs_raw_open(daddr, &c->saddr);
     if (c->fd < 0) return -1;
@@ -234,6 +235,8 @@ int xs_conn_send(struct xs_conn *c, uint8_t flags, const void *payload, size_t p
     c->seq += (uint32_t)plen;
     if (flags & TH_SYN) c->seq += 1;              /* SYN занимает один номер */
     c->last_tx = xs_now_ms();
+    /* Нагрузка — это разговор, голое подтверждение — нет. См. last_data_tx в xsconn.h. */
+    if (plen) c->last_data_tx = c->last_tx;
     if (flags & TH_ACK) { c->unacked = 0; c->last_ack = c->last_tx; }
     return sent < 0 ? -1 : 0;
 }
@@ -262,6 +265,7 @@ uint8_t *xs_conn_ahead(struct xs_conn *c, uint8_t *row, size_t plen, size_t *seg
      * тысячах пакетов в секунду это проценты единственного ядра за метку, которая всё равно
      * измеряется с гранулярностью тика. Тот же довод, что у build_ahead в obfs.c. */
     c->last_tx = now;
+    if (plen) c->last_data_tx = now;
     c->last_ack = now;
     c->unacked = 0;
     return seg;
@@ -309,9 +313,22 @@ int xs_conn_on_seg(struct xs_conn *c, const struct obfs_seg *s, long long now) {
 int xs_conn_tick(struct xs_conn *c, long long now, int sending) {
     /* Сколько времени за текущую тишину не работали МЫ. Считается здесь, потому что tick — это и
      * есть тот самый цикл: если его не вызывали, значит поток не исполнялся. */
+    /* ДВА вида не нашей тишины, и оба обязаны вычитаться из порога.
+     *
+     * Первый — нас не исполняли: перерыв между вызовами больше XSC_STALL_GAP_MS означает, что
+     * потоку не давали процессор. Ради него этот учёт и заводился.
+     *
+     * Второй — НАМ БЫЛО НЕЧЕГО СКАЗАТЬ (sending == 0). Пока мы молчим, путь не обязан отвечать
+     * ничем, и это время такая же не наша тишина, как первая. Без этого вычета покой дольше
+     * порога убивал соединение ПЕРВЫМ ЖЕ тиком после того, как отправлять снова стало что: вся
+     * тишина уже была накоплена на покое, и хаб не получал на круг ни миллисекунды. На живой
+     * связи роутер↔VPS это выглядело как переподъём каждые пятнадцать-двадцать пять секунд, и
+     * тем чаще, чем МЕНЬШЕ шло трафика (пир говорит раз в двадцать пять секунд по
+     * PersistentKeepalive, а хаб на покое молчит сам). В пространствах имён и в стенде такого
+     * покоя не бывает — трафик там идёт непрерывно, — поэтому поймано это только вживую. */
     if (c->tick_at) {
         long long gap = now - c->tick_at;
-        if (gap > XSC_STALL_GAP_MS) c->stall += gap;
+        if (gap > XSC_STALL_GAP_MS || !sending) c->stall += gap;
     }
     c->tick_at = now;
     if (c->state == XSC_SYN_SENT) {

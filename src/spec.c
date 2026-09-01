@@ -1091,7 +1091,7 @@ void probe_report(const char *out_name, enum probe_state st, int node, int total
     FILE *f = fopen(path, "w");
     if (!f) return;
     fprintf(f, "%s %d %d %ld %ld\n",
-            st == PROBE_RUNNING ? "probing" : "failed",
+            st == PROBE_RUNNING ? "probing" : st == PROBE_NO_SUCH_NODE ? "nonode" : "failed",
             node, total, (long)getpid(), (long)time(NULL));
     fclose(f);
 }
@@ -1127,15 +1127,27 @@ struct probe_status probe_read(const char *out_name) {
         out.total = total;
         return out;
     }
-    if (!strcmp(word, "failed")) {
+    if (!strcmp(word, "failed") || !strcmp(word, "nonode")) {
         /* А это переживает смерть процесса намеренно: клиент выходит с кодом 1 именно потому,
-         * что ни один узел не ответил, и приговор нужен ПОСЛЕ него. Живёт, пока свеж. */
+         * что ни один узел не ответил, и приговор нужен ПОСЛЕ него. Живёт, пока свеж.
+         *
+         * `nonode` — то же по времени жизни и другое по смыслу: номер узла вне подписки.
+         * Сохраняется ИМЕННО номер, который написал человек: без него приговор снова
+         * превратился бы в «узлов нет», то есть во враньё про чужую подписку. */
         long now = (long)time(NULL);
         if (at <= 0 || now - at > PROBE_FAILED_TTL) return out;
-        out.state = PROBE_FAILED;
-        out.node = 0;
+        if (!strcmp(word, "nonode")) {
+            out.state = PROBE_NO_SUCH_NODE;
+            out.node = node;
+        } else {
+            out.state = PROBE_FAILED;
+            out.node = 0;
+        }
         out.total = total;
         return out;
     }
+    /* Незнакомое слово читается как «не знаем», а не как отказ: запись мог оставить движок
+     * другой версии (в /var она переживает подмену бинарника, но не перезагрузку), и жёлтая
+     * метка на исправном выходе тут была бы хуже молчания. */
     return out;
 }

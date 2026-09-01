@@ -90,7 +90,8 @@ static FILE *test_popen(const char *cmd, const char *mode) {
 /* Ожидание подъёма подменено пустышкой. revive ждёт десятью секундными шагами, и настоящий
  * sleep стоил бы десять секунд на каждую проверку этой ветки, не добавляя к ней ничего:
  * устройства в стенде по ходу прохода не появляются и не исчезают. */
-static unsigned test_sleep(unsigned n) { (void)n; return 0; }
+static int g_slept;
+static unsigned test_sleep(unsigned n) { (void)n; g_slept++; return 0; }
 #define sleep(n) test_sleep(n)
 
 #include "../src/spec.h"
@@ -102,6 +103,13 @@ const char *g_state_dir = "/tmp";
 void load_spec(const char *path) { (void)path; }
 void registry_assign(void) {}
 
+/* Ход подъёма выхода читается из файла в state_dir (src/spec.c). Здесь он задаётся прямо:
+ * стенду нужен не разбор файла — его проверяет specmatch, — а поведение сторожа при каждом
+ * из состояний. Особенно при «номер узла вне подписки»: ждать там нечего, и сторож обязан
+ * это знать, а не обещать подъём. */
+struct probe_status g_probe_stub;
+struct probe_status probe_read(const char *out_name) { (void)out_name; return g_probe_stub; }
+
 #include "../src/failover.c"
 
 #undef popen
@@ -109,6 +117,29 @@ void registry_assign(void) {}
 #undef sleep
 
 static int g_fail;
+
+/* Позвать revive и забрать то, что он сказал. Приговор здесь — половина поведения: сторож не
+ * умеет ничего починить у выхода, которым владеет наш же процесс, и всё, что у него есть, —
+ * это слова в журнале. Проверять их надо ровно так же, как код возврата. */
+static int revive_with_stderr(const struct output *o, const char *dev, char *buf, size_t n) {
+    buf[0] = '\0';
+    char tmpl[] = "/tmp/failovermatch-err.XXXXXX";
+    int fd = mkstemp(tmpl);
+    if (fd < 0) return -1;
+    fflush(stderr);
+    int saved = dup(fileno(stderr));
+    dup2(fd, fileno(stderr));
+    int rc = revive(o, dev, 0);
+    fflush(stderr);
+    dup2(saved, fileno(stderr));
+    close(saved);
+    lseek(fd, 0, SEEK_SET);
+    ssize_t got = read(fd, buf, n - 1);
+    if (got > 0) buf[got] = '\0';
+    close(fd);
+    unlink(tmpl);
+    return rc;
+}
 
 static void check(const char *what, int got, int want) {
     if (got == want) return;
@@ -541,6 +572,68 @@ int main(void) {
         check("пустая таблица при читаемых правилах: состояние известно", g.known, 1);
         check("пустая таблица при читаемых правилах: правила нашего нет", g.rule, 0);
         check("пустая таблица при читаемых правилах: таблица пуста", g.table, TBL_EMPTY);
+    }
+
+    /* ---- сторож не обещает подъём, которого не будет ---------------------------
+     *
+     * Снято с живого роутера. У выхода стоял `node: 31`, а в подписке было двадцать девять
+     * узлов, и сторож писал «должен подняться заново через procd; жду» каждые пять минут —
+     * часами. Ждать там нечего: номер вне подписки, procd поднимает клиента, тот выходит с
+     * тем же отказом, и так до правки числа человеком. Строка «жду» обещает работу, которой
+     * не будет, и этим она хуже молчания: по ней человек ждёт вместе со сторожем.
+     *
+     * Проверяется и поведение, и слова. Поведение — по числу ожиданий: обычная ветка ждёт
+     * десятью шагами, эта не ждёт вовсе. Слова — потому что весь смысл правки в них: приговор
+     * обязан назвать оба числа, иначе он снова отправит человека не туда. */
+    {
+        struct output o = {0};
+        snprintf(o.name, sizeof(o.name), "vl");
+        o.kind = OUT_VLESS;
+        o.on_fail = FAIL_DROP;
+        g_rules = "";
+        g_routes = "";
+
+        /* Приговора нет — прежнее поведение: сказать, что молчит, и подождать procd. */
+        char dir[] = "/tmp/failovermatch.XXXXXX";
+        char *d = mkdtemp(dir);
+        g_state_dir = d ? d : "/tmp";
+        g_probe_stub = (struct probe_status){ PROBE_NONE, 0, 0 };
+        g_slept = 0;
+        char err[4096] = "";
+        int rc = revive_with_stderr(&o, "vlA", err, sizeof(err));
+        check("нет приговора: сторож ждёт procd", g_slept, 10);
+        check("нет приговора: возврат 0", rc, 0);
+        check("нет приговора: сказано, что ждём", strstr(err, "жду") != NULL, 1);
+
+        /* Ни один узел не ответил — ждать по-прежнему осмысленно: узлы есть, следующая
+         * попытка procd может застать один из них живым. */
+        g_probe_stub = (struct probe_status){ PROBE_FAILED, 0, 29 };
+        g_slept = 0;
+        rc = revive_with_stderr(&o, "vlB", err, sizeof(err));
+        check("узлы не ответили: сторож всё равно ждёт", g_slept, 10);
+
+        /* А номер вне подписки не исправится сам никогда. */
+        g_probe_stub = (struct probe_status){ PROBE_NO_SUCH_NODE, 31, 29 };
+        g_slept = 0;
+        rc = revive_with_stderr(&o, "vlC", err, sizeof(err));
+        check("номер вне подписки: не ждём вовсе", g_slept, 0);
+        check("номер вне подписки: возврат 0", rc, 0);
+        check("номер вне подписки: «жду» не обещаем", strstr(err, "жду") == NULL, 1);
+        check("номер вне подписки: назван выбранный номер", strstr(err, "31") != NULL, 1);
+        check("номер вне подписки: названо число пригодных", strstr(err, "29") != NULL, 1);
+        check("номер вне подписки: сказано, что сам не поднимется",
+              strstr(err, "сам не поднимется") != NULL, 1);
+
+        if (d) {
+            char path[512];
+            for (const char *dev = "vlA"; dev; dev = !strcmp(dev, "vlA") ? "vlB"
+                                              : !strcmp(dev, "vlB") ? "vlC" : NULL) {
+                snprintf(path, sizeof(path), "%s/restart-%s", d, dev);
+                unlink(path);
+            }
+            rmdir(d);
+        }
+        g_state_dir = "/tmp";
     }
 
     if (g_fail) {

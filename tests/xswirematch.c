@@ -552,7 +552,7 @@ int main(void) {
         size_t off = 0;
         int done = 0;
         for (int i = 0; i < 3; i++) {
-            done = xs_reasm_feed(&r, seq, isn, rec + off, parts[i], &body, &body_n, &hdr, &rel);
+            done = xs_reasm_feed(&r, seq, isn, rec + off, parts[i], &body, &body_n, &hdr, &rel, NULL);
             if (i < 2) check("сборка: раньше времени не собралась", 0, done);
             off += parts[i];
             seq += (uint32_t)parts[i];
@@ -568,9 +568,9 @@ int main(void) {
         /* Пропавший средний сегмент: запись обязана быть выброшена и посчитана, а не склеена
          * из несмежных байтов. */
         memset(&r, 0, sizeof(r));
-        xs_reasm_feed(&r, 1, 0, rec, 1400, &body, &body_n, &hdr, &rel);
+        xs_reasm_feed(&r, 1, 0, rec, 1400, &body, &body_n, &hdr, &rel, NULL);
         check("сборка: несмежные сегменты не склеиваются", 0,
-              xs_reasm_feed(&r, 1400 + 1000, 0, rec + 2800, 205, &body, &body_n, &hdr, &rel));
+              xs_reasm_feed(&r, 1400 + 1000, 0, rec + 2800, 205, &body, &body_n, &hdr, &rel, NULL));
         check("сборка: выброшенная посчитана", 1, (long)(r.dropped > 0));
 
         /* Целая запись в одном сегменте по-прежнему разбирается сразу и без копии. */
@@ -578,8 +578,82 @@ int main(void) {
         static uint8_t one[XS_REC_HDR + XS_TAG + 10];
         xs_rec_build(one, XS_TAG + 10);
         check("сборка: целая запись в одном сегменте", 1,
-              xs_reasm_feed(&r, 5, 0, one, sizeof(one), &body, &body_n, &hdr, &rel));
+              xs_reasm_feed(&r, 5, 0, one, sizeof(one), &body, &body_n, &hdr, &rel, NULL));
         check("сборка: она отдана без копии", 1, body == one + XS_REC_HDR);
+    }
+
+    /* ---- склейка GRO: несколько записей в одной нагрузке -------------------
+     *
+     * Это не чужая реализация и не порча, а нагрузка от СВОЕГО ЖЕ ядра. В сырой сокет пакеты
+     * приходят ПОСЛЕ сборки GRO: идущие подряд сегменты одного потока склеиваются в один, и в
+     * нагрузке оказывается несколько записей, а последняя может быть обрезана посередине. Пока
+     * приёмник отвергал такое целиком («заявлено меньше, чем пришло»), каждая склейка уносила
+     * пачку внутренних пакетов, и внутренний TCP сидел на окне в один пакет. Замер на живой связи
+     * роутер↔VPS: 0,45 Мбит/с против 110 при НУЛЕ потерь на самом канале — в двести сорок раз.
+     * В пространствах имён этого не видно вовсе (там канал без задержки, а склейки не случается),
+     * поэтому случай закреплён здесь. */
+    {
+        static uint8_t glue[3 * (XS_REC_HDR + XS_TAG + 1000)];
+        size_t lens[3] = { XS_TAG + 100, XS_TAG + 50, XS_TAG + 1000 };
+        size_t off = 0, starts[3] = { 0, 0, 0 };
+        for (int i = 0; i < 3; i++) {
+            starts[i] = off;
+            xs_rec_build(glue + off, lens[i]);
+            memset(glue + off + XS_REC_HDR, 0x40 + i, lens[i]);
+            off += XS_REC_HDR + lens[i];
+        }
+        size_t total = off;
+
+        struct xs_reasm r;
+        memset(&r, 0, sizeof(r));
+        const uint8_t *body = NULL, *hdr = NULL;
+        size_t body_n = 0, used = 0;
+        uint32_t rel = 0, isn = 0, seq = 1;
+        int got = 0;
+        long rels[4] = { 0, 0, 0, 0 };
+        for (size_t p = 0; p < total; ) {
+            int done = xs_reasm_feed(&r, seq + (uint32_t)p, isn, glue + p, total - p,
+                                    &body, &body_n, &hdr, &rel, &used);
+            if (!used) break;
+            if (done && got < 4) {
+                rels[got] = (long)rel;
+                check("склейка: длина тела записи", (long)lens[got], (long)body_n);
+                got++;
+            }
+            p += used;
+        }
+        check("склейка: разобрано три записи", 3, got);
+        /* Смещение — это то, чем шифруется запись. Возьми вызывающий номер СЕГМЕНТА вместо номера
+         * самой записи, и у второй записи в склейке не сошёлся бы тег. */
+        check("склейка: смещение первой", 1, rels[0]);
+        check("склейка: смещение второй", (long)(1 + starts[1]), rels[1]);
+        check("склейка: смещение третьей", (long)(1 + starts[2]), rels[2]);
+        check("склейка: ничего не выброшено", 0, (long)r.dropped);
+
+        /* Та же склейка, обрезанная посередине третьей записи: хвост приходит следующим
+         * сегментом. Так выглядит склейка, упёршаяся в предел GRO. */
+        memset(&r, 0, sizeof(r));
+        size_t cut = starts[2] + 40;
+        got = 0;
+        for (size_t p = 0; p < cut; ) {
+            int done = xs_reasm_feed(&r, seq + (uint32_t)p, isn, glue + p, cut - p,
+                                    &body, &body_n, &hdr, &rel, &used);
+            if (!used) break;
+            if (done) got++;
+            p += used;
+        }
+        check("склейка с обрывом: до хвоста готовы две", 2, got);
+        for (size_t p = cut; p < total; ) {
+            int done = xs_reasm_feed(&r, seq + (uint32_t)p, isn, glue + p, total - p,
+                                    &body, &body_n, &hdr, &rel, &used);
+            if (!used) break;
+            if (done) { got++; rels[3] = (long)rel; }
+            p += used;
+        }
+        check("склейка с обрывом: хвост достроил третью", 3, got);
+        check("склейка с обрывом: смещение от первого сегмента записи",
+              (long)(1 + starts[2]), rels[3]);
+        check("склейка с обрывом: ничего не выброшено", 0, (long)r.dropped);
     }
 
     printf("\n%s\n", fails ? "ЕСТЬ ПРОВАЛЫ" : "все проверки прошли");

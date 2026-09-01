@@ -370,7 +370,7 @@ struct worker {
     int base, cap;                   /* свой отрезок g_sess */
     int listen_port;
     int debug;
-    uint8_t rx_buf[XSH_BATCH][XS_ROW];
+    uint8_t rx_buf[XSH_BATCH][XS_ROW_RX];
     struct mmsghdr mm[XSH_BATCH];
     struct iovec iov[XSH_BATCH];
     /* Строка под ОДНУ запись целиком: с пачкой она больше сегмента по построению. Нагрузка лежит
@@ -1560,7 +1560,7 @@ static void *worker_loop(void *arg) {
           for (;;) {
             for (int i = 0; i < XSH_BATCH; i++) {
                 w->iov[i].iov_base = w->rx_buf[i];
-                w->iov[i].iov_len = XS_ROW;
+                w->iov[i].iov_len = XS_ROW_RX;
                 memset(&w->mm[i].msg_hdr, 0, sizeof(w->mm[i].msg_hdr));
                 w->mm[i].msg_hdr.msg_iov = &w->iov[i];
                 w->mm[i].msg_hdr.msg_iovlen = 1;
@@ -1615,13 +1615,20 @@ static void *worker_loop(void *arg) {
 
                 /* Сборка записи, которая могла быть разрезана между сегментами. Она же
                  * предфильтр: сегмент, не начинающийся с заголовка записи и не продолжающий
-                 * начатую, отбрасывается до всякой криптографии. */
+                 * начатую, отбрасывается до всякой криптографии.
+                 *
+                 * ЦИКЛОМ по нагрузке, а не по одной записи на сегмент: в сырой сокет ядро отдаёт
+                 * склеенное GRO, и записей в одной нагрузке бывает несколько (см. xs_reasm_feed). */
+                for (size_t poff = 0; poff < seg.plen; ) {
                 const uint8_t *body, *hdr;
-                size_t body_n;
+                size_t body_n, used = 0;
                 uint32_t rel;
-                if (!xs_reasm_feed(&s->reasm, seg.seq, s->conn.isn_rx, seg.payload, seg.plen,
-                                   &body, &body_n, &hdr, &rel))
-                    continue;
+                int have = xs_reasm_feed(&s->reasm, seg.seq + (uint32_t)poff, s->conn.isn_rx,
+                                         seg.payload + poff, seg.plen - poff,
+                                         &body, &body_n, &hdr, &rel, &used);
+                if (!used) break;              /* защита от вечного цикла */
+                poff += used;
+                if (!have) continue;
                 if (xs_win_check(&s->win, rel) != 0) continue;
                 /* Расшифровка НА МЕСТЕ: у целой записи — прямо в приёмной строке, у собранной —
                  * в буфере сборки. Пересылку другому пиру это не удорожает: копия туда всё равно
@@ -1639,6 +1646,7 @@ static void *worker_loop(void *arg) {
                     if (xs_batch_iter(ct, pn, hub_frame_cb, &fc) != 0) w->d_bad++;
                 } else {
                     hub_frame(w, s, ct, pn, now);
+                }
                 }
             }
             if (got < XSH_BATCH) break;

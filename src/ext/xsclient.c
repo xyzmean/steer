@@ -172,7 +172,7 @@ struct spoke {
     long long cool_until, last_report, last_grow, keep_next;
 
     /* Приём и отправка: свои у каждого воркера (см. выше). */
-    uint8_t rx_buf[XSC_BATCH][XS_ROW];
+    uint8_t rx_buf[XSC_BATCH][XS_ROW_RX];
     struct mmsghdr mm[XSC_BATCH];
     struct iovec iov[XSC_BATCH];
     /* Буфер отправки одиночного кадра И сборки Hello. Больше строки пакета намеренно: с
@@ -1606,7 +1606,7 @@ static void *worker_main(void *arg) {
             for (;;) {
                 for (int i = 0; i < XSC_BATCH; i++) {
                     s->iov[i].iov_base = s->rx_buf[i];
-                    s->iov[i].iov_len = XS_ROW;
+                    s->iov[i].iov_len = XS_ROW_RX;
                     memset(&s->mm[i].msg_hdr, 0, sizeof(s->mm[i].msg_hdr));
                     s->mm[i].msg_hdr.msg_iov = &s->iov[i];
                     s->mm[i].msg_hdr.msg_iovlen = 1;
@@ -1622,13 +1622,21 @@ static void *worker_main(void *arg) {
                     if (what != 1) continue;
                     /* Сборка записи, которая могла быть разрезана между сегментами. Она же
                      * предфильтр: сегмент, не начинающийся с заголовка записи и не продолжающий
-                     * начатую, отбрасывается до всякой криптографии. */
+                     * начатую, отбрасывается до всякой криптографии.
+                     *
+                     * ЦИКЛОМ по нагрузке, а не по одной записи на сегмент: в сырой сокет ядро
+                     * отдаёт склеенное GRO, и записей в одной нагрузке бывает несколько
+                     * (см. xs_reasm_feed). */
+                    for (size_t poff = 0; poff < seg.plen; ) {
                     const uint8_t *body, *hdr;
-                    size_t body_n;
+                    size_t body_n, used = 0;
                     uint32_t rel;
-                    if (!xs_reasm_feed(&s->reasm, seg.seq, s->conn.isn_rx, seg.payload, seg.plen,
-                                       &body, &body_n, &hdr, &rel))
-                        continue;
+                    int have = xs_reasm_feed(&s->reasm, seg.seq + (uint32_t)poff, s->conn.isn_rx,
+                                             seg.payload + poff, seg.plen - poff,
+                                             &body, &body_n, &hdr, &rel, &used);
+                    if (!used) break;          /* защита от вечного цикла */
+                    poff += used;
+                    if (!have) continue;
                     if (xs_win_check(&s->win, rel) != 0) continue;
                     uint8_t *ct = (uint8_t *)(uintptr_t)body;
                     /* AAD — заголовок записи, и у разрезанной это байты ПЕРВОГО сегмента: возьми мы
@@ -1647,6 +1655,7 @@ static void *worker_main(void *arg) {
                     }
                     tun_gro_flush(&s->tun, &s->gro);   /* см. пояснение выше */
                     /* keepalive молча учтён: он уже обновил last_rx. */
+                    }
                 }
                 if (got < XSC_BATCH) break;
             }
@@ -1706,10 +1715,13 @@ static void *worker_main(void *arg) {
                 if (fn && send_frame(s, fin, fn, now) == 0) s->mtu_told = g_mtu_pub;
             }
         }
-        /* «Активная отправка» — это «мы отправили ПОСЛЕ того, как получили», а не «мы вообще
-         * когда-нибудь отправляли». Разница принципиальна: со вторым условием туннель на
-         * покое, однажды отправивший пакет, считался бы мёртвым навсегда. */
-        if (xs_conn_tick(&s->conn, now, s->conn.last_tx > s->conn.last_rx)) {
+        /* «Активная отправка» — это «мы отправили НАГРУЗКУ после того, как получили», а не «мы
+         * вообще когда-нибудь отправляли» и не «мы отправили хоть что-нибудь». Оба уточнения
+         * оплачены ошибками: со вторым условием туннель на покое, однажды отправивший пакет,
+         * считался бы мёртвым навсегда; с третьим голое подтверждение сходило за разговор, и
+         * сторона, только подтвердившая принятое, убивала живой путь через порог (см.
+         * last_data_tx в xsconn.h). */
+        if (xs_conn_tick(&s->conn, now, s->conn.last_data_tx > s->conn.last_rx)) {
             fprintf(stderr, LOG_W "путь молчит %d мс при активной отправке — поднимаю "
                                   "соединение заново\n", XSC_DEAD_MS);
             session_down_why(s, "путь молчит");

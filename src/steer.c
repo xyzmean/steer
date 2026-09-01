@@ -1515,6 +1515,12 @@ static void status_emit(FILE *out) {
                            pr.node, pr.total);
                 else if (pr.state == PROBE_FAILED)
                     fprintf(out, ",\"probe\":{\"state\":\"failed\",\"total\":%d}", pr.total);
+                /* Номер вне подписки — СВОЁ состояние, а не разновидность failed: интерфейс
+                 * обязан уметь сказать «поправьте номер», а не «поменяйте подписку». Оба
+                 * числа рядом, потому что порознь они ничего не значат. */
+                else if (pr.state == PROBE_NO_SUCH_NODE)
+                    fprintf(out, ",\"probe\":{\"state\":\"no_such_node\",\"node\":%d"
+                                 ",\"total\":%d}", pr.node, pr.total);
             }
             fprintf(out, ",\"devices\":[");
             for (size_t d = 0; d < g_out[i].devices_n; d++)
@@ -2088,6 +2094,25 @@ static int cmd_diag(const char *spec) {
                 diag("output", "note", what, why);
                 continue;
             }
+            /* Выбранный номер узла за пределами подписки. Отдельная ветка, и это
+             * исправление вранья, снятого с живого роутера: раньше такой выход попадал в
+             * ветку PROBE_FAILED с total=0 и получал приговор «в подписке нет пригодных
+             * узлов» — на подписке из двадцати девяти живых узлов. Человек по такому
+             * приговору идёт перекачивать подписку и менять поставщика, а поправить надо
+             * одно число. */
+            if (pr.state == PROBE_NO_SUCH_NODE) {
+                snprintf(what, sizeof(what),
+                         "выход %.40s: выбран узел %d, а пригодных в подписке %d",
+                         g_out[i].name, pr.node, pr.total);
+                /* Текст короткий не для красоты: буфер 240 байт, а кириллица — два байта на
+                 * знак, и обрезка пришлась бы посреди последовательности UTF-8. Ровно на
+                 * этом компилятор и поймал первую редакцию (301 байт). */
+                snprintf(why, sizeof(why),
+                         "номер вне подписки: она обновилась, узлов стало меньше. Лучше не "
+                         "задавать номер — «первый рабочий» найдёт живой сам");
+                diag("output", "fail", what, why);
+                continue;
+            }
             if (pr.state == PROBE_FAILED) {
                 if (pr.total > 0)
                     snprintf(what, sizeof(what),
@@ -2275,6 +2300,32 @@ static int cmd_diag(const char *spec) {
     return g_diag_fail ? 1 : 0;
 }
 
+/* Чем именно объяснять совпадение: адресным списком, доменным или обоими.
+ *
+ * ЗАЧЕМ ФУНКЦИЯ, А НЕ ТЕРНАРНИК НА МЕСТЕ. Фраза выводилась из ИМЕНИ набора: у группы с
+ * доменами она всегда была «domain set». Но группа, у которой есть и адресный список, и
+ * доменный, держит оба в ОДНОМ наборе — так его находит резолвер (см. build_groups), — и
+ * адрес из АДРЕСНОГО списка объяснялся как совпадение по домену. Человек, выясняющий,
+ * почему 142.250.1.1 идёт в туннель, получал ответ про DNS, которого там не было. Снято с
+ * живого роутера: канал с обоими списками, адрес из youtube.lst, ответ «domain set».
+ *
+ * Теперь фраза отвечает на «откуда этот адрес взялся в наборе»:
+ *
+ *   fake-IP            — его выдал резолвер, значит имя нашлось в доменном списке;
+ *   есть оба списка    — по настоящему адресу различить нельзя (в режиме realip резолвер
+ *                        кладёт в набор настоящие адреса), и честнее назвать оба, чем
+ *                        угадать один;
+ *   один вид списка    — ответ тот же, что был.
+ *
+ * Отдельной функцией — чтобы это проверялось стендом: разбор ответа ядра для проверки
+ * требует живого nft, а выбор фразы — нет. */
+static const char *explain_set_phrase(const char *addr, int has_files, int has_domains) {
+    int fake = addr && (strncmp(addr, "198.18.", 7) == 0 || strncmp(addr, "198.19.", 7) == 0);
+    if (fake) return "domain set";
+    if (has_files && has_domains) return "address+domain set";
+    return has_domains ? "domain set" : "address set";
+}
+
 /* ---- explain по имени --------------------------------------------------------
  *
  * Спрашиваем НАШ резолвер, а не getaddrinfo. Разница принципиальная: getaddrinfo пойдёт к
@@ -2426,7 +2477,8 @@ static int cmd_explain(const char *spec, const char *what) {
         struct output *o = out_by_name(g_grp[i].out);
         if (!o) die("group %s points at a missing output", g_grp[i].name);
         printf("%s -> %s \"%s\" -> output \"%s\"", addr,
-               g_grp[i].domains ? "domain set" : "address set", g_grp[i].name, o->name);
+               explain_set_phrase(addr, g_grp[i].files_n > 0, g_grp[i].domains),
+               g_grp[i].name, o->name);
         if (out_has_device(o))
             printf(" -> dev %s (mark 0x%08x, table %d)\n", o->device, o->mark, o->table);
         else

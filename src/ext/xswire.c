@@ -213,25 +213,33 @@ int xs_loss_value(const uint8_t *pt, size_t n) {
 
 int xs_reasm_feed(struct xs_reasm *r, uint32_t seq, uint32_t isn_rx,
                   const uint8_t *pl, size_t n,
-                  const uint8_t **body, size_t *body_n, const uint8_t **hdr, uint32_t *rel) {
+                  const uint8_t **body, size_t *body_n, const uint8_t **hdr, uint32_t *rel,
+                  size_t *used) {
+    if (used) *used = n;                        /* по умолчанию нагрузка съедена целиком */
     if (r->active && seq == r->next_seq) {
-        if (r->len + n > sizeof(r->buf)) {      /* больше заявленного — не наш поток */
-            r->active = 0;
-            r->dropped++;
-            return 0;
-        }
-        memcpy(r->buf + r->len, pl, n);
-        r->len += n;
-        if (r->len < XS_REC_HDR + r->need) {
+        /* Берём РОВНО недостающий хвост записи, а не всю нагрузку: за концом записи в той же
+         * нагрузке может лежать следующая (склейка GRO) — её разберёт следующий круг цикла. */
+        size_t want = XS_REC_HDR + r->need - r->len;
+        if (want > n) {
+            if (r->len + n > sizeof(r->buf)) {  /* больше заявленного — не наш поток */
+                r->active = 0;
+                r->dropped++;
+                return 0;
+            }
+            memcpy(r->buf + r->len, pl, n);
+            r->len += n;
             r->next_seq = seq + (uint32_t)n;
             return 0;
         }
-        if (r->len != XS_REC_HDR + r->need) {
+        if (r->len + want > sizeof(r->buf)) {
             r->active = 0;
             r->dropped++;
             return 0;
         }
+        memcpy(r->buf + r->len, pl, want);
+        r->len += want;
         r->active = 0;
+        if (used) *used = want;
         *body = r->buf + XS_REC_HDR;
         *body_n = r->need;
         *hdr = r->buf;
@@ -249,23 +257,21 @@ int xs_reasm_feed(struct xs_reasm *r, uint32_t seq, uint32_t isn_rx,
     if (pl[0] != XS_REC_TYPE || pl[1] != XS_REC_V0 || pl[2] != XS_REC_V1) return 0;
     size_t want = ((size_t)pl[3] << 8) | pl[4];
     if (want < XS_TAG || want > XS_MAX_RECORD) return 0;
-    if (XS_REC_HDR + want == n) {              /* целая запись в одном сегменте */
+    if (XS_REC_HDR + want <= n) {              /* целая запись; за ней в склейке может быть ещё */
+        if (used) *used = XS_REC_HDR + want;
         *body = pl + XS_REC_HDR;
         *body_n = want;
         *hdr = pl;
         *rel = xs_rel(seq, isn_rx);
         return 1;
     }
-    if (XS_REC_HDR + want > n) {               /* начало разрезанной записи */
-        if (n > sizeof(r->buf)) return 0;
-        memcpy(r->buf, pl, n);
-        r->len = n;
-        r->need = want;
-        r->rel0 = xs_rel(seq, isn_rx);
-        r->next_seq = seq + (uint32_t)n;
-        r->active = 1;
-        return 0;
-    }
-    /* Заявлено меньше, чем пришло: за концом записи что-то ещё. Мы такого не отправляем. */
+    /* Начало разрезанной записи. */
+    if (n > sizeof(r->buf)) return 0;
+    memcpy(r->buf, pl, n);
+    r->len = n;
+    r->need = want;
+    r->rel0 = xs_rel(seq, isn_rx);
+    r->next_seq = seq + (uint32_t)n;
+    r->active = 1;
     return 0;
 }
