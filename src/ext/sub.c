@@ -103,6 +103,48 @@ static void set_field(char *dst, size_t n, const char *src, size_t len) {
     dst[len] = '\0';
 }
 
+/* Снять с конца строки неполную последовательность UTF-8. Нужно там, где строку обрезал
+ * буфер: обрезка идёт по байту, а буква вне ASCII занимает от двух байт, и граница
+ * приходится на её середину. Одинокий ведущий байт — не «испорченная буква», а байт,
+ * который ни один потребитель истолковать не может: JSON статуса печатает его как есть,
+ * и разбирать этот JSON приходится уже интерфейсу. Терять последнюю букву честнее. */
+static void utf8_trim_tail(char *s) {
+    size_t n = strlen(s);
+    if (!n) return;
+    unsigned char last = (unsigned char)s[n - 1];
+    if (last < 0x80) return;                       /* ASCII — рвать нечего */
+    if ((last & 0xC0) != 0x80) { s[n - 1] = '\0'; return; }  /* ведущий байт без продолжения */
+
+    /* Байт продолжения последним: отступить к ведущему и сверить длину. */
+    size_t at = n - 1, cont = 1;
+    while (at && ((unsigned char)s[at - 1] & 0xC0) == 0x80) { at--; cont++; }
+    if (!at) { s[0] = '\0'; return; }              /* одни продолжения — мусор целиком */
+    unsigned char lead = (unsigned char)s[at - 1];
+    size_t need = (lead & 0xE0) == 0xC0 ? 1 :
+                  (lead & 0xF0) == 0xE0 ? 2 :
+                  (lead & 0xF8) == 0xF0 ? 3 : 0;
+    if (need && cont == need) return;              /* последовательность целая */
+    s[at - 1] = '\0';
+}
+
+/* Имя узла: единственное поле, куда подписка кладёт что угодно, включая UTF-8, и потому
+ * единственное, где обрезка по байту буфера видна снаружи. Порядок важен: сначала снять
+ * оборванную процентную форму (её оставила та же обрезка, декодировать её нечем), потом
+ * раскодировать, потом снять оборванную последовательность UTF-8 — она могла появиться и
+ * из процентной формы, и из сырых байт во фрагменте ссылки. */
+static void set_name(char *dst, size_t n, const char *src) {
+    size_t len = strlen(src);
+    int cut = len >= n;
+    set_field(dst, n, src, len);
+    if (cut) {
+        size_t l = strlen(dst);
+        if (l >= 1 && dst[l - 1] == '%') dst[l - 1] = '\0';
+        else if (l >= 2 && dst[l - 2] == '%') dst[l - 2] = '\0';
+    }
+    pct_decode(dst);
+    utf8_trim_tail(dst);
+}
+
 /* Пригодность разобранного узла — общее правило для обоих путей разбора; тело ниже. */
 static int node_usable(struct vless_node *n);
 
@@ -131,8 +173,7 @@ int vless_parse_url(const char *url, struct vless_node *n) {
 
     /* Имя узла: за '#', и оно единственное, что может содержать что угодно. */
     if (hash) {
-        set_field(n->name, sizeof(n->name), hash + 1, strlen(hash + 1));
-        pct_decode(n->name);
+        set_name(n->name, sizeof(n->name), hash + 1);
     }
 
     /* Параметры. Значения по умолчанию — те, что подразумевает VLESS, когда поле
@@ -503,7 +544,9 @@ static int xray_outbound(struct sj *j, struct vless_node *n) {
      * не вредит, потому что узел всё равно не будет взят. */
     while (sj_obj_key(j, &first, k, sizeof(k)) == 0) {
         if (!strcmp(k, "protocol")) sj_str(j, proto, sizeof(proto));
-        else if (!strcmp(k, "tag")) sj_str(j, n->name, sizeof(n->name));
+        /* tag из конфигурации Xray обрезается тем же байтовым пределом, что и имя из
+         * фрагмента ссылки, — и рвётся так же. */
+        else if (!strcmp(k, "tag")) { sj_str(j, n->name, sizeof(n->name)); utf8_trim_tail(n->name); }
         else if (!strcmp(k, "settings")) xray_settings(j, n);
         else if (!strcmp(k, "streamSettings")) xray_stream(j, n);
         else sj_skip(j);
