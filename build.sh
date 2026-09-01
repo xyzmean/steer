@@ -244,6 +244,11 @@ for spec in $ISAS; do
     mkdir -p "$root/usr/sbin" "$root/etc/init.d" "$root/etc/steer/lists" \
              "$root/lib/upgrade/keep.d" "$root/etc/hotplug.d/iface"
     cp "build/steer-$arch" "$root/usr/sbin/steer"
+    # Обёртка обработчика обхода DPI: её запускает procd для каждого выхода kind=zapret, и
+    # читает она файл стратегии при КАЖДОМ запуске (см. её шапку). Едет в оба корня — как
+    # init-скрипт: расширенный пакет ставится вместо базового, и без своей копии замена
+    # пакета молча оставила бы выходы kind=zapret без обработчиков.
+    cp files/usr/sbin/steer-nfqws "$root/usr/sbin/steer-nfqws"
     cp files/etc/init.d/steer "$root/etc/init.d/steer"
     # Реакция на события сети: подъём и падение интерфейса доходят до сторожа сразу, а не
     # через минуту опроса. Файл невелик, но без него правка I-137 существует только в дереве.
@@ -256,7 +261,7 @@ for spec in $ISAS; do
     # Файл кладётся В ПОЛЕЗНУЮ НАГРУЗКУ, а не в скрипт установки: он обязан исчезнуть вместе
     # с пакетом и принадлежать ему, как init-скрипт.
     cp files/lib/upgrade/keep.d/steer "$root/lib/upgrade/keep.d/steer"
-    chmod 0755 "$root/usr/sbin/steer" "$root/etc/init.d/steer" \
+    chmod 0755 "$root/usr/sbin/steer" "$root/usr/sbin/steer-nfqws" "$root/etc/init.d/steer" \
                "$root/etc/hotplug.d/iface/95-steer"
     chmod 0644 "$root/lib/upgrade/keep.d/steer"
 
@@ -292,6 +297,7 @@ EOF
         mkdir -p "$eroot/usr/sbin" "$eroot/etc/init.d" "$eroot/etc/steer/lists" \
                  "$eroot/lib/upgrade/keep.d" "$eroot/etc/hotplug.d/iface"
         cp "build/steer-ext-$arch" "$eroot/usr/sbin/steer"
+        cp files/usr/sbin/steer-nfqws "$eroot/usr/sbin/steer-nfqws"
         cp files/etc/init.d/steer "$eroot/etc/init.d/steer"
         cp files/etc/hotplug.d/iface/95-steer "$eroot/etc/hotplug.d/iface/95-steer"
         # Тот же файл, что и в базовом пакете: расширенный ставится ВМЕСТО базового
@@ -299,8 +305,8 @@ EOF
         # объявление настроек — то есть возвращала бы I-037 на ровно том пакете, который
         # ставит большинство.
         cp files/lib/upgrade/keep.d/steer "$eroot/lib/upgrade/keep.d/steer"
-        chmod 0755 "$eroot/usr/sbin/steer" "$eroot/etc/init.d/steer" \
-                   "$eroot/etc/hotplug.d/iface/95-steer"
+        chmod 0755 "$eroot/usr/sbin/steer" "$eroot/usr/sbin/steer-nfqws" \
+                   "$eroot/etc/init.d/steer" "$eroot/etc/hotplug.d/iface/95-steer"
         chmod 0644 "$eroot/lib/upgrade/keep.d/steer"
         # Зависимости считаются по СОБРАННОМУ файлу — см. pkg_deps выше.
         edeps="$(pkg_deps "$eroot/usr/sbin/steer" ext)"
