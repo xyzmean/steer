@@ -390,6 +390,52 @@ done
 check "каждый файл из files/ упакован" "" "$missing"
 check "каждый файл из files/ упакован в ОБА корня" "" "$once"
 
+# ---- зависимости пакета: считаются по файлу, а не по памяти -------------------
+#
+# pkg_deps в build.sh отвечает на вопрос «чего этому бинарнику не хватает в системе», и
+# отвечает ЧТЕНИЕМ ФАЙЛА. Проверять это стендом нужно потому, что ошибиться здесь можно
+# в обе стороны и обе молчат: недостающая зависимость — это половина движка, которая не
+# работает на стоковом роутере (conntrack, H-110), а лишняя — пакет, который менеджер
+# отказывается ставить там, где всё для него есть (libmbedtls у статической сборки).
+#
+# Функция берётся из build.sh как есть: копия здесь разошлась бы с оригиналом, а стенд
+# на копии проверяет копию.
+eval "$(sed -n '/^pkg_deps() {/,/^}/p' build.sh)"
+dtmp="$(mktemp -d)"
+printf 'static binary without any SONAME\n' > "$dtmp/static"
+# Строка ровно того вида, что пишет линковщик в DT_NEEDED. Нулевые байты вокруг — чтобы
+# файл не был текстовым: grep без -a такой файл пропускает, и проверка стояла бы на том,
+# что бинарник — это текст.
+printf 'x\000libmbedcrypto.so.16\000x\n' > "$dtmp/native"
+
+check "базовый пакет требует conntrack и kmod-nft-queue" \
+    "nftables ip-full conntrack kmod-nft-queue" "$(pkg_deps "$dtmp/static" base)"
+check "расширенный добавляет kmod-tun" \
+    "nftables ip-full conntrack kmod-nft-queue kmod-tun" "$(pkg_deps "$dtmp/static" ext)"
+check "статическая сборка НЕ требует libmbedtls" \
+    "" "$(pkg_deps "$dtmp/static" ext | grep -o libmbedtls)"
+check "нативная сборка требует libmbedtls" \
+    "nftables ip-full conntrack kmod-nft-queue kmod-tun libmbedtls" "$(pkg_deps "$dtmp/native" ext)"
+# Версия ABI в имени зависимости привязала бы пакет к одному выпуску OpenWrt: пакет
+# называется libmbedtls21 на 25.12 и libmbedtls12 на 23.05, а provides: libmbedtls
+# объявляют оба.
+check "имя зависимости без версии ABI" \
+    "" "$(pkg_deps "$dtmp/native" ext | grep -o 'libmbedtls[0-9][0-9]*')"
+rm -rf "$dtmp"
+
+# Оба формата пакета обязаны получить ОДИН список, и это не педантизм: apk берёт его через
+# пробел, opkg через запятую, и разойтись они могут молча — .ipk с прежним списком выглядит
+# собранным ровно так же, как .apk с новым. Поэтому проверяется, что и там и там подставлена
+# ОДНА переменная, посчитанная pkg_deps, а не литерал.
+for v in deps edeps; do
+    check "apk берёт зависимости из \$$v" "1" \
+        "$(grep -c "depends:'\$$v'" build.sh)"
+    check "opkg берёт зависимости из \$$v" "1" \
+        "$(grep -c "mk_ipk .*\$(echo \"\$$v\"" build.sh)"
+done
+check "литералов зависимостей в упаковке не осталось" "" \
+    "$(grep -n "depends:'nftables\|mk_ipk .*\"nftables" build.sh)"
+
 printf '\n%d проверок пройдено' "$pass"
 if [ "$fail" -gt 0 ]; then printf ', %d ПРОВАЛЕНО\n' "$fail"; exit 1; fi
 printf '\nвсе проверки прошли\n'

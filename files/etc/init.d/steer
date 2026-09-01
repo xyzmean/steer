@@ -58,6 +58,25 @@ start_service() {
         procd_close_instance
     done
 
+    # Выходы kind=xsteer — тем же порядком и по той же причине, что vless: устройство
+    # создаёт сам процесс туннеля, и к моменту apply оно должно существовать, иначе выход
+    # уходит в blackhole до следующего тика сторожа. Отдельным циклом, а не общим с vless:
+    # команда у них разная (`steer xsteer` против `steer vless`), и склеивать их значило бы
+    # выбирать команду по виду выхода внутри цикла — то есть держать тот же перебор, только
+    # спрятанным.
+    #
+    # Транспорт (поддельный TCP или поток) процесс берёт из самой спеки, поэтому ключей
+    # здесь нет: procd передать их некуда, а настройка обязана переживать перезагрузку.
+    xs_outs="$(steer outputs --kind xsteer --spec "$SPEC" 2>/dev/null)"
+    for out in $xs_outs; do
+        procd_open_instance "xsteer_$out"
+        procd_set_param command /usr/sbin/steer xsteer "$out" --spec "$SPEC"
+        procd_set_param respawn 3600 5 0
+        procd_set_param stdout 1
+        procd_set_param stderr 1
+        procd_close_instance
+    done
+
     # Обфускаторы — тоже ПЕРЕД apply, но по другой причине, чем vless. Устройство у
     # выхода с obfs создаёт netifd, оно уже есть; а вот WireGuard начинает слать
     # рукопожатия сразу после подъёма, и если процесса, слушающего его Endpoint, ещё
@@ -77,6 +96,88 @@ start_service() {
         procd_set_param stderr 1
         procd_close_instance
     done
+
+    # Обработчики выходов kind=zapret — по одному на выход. Тоже ПЕРЕД apply, и причина
+    # ровно та же, что у обфускаторов, только жёстче: при on_fail=drop (умолчание) правило
+    # очереди стоит БЕЗ `bypass`, то есть пока процесса на очереди нет, помеченный трафик
+    # отбрасывается ядром. Поднять их позже правил значило бы гарантированную дырку в
+    # несколько секунд на каждом старте.
+    #
+    # Список спрашиваем у движка (steer zapret-instances), а не собираем из спеки: он же
+    # печатает номер очереди, потому что выводит его из метки выхода. Повторять этот вывод
+    # здесь значило бы завести второй источник правды о том, какой процесс какой трафик
+    # разбирает, — и расхождение выглядело бы как «стратегия применилась и не действует».
+    #
+    # КЛЮЧИ ЧИТАЮТСЯ ИЗ ФАЙЛА ПОСТРОЧНО, а не передаются самому nfqws через @файл, хотя
+    # такой ключ у него есть. Причина в его же справке: «@<config_file> must be the only
+    # argument, other options are ignored» — то есть с @файлом нельзя передать ни --qnum, ни
+    # --dpi-desync-fwmark, и тогда номер очереди и биты меток пришлось бы вписывать в файл
+    # стратегии. Файл стратегии обязан оставаться СТРАТЕГИЕЙ: его пишет управляющий слой из
+    # каталога, и один и тот же файл должен годиться и для выхода, и для проверки на другой
+    # очереди. Строка целиком становится ОДНИМ аргументом — так значение с пробелом внутри
+    # (например --comment=) не разваливается на два.
+    #
+    # БЕЗ КОНВЕЙЕРА, и это не стиль. `... | while read` в ash исполняет тело в ПОДОБОЛОЧКЕ, а
+    # procd_open_instance накапливает описание экземпляра в переменных оболочки: из
+    # подоболочки оно не возвращается никуда, и результат — ни одного поднятого обработчика
+    # при полностью исправном на вид скрипте. Поэтому строки перебираются подстановкой с
+    # IFS, а поля режутся сокращением строки.
+    zp="$(steer zapret-instances --spec "$SPEC" 2>/dev/null)"
+    if [ -n "$zp" ]; then
+        zp_ifs="$IFS"
+        zp_tab="$(printf '\t')"
+        IFS='
+'
+        for zrow in $zp; do
+            IFS="$zp_ifs"
+            zname="${zrow%%${zp_tab}*}"
+            zrest="${zrow#*${zp_tab}}"
+            zqueue="${zrest%%${zp_tab}*}"
+            zopts="${zrest#*${zp_tab}}"
+            [ -n "$zname" ] && [ -n "$zqueue" ] || { IFS='
+'; continue; }
+            if [ ! -x /opt/zapret/nfq/nfqws ]; then
+                echo "steer: выход $zname ждёт обхода DPI, а /opt/zapret/nfq/nfqws нет —" \
+                     "поставьте пакет zapret"
+                IFS='
+'; continue
+            fi
+            if [ ! -s "$zopts" ]; then
+                echo "steer: выход $zname: файла стратегии $zopts нет или он пуст —" \
+                     "обработчик не поднят"
+                IFS='
+'; continue
+            fi
+            set --
+            while IFS= read -r zline; do
+                case "$zline" in ''|\#*) continue ;; esac
+                set -- "$@" "$zline"
+            done < "$zopts"
+            if [ "$#" -gt 0 ]; then
+                procd_open_instance "zapret_$zname"
+                # --dpi-desync-fwmark: чем обработчик метит СВОИ пакеты. Значение — не наше
+                # изобретение, оно объяснено у ZAPRET_OWN_MARK в src/spec.h; коротко:
+                # 0x40000000 снимает их с учёта conntrack через цепочку predefrag самого
+                # zapret (без этого ядро отбросит их как INVALID), а 0x20000000 выводит их
+                # из нашей очереди.
+                #
+                # --user=daemon: тот же непривилегированный пользователь, под которым обход
+                # запускает свои экземпляры (WS_USER в /etc/config/zapret). Сокеты nfqws
+                # открывает до сброса прав.
+                procd_set_param command /opt/zapret/nfq/nfqws \
+                    "--qnum=$zqueue" --dpi-desync-fwmark=0x60000000 --user=daemon "$@"
+                procd_set_param respawn 3600 5 0
+                procd_set_param stdout 1
+                procd_set_param stderr 1
+                procd_close_instance
+            else
+                echo "steer: выход $zname: в $zopts нет ни одного ключа"
+            fi
+            IFS='
+'
+        done
+        IFS="$zp_ifs"
+    fi
 
     # Ждать здесь появления устройства НЕЛЬЗЯ, и это не осторожность, а свойство procd:
     # procd_open_instance только описывает экземпляр, а запускает его procd после возврата

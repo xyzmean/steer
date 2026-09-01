@@ -121,6 +121,58 @@ if [ ! -x "$IPKG" ]; then
     chmod +x "$IPKG"
 fi
 
+# ---- зависимости пакета: не список в голове, а свойство собранного файла ------
+#
+# Три вещи, которых движку не хватает самому по себе, и все три до сих пор не были
+# объявлены — то есть проверить их было нечем, а узнавал о них человек по молчаливо
+# неработающей половине.
+#
+#   nftables, ip-full  — правила и `ip rule`; объявлены с самого начала.
+#   kmod-nft-queue     — выражение `queue` в наборе правил: им выход kind=zapret отдаёт
+#                        помеченный трафик своему обработчику nfqws. Без модуля ядро
+#                        отвергает правило, а `nft -f` атомарен — то есть один такой выход
+#                        снимает маршрутизацию ЦЕЛИКОМ, сообщением «No such file or
+#                        directory» с указателем на слово queue (проверено на роутере,
+#                        OpenWrt 25.12 / nftables 1.1.6). Модуль весит единицы килобайт;
+#                        цена объявить его всем несравнимо меньше цены такого отказа.
+#                        Движок при этом ещё и проверяет ядро сам (nfqueue_supported в
+#                        src/steer.c) — установке файлом из релиза зависимости не помогают.
+#   conntrack          — снятие установленных соединений выхода при смене маршрута
+#                        (src/failover.c, conntrack_evict). Без инструмента движок
+#                        предупреждает и работает дальше, но при включённой выгрузке
+#                        потоков это значит, что уже установленное соединение маршрут
+#                        больше не пересматривает — и запрет on_fail=drop до него не
+#                        доходит (H-110, R-096). Предупреждение в журнале читают редко,
+#                        а зависимость проверяет менеджер пакетов при установке.
+#   libmbedtls         — ТОЛЬКО у расширенной половины и ТОЛЬКО когда та связана с
+#                        libmbedcrypto самого устройства (build/build-ext-native.sh).
+#
+# Про mbedtls важно, что зависимость выводится ИЗ БИНАРНИКА, а не приписывается расширенному
+# пакету списком. Расширенных сборок две и они разные: обычная (build-ext.sh, build-ext-sdk.sh)
+# несёт свою mbedtls статикой и от пакета библиотеки не зависит вовсе, нативная (build-ext-native.sh)
+# ссылается на libmbedcrypto.so.16 роутера и без пакета не запустится ни одной командой. Список
+# «расширенный зависит от libmbedtls» был бы ложью в первом случае и правдой во втором; проверка
+# самого файла верна в обоих и не требует помнить, каким рецептом он собран.
+#
+# Ищется SONAME в самом файле: у статического бинарника строки «libmbedcrypto.so» нет —
+# она появляется только записью DT_NEEDED, которую пишет линковщик. readelf для этого не
+# нужен (его нет ни в alpine по умолчанию, ни на машине сборщика гарантированно), а grep -a
+# по бинарнику есть везде.
+#
+# Имя пакета — libmbedtls БЕЗ версии ABI: на роутере лежит libmbedtls21 (25.12, mbedtls 3.6),
+# на 23.05 это libmbedtls12, и оба ОБЪЯВЛЯЮТ provides: libmbedtls через ABI_VERSION OpenWrt
+# (проверено на устройстве: `grep -o "libmbedtls[a-z0-9]*" /lib/apk/db/installed` даёт и
+# libmbedtls, и libmbedtls21). Версия ABI в имени зависимости привязала бы пакет к одному
+# выпуску OpenWrt там, где привязки нет.
+pkg_deps() {  # ФАЙЛ_БИНАРНИКА -> "nftables ip-full ..." через пробел
+    _pd="nftables ip-full conntrack kmod-nft-queue"
+    case "$2" in ext) _pd="$_pd kmod-tun" ;; esac
+    if grep -aq 'libmbedcrypto\.so' "$1" 2>/dev/null; then
+        _pd="$_pd libmbedtls"
+    fi
+    printf '%s' "$_pd"
+}
+
 # mk_ipk КОРЕНЬ ИМЯ АРХ ЗАВИСИМОСТИ ОПИСАНИЕ [ДОПОЛНИТЕЛЬНЫЕ ПОЛЯ CONTROL]
 #
 # Каталог CONTROL создаётся ВНУТРИ дерева пакета, поэтому зовётся строго ПОСЛЕ apk mkpkg
@@ -250,11 +302,13 @@ EOF
         chmod 0755 "$eroot/usr/sbin/steer" "$eroot/etc/init.d/steer" \
                    "$eroot/etc/hotplug.d/iface/95-steer"
         chmod 0644 "$eroot/lib/upgrade/keep.d/steer"
+        # Зависимости считаются по СОБРАННОМУ файлу — см. pkg_deps выше.
+        edeps="$(pkg_deps "$eroot/usr/sbin/steer" ext)"
         docker run --rm -v "$PWD":/w -w /w alpine:latest sh -c \
             "apk add --no-cache apk-tools >/dev/null 2>&1; apk mkpkg \
                --info name:steer-extended --info version:$VERSION-r1 \
                --info description:'steer + клиент VLESS/Reality (как dnsmasq-full)' \
-               --info arch:$arch --info depends:'nftables ip-full kmod-tun' \
+               --info arch:$arch --info depends:'$edeps' \
                --info provides:steer --info replaces:steer \
                --script post-install:build/scripts/post-install \
                --script pre-deinstall:build/scripts/pre-deinstall \
@@ -267,20 +321,21 @@ EOF
         EXT_FIELDS='Provides: steer
 Replaces: steer
 Conflicts: steer'
-        mk_ipk "$eroot" steer-extended "$arch" "nftables, ip-full, kmod-tun" \
+        mk_ipk "$eroot" steer-extended "$arch" "$(echo "$edeps" | tr ' ' ',' | sed 's/,/, /g')" \
             "steer + клиент VLESS/Reality (как dnsmasq-full)" "$EXT_FIELDS"
     fi
 
+    deps="$(pkg_deps "$root/usr/sbin/steer" base)"
     docker run --rm -v "$PWD":/w -w /w alpine:latest sh -c \
         "apk add --no-cache apk-tools >/dev/null 2>&1; apk mkpkg \
            --info name:steer --info version:$VERSION-r1 \
            --info description:'policy routing engine: channels in, nftables out' \
-           --info arch:$arch --info depends:'nftables ip-full' \
+           --info arch:$arch --info depends:'$deps' \
            --script post-install:build/scripts/post-install \
            --script pre-deinstall:build/scripts/pre-deinstall \
            -F $root -o $OUT/steer-$VERSION-1_$arch.apk" >/dev/null 2>&1 \
         || echo "    (apk packaging failed for $arch)"
-    mk_ipk "$root" steer "$arch" "nftables, ip-full" \
+    mk_ipk "$root" steer "$arch" "$(echo "$deps" | tr ' ' ',' | sed 's/,/, /g')" \
         "policy routing engine: channels in, nftables out"
 done
 

@@ -236,14 +236,31 @@ static int device_healthy_for(const struct output *o, const char *dev) {
 #include <dirent.h>
 #include <ctype.h>
 
-static int zapret_running(void) {
+/* Есть ли в системе процесс, командная строка которого содержит NEEDLE.
+ *
+ * Вынесено из zapret_running, потому что тот же обход /proc понадобился второму
+ * спрашивающему — выходу kind=zapret, которому нужен не «работает ли обход вообще», а
+ * «жив ли обработчик МОЕЙ очереди». Два обхода /proc с двумя копиями разбора cmdline
+ * разошлись бы на первой же правке (буфер, замена нулей, пропуск не-цифр).
+ *
+ * Почему вообще /proc, а не вопрос ядру: списка «кто слушает очередь nfqueue N» ядро не
+ * отдаёт ни через netlink, ни через /proc/net/netfilter/nfnetlink_queue (там номер очереди
+ * и pid, но только для очередей, через которые уже прошёл пакет, — то есть у поднятого и
+ * ещё не нагруженного обработчика запись отсутствует). Командная строка с --qnum=N
+ * отвечает на тот же вопрос и отвечает всегда. */
+static int cmdline_find(const char *needle, int digit_end);
+static int cmdline_has(const char *needle) { return cmdline_find(needle, 0); }
+
+/* NEEDLE в командной строке какого-нибудь процесса. digit_end — требовать, чтобы сразу за
+ * NEEDLE не стояла цифра: так «--qnum=830» перестаёт находиться в «--qnum=8300». */
+static int cmdline_find(const char *needle, int digit_end) {
     DIR *d = opendir("/proc");
     if (!d) return 0;
     struct dirent *dir;
     int found = 0;
     char path[300];
     char buf[512];
-    
+
     while ((dir = readdir(d)) != NULL && !found) {
         if (!isdigit(dir->d_name[0])) continue;
         snprintf(path, sizeof(path), "/proc/%s/cmdline", dir->d_name);
@@ -255,13 +272,31 @@ static int zapret_running(void) {
                 for (ssize_t i = 0; i < n; i++) {
                     if (buf[i] == '\0') buf[i] = ' ';
                 }
-                if (strstr(buf, "nfqws")) found = 1;
+                for (const char *q = strstr(buf, needle); q; q = strstr(q + 1, needle)) {
+                    char after = q[strlen(needle)];
+                    if (digit_end && after >= '0' && after <= '9') continue;
+                    found = 1;
+                    break;
+                }
             }
             close(fd);
         }
     }
     closedir(d);
     return found;
+}
+
+static int zapret_running(void) { return cmdline_has("nfqws"); }
+
+/* Жив ли обработчик ИМЕННО ЭТОЙ очереди.
+ *
+ * Ищется «--qnum=N» целиком, вместе с ключом, и это не педантизм: подстрока «8300» нашлась
+ * бы и в чужом пути, и в номере другой очереди (83001), а ответ «выход работает» о мёртвом
+ * обходе — худший из возможных, потому что трафик при этом уходит и выглядит ушедшим. */
+int nfqws_on_queue(int queue) {
+    char needle[32];
+    snprintf(needle, sizeof(needle), "--qnum=%d", queue);
+    return cmdline_find(needle, 1);
 }
 
 /* ---- правило маршрутизации выхода: одно место на четыре вызывающих ---------------

@@ -314,6 +314,15 @@ static int has_domains(void) {
     return 0;
 }
 
+/* Есть ли хоть один выход kind=zapret. Отдельной функцией по той же причине, что
+ * has_domains: цепочка очередей пишется только когда ей есть что писать, а пустая базовая
+ * цепочка в postrouting — это лишний проход по правилам на КАЖДОМ пакете роутера. */
+static int has_zapret(void) {
+    for (size_t i = 0; i < g_out_n; i++)
+        if (g_out[i].kind == OUT_ZAPRET) return 1;
+    return 0;
+}
+
 static int has_fakeip(void) {
     for (size_t i = 0; i < g_grp_n; i++)
         if (g_grp[i].domains && !g_grp[i].realip) return 1;
@@ -718,7 +727,7 @@ static void generate(FILE *f) {
          * контракте. Ядро при выводе канонизирует выражение (оно само выставляет в маске
          * бит, который следующий `or` всё равно поднимает) — на поведение это не влияет,
          * проверено на живом роутере. */
-        if (out_has_device(o))
+        if (out_needs_mark(o))
             /* Метка ПАКЕТА решает маршрут, метка СОЕДИНЕНИЯ позволяет с этим соединением
              * потом что-то сделать. Без второй запись conntrack про выход не знает ничего
              * (mark=0 в дампе), и «сними соединения этого выхода» выразить нечем — а это
@@ -729,8 +738,15 @@ static void generate(FILE *f) {
              * одиннадцати тысяч, то есть после установления маршрут больше не
              * пересматривается — и запрет on_fail=drop до такого соединения не доходит
              * (R-096). Тот же приём и по той же причине использует mwan3. */
+            /* У kind=zapret к нашей метке добавляется чужой бит — тот, которым системный
+             * zapret узнаёт «этот пакет не мой» (ZAPRET_SKIP_MARK, см. spec.h). Без него
+             * трафик разбирали бы двое: сначала общий обход своей стратегией, потом наш
+             * экземпляр своей, — и вышло бы не то, что выбрал человек, ни в одном из двух
+             * смыслов. Ставится ЗДЕСЬ, в prerouting, потому что цепочки zapret висят на
+             * postrouting: позже было бы поздно. */
             fprintf(f, "meta mark set mark and 0x%08x or 0x%08x ct mark set mark ",
-                    ~STEER_MARK_MASK, o->mark);
+                    ~STEER_MARK_MASK,
+                    o->kind == OUT_ZAPRET ? (o->mark | ZAPRET_SKIP_MARK) : o->mark);
         /* `return` and not `accept`: it ends OUR chain, letting the rest of the
          * firewall proceed, while making the first matching group the winner. */
         emit_counter(f, g->name, 0);
@@ -773,6 +789,77 @@ static void generate(FILE *f) {
         fprintf(f, "comment \"steer-down:%s\"\n", g->name);
     }
     fprintf(f, "    }\n");
+
+    /* ---- выходы kind=zapret: помеченный трафик уходит в свой nfqws ----------------
+     *
+     * ЗДЕСЬ И БОЛЬШЕ НИГДЕ движок соприкасается с обходом DPI. Никаких стратегий он не
+     * знает, ключей nfqws не разбирает и процесс отсюда не запускает: его дело — сказать
+     * ядру, какой помеченный трафик в какую очередь отдать, и это ровно то же самое, что
+     * он делает метками и таблицами для туннелей.
+     *
+     * Всё, что ниже, СВЕРЕНО С ЖИВЫМ НАБОРОМ ПРАВИЛ zapret, а не выведено из документации:
+     * пакет remittor/zapret-openwrt v72.20260307 поставлен на роутер 10.8.1.87 (OpenWrt
+     * 25.12.5, nftables 1.1.6), и `nft list table inet zapret` показал вот что.
+     *
+     *   chain postnat_hook { type filter hook postrouting priority srcnat + 1;
+     *       meta mark & 0x40000000 == 0x00000000 jump postnat }
+     *   chain postnat { oifname @wanif tcp dport {...} ct original packets 1-9
+     *       ip daddr != @nozapret meta mark set meta mark | 0x20000000
+     *       ct mark set ct mark | 0x40000000 queue flags bypass to 200 }
+     *   chain predefrag { type filter hook output priority -401;
+     *       meta mark & 0x40000000 != 0x00000000 jump predefrag_nfqws }
+     *   chain predefrag_nfqws { meta mark & 0x20000000 != 0x00000000 notrack ... }
+     *
+     * Из этого следуют ТРИ решения, и ни одно из них не про вкус.
+     *
+     * ПРИОРИТЕТ srcnat + 2, а не mangle. Сначала здесь стояло `mangle + 10` (то есть -140),
+     * и это было неверно дважды. Во-первых, mangle идёт ДО трансляции адресов, а nfqws
+     * обязан видеть пакет таким, каким тот уйдёт с роутера: у zapret на OpenWrt для этого
+     * есть отдельный режим POSTNAT, включённый по умолчанию, и его цепочка висит на
+     * srcnat + 1 именно поэтому. Чинить ClientHello с адресом источника из локальной сети —
+     * значит чинить пакет, которого в сети не будет. Во-вторых, до нашей цепочки должна
+     * успеть отработать цепочка zapret: она увидит нашу метку, пропустит наш трафик, и
+     * пакет дойдёт сюда нетронутым. Обратный порядок дал бы два обхода на одном пакете.
+     *
+     * ЧУЖИЕ БИТЫ МЕТКИ. На исходный пакет мы ставим 0x40000000 (это делает prerouting_mark
+     * выше) — по нему postnat_hook говорит «не мой» и трафик выхода мимо общего обхода
+     * проходит целиком. Свой обработчик поднимается с --dpi-desync-fwmark=0x60000000, то
+     * есть его собственные пакеты (подделки, повторы, куски разрезанного) несут ОБА бита:
+     * 0x40000000 уводит их и от общего обхода, и в predefrag_nfqws — там их снимают с учёта
+     * conntrack, без чего ядро отбросило бы их как INVALID; 0x20000000 выводит их из НАШЕЙ
+     * очереди первым правилом ниже. Разные биты у исходного и у порождённого — единственный
+     * способ различить их здесь: у обоих есть 0x40000000, и один бит на двоих означал бы
+     * либо круг (свой пакет снова в свою очередь), либо неразобранный исходный.
+     *
+     * ПРЕДЕЛ ПАКЕТОВ. `ct original packets 1-N` — не осторожность, а цена: без него в
+     * userspace уезжает КАЖДЫЙ пакет соединения, то есть весь поток видео проходит через
+     * копирование в nfqws и обратно на 880 МГц. Обходу нужны только первые пакеты — там
+     * лежат SYN, ClientHello и QUIC Initial; zapret по той же причине ставит свой предел
+     * (NFQWS_TCP_PKT_OUT, по умолчанию 9), и число здесь взято его же.
+     *
+     * BYPASS ВЫРАЖАЕТ on_fail, и выражает его САМО ЯДРО, без сторожа и без опроса:
+     *   on_fail=direct — `bypass`: нет процесса на очереди, пакет идёт дальше как обычный;
+     *   on_fail=drop   — без `bypass`: нет процесса — пакет отбрасывается.
+     * Умолчание общее для всех выходов — drop, и здесь оно значит то же, что везде: канал
+     * заводят ради обхода, и молча вернуть трафик на открытый путь в момент, когда обход
+     * умер, — значит нарушить единственное обещание выхода ровно тогда, когда это важнее
+     * всего. Оговорка у `bypass` одна и её стоит знать: он срабатывает и на ПЕРЕПОЛНЕНИИ
+     * очереди, а не только на отсутствии процесса. */
+    if (has_zapret()) {
+        fprintf(f, "\n    chain zapret_queue {\n"
+                   "        type filter hook postrouting priority srcnat + 2; policy accept;\n");
+        fprintf(f, "        meta mark and 0x%08x == 0x%08x counter return "
+                   "comment \"steer:zapret-own\"\n", ZAPRET_MINE_BIT, ZAPRET_MINE_BIT);
+        for (size_t i = 0; i < g_out_n; i++) {
+            struct output *o = &g_out[i];
+            if (o->kind != OUT_ZAPRET) continue;
+            fprintf(f, "        meta mark and 0x%08x == 0x%08x ct original packets 1-%d "
+                       "counter queue num %d%s comment \"steer:zapret:%s\"\n",
+                    STEER_MARK_MASK, o->mark, ZAPRET_FIRST_PACKETS, out_zapret_queue(o),
+                    o->on_fail == FAIL_DROP ? "" : " bypass", o->name);
+        }
+        fprintf(f, "    }\n");
+    }
 
     if (has_domains()) {
         if (has_fakeip()) {
@@ -1165,6 +1252,45 @@ static void apply_routing(void) {
     }
 }
 
+/* Умеет ли ЯДРО отдавать пакеты в очередь nfqueue.
+ *
+ * ЗАЧЕМ ОТДЕЛЬНАЯ ПРОВЕРКА. Без модуля nft_queue правило `queue num N` не отвергается
+ * разбором — оно отвергается ядром, и nft говорит об этом так: «Could not process rule: No
+ * such file or directory» с указателем на слово queue. Дословно проверено на роутере
+ * (OpenWrt 25.12, nftables 1.1.6, kmod-nft-queue не установлен). Прочитать в этом «нет
+ * пакета kmod-nft-queue» невозможно, а последствие — отказ ВСЕЙ транзакции: `nft -f`
+ * атомарен, поэтому вместе с очередью не встают ни наборы, ни метки, ни перенаправление
+ * DNS. То есть один незнакомый роутеру вид выхода снимает маршрутизацию целиком.
+ *
+ * Зависимость пакета этого не закрывает, и это главный довод. Движок ставят файлом из
+ * GitHub Releases (install.sh), а файл зависимостей не разрешает — их проверяет только
+ * менеджер пакетов. Объявить kmod-nft-queue в .apk нужно (и объявлено), но полагаться на
+ * это как на единственную защиту значит защитить не тот путь установки.
+ *
+ * ПРОБА, А НЕ ПОИСК МОДУЛЯ. Спросить у ядра «есть ли nft_queue» нечем: /proc/modules врёт о
+ * встроенном в ядро (=y вместо =m), а перечня поддерживаемых выражений nftables не отдаёт.
+ * Поэтому спрашивается ровно то, что нам нужно: примет ли ядро правило с queue. Стоит это
+ * одного запуска nft и только когда в спеке есть выход kind=zapret. */
+static int nfqueue_supported(void) {
+    char tmp[] = "/tmp/steer-qprobe.XXXXXX";
+    int fd = mkstemp(tmp);
+    if (fd < 0) return 1;   /* не смогли проверить — не мешаем: решать будет сам nft */
+    FILE *f = fdopen(fd, "w");
+    if (!f) { close(fd); unlink(tmp); return 1; }
+    /* Своё имя таблицы: `nft -c` ничего не создаёт, но столкнуться именем с чужой живой
+     * таблицей всё равно нельзя — проверка тогда проверяла бы её содержимое. */
+    fprintf(f, "table inet steer_qprobe {\n"
+               "    chain c {\n"
+               "        type filter hook output priority mangle + 10; policy accept;\n"
+               "        meta mark and 0x%08x == 0x%08x queue num %d bypass\n"
+               "    }\n}\n", STEER_MARK_MASK, STEER_MARK_BASE, ZAPRET_QUEUE_BASE);
+    fclose(f);
+    const char *check[] = { "nft", "-c", "-f", tmp, NULL };
+    int rc = run_quiet(check);
+    unlink(tmp);
+    return rc == 0;
+}
+
 static int cmd_apply(const char *spec, int dry) {
     load_spec(spec);
     /* Снимок реестра — строго до registry_assign: тот перезапишет файл текущими
@@ -1192,6 +1318,15 @@ static int cmd_apply(const char *spec, int dry) {
      * продолжает отвечать, а следующий apply не зависит от того, была ли таблица
      * раньше. */
     if (dry) { generate(stdout); return 0; }
+
+    /* Отказываем ДО транзакции и НАЗЫВАЕМ причину: иначе человек получит отказ всей
+     * маршрутизации с сообщением про несуществующий файл. Пакет назван прямо — его же
+     * тянет за собой zapret, поэтому у тех, кто обходом уже пользуется, он стоит. */
+    if (has_zapret() && !nfqueue_supported())
+        die("в спеке есть выход kind=zapret, а ядро не принимает правило queue — "
+            "нужен пакет kmod-nft-queue (его ставит и сам zapret). Правила НЕ применены: "
+            "nft грузит набор целиком, и отказ на очереди снял бы заодно наборы, метки и "
+            "перенаправление DNS", NULL);
 
     char tmp[] = "/tmp/steer-ruleset.XXXXXX";
     int fd = mkstemp(tmp);
@@ -1410,6 +1545,32 @@ static void status_emit(FILE *out) {
                        ",\"listen\":\"%s:%d\"}",
                        g_out[i].obfs.server, g_out[i].obfs.server_port,
                        g_out[i].obfs.listen, g_out[i].obfs.listen_port);
+        }
+        /* Выход kind=zapret: устройства нет, поэтому и ветка своя. Печатается всё, что о
+         * нём вообще можно знать снаружи, и ничего сверх того:
+         *
+         *   mark, queue  — по ним управляющий слой находит СВОЙ процесс на СВОЕЙ очереди.
+         *                  Номер очереди выводится из метки (см. out_zapret_queue), и
+         *                  печатать его надо именно потому, что вывод — наше внутреннее
+         *                  дело: второй, повторяющий его расчёт снаружи разошёлся бы.
+         *   opts_file    — какой файл стратегии отдан процессу. Без него «стратегия не та»
+         *                  выясняется только чтением командной строки процесса.
+         *   up           — жив ли обработчик очереди. Спрашивается у /proc, а не у ядра:
+         *                  списка «кто слушает очередь N» ядро не отдаёт, а процесс с
+         *                  --qnum=N в командной строке отвечает на тот же вопрос точно.
+         *
+         * Признак живости здесь всё же печатается, в отличие от obfs, и разница
+         * оправданна: у obfs он стоил бы pgrep на каждый круг опроса ради поля, которое
+         * дублирует diag; здесь без него у выхода не было бы вообще НИ ОДНОГО признака
+         * работы — устройства нет, счётчик канала растёт одинаково при живом и мёртвом
+         * обходе (пакеты уходят и так, разница в том, доходят ли они). */
+        if (g_out[i].kind == OUT_ZAPRET) {
+            int q = out_zapret_queue(&g_out[i]);
+            fprintf(out, ",\"mark\":\"0x%08x\",\"queue\":%d,\"opts_file\":\"%s\""
+                   ",\"up\":%s,\"on_fail\":\"%s\"",
+                   g_out[i].mark, q, g_out[i].zp_opts,
+                   nfqws_on_queue(q) ? "true" : "false",
+                   g_out[i].on_fail == FAIL_DROP ? "drop" : "direct");
         }
         fprintf(out, "}");
     }
@@ -2060,6 +2221,55 @@ static int cmd_diag(const char *spec) {
         }
     }
 
+    /* 9. Выходы kind=zapret (обход DPI своим обработчиком на свою очередь).
+     *
+     *    У такого выхода НЕТ НИ ОДНОГО обычного признака работы: устройства нет, таблицы
+     *    маршрутизации нет, а счётчик канала растёт одинаково при живом и мёртвом обходе —
+     *    пакеты уходят и так, разница лишь в том, доходят ли они. То есть «не открывается
+     *    YouTube» здесь не отличить от «всё в порядке» ничем, кроме этих проверок.
+     *
+     *    Три вопроса, и каждый про свой отказ: нет пакета zapret (обработчика взять негде),
+     *    нет файла стратегии (обработчику нечего применять), обработчик не запущен (при
+     *    on_fail=drop это ещё и остановленный трафик канала, что человек читает как
+     *    «интернета нет», а не как «обход упал»). */
+    for (size_t i = 0; i < g_out_n; i++) {
+        if (g_out[i].kind != OUT_ZAPRET) continue;
+        char what[200], why[400];
+        int q = out_zapret_queue(&g_out[i]);
+
+        if (access(NFQWS_PATH, X_OK) != 0) {
+            snprintf(what, sizeof(what), "выход %.40s: обход DPI не установлен",
+                     g_out[i].name);
+            snprintf(why, sizeof(why),
+                     "нет " NFQWS_PATH " — поставьте пакет zapret. Правило очереди при этом "
+                     "стоит, и при on_fail=%s трафик канала %s",
+                     g_out[i].on_fail == FAIL_DROP ? "drop" : "direct",
+                     g_out[i].on_fail == FAIL_DROP ? "остановлен" : "идёт без обхода");
+            diag("zapret", "fail", what, why);
+            continue;
+        }
+        if (access(g_out[i].zp_opts, R_OK) != 0) {
+            snprintf(what, sizeof(what), "выход %.40s: файла стратегии нет", g_out[i].name);
+            snprintf(why, sizeof(why),
+                     "%.200s не читается — стратегию выбирают в splify2, вкладка Zapret. "
+                     "Без файла обработчик не поднимается вовсе",
+                     g_out[i].zp_opts);
+            diag("zapret", "fail", what, why);
+            continue;
+        }
+        int alive = nfqws_on_queue(q);
+        snprintf(what, sizeof(what), "выход %.40s: обработчик очереди %d %s",
+                 g_out[i].name, q, alive ? "работает" : "не запущен");
+        snprintf(why, sizeof(why), "%s",
+                 alive ? ""
+                 : g_out[i].on_fail == FAIL_DROP
+                   ? "перезапустите движок: /etc/init.d/steer restart. До тех пор трафик "
+                     "канала ОСТАНОВЛЕН — так выражен on_fail=drop, очередь стоит без bypass"
+                   : "перезапустите движок: /etc/init.d/steer restart. До тех пор трафик "
+                     "канала идёт без обхода — так выражен on_fail=direct");
+        diag("zapret", alive ? "ok" : "fail", what, why);
+    }
+
     printf("],\"warn\":%d,\"fail\":%d}\n", g_diag_warn, g_diag_fail);
     /* Код возврата — чтобы это годилось в скрипт, а не только глазам. */
     return g_diag_fail ? 1 : 0;
@@ -2308,7 +2518,7 @@ int main(int argc, char **argv) {
          * поднимать процессы. Тишина вместо отказа означала бы не поднятый туннель без
          * единой строки о причине. */
         if (a.kind && !out_kind_known(a.kind))
-            die("--kind: нужен interface, vless, xsteer или direct, а не %s", a.kind);
+            die("--kind: нужен interface, vless, xsteer, zapret или direct, а не %s", a.kind);
         load_spec(spec);
         for (size_t i = 0; i < g_out_n; i++) {
             const char *k = out_kind_name(g_out[i].kind);
@@ -2332,6 +2542,30 @@ int main(int argc, char **argv) {
      * находиться — резолвер не поднимался, а apply при этом ставил перенаправление
      * DNS, и каждый запрос из LAN уходил в закрытый порт. Что будет сгенерировано,
      * знает только движок, поэтому отвечает он. */
+    /* Что поднимать для выходов kind=zapret: по строке на выход, поля через табуляцию —
+     * имя, номер очереди, файл ключей. Отдельной командой, а не полем `outputs`, потому
+     * что читает её init-скрипт, а не человек, и читает построчно: разбирать в shell
+     * ответ `status` (JSON, сотни байт на выход, jsonfilter на каждое поле) значило бы
+     * платить за каждую перезагрузку сети разбором, который тут не нужен.
+     *
+     * Номер очереди печатает движок, а не считает init-скрипт. Вывод номера из метки —
+     * наше внутреннее дело (out_zapret_queue), и второй, повторяющий его расчёт в shell
+     * разошёлся бы при первой правке: процесс встал бы на очередь, в которую ядро ничего
+     * не отдаёт, и выглядело бы это как «стратегия применилась и не действует».
+     *
+     * Код возврата — как у needs-dnsd: 0, если поднимать есть что. */
+    if (!strcmp(cmd, "zapret-instances")) {
+        load_spec(spec);
+        registry_assign();
+        int n = 0;
+        for (size_t i = 0; i < g_out_n; i++) {
+            if (g_out[i].kind != OUT_ZAPRET) continue;
+            printf("%s\t%d\t%s\n", g_out[i].name, out_zapret_queue(&g_out[i]),
+                   g_out[i].zp_opts);
+            n++;
+        }
+        return n ? 0 : 1;
+    }
     if (!strcmp(cmd, "needs-dnsd")) {
         load_spec(spec);
         registry_assign();

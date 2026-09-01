@@ -398,6 +398,7 @@ static const struct { const char *name; enum out_kind kind; } KINDS[] = {
     { "interface", OUT_INTERFACE },
     { "vless",     OUT_VLESS },
     { "xsteer",    OUT_XSTEER },
+    { "zapret",    OUT_ZAPRET },
 };
 #define KINDS_N (sizeof(KINDS) / sizeof(KINDS[0]))
 
@@ -475,6 +476,11 @@ static void parse_outputs(struct js *j) {
             else if (!strcmp(key, "obfs")) parse_obfs(j, &o);
             else if (!strcmp(key, "sub_file")) js_str(j, o.sub_file, sizeof(o.sub_file));
             else if (!strcmp(key, "conf")) js_str(j, o.xs_conf, sizeof(o.xs_conf));
+            /* Файл ключей nfqws у kind=zapret. Отдельным ключом, а не переиспользованным
+             * `conf`: у xsteer там конфигурация в стиле wg с приватным ключом, здесь —
+             * список ключей командной строки, и одно имя для двух разных вещей однажды
+             * привело бы к попытке поднять туннель по стратегии обхода. */
+            else if (!strcmp(key, "opts_file")) js_str(j, o.zp_opts, sizeof(o.zp_opts));
             /* Транспорт выхода xsteer. Полем спеки, а не только ключом командной строки,
              * потому что процесс поднимает procd: ключи ему передать негде, а настройка
              * обязана переживать перезагрузку. */
@@ -557,6 +563,26 @@ static void parse_outputs(struct js *j) {
                 die("outputs.%s: stream_port без stream: транспорт остался бы поддельным TCP",
                     o.name);
         }
+        else if (!strcmp(kind, "zapret")) {
+            o.kind = OUT_ZAPRET;
+            /* Устройства нет и не будет: трафик уходит обычным маршрутом, а выход меняет
+             * только то, ЧТО с ним по дороге сделает nfqws. Названное устройство здесь —
+             * почти наверняка описка (человек копировал выход-туннель), и принять его
+             * молча значило бы обещать маршрутизацию, которой не будет. */
+            if (o.device[0] || o.devices_n)
+                die("outputs.%s: у kind zapret нет устройства — трафик идёт обычным путём",
+                    o.name);
+            /* Путь выводится из имени выхода — тот же довод, что у conf у xsteer: два
+             * имени, которым позволено разойтись, пользы не приносят. Имя уже проверено
+             * name_ok выше, поэтому путь собирается из проверенного. */
+            if (!o.zp_opts[0])
+                snprintf(o.zp_opts, sizeof(o.zp_opts), "/etc/steer/zapret/%.200s.opts", o.name);
+            /* Абсолютный путь и годность к JSON: путь печатается в status и в diag, а
+             * запускает процесс procd со своим рабочим каталогом — относительный «работал
+             * бы из шелла» и не работал бы у службы. Тот же барьер, что у conf. */
+            else if (o.zp_opts[0] != '/' || !label_ok(o.zp_opts))
+                die("outputs.%s: opts_file должен быть абсолютным путём без кавычек", o.name);
+        }
         else if (!strcmp(kind, "interface")) {
             o.kind = OUT_INTERFACE;
             /* device и devices описывают одно и то же с разных сторон: device — что
@@ -566,7 +592,7 @@ static void parse_outputs(struct js *j) {
             if (!o.device[0] && o.devices_n) snprintf(o.device, sizeof(o.device), "%s", o.devices[0]);
             if (!o.device[0]) die("outputs.%s: kind interface needs a device", o.name);
         } else die("outputs.%s: неизвестный kind "
-                   "(нужен direct, interface, vless или xsteer)", o.name);
+                   "(нужен direct, interface, vless, xsteer или zapret)", o.name);
         /* Обфускация осмысленна только там, где транспорт — чужой UDP, до которого
          * движку не дотянуться иначе. У vless свой транспорт внутри движка (и свои
          * средства маскировки — Reality), у xsteer он свой и поддельный TCP уже внутри
@@ -578,6 +604,16 @@ static void parse_outputs(struct js *j) {
          * поле молча значило бы сказать «настроено», не настроив ничего. */
         if ((o.xs_stream || o.xs_stream_port) && o.kind != OUT_XSTEER)
             die("outputs.%s: stream есть только у kind=xsteer", o.name);
+        /* Тот же довод, что у obfs и stream: поле, принятое молча у чужого вида выхода, —
+         * это «настроено», сказанное о том, что не настроено. Проверка стоит ПОСЛЕ разбора
+         * kind, потому что у своего вида это поле выставляет умолчание. */
+        if (o.zp_opts[0] && o.kind != OUT_ZAPRET)
+            die("outputs.%s: opts_file есть только у kind=zapret", o.name);
+        /* on_fail=zapret у выхода kind=zapret — это «при отказе обхода включить обход».
+         * Молча принять значило бы записать в настройку круг, который ничего не значит. */
+        if (o.kind == OUT_ZAPRET && o.on_fail == FAIL_ZAPRET)
+            die("outputs.%s: on_fail zapret у выхода kind zapret ничего не значит "
+                "(нужен drop или direct)", o.name);
         if (node_one && node_many)
             die("outputs.%s: задано и node, и nodes — оставьте одно", o.name);
         /* Выбор узлов есть только у подписки. Отвергается ТОЛЬКО новая форма: `nodes` не
