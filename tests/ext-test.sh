@@ -138,10 +138,13 @@ fi
 rm -f "$probe" "$probe.c"
 
 echo "ext-test: собираю и прогоняю spokematch (ASan: ${ASAN:-нет})..."
+# xslink.c в списке ОБЯЗАТЕЛЕН: командная строка клиента принимает и ссылку xs://, и файл
+# одним xs_conf_load_any, и живёт эта функция там. Без неё сборка стенда падает на компоновке,
+# то есть весь ext-test не доходит даже до первой проверки — а именно в нём и живёт ASan.
 $CC -O1 -g -w -Isrc $ASAN $MBED_INC "$PRIV" -o "$BUILD/spokematch" \
 	tests/spokematch.c \
 	src/ext/xsconn.c src/ext/xswire.c src/ext/xsepoch.c src/ext/xsroute.c \
-	src/ext/xsconf.c src/ext/xsstream.c src/ext/xshake.c src/ext/chello.c \
+	src/ext/xsconf.c src/ext/xslink.c src/ext/xsstream.c src/ext/xshake.c src/ext/chello.c \
 	src/ext/reality.c src/ext/tls13.c src/ext/h2.c src/ext/tun.c src/obfs.c \
 	src/spec.c $MBED_LIB -lpthread
 "$BUILD/spokematch"
@@ -150,7 +153,7 @@ $CC -O1 -g -w -Isrc $ASAN $MBED_INC "$PRIV" -o "$BUILD/spokematch" \
 echo "ext-test: собираю и прогоняю hubmatch..."
 $CC -O2 -w -Isrc $MBED_INC "$PRIV" -o "$BUILD/hubmatch" tests/hubmatch.c \
 	src/ext/xsconn.c src/ext/xswire.c src/ext/xsepoch.c src/ext/xsroute.c \
-	src/ext/xsconf.c src/ext/xsstream.c src/ext/xshake.c src/ext/chello.c \
+	src/ext/xsconf.c src/ext/xslink.c src/ext/xsstream.c src/ext/xshake.c src/ext/chello.c \
 	src/ext/reality.c src/ext/tls13.c src/ext/h2.c src/ext/tun.c src/obfs.c \
 	src/spec.c $MBED_LIB -lpthread
 "$BUILD/hubmatch"
@@ -175,7 +178,7 @@ $CC -O2 -w -Isrc $MBED_INC "$PRIV" -o "$BUILD/devupmatch" tests/devupmatch.c \
 echo "ext-test: собираю серверный бинарник для стенда зондирования..."
 $CC -O1 -w -Isrc $MBED_INC "$PRIV" -DSTEER_SERVER -o "$BUILD/steer-hub-native" \
 	src/steer.c src/spec.c src/dnsd.c src/failover.c src/aggregate.c src/obfs.c src/cli.c \
-	src/ext/xswire.c src/ext/xsconf.c src/ext/xsroute.c src/ext/chello.c src/ext/xshake.c \
+	src/ext/xswire.c src/ext/xsconf.c src/ext/xslink.c src/ext/xsroute.c src/ext/chello.c src/ext/xshake.c \
 	src/ext/xsconn.c src/ext/xsstream.c src/ext/xsepoch.c src/ext/tls13.c src/ext/reality.c \
 	src/ext/tun.c src/ext/h2.c src/ext/xsadmin.c src/ext/xshub.c \
 	$MBED_LIB -lpthread
