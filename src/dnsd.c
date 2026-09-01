@@ -57,6 +57,7 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <fnmatch.h>
+#include <limits.h>
 #include <netinet/in.h>
 #include <regex.h>
 #include <signal.h>
@@ -1202,8 +1203,13 @@ static void fakeip_state_append(const char *path, const char *domain, uint32_t a
  * (atomic via rename); a failure just means a later restart re-resolves. */
 static void fakeip_state_rewrite(void) {
     if (!g_fakeip_state_path) return;
-    char tmp[MAX_HOSTNAME];
-    snprintf(tmp, sizeof(tmp), "%s.tmp", g_fakeip_state_path);
+    /* Буфер — по длине ПУТИ, а не имени хоста: путь состояния задаёт снаружи
+     * (--state-file/--state-dir), и обрезка «%s.tmp» на произвольном месте давала
+     * чужое имя — от несуществующего до самого файла состояния или существующего
+     * каталога. Обрезка проверяется явно: писать некуда лучше, чем писать не туда. */
+    char tmp[PATH_MAX];
+    int need = snprintf(tmp, sizeof(tmp), "%s.tmp", g_fakeip_state_path);
+    if (need < 0 || (size_t)need >= sizeof(tmp)) return;
     FILE *f = fopen(tmp, "w");
     if (!f) return;
     for (size_t i = 0; i < g_fakeip.n; i++) {
@@ -2171,8 +2177,12 @@ int dnsd_main(int argc, char **argv) {
         return 0;
     }
     if (!g_fakeip_state_path) {
-        static char st[256];
-        snprintf(st, sizeof(st), "%s/fakeip.state", g_state_dir);
+        static char st[PATH_MAX];
+        int need = snprintf(st, sizeof(st), "%s/fakeip.state", g_state_dir);
+        if (need < 0 || (size_t)need >= sizeof(st)) {
+            fprintf(stderr, "steer dnsd: --state-dir too long, no room for fakeip.state\n");
+            return 1;
+        }
         g_fakeip_state_path = st;
     }
     return run_proxy(listen_port, upstream_port);

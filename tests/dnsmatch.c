@@ -18,6 +18,7 @@
  * иначе можно было бы только через новую подкоманду, то есть добавив в движок код ради
  * теста. */
 #include "../src/dnsd.c"
+#include <sys/stat.h>
 
 static int fails;
 
@@ -211,6 +212,54 @@ int main(void) {
         check("A из запроса: ancount = 1", 1, out[7]);
         check("A из запроса: fake-IP в rdata", 0,
               memcmp(out + len - 4, "\xC6\x12\x00\x05", 4));
+    }
+
+    {
+        /* Долгий путь к файлу состояния fake-IP. Путь задаётся снаружи (--state-file,
+         * --state-dir), то есть его длину выбирает не движок, а буфер под имя временного
+         * файла был размером в имя ХОСТА (MAX_HOSTNAME, 256). «%s.tmp» в него молча не
+         * влезал, и обрезка приходилась на произвольное место пути — в том числе ровно на
+         * границу компонента, и тогда обрезанное имя оказывалось существующим КАТАЛОГОМ:
+         * fopen падал с EISDIR, функция молча возвращалась, и таблица fake-IP не
+         * сохранялась вовсе. Следствие видно только после перезапуска — весь DNAT
+         * собирается заново, а прежние адреса у клиентов в кеше уже другие.
+         *
+         * Стенд ставит длину каталога ровно 255: тогда обрезка «%s.tmp» до 255 символов
+         * даёт сам каталог. Проверяется наблюдаемое следствие — файл состояния после
+         * rewrite обязан существовать и содержать записанную пару. */
+        char dir[512];
+        snprintf(dir, sizeof(dir), "/tmp/dnsmatch-long.XXXXXX");
+        if (!mkdtemp(dir)) { perror("mkdtemp"); return 1; }
+        size_t at = strlen(dir);
+        /* Два уровня по 115 символов добирают путь каталога до 255 (25 + 115 + 115). */
+        for (int lvl = 0; lvl < 2; lvl++) {
+            at += (size_t)snprintf(dir + at, sizeof(dir) - at, "/%0114d", lvl);
+            if (mkdir(dir, 0755) != 0 && errno != EEXIST) { perror("mkdir"); return 1; }
+        }
+        check("долгий путь: каталог ровно на границе буфера", 255, (int)strlen(dir));
+        char path[768];
+        snprintf(path, sizeof(path), "%s/fakeip.state", dir);
+
+        memset(&g_fakeip, 0, sizeof(g_fakeip));
+        g_fakeip_next = 0;
+        uint32_t addr = 0;
+        g_fakeip_state_path = NULL;             /* без append: пишет только rewrite */
+        check("долгий путь: адрес выдан", 0, fakeip_lookup_or_alloc("long.test", &addr));
+        g_fakeip_state_path = path;
+        fakeip_state_rewrite();
+
+        FILE *rf = fopen(path, "r");
+        check("долгий путь: файл состояния создан", 1, rf != NULL);
+        if (rf) {
+            char line[512] = {0};
+            char *got = fgets(line, sizeof(line), rf);
+            check("долгий путь: строка прочитана", 1, got != NULL);
+            check("долгий путь: домен на месте", 1, strstr(line, "long.test") != NULL);
+            fclose(rf);
+        }
+        g_fakeip_state_path = NULL;
+        memset(&g_fakeip, 0, sizeof(g_fakeip));
+        g_fakeip_next = 0;
     }
 
     printf("\n%s\n", fails ? "ЕСТЬ ПРОВАЛЫ" : "все проверки прошли");
