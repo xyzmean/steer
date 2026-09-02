@@ -850,13 +850,40 @@ static void generate(FILE *f) {
                    "        type filter hook postrouting priority srcnat + 2; policy accept;\n");
         fprintf(f, "        meta mark and 0x%08x == 0x%08x counter return "
                    "comment \"steer:zapret-own\"\n", ZAPRET_MINE_BIT, ZAPRET_MINE_BIT);
+        /* БИТ 0x40000000 СНИМАЕТСЯ С ПАКЕТА ПЕРЕД ОЧЕРЕДЬЮ, и без этого выход не работал
+         * вовсе. nfqws считает своим порождённым любой пакет, у которого с его
+         * --dpi-desync-fwmark есть хоть один общий бит, и пропускает такой без обработки
+         * («ignoring generated packet» в его отладке). Наш обработчик поднят с 0x60000000,
+         * бит 0x40000000 в него входит — а на исходном пакете он стоит с prerouting, чтобы
+         * общий обход сказал «не мой». Пока бит доезжал до очереди, обработчик не трогал
+         * НИ ОДНОГО пакета: снято с роутера владельца — YouTube через выход 3 из 37 при
+         * любой стратегии, со снятым битом 33 из 37. Снимать здесь безопасно: цепочка
+         * общего обхода (srcnat + 1) уже позади, дальше бит никому не нужен, а свои восемь
+         * бит метки (маршрут) целы. */
         for (size_t i = 0; i < g_out_n; i++) {
             struct output *o = &g_out[i];
             if (o->kind != OUT_ZAPRET) continue;
             fprintf(f, "        meta mark and 0x%08x == 0x%08x ct original packets 1-%d "
-                       "counter queue num %d%s comment \"steer:zapret:%s\"\n",
-                    STEER_MARK_MASK, o->mark, ZAPRET_FIRST_PACKETS, out_zapret_queue(o),
-                    o->on_fail == FAIL_DROP ? "" : " bypass", o->name);
+                       "meta mark set mark and 0x%08x counter queue num %d%s "
+                       "comment \"steer:zapret:%s\"\n",
+                    STEER_MARK_MASK, o->mark, ZAPRET_FIRST_PACKETS, ~ZAPRET_SKIP_MARK,
+                    out_zapret_queue(o), o->on_fail == FAIL_DROP ? "" : " bypass", o->name);
+        }
+        fprintf(f, "    }\n");
+        /* Ответные пакеты — SYN-ACK и два за ним — тоже в очередь, как у zapret
+         * (`ct reply packets 1-3`): по ним nfqws узнаёт TTL сервера для autottl и состояние
+         * соединения; без них стратегии с autottl работали бы вслепую. Соединение узнаётся по
+         * ct mark — он ставится вместе с меткой в prerouting и несёт номер выхода. Всегда с
+         * bypass: ответ терять нельзя ни при каком on_fail, исходные пакеты и так решают
+         * судьбу соединения. */
+        fprintf(f, "\n    chain zapret_queue_in {\n"
+                   "        type filter hook prerouting priority mangle; policy accept;\n");
+        for (size_t i = 0; i < g_out_n; i++) {
+            struct output *o = &g_out[i];
+            if (o->kind != OUT_ZAPRET) continue;
+            fprintf(f, "        ct mark and 0x%08x == 0x%08x ct reply packets 1-3 "
+                       "counter queue num %d bypass comment \"steer:zapret-reply:%s\"\n",
+                    STEER_MARK_MASK, o->mark, out_zapret_queue(o), o->name);
         }
         fprintf(f, "    }\n");
         /* СВОЯ predefrag, а не расчёт на цепочку zapret. Порождённые обработчиком пакеты
