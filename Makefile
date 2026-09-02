@@ -26,7 +26,7 @@ $(BUILD)/steer: src/steer.c src/spec.c src/dnsd.c src/failover.c src/aggregate.c
 	$(CC) $(CFLAGS) $(DEFS) -o $@ src/steer.c src/spec.c src/dnsd.c src/failover.c \
 	      src/aggregate.c src/obfs.c src/cli.c
 
-test: all ext-syntax $(BUILD)/dnsmatch $(BUILD)/specmatch $(BUILD)/specmatch-ext $(BUILD)/xswirematch $(BUILD)/xsconnmatch $(BUILD)/xsstreammatch $(BUILD)/tungromatch $(BUILD)/tunnamematch $(BUILD)/xsconfmatch $(BUILD)/xslinkmatch $(BUILD)/xsroutematch $(BUILD)/chellomatch $(BUILD)/failovermatch $(BUILD)/h2match $(BUILD)/submatch $(BUILD)/subfetchmatch $(BUILD)/fwmatch $(BUILD)/obfsmatch $(BUILD)/visionmatch $(BUILD)/diagsim
+test: all ext-syntax $(BUILD)/dnsmatch $(BUILD)/specmatch $(BUILD)/specmatch-ext $(BUILD)/xswirematch $(BUILD)/xsconnmatch $(BUILD)/xsstreammatch $(BUILD)/tungromatch $(BUILD)/tunnamematch $(BUILD)/xsconfmatch $(BUILD)/xslinkmatch $(BUILD)/xsroutematch $(BUILD)/chellomatch $(BUILD)/failovermatch $(BUILD)/dcmatch $(BUILD)/h2match $(BUILD)/submatch $(BUILD)/subfetchmatch $(BUILD)/fwmatch $(BUILD)/obfsmatch $(BUILD)/visionmatch $(BUILD)/diagsim
 	@sh tests/run.sh
 	@sh tests/gen.sh
 	@sh tests/climatch.sh
@@ -39,6 +39,7 @@ test: all ext-syntax $(BUILD)/dnsmatch $(BUILD)/specmatch $(BUILD)/specmatch-ext
 	@$(BUILD)/specmatch
 	@$(BUILD)/specmatch-ext
 	@$(BUILD)/failovermatch
+	@$(BUILD)/dcmatch
 	@$(BUILD)/h2match
 	@$(BUILD)/submatch
 	@$(BUILD)/subfetchmatch
@@ -98,6 +99,13 @@ $(BUILD)/dnsmatch: tests/dnsmatch.c src/dnsd.c src/spec.c src/spec.h
 # читает файл и зовёт die()/exit(2) на неверной спеке — перехватить это через подкоманду
 # движка нельзя. Файл включает исходник парсера и перехватывает exit через setjmp —
 # см. tests/specmatch.c.
+# Таблица дата-центров Telegram — см. пояснение в самом стенде. Собирается с заглушками
+# mbedtls (-Itests/stub) по той же причине, что и ext-syntax: настоящей библиотеки в `make
+# test` нет по построению.
+$(BUILD)/dcmatch: tests/dcmatch.c src/ext/tgws.c
+	@mkdir -p $(BUILD)
+	$(CC) $(CFLAGS) -Itests/stub -Isrc -o $@ tests/dcmatch.c
+
 $(BUILD)/specmatch: tests/specmatch.c src/spec.c src/spec.h
 	@mkdir -p $(BUILD)
 	$(CC) $(CFLAGS) -o $@ tests/specmatch.c
@@ -253,7 +261,7 @@ $(BUILD)/chellomatch: tests/chellomatch.c tests/chello-frozen.h src/ext/chello.c
 # только артефакты: то, что здесь же и собирается, плюс упаковка из build.sh.
 clean:
 	rm -rf $(BUILD)/steer $(BUILD)/steer-* $(BUILD)/dnsmatch $(BUILD)/specmatch $(BUILD)/specmatch-ext \
-	       $(BUILD)/failovermatch $(BUILD)/h2match $(BUILD)/submatch $(BUILD)/subfetchmatch $(BUILD)/fwmatch $(BUILD)/obfsmatch \
+	       $(BUILD)/failovermatch $(BUILD)/dcmatch $(BUILD)/h2match $(BUILD)/submatch $(BUILD)/subfetchmatch $(BUILD)/fwmatch $(BUILD)/obfsmatch \
 	       $(BUILD)/visionmatch $(BUILD)/xswirematch $(BUILD)/xsconnmatch $(BUILD)/xsstreammatch $(BUILD)/xsepochmatch $(BUILD)/tungromatch $(BUILD)/tunnamematch $(BUILD)/xsconfmatch $(BUILD)/xslinkmatch $(BUILD)/xsroutematch $(BUILD)/chellomatch $(BUILD)/hellofreeze $(BUILD)/xsloop $(BUILD)/xsbench \
 	       $(BUILD)/steer-hub $(BUILD)/steer-ext \
 	       $(BUILD)/diagsim $(BUILD)/libmbed-*.a \

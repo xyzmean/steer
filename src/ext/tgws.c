@@ -87,7 +87,13 @@
  * держим больше. Поймано пробой против openssl s_server: ответ в 3 КБ не влезал в буфер на
  * 2 КБ, и ошибка выглядела как «сервер отказал». */
 #define TLS_REC_MAX   17408
-#define MAX_CONNS     64        /* больше клиент не открывает; предел от утечки потоков */
+/* Предел одновременных соединений. Был 64 — «больше клиент не открывает», — и на живом
+ * роутере кончился за секунду: перехват берёт ВСЁ, что идёт на адреса Telegram по 80 и 443,
+ * а это не только MTProto, но и веб-клиент со своей пачкой соединений, и каждое из них,
+ * даже пропускаемое насквозь, занимает слот. Отказ при этом выглядит для человека как
+ * «Telegram не работает», причём молча. 192 — потому что стек потока выделяется лениво:
+ * место под них резервируется в адресном пространстве, а не в памяти. */
+#define MAX_CONNS     192
 #define UP_TIMEOUT_S  10
 
 /* Домен точек веб-сокета. Прямой (web.telegram.org) НЕ работает у нас по двум причинам
@@ -116,31 +122,86 @@
  * строки вида `149.154.167.220 2` или `149.154.164.250 4 media`. Файл, а не только сборка,
  * потому что список чужой: Telegram может добавить адрес, и чинить это перевыпуском пакета
  * — заведомо медленнее, чем строкой в конфигурации. */
-struct dc_ent { uint32_t ip; short dc; short media; };
-static struct dc_ent g_dc[64] = {
-    { 0, 1, 0 }, { 0, 1, 0 },            /* заполняются в dc_table_init */
-};
+/* Запись таблицы — АДРЕС ИЛИ ПОДСЕТЬ. Только поимённых адресов не хватило: Telegram держит
+ * за одним дата-центром весь /24 и раздаёт клиентам разные адреса из него, поэтому мост,
+ * знающий девять адресов, видел живого клиента и говорил «не наш дата-центр». Совпадение
+ * ищется по самой длинной маске: подсеть задаёт общее правило, отдельный адрес — исключение
+ * из него (в 149.154.167.0/24 живёт второй ДЦ, но .91 и .92 — четвёртый). */
+struct dc_ent { uint32_t ip; uint32_t mask; short dc; short media; };
+static struct dc_ent g_dc[128];
 static size_t g_dc_n;
 
+/* Подсети — из объявлений Telegram, отдельные адреса — исключения внутри них. Медийные ДЦ
+ * (флаг media) обслуживают загрузку файлов и имеют свою точку kwsN-1. */
 static const struct { const char *ip; short dc; short media; } DC_BUILTIN[] = {
+    { "149.154.175.0/24",  1, 0 },
+    { "149.154.167.0/24",  2, 0 },
+    { "149.154.161.0/24",  2, 0 },
+    { "149.154.162.0/24",  2, 0 },
+    { "149.154.171.0/24",  5, 0 },
+    { "91.108.56.0/22",    5, 0 },
+    { "91.108.4.0/22",     4, 0 },
+    { "91.108.8.0/22",     2, 0 },
+    { "91.108.12.0/22",    1, 0 },
+    { "91.108.16.0/22",    3, 0 },
+    { "91.108.20.0/22",    4, 0 },
+    { "91.105.192.0/23",   2, 0 },
+    { "185.76.151.0/24",   2, 0 },
+    { "95.161.64.0/20",    2, 0 },
+    /* Исключения поимённо: они перекрывают подсеть выше, потому что маска длиннее. */
     { "149.154.175.50",  1, 0 },
     { "149.154.175.53",  1, 0 },
+    { "149.154.175.100", 3, 0 },
+    { "149.154.175.115", 3, 0 },
     { "149.154.167.50",  2, 0 },
     { "149.154.167.51",  2, 0 },
-    { "149.154.175.100", 3, 0 },
+    /* Медийные точки клиента. Они обслуживают файлы и картинки, у них своя точка kwsN-1, и
+     * отправленное на обычную точку того же ДЦ соединение авторизуется, а файлы не отдаёт —
+     * снаружи это ровно «переписка идёт, медиа не грузится». Адреса сверены с картой
+     * дата-центров Telegram (getProxyConfig: -2 и -4 живут в 149.154.161.x и 149.154.165.x). */
+    { "149.154.167.151", 2, 1 },
+    { "149.154.167.222", 2, 1 },
+    { "149.154.161.184", 2, 1 },
+    { "149.154.164.0/24", 4, 1 },
+    { "149.154.165.0/24", 4, 1 },
+    { "149.154.166.0/24", 4, 1 },
     { "149.154.167.91",  4, 0 },
     { "149.154.167.92",  4, 0 },
+    { "149.154.164.250", 4, 1 },
+    { "149.154.166.120", 4, 1 },
     { "149.154.171.5",   5, 0 },
     { "91.108.56.130",   5, 0 },
+    { "91.108.56.140",   5, 1 },
 };
 
+/* Принимает и `1.2.3.4`, и `1.2.3.0/24`. Повторная запись с той же маской заменяет прежнюю:
+ * файл дополняет встроенную таблицу, а не спорит с ней. */
 static void dc_add(const char *ip, short dc, short media) {
     struct in_addr a;
+    char buf[64];
+    unsigned bits = 32;
+    const char *slash = strchr(ip, '/');
+
     if (g_dc_n >= sizeof(g_dc) / sizeof(g_dc[0])) return;
+    if (slash) {
+        size_t n = (size_t)(slash - ip);
+        if (n >= sizeof(buf)) return;
+        memcpy(buf, ip, n);
+        buf[n] = '\0';
+        bits = (unsigned)atoi(slash + 1);
+        if (bits > 32) return;
+        ip = buf;
+    }
     if (inet_pton(AF_INET, ip, &a) != 1) return;
+
+    uint32_t mask = bits ? htonl(0xffffffffu << (32 - bits)) : 0;
+    uint32_t net = a.s_addr & mask;
     for (size_t i = 0; i < g_dc_n; i++)
-        if (g_dc[i].ip == a.s_addr) { g_dc[i].dc = dc; g_dc[i].media = media; return; }
-    g_dc[g_dc_n].ip = a.s_addr;
+        if (g_dc[i].ip == net && g_dc[i].mask == mask) {
+            g_dc[i].dc = dc; g_dc[i].media = media; return;
+        }
+    g_dc[g_dc_n].ip = net;
+    g_dc[g_dc_n].mask = mask;
     g_dc[g_dc_n].dc = dc;
     g_dc[g_dc_n].media = media;
     g_dc_n++;
@@ -171,6 +232,36 @@ static void dc_table_init(void) {
     if (added) fprintf(stderr, LOG_I "адресов ДЦ из %s: %zu\n", path, added);
 }
 
+/* Запасные домены. Точки общественные и чужие: 503 от Cloudflare приходит и на исправном
+ * домене — просто потому, что за ним сейчас слишком много народу. Пропускать соединение
+ * насквозь в такой момент значит отдать его в блокировку, а клиент ответит на это тем, что
+ * переподключится через секунду, и так по кругу; снаружи это видно как
+ * «подключается-отключается раз в 2-3 секунды».
+ *
+ * Список — файлом, а не в спеке: домены живут и умирают чаще, чем настройка роутера, и
+ * обновляет его тот же набор данных, что и списки (у brb это data/tgws-domains.lst). */
+#define MAX_ALT 8
+static char g_alt[MAX_ALT][128];
+static size_t g_alt_n;
+
+static void alt_init(void) {
+    const char *path = getenv("STEER_TGWS_DOMAINS");
+    if (!path) path = "/etc/steer/tgws-domains.lst";
+    FILE *f = fopen(path, "r");
+    if (!f) return;
+    char line[160];
+    while (g_alt_n < MAX_ALT && fgets(line, sizeof(line), f)) {
+        char *p = line;
+        while (*p == ' ' || *p == '\t') p++;
+        p[strcspn(p, " \t\r\n")] = '\0';
+        if (!*p || *p == '#') continue;
+        snprintf(g_alt[g_alt_n], sizeof(g_alt[0]), "%s", p);
+        g_alt_n++;
+    }
+    fclose(f);
+    if (g_alt_n) fprintf(stderr, LOG_I "запасных доменов: %zu\n", g_alt_n);
+}
+
 /* Домен точек. Из спеки, а её может не быть (проба спеку не читает) — тогда из окружения,
  * иначе прямой. */
 static char g_domain[128];
@@ -184,16 +275,39 @@ static void domain_init(const char *from_spec) {
  * Их всегда два, и второй не запасной «на всякий случай»: медийную запись публикует не
  * каждый домен-посредник (проверено — у общественных её нет), и без отката медийные
  * дата-центры просто не работали бы. */
+/* Имя точки: kwsN у обычного дата-центра, kwsN-1 у медийного.
+ *
+ * ВТОРЫМ КАНДИДАТОМ ИДЁТ ТОЧКА ДРУГОГО ВИДА, и это не небрежность. У самого Telegram записи
+ * kwsN-1 есть, а у общественных доменов за Cloudflare их не завёл никто: из двадцати доменов
+ * пула kws2-1 не отвечает ни один. Идти в таком случае напрямую нельзя — адреса медийных ДЦ
+ * блокируют так же, как и остальные, — а ключ авторизации у медийного и обычного ДЦ с одним
+ * номером общий, и файлы обычная точка отдаёт. Поэтому: сначала своя точка, потом соседняя,
+ * и только если молчат обе — насквозь. */
+static void tgws_hosts_at(const char *domain, int dc, int media, char out[2][160]) {
+    snprintf(out[0], 160, "kws%d%s.%s", dc, media ? "-1" : "", domain);
+    snprintf(out[1], 160, "kws%d%s.%s", dc, media ? "" : "-1", domain);
+}
+
 static void tgws_hosts(int dc, int media, char out[2][160]) {
-    snprintf(out[0], 160, "kws%d%s.%s", dc, media ? "-1" : "", g_domain);
-    snprintf(out[1], 160, "kws%d%s.%s", dc, media ? "" : "-1", g_domain);
+    tgws_hosts_at(g_domain, dc, media, out);
 }
 
 /* Номер ДЦ по адресу назначения. 0 — адрес неизвестен, перехватывать нельзя. */
+/* Самая длинная подходящая маска. Порядок записей в таблице при этом не важен — важно
+ * только, насколько запись точна. */
 static short dc_of(uint32_t ip, short *media) {
-    for (size_t i = 0; i < g_dc_n; i++)
-        if (g_dc[i].ip == ip) { *media = g_dc[i].media; return g_dc[i].dc; }
-    return 0;
+    short dc = 0;
+    uint32_t best = 0;
+    int have = 0;
+    for (size_t i = 0; i < g_dc_n; i++) {
+        if ((ip & g_dc[i].mask) != g_dc[i].ip) continue;
+        uint32_t m = ntohl(g_dc[i].mask);
+        if (have && m <= best) continue;
+        best = m; have = 1;
+        dc = g_dc[i].dc;
+        *media = g_dc[i].media;
+    }
+    return dc;
 }
 
 /* ---- обфускация MTProto ------------------------------------------------------------ */
@@ -453,30 +567,47 @@ struct ws_rx {
      * нельзя (см. TLS_REC_MAX). */
     unsigned char buf[BUF_N * 2 + TLS_REC_MAX];
     size_t n;
+    /* Тело кадра, которое ещё не дошло до клиента. Кадр НЕ обязан помещаться в буфер
+     * целиком — см. пояснение у ws_head. */
+    size_t pend;
+    int    pend_op;
 };
 
-/* 1 — кадр разобран (payload/len), 0 — нужно ещё читать, -1 — ошибка/закрытие. */
-static int ws_frame(struct ws_rx *rx, unsigned char **payload, size_t *len, int *opcode) {
+/* Разбор ЗАГОЛОВКА кадра, без требования, чтобы тело уже пришло целиком.
+ *
+ * ПОЧЕМУ ТЕЛО НЕ СОБИРАЕТСЯ В БУФЕР. Раньше кадр, не влезший в буфер (около 50 КБ), считался
+ * ошибкой и обрывал соединение. Переписка в такие кадры не попадает никогда, а кусок файла —
+ * всегда: клиент просит их по 128 КБ и по 512 КБ. Снаружи это выглядело ровно так, как
+ * рассказал владелец: «подключается-отключается раз в 2-3 секунды, медиа не грузится».
+ * Собирать такой кадр целиком незачем и нечем — за ним поток, а не сообщение: тело
+ * переливается по мере прихода, а буфер держит только заголовок и то, что уже прочитано.
+ *
+ * 1 — заголовок разобран, 0 — нужно ещё читать, -1 — ошибка. */
+static int ws_head(struct ws_rx *rx, size_t *need, size_t *plen, int *opcode) {
     if (rx->n < 2) return 0;
     unsigned char b1 = rx->buf[1];
-    size_t need = 2, plen = b1 & 0x7f;
+    size_t hn = 2, n = b1 & 0x7f;
     if (b1 & 0x80) return -1;                         /* сервер маскировать не должен */
-    if (plen == 126) {
+    if (n == 126) {
         if (rx->n < 4) return 0;
-        plen = ((size_t)rx->buf[2] << 8) | rx->buf[3];
-        need = 4;
-    } else if (plen == 127) {
+        n = ((size_t)rx->buf[2] << 8) | rx->buf[3];
+        hn = 4;
+    } else if (n == 127) {
         if (rx->n < 10) return 0;
-        plen = 0;
-        for (int i = 0; i < 8; i++) plen = (plen << 8) | rx->buf[2 + i];
-        need = 10;
+        n = 0;
+        for (int i = 0; i < 8; i++) n = (n << 8) | rx->buf[2 + i];
+        hn = 10;
     }
-    if (plen > sizeof(rx->buf) - 16) return -1;       /* кадр больше буфера — не наш случай */
-    if (rx->n < need + plen) return 0;
     *opcode = rx->buf[0] & 0x0f;
-    *payload = rx->buf + need;
-    *len = plen;
-    return (int)(need + plen);
+    /* Управляющий кадр по RFC 6455 §5.5 не длиннее 125 байт и не дробится — его ждём
+     * целиком, иначе отвечать нечем. */
+    if (*opcode & 0x8) {
+        if (n > 125) return -1;
+        if (rx->n < hn + n) return 0;
+    }
+    *need = hn;
+    *plen = n;
+    return 1;
 }
 
 static void ws_consume(struct ws_rx *rx, size_t used) {
@@ -567,6 +698,8 @@ static void pump(int cfd, struct upstream *u) {
     struct ws_rx rx;
     unsigned char buf[BUF_N];
     rx.n = 0;
+    rx.pend = 0;
+    rx.pend_op = 0;
 
     for (;;) {
         struct pollfd p[2];
@@ -588,23 +721,43 @@ static void pump(int cfd, struct upstream *u) {
         }
 
         if ((p[1].revents & POLLIN) || wait == 0) {
-            if (sizeof(rx.buf) - rx.n < TLS_REC_MAX) return;   /* кадр больше буфера */
-            int r = up_read(u, rx.buf + rx.n, sizeof(rx.buf) - rx.n);
-            if (r < 0) return;
-            if (r > 0) rx.n += (size_t)r;
+            /* Места всегда хватает: разбор ниже опустошает буфер до заголовка следующего
+             * кадра, а тело через него только протекает. */
+            if (sizeof(rx.buf) - rx.n >= TLS_REC_MAX) {
+                int r = up_read(u, rx.buf + rx.n, sizeof(rx.buf) - rx.n);
+                if (r < 0) return;
+                if (r > 0) rx.n += (size_t)r;
+            }
             for (;;) {
-                unsigned char *pl;
-                size_t len;
+                /* Хвост предыдущего кадра идёт вперёд заголовков: пока он не дошёл до
+                 * клиента, следующего кадра в потоке нет. */
+                if (rx.pend) {
+                    size_t take = rx.n < rx.pend ? rx.n : rx.pend;
+                    if (!take) break;
+                    if (rx.pend_op == 0x1 || rx.pend_op == 0x2 || rx.pend_op == 0x0) {
+                        size_t off = 0;
+                        while (off < take) {
+                            ssize_t w = send(cfd, rx.buf + off, take - off, MSG_NOSIGNAL);
+                            if (w <= 0) { if (errno == EINTR) continue; return; }
+                            off += (size_t)w;
+                        }
+                    }
+                    ws_consume(&rx, take);
+                    rx.pend -= take;
+                    continue;
+                }
+
+                size_t need, len;
                 int op;
-                int used = ws_frame(&rx, &pl, &len, &op);
-                if (used == 0) break;
-                if (used < 0) return;
+                int h = ws_head(&rx, &need, &len, &op);
+                if (h == 0) break;
+                if (h < 0) return;
                 if (op == 0x8) return;                /* close */
                 if (op == 0x9) {                      /* ping — отвечаем тем же телом */
                     unsigned char pong[128];
                     size_t pn = len > sizeof(pong) ? sizeof(pong) : len;
-                    memcpy(pong, pl, pn);
-                    ws_consume(&rx, (size_t)used);
+                    memcpy(pong, rx.buf + need, pn);
+                    ws_consume(&rx, need + len);
                     /* pong — управляющий кадр, но маскировка та же; тело копируем заранее,
                      * потому что ws_consume сдвигает буфер под ним. */
                     unsigned char hdr[6];
@@ -618,15 +771,11 @@ static void pump(int cfd, struct upstream *u) {
                     if (pn && up_write(u, pong, pn) < 0) return;
                     continue;
                 }
-                if (op == 0x1 || op == 0x2 || op == 0x0) {
-                    size_t off = 0;
-                    while (off < len) {
-                        ssize_t w = send(cfd, pl + off, len - off, MSG_NOSIGNAL);
-                        if (w <= 0) { if (errno == EINTR) continue; return; }
-                        off += (size_t)w;
-                    }
-                }
-                ws_consume(&rx, (size_t)used);
+                if (op & 0x8) { ws_consume(&rx, need + len); continue; }  /* прочее управление */
+
+                ws_consume(&rx, need);
+                rx.pend = len;
+                rx.pend_op = op;
             }
         }
         if ((p[0].revents | p[1].revents) & (POLLERR | POLLHUP)) {
@@ -735,6 +884,13 @@ static void *serve(void *arg) {
     const char *port = "443";
     const char *ep = getenv("STEER_TGWS_ENDPOINT");
     char epbuf[160];
+    /* Домены по порядку: свой, потом запасные. Больше трёх не пробуем — человек ждёт
+     * соединения, а не полного обхода списка. */
+    const char *doms[1 + MAX_ALT];
+    size_t dom_n = 0;
+    doms[dom_n++] = g_domain;
+    for (size_t i = 0; i < g_alt_n && dom_n < 3; i++)
+        if (strcmp(g_alt[i], g_domain) != 0) doms[dom_n++] = g_alt[i];
     tgws_hosts(dc, media, cand);
     if (ep) {
         snprintf(epbuf, sizeof(epbuf), "%s", ep);
@@ -745,25 +901,32 @@ static void *serve(void *arg) {
     struct upstream u;
     int ok = 0;
     const char *sni = cand[0];
-    for (int i = 0; i < 2 && !ok; i++) {
-        sni = cand[i];
-        memset(&u, 0, sizeof(u));
-        u.fd = tcp_connect(ep ? epbuf : sni, port, UP_TIMEOUT_S);
-        if (u.fd < 0) continue;
-        if (!getenv("STEER_TGWS_PLAIN") && tls_start(&u, sni) != 0) {
-            fprintf(stderr, LOG_W "%s: TLS не поднялся (код %d)\n", sni, g_tls_rc);
-            close(u.fd);
-            continue;
+    for (size_t d = 0; d < dom_n && !ok; d++) {
+        if (d) tgws_hosts_at(doms[d], dc, media, cand);
+        for (int i = 0; i < 2 && !ok; i++) {
+            sni = cand[i];
+            memset(&u, 0, sizeof(u));
+            u.fd = tcp_connect(ep ? epbuf : sni, port, UP_TIMEOUT_S);
+            if (u.fd < 0) continue;
+            if (!getenv("STEER_TGWS_PLAIN") && tls_start(&u, sni) != 0) {
+                fprintf(stderr, LOG_W "%s: TLS не поднялся (код %d)\n", sni, g_tls_rc);
+                close(u.fd);
+                continue;
+            }
+            if (ws_upgrade(&u, sni) != 0 || ws_send(&u, hs, HS_LEN) < 0) {
+                if (u.tls_on) tls13_free(&u.tls);
+                close(u.fd);
+                continue;
+            }
+            ok = 1;
         }
-        if (ws_upgrade(&u, sni) != 0 || ws_send(&u, hs, HS_LEN) < 0) {
-            if (u.tls_on) tls13_free(&u.tls);
-            close(u.fd);
-            continue;
-        }
-        ok = 1;
     }
     if (!ok) {
-        fprintf(stderr, LOG_W "%s: точка ДЦ%d недоступна — пропускаю как есть\n", cand[0], dc);
+        /* Пропустить насквозь — единственный честный ответ. Точки нет, а отправить
+         * соединение в чужую значит сломать его наверняка; напрямую же оно сломано только
+         * там, где провайдер этот адрес и правда режет. */
+        fprintf(stderr, LOG_W "%s: точка ДЦ%d%s недоступна — пропускаю как есть\n",
+                cand[0], dc, media ? "m" : "");
         relay_direct(cfd, &dst, hs, got);
         goto done;
     }
@@ -945,10 +1108,13 @@ int cmd_tgws_probe(int dc, int media) {
         rx.n += (size_t)r;
         for (;;) {
             unsigned char *pl;
-            size_t len;
+            size_t need, len;
             int op;
-            int used = ws_frame(&rx, &pl, &len, &op);
-            if (used <= 0) break;
+            /* Пробе хватает кадра целиком: resPQ — четыре с небольшим десятка байт. */
+            if (ws_head(&rx, &need, &len, &op) != 1) break;
+            if (rx.n < need + len) break;
+            size_t used = need + len;
+            pl = rx.buf + need;
             if (op == 0x2 && len > 8) {
                 unsigned char dec[512];
                 size_t n = len > sizeof(dec) ? sizeof(dec) : len;
@@ -971,7 +1137,7 @@ int cmd_tgws_probe(int dc, int media) {
                 printf("\n");
                 goto bad;
             }
-            ws_consume(&rx, (size_t)used);
+            ws_consume(&rx, used);
         }
     }
     printf("итог:       ответа нет (точка молчит)\n");
@@ -1000,6 +1166,7 @@ int cmd_tgws(const char *spec, const char *name) {
 
     dc_table_init();
     domain_init(o->tg_domain);
+    alt_init();
     int port = out_tgws_port(o);
 
     int srv = socket(AF_INET, SOCK_STREAM, 0);
