@@ -79,6 +79,14 @@
 #define TAG_POS       56        /* метка транспорта */
 #define DC_POS        60        /* номер ДЦ, signed LE */
 #define BUF_N         16384     /* столько за раз переливаем в каждую сторону */
+/* Место, которое обязано быть свободно перед чтением из TLS.
+ *
+ * tls13_read отдаёт запись ЦЕЛИКОМ и отказывает (TLS13_ETOOBIG), если она не влезла, — то
+ * есть «мало места» здесь не «прочитаем остаток потом», а потерянная запись и разъехавшийся
+ * поток. Запись TLS 1.3 — до 16 КБ полезной нагрузки, поэтому свободного места всегда
+ * держим больше. Поймано пробой против openssl s_server: ответ в 3 КБ не влезал в буфер на
+ * 2 КБ, и ошибка выглядела как «сервер отказал». */
+#define TLS_REC_MAX   17408
 #define MAX_CONNS     64        /* больше клиент не открывает; предел от утечки потоков */
 #define UP_TIMEOUT_S  10
 
@@ -172,6 +180,15 @@ static void domain_init(const char *from_spec) {
     snprintf(g_domain, sizeof(g_domain), "%s", d);
 }
 
+/* Имена точек ДЦ в порядке предпочтения: у медийного впереди `kwsN-1`, у обычного `kwsN`.
+ * Их всегда два, и второй не запасной «на всякий случай»: медийную запись публикует не
+ * каждый домен-посредник (проверено — у общественных её нет), и без отката медийные
+ * дата-центры просто не работали бы. */
+static void tgws_hosts(int dc, int media, char out[2][160]) {
+    snprintf(out[0], 160, "kws%d%s.%s", dc, media ? "-1" : "", g_domain);
+    snprintf(out[1], 160, "kws%d%s.%s", dc, media ? "" : "-1", g_domain);
+}
+
 /* Номер ДЦ по адресу назначения. 0 — адрес неизвестен, перехватывать нельзя. */
 static short dc_of(uint32_t ip, short *media) {
     for (size_t i = 0; i < g_dc_n; i++)
@@ -258,6 +275,10 @@ static int hs_build(unsigned char hs[HS_LEN], unsigned char tag, short dc, short
  *
  * Голый нужен стенду: поднимать в нём настоящий TLS означало бы проверять чужую библиотеку
  * вместо своего моста. Включается STEER_TGWS_PLAIN=1 и в бою не встречается. */
+/* Код последней неудачи TLS — только для сообщений: без него «не поднялось» неотличимо от
+ * «узел молчит», а это разные причины с разными действиями. */
+static int g_tls_rc;
+
 struct upstream {
     int fd;
     struct tls13 tls;
@@ -275,13 +296,22 @@ static int up_write(struct upstream *u, const unsigned char *p, size_t n) {
     return (int)n;
 }
 
+/* Возвращает число байт, 0 — «пока нечего, приходи снова», -1 — конец или отказ.
+ *
+ * TLS13_EAGAIN здесь ОБЯЗАН отличаться от отказа, и это не мелочь: он значит «целой записи в
+ * сокете ещё нет», а не поломку. Первая версия считала его отказом — и апгрейд веб-сокета
+ * падал на живой точке, которая отвечала 101 (проверено вручную через openssl): ответ просто
+ * не успевал прийти целиком к первому чтению. */
 static int up_read(struct upstream *u, unsigned char *p, size_t cap) {
     if (u->tls_on) {
         size_t got = 0;
-        if (tls13_read(&u->tls, p, cap, &got) != 0) return -1;
+        int rc = tls13_read(&u->tls, p, cap, &got);
+        if (rc == TLS13_EAGAIN) return 0;
+        if (rc != 0) { g_tls_rc = rc; return -1; }
         return (int)got;
     }
     ssize_t r = recv(u->fd, p, cap, 0);
+    if (r < 0 && (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR)) return 0;
     return r > 0 ? (int)r : -1;
 }
 
@@ -324,7 +354,12 @@ static void b64(const unsigned char *in, size_t n, char *out) {
  * нас поверх TLS посредника нет, и SHA-1 ради одной проверки в сборку тянуть незачем. */
 static int ws_upgrade(struct upstream *u, const char *host) {
     unsigned char nonce[16];
-    char key[32], req[512], resp[2048];
+    char key[32], req[512];
+    /* Ответ читается в буфер под целую запись TLS: см. TLS_REC_MAX. В куче, а не на стеке, —
+     * поток моста живёт со стеком в 128 КБ, и 17 КБ на кадр установления там лишние. */
+    char *resp = malloc(TLS_REC_MAX + 1);
+    if (!resp) return -1;
+#define WS_UP_FAIL(...) do { fprintf(stderr, __VA_ARGS__); free(resp); return -1; } while (0)
 
     if (xc_random(nonce, sizeof(nonce)) != 0) return -1;
     b64(nonce, sizeof(nonce), key);
@@ -341,23 +376,35 @@ static int ws_upgrade(struct upstream *u, const char *host) {
                      "User-Agent: Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
                      "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36\r\n"
                      "\r\n", host, key);
-    if (n <= 0 || up_write(u, (unsigned char *)req, (size_t)n) < 0) return -1;
+    if (n <= 0) WS_UP_FAIL(LOG_W "запрос не собрался\n");
+    if (up_write(u, (unsigned char *)req, (size_t)n) < 0) WS_UP_FAIL(LOG_W "запрос не ушёл\n");
 
     size_t got = 0;
-    for (;;) {
-        int r = up_read(u, (unsigned char *)resp + got, sizeof(resp) - 1 - got);
-        if (r <= 0) return -1;
+    for (int round = 0; round < 200; round++) {
+        if (TLS_REC_MAX - got < 1) WS_UP_FAIL(LOG_W "ответ на апгрейд не влез\n");
+        int r = up_read(u, (unsigned char *)resp + got, TLS_REC_MAX - got);
+        if (r < 0) WS_UP_FAIL(LOG_W "чтение ответа отказало (код %d)\n", g_tls_rc);
+        if (r == 0) {
+            /* Записи ещё нет — ждём событие на сокете, а не крутим цикл: у моста это путь
+             * установления, и занимать им процессор роутера незачем. */
+            struct pollfd p = { .fd = u->fd, .events = POLLIN, .revents = 0 };
+            if (!(u->tls_on && tls13_has_record(&u->tls)) && poll(&p, 1, 100) < 0)
+                WS_UP_FAIL(LOG_W "ожидание ответа прервано\n");
+            continue;
+        }
         got += (size_t)r;
         resp[got] = '\0';
         if (strstr(resp, "\r\n\r\n")) break;
-        if (got >= sizeof(resp) - 1) return -1;
     }
+    if (!strstr(resp, "\r\n\r\n"))
+        WS_UP_FAIL(LOG_W "ответа на апгрейд нет (получено %zu байт)\n", got);
     if (strncmp(resp, "HTTP/1.1 101", 12) != 0) {
         char *e = strchr(resp, '\r');
         if (e) *e = '\0';
-        fprintf(stderr, LOG_W "%s: апгрейд отклонён (%s)\n", host, resp);
-        return -1;
+        WS_UP_FAIL(LOG_W "%s: апгрейд отклонён (%s)\n", host, resp);
     }
+    free(resp);
+#undef WS_UP_FAIL
     /* Тело после заголовков быть не должно: сервер отвечает 101 и молчит до первого кадра.
      * Если что-то пришло, это уже кадры — но их приход раньше нашего init означал бы, что
      * мы говорим не с той точкой, и разбирать это нечем. */
@@ -402,7 +449,9 @@ static int ws_send(struct upstream *u, const unsigned char *p, size_t n) {
  * Свой буфер, а не чтение по байту: TLS отдаёт запись целиком, и в ней бывает несколько
  * кадров — читая по одному, второй оставляли бы ждать события, которого может не быть. */
 struct ws_rx {
-    unsigned char buf[BUF_N * 2];
+    /* Кадр веб-сокета плюс запас под целую запись TLS: читать в остаток меньше записи
+     * нельзя (см. TLS_REC_MAX). */
+    unsigned char buf[BUF_N * 2 + TLS_REC_MAX];
     size_t n;
 };
 
@@ -475,7 +524,6 @@ static int sid_random(void *ctx, unsigned char sid[32], const unsigned char *hs,
     return xc_random(sid, 32);
 }
 
-static int g_tls_rc;
 static int tls_start(struct upstream *u, const char *sni) {
     unsigned char priv[32], pub[32], hello[4096];
     size_t hello_n = 0;
@@ -497,7 +545,10 @@ static int tls_start(struct upstream *u, const char *sni) {
     struct reality_cfg cfg = { .sni = sni, .pbk = pbk_b64, .sid = "", .fp = "chrome",
                                .alpn = "http/1.1" };
     struct reality_state st;
-    struct reality_carrier car = { .priv = priv, .pub = pub, .fill_sid = sid_random };
+    /* ALPN только http/1.1: с обычной парой Cloudflare выбирает h2, и апгрейд по HTTP/1.1
+     * для неё мусор (см. поле alpn_http11 в reality.h — там же, как это выяснилось). */
+    struct reality_carrier car = { .priv = priv, .pub = pub, .fill_sid = sid_random,
+                                   .alpn_http11 = 1 };
     int hrc = reality_build_hello_carry(&cfg, &st, &car, hello, sizeof(hello), &hello_n);
     if (hrc != 0) { g_tls_rc = -200 + hrc; return -1; }
     if (up_write(u, hello, hello_n) < 0) { g_tls_rc = -102; return -1; }
@@ -537,8 +588,9 @@ static void pump(int cfd, struct upstream *u) {
         }
 
         if ((p[1].revents & POLLIN) || wait == 0) {
+            if (sizeof(rx.buf) - rx.n < TLS_REC_MAX) return;   /* кадр больше буфера */
             int r = up_read(u, rx.buf + rx.n, sizeof(rx.buf) - rx.n);
-            if (r <= 0 && !(wait == 0 && r == 0)) return;
+            if (r < 0) return;
             if (r > 0) rx.n += (size_t)r;
             for (;;) {
                 unsigned char *pl;
@@ -679,35 +731,39 @@ static void *serve(void *arg) {
 
     /* Куда идём. Имя точки — kwsN[-1].<домен>, оно же SNI и Host; АДРЕС подключения обычно
      * тот же, но стенду его задают отдельно (там поднят свой сервер на петле). */
-    char host[160], sni[160];
+    char cand[2][160];
     const char *port = "443";
     const char *ep = getenv("STEER_TGWS_ENDPOINT");
-    snprintf(sni, sizeof(sni), "kws%d%s.%s", dc, media ? "-1" : "", g_domain);
+    char epbuf[160];
+    tgws_hosts(dc, media, cand);
     if (ep) {
-        snprintf(host, sizeof(host), "%s", ep);
-        char *c = strchr(host, ':');
+        snprintf(epbuf, sizeof(epbuf), "%s", ep);
+        char *c = strchr(epbuf, ':');
         if (c) { *c = '\0'; port = c + 1; }
-    } else {
-        snprintf(host, sizeof(host), "%s", sni);
     }
 
     struct upstream u;
-    memset(&u, 0, sizeof(u));
-    u.fd = tcp_connect(host, port, UP_TIMEOUT_S);
-    if (u.fd < 0) {
-        fprintf(stderr, LOG_W "%s: не соединиться (ДЦ%d) — пропускаю как есть\n", host, dc);
-        relay_direct(cfd, &dst, hs, got);
-        goto done;
+    int ok = 0;
+    const char *sni = cand[0];
+    for (int i = 0; i < 2 && !ok; i++) {
+        sni = cand[i];
+        memset(&u, 0, sizeof(u));
+        u.fd = tcp_connect(ep ? epbuf : sni, port, UP_TIMEOUT_S);
+        if (u.fd < 0) continue;
+        if (!getenv("STEER_TGWS_PLAIN") && tls_start(&u, sni) != 0) {
+            fprintf(stderr, LOG_W "%s: TLS не поднялся (код %d)\n", sni, g_tls_rc);
+            close(u.fd);
+            continue;
+        }
+        if (ws_upgrade(&u, sni) != 0 || ws_send(&u, hs, HS_LEN) < 0) {
+            if (u.tls_on) tls13_free(&u.tls);
+            close(u.fd);
+            continue;
+        }
+        ok = 1;
     }
-    if (!getenv("STEER_TGWS_PLAIN") && tls_start(&u, sni) != 0) {
-        fprintf(stderr, LOG_W "%s: TLS не поднялся — пропускаю как есть\n", sni);
-        close(u.fd);
-        relay_direct(cfd, &dst, hs, got);
-        goto done;
-    }
-    if (ws_upgrade(&u, sni) != 0 || ws_send(&u, hs, HS_LEN) < 0) {
-        if (u.tls_on) tls13_free(&u.tls);
-        close(u.fd);
+    if (!ok) {
+        fprintf(stderr, LOG_W "%s: точка ДЦ%d недоступна — пропускаю как есть\n", cand[0], dc);
         relay_direct(cfd, &dst, hs, got);
         goto done;
     }
@@ -758,13 +814,13 @@ static int obf_init(struct obf *o, const unsigned char hs[HS_LEN]) {
     o->oe = o->od = 0;
     if (mbedtls_aes_setkey_enc(&o->enc, hs + 8, 256) != 0) return -1;
     if (mbedtls_aes_setkey_enc(&o->dec, rev + 8, 256) != 0) return -1;
-    /* Первые 64 байта гаммы съедены самим init: он уходит в сеть как есть, а поток
-     * продолжается с 64-й позиции. Не промотать их — значит расшифровывать со сдвигом. */
+    /* Промотать 64 байта гаммы надо ТОЛЬКО шифрующему направлению: их съел наш собственный
+     * init, который ушёл в сеть. Поток сервера к нам начинается с нуля — он нам никакого
+     * init не слал. Промотав оба, получаешь расшифровку со сдвигом: снято пробой против
+     * настоящего Telegram — ответ приходил, но выглядел шумом. */
     unsigned char skip[HS_LEN], zero[HS_LEN];
     memset(zero, 0, sizeof(zero));
     if (mbedtls_aes_crypt_ctr(&o->enc, HS_LEN, &o->oe, o->nce, o->sbe, zero, skip) != 0)
-        return -1;
-    if (mbedtls_aes_crypt_ctr(&o->dec, HS_LEN, &o->od, o->ncd, o->sbd, zero, skip) != 0)
         return -1;
     return 0;
 }
@@ -794,23 +850,30 @@ int cmd_tgws_probe(int dc, int media) {
     if (dc < 1 || dc > 9) { fprintf(stderr, LOG_W "номер ДЦ: 1..5\n"); return 2; }
     domain_init(NULL);
 
-    char sni[160], host[160];
+    char cand[2][160], host[160];
     const char *port = "443";
     const char *ep = getenv("STEER_TGWS_ENDPOINT");
-    snprintf(sni, sizeof(sni), "kws%d%s.%s", dc, media ? "-1" : "", g_domain);
-    if (ep) {
-        snprintf(host, sizeof(host), "%s", ep);
-        char *c = strchr(host, ':');
-        if (c) { *c = '\0'; port = c + 1; }
-    } else {
-        snprintf(host, sizeof(host), "%s", sni);
-    }
+    tgws_hosts(dc, media, cand);
+    const char *sni = cand[0];
 
     struct upstream u;
     memset(&u, 0, sizeof(u));
-    printf("точка:      %s:%s\n", host, port);
-    u.fd = tcp_connect(host, port, UP_TIMEOUT_S);
-    if (u.fd < 0) { printf("итог:       не соединиться (%s)\n", strerror(errno)); return 1; }
+    u.fd = -1;
+    for (int i = 0; i < 2 && u.fd < 0; i++) {
+        sni = cand[i];
+        if (ep) {
+            snprintf(host, sizeof(host), "%s", ep);
+            char *c = strchr(host, ':');
+            if (c) { *c = '\0'; port = c + 1; }
+        } else {
+            snprintf(host, sizeof(host), "%s", sni);
+        }
+        printf("точка:      %s:%s\n", host, port);
+        u.fd = tcp_connect(host, port, UP_TIMEOUT_S);
+        if (u.fd < 0) printf("            не соединиться (%s)\n", strerror(errno));
+        if (ep) break;
+    }
+    if (u.fd < 0) { printf("итог:       ни одна точка не отвечает\n"); return 1; }
     printf("соединение: есть\n");
 
     if (!getenv("STEER_TGWS_PLAIN")) {
@@ -820,6 +883,23 @@ int cmd_tgws_probe(int dc, int media) {
             return 1;
         }
         printf("TLS 1.3:    есть (SNI %s, сертификат не проверяется — см. tgws.c)\n", sni);
+    }
+    /* Разведочный режим: TLS подняли и молчим. Нужен ровно для одного вопроса — приходит ли
+     * отказ узла ДО нашего запроса; ответ на него разделяет «не нравится рукопожатие» и «не
+     * нравится запрос», а это разные починки. */
+    if (getenv("STEER_TGWS_NOREQ")) {
+        unsigned char probe_buf[4096];
+        for (int i = 0; i < 20; i++) {
+            int r = up_read(&u, probe_buf, sizeof(probe_buf));
+            if (r < 0) { printf("после TLS: узел закрыл сам (код %d)\n", g_tls_rc); break; }
+            if (r > 0) { printf("после TLS: узел прислал %d байт до запроса\n", r); break; }
+            struct pollfd pp = { .fd = u.fd, .events = POLLIN, .revents = 0 };
+            if (poll(&pp, 1, 100) < 0) break;
+        }
+        printf("итог:       разведка закончена\n");
+        if (u.tls_on) tls13_free(&u.tls);
+        close(u.fd);
+        return 0;
     }
     if (ws_upgrade(&u, sni) != 0) {
         printf("итог:       апгрейд WebSocket отклонён\n");
@@ -858,8 +938,10 @@ int cmd_tgws_probe(int dc, int media) {
         struct pollfd p = { .fd = u.fd, .events = POLLIN, .revents = 0 };
         int wait = (u.tls_on && tls13_has_record(&u.tls)) ? 0 : 500;
         if (wait && poll(&p, 1, wait) <= 0) continue;
+        if (sizeof(rx.buf) - rx.n < TLS_REC_MAX) break;
         int r = up_read(&u, rx.buf + rx.n, sizeof(rx.buf) - rx.n);
-        if (r <= 0) break;
+        if (r < 0) break;
+        if (r == 0) continue;
         rx.n += (size_t)r;
         for (;;) {
             unsigned char *pl;
@@ -871,10 +953,11 @@ int cmd_tgws_probe(int dc, int media) {
                 unsigned char dec[512];
                 size_t n = len > sizeof(dec) ? sizeof(dec) : len;
                 if (mbedtls_aes_crypt_ctr(&o.dec, n, &o.od, o.ncd, o.sbd, pl, dec) != 0) goto bad;
-                /* resPQ#05162463 — первые четыре байта тела после заголовка сообщения:
-                 * 4 длины транспорта + 8 auth_key_id + 8 message_id + 4 длины. */
-                if (n >= 28 && dec[20] == 0x63 && dec[21] == 0x24 && dec[22] == 0x16 &&
-                    dec[23] == 0x05) {
+                /* resPQ#05162463 — первые четыре байта ТЕЛА, а тело начинается за заголовком:
+                 * 4 байта длины транспорта + 8 auth_key_id + 8 message_id + 4 длины тела =
+                 * 24. Смещение снято с живого ответа, а не выведено из документации. */
+                if (n >= 28 && dec[24] == 0x63 && dec[25] == 0x24 && dec[26] == 0x16 &&
+                    dec[27] == 0x05) {
                     printf("ответ:      resPQ, %zu байт\n", n);
                     printf("итог:       дата-центр %d%s отвечает через веб-сокет\n",
                            dc, media ? " (медийный)" : "");
@@ -883,7 +966,9 @@ int cmd_tgws_probe(int dc, int media) {
                     close(u.fd);
                     return 0;
                 }
-                printf("ответ:      %zu байт, но это не resPQ\n", n);
+                printf("ответ:      %zu байт, но это не resPQ; начало:", n);
+                for (size_t k = 0; k < (n < 28 ? n : 28); k++) printf(" %02x", dec[k]);
+                printf("\n");
                 goto bad;
             }
             ws_consume(&rx, (size_t)used);

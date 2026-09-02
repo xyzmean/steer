@@ -435,9 +435,15 @@ int reality_build_hello_carry(const struct reality_cfg *cfg, struct reality_stat
      * (NextProtos nil в Xray) и присылает пустые EncryptedExtensions. */
     {
         struct buf ab = { b_alpn, 0, sizeof(b_alpn) };
-        put16(&ab, 12);
-        put8(&ab, 2); put(&ab, "h2", 2);
-        put8(&ab, 8); put(&ab, "http/1.1", 8);
+        if (car && car->alpn_http11) {
+            /* Только http/1.1: см. объяснение у поля в reality.h. */
+            put16(&ab, 9);
+            put8(&ab, 8); put(&ab, "http/1.1", 8);
+        } else {
+            put16(&ab, 12);
+            put8(&ab, 2); put(&ab, "h2", 2);
+            put8(&ab, 8); put(&ab, "http/1.1", 8);
+        }
         px[pn].type = 0x0010; px[pn].body = b_alpn; px[pn].n = ab.len; pn++;
     }
 
