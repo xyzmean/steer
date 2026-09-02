@@ -859,6 +859,34 @@ static void generate(FILE *f) {
                     o->on_fail == FAIL_DROP ? "" : " bypass", o->name);
         }
         fprintf(f, "    }\n");
+        /* СВОЯ predefrag, а не расчёт на цепочку zapret. Порождённые обработчиком пакеты
+         * (подделки, повторы, куски разрезанного) для conntrack — мусор: чужие номера
+         * последовательности, дубли, части без начала. Учтённые, они становятся INVALID, и
+         * fw4 их отбрасывает — обход молча не работает, хотя обработчик жив и очередь
+         * считает пакеты. Снятие с учёта (notrack) делает predefrag_nfqws системного
+         * zapret, и до сих пор мы на неё и рассчитывали: у порождённых пакетов поднят
+         * 0x40000000, её условие. Но эта цепочка живёт в таблице СЛУЖБЫ zapret и исчезает
+         * вместе с ней — а выключить общий обход и оставить обход только одному выходу
+         * (например, YouTube) — ровно то, ради чего выход kind=zapret и заводят. Снято с
+         * живого роутера владельца: общий обход выключен, выход стоит, стратегия рабочая,
+         * очередь считает пакеты — YouTube не открывается; проверка стратегий при этом даёт
+         * числа, равные «без обхода», по той же причине.
+         *
+         * Правила — те же четыре, что у zapret (postnat-метка, два вида фрагментов,
+         * данные без ACK), и на том же приоритете -401 — до conntrack. Две одинаковые
+         * цепочки при работающем общем обходе не мешают друг другу: notrack дважды — это
+         * notrack. */
+        fprintf(f, "\n    chain zapret_predefrag {\n"
+                   "        type filter hook output priority -401; policy accept;\n"
+                   "        meta mark and 0x%08x != 0x00000000 jump zapret_predefrag_nfqws "
+                   "comment \"steer:zapret-notrack\"\n"
+                   "    }\n"
+                   "    chain zapret_predefrag_nfqws {\n"
+                   "        meta mark and 0x%08x != 0x00000000 notrack comment \"postnat traffic\"\n"
+                   "        ip frag-off and 0x1fff != 0x0 notrack comment \"ipfrag\"\n"
+                   "        exthdr frag exists notrack comment \"ipfrag\"\n"
+                   "        tcp flags ! syn,rst,ack notrack comment \"datanoack\"\n"
+                   "    }\n", ZAPRET_SKIP_MARK, ZAPRET_MINE_BIT);
     }
 
     if (has_domains()) {

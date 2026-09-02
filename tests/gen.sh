@@ -526,12 +526,25 @@ check "в очередь идут только первые пакеты" "2" \
 # Метка канала несёт ЧУЖОЙ бит 0x40000000 — им системный обход узнаёт «этот трафик не мой».
 check "трафик выхода помечен как чужой для общего обхода" "1" \
     "$(printf '%s\n' "$zout" | grep -c 'or 0x40100000')"
+# Порождённые обработчиком пакеты снимаются с учёта conntrack НАШЕЙ цепочкой, а не цепочкой
+# службы zapret: та исчезает вместе со службой, а выключить общий обход и оставить его одному
+# выходу — ровно то, ради чего выход и заводят. Снято с роутера владельца: общий обход
+# выключен, обработчик жив, очередь считает — YouTube не открывается (INVALID у fw4).
+check "своя predefrag до conntrack" "1" \
+    "$(printf '%s\n' "$zout" | grep -c 'chain zapret_predefrag {')"
+check "висит на output до conntrack" "1" \
+    "$(printf '%s\n' "$zout" | grep -c 'hook output priority -401')"
+check "вход по чужому биту порождённых пакетов" "1" \
+    "$(printf '%s\n' "$zout" | grep -c 'meta mark and 0x40000000 != 0x00000000 jump zapret_predefrag_nfqws')"
+check "четыре правила notrack, как у zapret" "4" \
+    "$(printf '%s\n' "$zout" | grep -c ' notrack comment')"
 # Таблицы маршрутизации у такого выхода нет: маршрут не меняется вовсе.
 check "маршрутной таблицы у выхода zapret нет" "0" \
     "$(printf '%s\n' "$zout" | grep -c 'ip route')"
 # Пока в спеке нет ни одного такого выхода, цепочки быть не должно: пустая базовая цепочка
 # в postrouting — это лишний проход по правилам на КАЖДОМ пакете роутера.
 check "без выходов zapret цепочки нет" "0" "$(printf '%s\n' "$out" | grep -c 'zapret_queue')"
+check "и predefrag без них тоже нет" "0" "$(printf '%s\n' "$out" | grep -c 'zapret_predefrag')"
 
 # Что поднимать — спрашивают у движка, вместе с номером очереди и файлом ключей.
 zi="$("$BIN" zapret-instances --spec "$tmp/zap.json" --state-dir "$tmp/state-z" 2>&1)"

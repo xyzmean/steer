@@ -747,6 +747,7 @@ static int failover_hyst(void) {
     return g_hyst_cache;
 }
 /* Стенду нужно менять порог между проходами; в бою процесс короткоживущий и это не зовётся. */
+static void failover_hyst_reset_for_test(void) __attribute__((unused));
 static void failover_hyst_reset_for_test(void) { g_hyst_cache = -2; }
 
 /* Счётчик подряд-здоровых тиков более предпочтительного устройства — рядом с активным, третьим
