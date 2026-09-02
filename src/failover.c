@@ -197,6 +197,16 @@ const struct output *out_for_device(const struct output *o, const char *dev) {
     return owner ? owner : o;
 }
 
+static int device_healthy_for(const struct output *o, const char *dev);
+/* Проба здоровья вызывается через указатель, а не напрямую, ровно ради одного: стенд
+ * гистерезиса задаёт здоровье устройств по тику, не создавая интерфейсов в /sys и не открывая
+ * сокетов. В бою указатель НИКОГДА не меняется и всегда ссылается на device_healthy_for —
+ * ветка предсказуемая, той же природы, что швы путей для стендов в остальном коде. */
+static int (*g_health_probe)(const struct output *, const char *);
+static int health_of(const struct output *o, const char *dev) {
+    return g_health_probe ? g_health_probe(o, dev) : device_healthy_for(o, dev);
+}
+
 static int device_healthy_for(const struct output *o, const char *dev) {
     if (!device_present(dev)) return 0;
     /* Мера здоровья принадлежит УСТРОЙСТВУ, а не виду выхода, который его назвал: у
@@ -720,6 +730,45 @@ static void active_path(char *buf, size_t n) {
     snprintf(buf, n, "%s/active", g_state_dir);
 }
 
+/* Гистерезис возврата: сколько тиков подряд более предпочтительное устройство обязано быть
+ * здоровым, прежде чем пул вернётся к нему с запасного. Возврат наверх «мгновенно, как только
+ * ожил» на живом роутере обернулся мельканием: узел-предпочтение №0 подхватывался пробой раз в
+ * минуту, трафик прыгал на него и через минуту падал обратно — и так по кругу, каждый прыжок
+ * это до минуты мёртвого трафика. УХОД с мёртвого устройства при этом мгновенен и гистерезисом
+ * не задерживается: держать трафик на упавшем туннеле нельзя. 0 — прежнее поведение (без
+ * задержки). Читается один раз: процесс короткоживущий. */
+static int g_hyst_cache = -2;
+static int failover_hyst(void) {
+    if (g_hyst_cache == -2) {
+        const char *e = getenv("STEER_FAILOVER_HYST");
+        g_hyst_cache = e ? atoi(e) : 3;
+        if (g_hyst_cache < 0) g_hyst_cache = 0;
+    }
+    return g_hyst_cache;
+}
+/* Стенду нужно менять порог между проходами; в бою процесс короткоживущий и это не зовётся. */
+static void failover_hyst_reset_for_test(void) { g_hyst_cache = -2; }
+
+/* Счётчик подряд-здоровых тиков более предпочтительного устройства — рядом с активным, третьим
+ * полем в том же файле. Все читатели файла обязаны СЪЕДАТЬ три поля, иначе оставшийся на строке
+ * счётчик уедет в имя следующего выхода. Старый файл без счётчика читается как ноль. */
+static int g_streak[MAX_OUTPUTS];
+
+static int active_streak_get(const char *out) {
+    char path[256];
+    active_path(path, sizeof(path));
+    FILE *f = fopen(path, "r");
+    if (!f) return 0;
+    char name[32], d[32];
+    int st = 0, val = 0;
+    while (fscanf(f, "%31s %31s %d", name, d, &st) >= 2) {
+        if (!strcmp(name, out)) val = st;
+        st = 0;   /* следующая запись без третьего поля не должна унаследовать этот */
+    }
+    fclose(f);
+    return val;
+}
+
 static void active_get(const char *out, char *dev, size_t n) {
     dev[0] = '\0';
     char path[256];
@@ -727,8 +776,11 @@ static void active_get(const char *out, char *dev, size_t n) {
     FILE *f = fopen(path, "r");
     if (!f) return;
     char name[32], d[32];
-    while (fscanf(f, "%31s %31s\n", name, d) == 2)
+    int st = 0;
+    while (fscanf(f, "%31s %31s %d", name, d, &st) >= 2) {
         if (!strcmp(name, out)) snprintf(dev, n, "%s", d);
+        st = 0;
+    }
     fclose(f);
 }
 
@@ -739,7 +791,8 @@ static void active_save(void) {
     if (!f) return;
     for (size_t i = 0; i < g_out_n; i++)
         if (out_has_device(&g_out[i]))
-            fprintf(f, "%s %s\n", g_out[i].name, g_out[i].device[0] ? g_out[i].device : "-");
+            fprintf(f, "%s %s %d\n", g_out[i].name,
+                    g_out[i].device[0] ? g_out[i].device : "-", g_streak[i]);
     fclose(f);
 }
 
@@ -773,7 +826,7 @@ void outputs_adopt_active(void) {
         if (!out_has_device(o)) continue;
 
         char rec[32];
-        active_get(o->name, rec, sizeof(rec));
+        active_get(o->name, rec, sizeof(rec));   /* читает три поля — см. active_get */
         const char *pick = NULL;
         if (rec[0] && strcmp(rec, "-") != 0 && device_present(rec))
             for (size_t k = 0; k < o->devices_n && !pick; k++)
@@ -932,15 +985,46 @@ int cmd_failover(const char *spec, int verbose) {
 
         char was[32];
         active_get(o->name, was, sizeof(was));
+        /* Где в списке предпочтения стоит несущее трафик сейчас. -1 — записи нет или её
+         * устройство больше не кандидат: тогда гистерезису не за что держаться, берём
+         * лучшее здоровое сразу. */
+        int cur = -1;
+        for (size_t k = 0; k < o->devices_n; k++)
+            if (!strcmp(o->devices[k], was)) { cur = (int)k; break; }
 
-        const char *chosen = NULL;
-        /* Сначала все по одному разу без перезапусков: если запасной здоров, поднимать
-         * основной незачем — трафик уже пойдёт. Перезапуск дороже проверки и на
-         * секунды роняет то, что перезапускают. */
+        /* Первое здоровое по предпочтению. Пробуем по порядку и ОСТАНАВЛИВАЕМСЯ на нём —
+         * пробить пробой каждое устройство значило бы платить таймаут за каждый мёртвый
+         * запас на каждом тике. Здоровье устройств 0..first_h тем самым известно. */
+        int first_h = -1;
         for (size_t k = 0; k < o->devices_n; k++) {
-            if (device_healthy_for(o, o->devices[k])) { chosen = o->devices[k]; break; }
+            if (health_of(o, o->devices[k])) { first_h = (int)k; break; }
             if (verbose)
                 fprintf(stderr, LOG_W "%s: %s не отвечает\n", o->name, o->devices[k]);
+        }
+
+        const char *chosen = NULL;
+        int streak = active_streak_get(o->name);
+        int new_streak = 0;
+        if (first_h >= 0) {
+            if (cur > first_h) {
+                /* Трафик сейчас на менее предпочтительном устройстве, а более
+                 * предпочтительное ожило. Уходить с текущего, если оно ещё живо, спешить
+                 * нельзя — это и есть мелькание. Держим его, пока верхнее не подтвердит
+                 * здоровье STEER_FAILOVER_HYST тиков подряд. Мёртвое текущее — сразу вниз. */
+                int hyst = failover_hyst();
+                if (health_of(o, o->devices[cur])) {
+                    int s = streak + 1;
+                    if (hyst > 0 && s < hyst) { chosen = o->devices[cur]; new_streak = s; }
+                    else chosen = o->devices[first_h];
+                } else {
+                    chosen = o->devices[first_h];
+                }
+            } else {
+                /* first_h == cur (несём лучшее доступное) либо cur < first_h (текущее
+                 * мертво — first_h это уход вниз): в обоих случаях берём first_h без
+                 * задержки, счётчик сбрасываем. */
+                chosen = o->devices[first_h];
+            }
         }
 
         /* Ни одно не ответило — вот теперь можно тратить время на оживление. Порядок
@@ -948,6 +1032,7 @@ int cmd_failover(const char *spec, int verbose) {
         if (!chosen)
             for (size_t k = 0; k < o->devices_n; k++)
                 if (revive(o, o->devices[k], verbose)) { chosen = o->devices[k]; break; }
+        g_streak[i] = new_streak;
 
         if (chosen) {
             snprintf(o->device, sizeof(o->device), "%s", chosen);

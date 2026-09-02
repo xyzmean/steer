@@ -279,6 +279,32 @@ static void out_set_pool(const char *dev) {
     g_out[1].table = 300;
 }
 
+/* Пул из ДВУХ устройств одного выхода: первое — предпочтение, второе — запас. Здоровье
+ * каждого задаётся стендом по тику через шов g_health_probe, поэтому ни /sys, ни сокеты не
+ * нужны. Это ровно форма, на которой мелькал живой роутер: узел-предпочтение подхватывался
+ * пробой на тик и снова падал. */
+static int g_h_first = 1, g_h_second = 1;
+static int hyst_health(const struct output *o, const char *dev) {
+    (void)o;
+    if (!strcmp(dev, "vpref"))  return g_h_first;
+    if (!strcmp(dev, "vspare")) return g_h_second;
+    return 0;
+}
+static void out_set_two(void) {
+    memset(g_out, 0, sizeof(g_out));
+    g_out_n = 1;
+    snprintf(g_out[0].name, sizeof(g_out[0].name), "%s", "vl");
+    g_out[0].kind = OUT_INTERFACE;
+    g_out[0].on_fail = FAIL_DROP;
+    snprintf(g_out[0].devices[0], sizeof(g_out[0].devices[0]), "%s", "vpref");
+    snprintf(g_out[0].devices[1], sizeof(g_out[0].devices[1]), "%s", "vspare");
+    g_out[0].devices_n = 2;
+    g_out[0].mark = 0x100000;
+    g_out[0].table = 300;
+}
+/* Что записано активным устройством после прохода. */
+static void active_dev(char *buf, size_t n) { active_get("vl", buf, n); }
+
 static void tick(const char *rules, const char *routes) {
     g_cmd_n = 0;
     rule_added = rule_deleted = 0;
@@ -635,6 +661,76 @@ int main(void) {
         }
         g_state_dir = "/tmp";
     }
+
+    /* ---- гистерезис возврата на предпочтительное устройство --------------------------
+     *
+     * Живой роутер: пул из двух устройств, предпочтение (vpref) — флаки-узел, подхватывается
+     * пробой на один тик и снова падает. Без гистерезиса трафик прыгал vpref↔vspare каждую
+     * минуту, каждый прыжок — до минуты мёртвого трафика. С STEER_FAILOVER_HYST=3 возврат на
+     * vpref происходит лишь после трёх подряд здоровых тиков; уход с упавшего — сразу. */
+    setenv("STEER_FAILOVER_HYST", "3", 1);
+    failover_hyst_reset_for_test();
+    g_health_probe = hyst_health;
+    out_set_two();
+    /* Свежий каталог состояния: предыдущий тест свой удалил и увёл g_state_dir в /tmp, а
+     * state_write пишет в g_dir. Держим оба на одном каталоге. */
+    snprintf(g_dir, sizeof(g_dir), "/tmp/failovermatch-hyst-XXXXXX");
+    if (!mkdtemp(g_dir)) { perror("mkdtemp"); return 1; }
+    g_state_dir = g_dir;
+    {
+        char dev[32];
+        /* Старт: оба здоровы — берём предпочтение. */
+        g_h_first = 1; g_h_second = 1;
+        state_write("active", "vl - 0\n");
+        tick(RULES_WITH, "default dev vpref \n");
+        active_dev(dev, sizeof(dev));
+        check("оба здоровы — трафик на предпочтении", !strcmp(dev, "vpref"), 1);
+
+        /* Предпочтение упало — уходим на запас СРАЗУ, без задержки. */
+        g_h_first = 0; g_h_second = 1;
+        tick(RULES_WITH, "default dev vpref \n");
+        active_dev(dev, sizeof(dev));
+        check("предпочтение упало — уход на запас немедленный", !strcmp(dev, "vspare"), 1);
+
+        /* Предпочтение мелькнуло здоровым один тик — НЕ возвращаемся (держим запас). */
+        g_h_first = 1; g_h_second = 1;
+        tick(RULES_WITH, "default dev vspare \n");
+        active_dev(dev, sizeof(dev));
+        check("предпочтение ожило на 1 тик — держим запас", !strcmp(dev, "vspare"), 1);
+
+        /* Второй здоровый тик — всё ещё держим (порог 3). */
+        tick(RULES_WITH, "default dev vspare \n");
+        active_dev(dev, sizeof(dev));
+        check("два тика здоровья — всё ещё запас", !strcmp(dev, "vspare"), 1);
+
+        /* Третий подряд здоровый тик — возвращаемся на предпочтение. */
+        tick(RULES_WITH, "default dev vspare \n");
+        active_dev(dev, sizeof(dev));
+        check("три тика подряд — возврат на предпочтение", !strcmp(dev, "vpref"), 1);
+
+        /* Мелькание не копится: два здоровых, падение, снова два — возврата нет. */
+        g_h_first = 0; g_h_second = 1;
+        tick(RULES_WITH, "default dev vpref \n");   /* ушли на запас */
+        g_h_first = 1;
+        tick(RULES_WITH, "default dev vspare \n");   /* тик 1 */
+        tick(RULES_WITH, "default dev vspare \n");   /* тик 2 */
+        g_h_first = 0;
+        tick(RULES_WITH, "default dev vspare \n");   /* провал — счётчик сброшен */
+        g_h_first = 1;
+        tick(RULES_WITH, "default dev vspare \n");   /* снова тик 1 */
+        active_dev(dev, sizeof(dev));
+        check("прерванный ряд не копится — по-прежнему запас", !strcmp(dev, "vspare"), 1);
+
+        /* Порог 0 (STEER_FAILOVER_HYST=0) — прежнее поведение: возврат сразу. */
+        setenv("STEER_FAILOVER_HYST", "0", 1);
+        failover_hyst_reset_for_test();
+        g_h_first = 1; g_h_second = 1;
+        state_write("active", "vl vspare 0\n");
+        tick(RULES_WITH, "default dev vspare \n");
+        active_dev(dev, sizeof(dev));
+        check("порог 0 — возврат наверх сразу", !strcmp(dev, "vpref"), 1);
+    }
+    g_health_probe = NULL;
 
     if (g_fail) {
         fprintf(stderr, "failovermatch: провалено проверок: %d\n", g_fail);
