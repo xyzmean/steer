@@ -399,6 +399,7 @@ static const struct { const char *name; enum out_kind kind; } KINDS[] = {
     { "vless",     OUT_VLESS },
     { "xsteer",    OUT_XSTEER },
     { "zapret",    OUT_ZAPRET },
+    { "tgws",      OUT_TGWS },
 };
 #define KINDS_N (sizeof(KINDS) / sizeof(KINDS[0]))
 
@@ -583,6 +584,16 @@ static void parse_outputs(struct js *j) {
             else if (o.zp_opts[0] != '/' || !label_ok(o.zp_opts))
                 die("outputs.%s: opts_file должен быть абсолютным путём без кавычек", o.name);
         }
+        else if (!strcmp(kind, "tgws")) {
+            o.kind = OUT_TGWS;
+            /* Устройства нет по той же причине, что у zapret: маршрут не меняется, меняется
+             * то, куда уводится перехваченное соединение. Названное устройство — почти
+             * наверняка описка, и принять её молча значило бы обещать маршрутизацию,
+             * которой не будет. */
+            if (o.device[0] || o.devices_n)
+                die("outputs.%s: у kind tgws нет устройства — соединение перехватывается",
+                    o.name);
+        }
         else if (!strcmp(kind, "interface")) {
             o.kind = OUT_INTERFACE;
             /* device и devices описывают одно и то же с разных сторон: device — что
@@ -592,7 +603,7 @@ static void parse_outputs(struct js *j) {
             if (!o.device[0] && o.devices_n) snprintf(o.device, sizeof(o.device), "%s", o.devices[0]);
             if (!o.device[0]) die("outputs.%s: kind interface needs a device", o.name);
         } else die("outputs.%s: неизвестный kind "
-                   "(нужен direct, interface, vless, xsteer или zapret)", o.name);
+                   "(нужен direct, interface, vless, xsteer, zapret или tgws)", o.name);
         /* Обфускация осмысленна только там, где транспорт — чужой UDP, до которого
          * движку не дотянуться иначе. У vless свой транспорт внутри движка (и свои
          * средства маскировки — Reality), у xsteer он свой и поддельный TCP уже внутри
@@ -614,6 +625,13 @@ static void parse_outputs(struct js *j) {
         if (o.kind == OUT_ZAPRET && o.on_fail == FAIL_ZAPRET)
             die("outputs.%s: on_fail zapret у выхода kind zapret ничего не значит "
                 "(нужен drop или direct)", o.name);
+        /* У tgws on_fail не выражается вовсе, и молчать об этом нельзя. Перехват — это
+         * правило nat, оно стоит в ядре всегда; когда моста нет, ядро отвечает отказом на
+         * соединение, то есть ведёт себя как drop, и никаким полем это не переключить.
+         * Обещать direct и не сделать его хуже, чем отказать сразу. */
+        if (o.kind == OUT_TGWS && o.on_fail != FAIL_DROP)
+            die("outputs.%s: у kind tgws on_fail только drop: перехват стоит в ядре, и без "
+                "моста соединение отвергается — обойти это правилом нечем", o.name);
         if (node_one && node_many)
             die("outputs.%s: задано и node, и nodes — оставьте одно", o.name);
         /* Выбор узлов есть только у подписки. Отвергается ТОЛЬКО новая форма: `nodes` не

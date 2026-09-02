@@ -24,11 +24,18 @@ static int stub(const char *who) {
 int cmd_vless(const char *spec_path, const char *out_name);
 int cmd_vless_nodes(const char *spec_path, const char *out_name);
 int cmd_vless_probe(const char *spec_path, const char *out_name, int node, int timeout_s);
+int cmd_tgws(const char *spec_path, const char *out_name);
 
 int cmd_vless(const char *spec_path, const char *out_name) {
     (void)spec_path; (void)out_name;
     return stub("vless");
 }
+int cmd_tgws(const char *spec_path, const char *out_name) {
+    (void)spec_path; (void)out_name;
+    fprintf(stderr, "нужна сборка steer-extended\n");
+    return 2;
+}
+
 int cmd_vless_nodes(const char *spec_path, const char *out_name) {
     (void)spec_path; (void)out_name;
     return stub("vless-nodes");

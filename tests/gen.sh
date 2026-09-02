@@ -556,6 +556,49 @@ check "маршрутной таблицы у выхода zapret нет" "0" \
 check "без выходов zapret цепочки нет" "0" "$(printf '%s\n' "$out" | grep -c 'zapret_queue')"
 check "и predefrag без них тоже нет" "0" "$(printf '%s\n' "$out" | grep -c 'zapret_predefrag')"
 
+# ---- перехват Telegram (kind=tgws) --------------------------------------------------------
+# Правило стоит в nat prerouting, то есть ловит трафик КЛИЕНТОВ. Приоритет и хук проверяются
+# здесь, а работу целиком — tests/run-tgws.sh на двух сетевых пространствах: на одном
+# пространстве соединение идёт через output и правило не срабатывает вовсе.
+cat > "$tmp/tgws.json" <<EOF
+{ "schema": 1, "lan_devices": ["br-lan"],
+  "outputs": { "direct": { "kind": "direct" }, "tg": { "kind": "tgws" } },
+  "channels": [ { "name": "тг", "match": { "prefixes_file": "$tmp/a.lst" }, "out": "tg" } ] }
+EOF
+tout="$("$BIN" apply --dry-run --spec "$tmp/tgws.json" --state-dir "$tmp/state-t" 2>&1)"
+check "tgws: спека компилируется" "0" "$?"
+check "цепочка перехвата появилась" "1" \
+    "$(printf '%s\n' "$tout" | grep -c 'chain tgws_redirect')"
+# dstnat + 1, а не dstnat: сначала наша же цепочка fakeip обязана вернуть настоящий адрес,
+# и только потом решается, наш ли он. И не mangle: метку канала ставят раньше, на mangle + 1.
+check "перехват идёт после трансляции адресов" "1" \
+    "$(printf '%s\n' "$tout" | grep -c 'hook prerouting priority dstnat + 1')"
+check "заворачивает по метке выхода на его порт" "1" \
+    "$(printf '%s\n' "$tout" | grep -c 'meta mark and 0x0ff00000 == 0x00100000 tcp dport { 443, 80, 5222 } counter redirect to :8480')"
+# Таблицы маршрутизации у такого выхода нет — маршрут не меняется, меняется адресат.
+check "маршрутной таблицы у выхода tgws нет" "0" \
+    "$(printf '%s\n' "$tout" | grep -c 'ip route')"
+check "без выходов tgws цепочки нет" "0" "$(printf '%s\n' "$out" | grep -c 'tgws_redirect')"
+# Порт печатает движок: второй расчёт того же в init-скрипте разошёлся бы молча.
+ti="$("$BIN" tgws-instances --spec "$tmp/tgws.json" --state-dir "$tmp/state-t" 2>&1)"
+check "tgws-instances: код 0, когда поднимать есть что" "0" "$?"
+check "имя и порт по строке на выход" "tg	8480" "$ti"
+"$BIN" tgws-instances --spec "$tmp/zap.json" --state-dir "$tmp/state-z" >/dev/null 2>&1
+check "без таких выходов код 1" "1" "$?"
+# Устройство у такого выхода — почти наверняка описка, и молча принять её значит обещать
+# маршрутизацию, которой не будет.
+cat > "$tmp/tgws-bad.json" <<EOF
+{ "schema": 1, "outputs": { "tg": { "kind": "tgws", "device": "eth0" } }, "channels": [] }
+EOF
+"$BIN" apply --dry-run --spec "$tmp/tgws-bad.json" --state-dir "$tmp/state-tb" >/dev/null 2>&1
+check "устройство у tgws отвергается" "2" "$?"
+# on_fail у него не выражается ничем: правило перехвата стоит в ядре всегда.
+cat > "$tmp/tgws-of.json" <<EOF
+{ "schema": 1, "outputs": { "tg": { "kind": "tgws", "on_fail": "direct" } }, "channels": [] }
+EOF
+"$BIN" apply --dry-run --spec "$tmp/tgws-of.json" --state-dir "$tmp/state-to" >/dev/null 2>&1
+check "on_fail=direct у tgws отвергается" "2" "$?"
+
 # Что поднимать — спрашивают у движка, вместе с номером очереди и файлом ключей.
 zi="$("$BIN" zapret-instances --spec "$tmp/zap.json" --state-dir "$tmp/state-z" 2>&1)"
 check "zapret-instances: код 0, когда поднимать есть что" "0" "$?"

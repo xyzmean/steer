@@ -55,6 +55,8 @@ void aggregate_usage_flags(FILE *out);
 int cmd_vless(const char *spec_path, const char *out_name);
 int cmd_vless_nodes(const char *spec_path, const char *out_name);
 int cmd_vless_probe(const char *spec_path, const char *out_name, int node, int timeout_s);
+/* Мост Telegram → веб-сокет; объяснение целиком — в src/ext/tgws.c. */
+int cmd_tgws(const char *spec_path, const char *out_name);
 /* Скачивание и обработка подписки. Объявления — в src/ext/subfetch.h, там же и рассказ,
  * почему это работа движка, а не управляющего слоя. */
 #include "ext/subfetch.h"
@@ -92,6 +94,10 @@ static int cmd_sub_quota(const char *url, const char *info_path) {
     return no_vless();
 }
 static int cmd_sub_hwid(void) { return no_vless(); }
+static int cmd_tgws(const char *spec_path, const char *out_name) {
+    (void)spec_path; (void)out_name;
+    return no_vless();
+}
 #endif
 
 /* Клиент и хаб xsteer. Клиент — расширенная сборка, хаб — серверная: на роутере хабу делать
@@ -320,6 +326,14 @@ static int has_domains(void) {
 static int has_zapret(void) {
     for (size_t i = 0; i < g_out_n; i++)
         if (g_out[i].kind == OUT_ZAPRET) return 1;
+    return 0;
+}
+
+/* Есть ли хоть один выход kind=tgws. Тот же довод, что у has_zapret: цепочка перехвата
+ * пишется, только когда ей есть что перехватывать. */
+static int has_tgws(void) {
+    for (size_t i = 0; i < g_out_n; i++)
+        if (g_out[i].kind == OUT_TGWS) return 1;
     return 0;
 }
 
@@ -914,6 +928,43 @@ static void generate(FILE *f) {
                    "        exthdr frag exists notrack comment \"ipfrag\"\n"
                    "        tcp flags ! syn,rst,ack notrack comment \"datanoack\"\n"
                    "    }\n", ZAPRET_SKIP_MARK, ZAPRET_MINE_BIT);
+    }
+
+    /* ---- перехват Telegram у выходов kind=tgws ------------------------------------
+     *
+     * ПЕРЕХВАТ, А НЕ МАРШРУТ. Приложению ничего не настраивают: соединение с дата-центром
+     * заворачивается на мост здесь же, в ядре, а он уводит его веб-сокетом (см. длинное
+     * объяснение у TGWS_PORT_BASE в spec.h).
+     *
+     * ПРИОРИТЕТ dstnat + 1, и оба слова важны. Метку канала ставит prerouting на
+     * `mangle + 1` (то есть -149), а трансляция адресов идёт на -100 — значит к моменту
+     * этой цепочки метка на пакете уже есть и по ней можно узнать выход. Плюс единица —
+     * чтобы пропустить вперёд свою же цепочку fakeip: доменное правило сначала должно
+     * вернуть настоящий адрес, и только потом мы решаем, наш ли он.
+     *
+     * ТОЛЬКО PREROUTING, то есть только трафик клиентов сети. Трафик самого роутера сюда
+     * не попадает нарочно: перехватывать собственные соединения движка (обновление
+     * списков, проверки) значило бы заворачивать в мост то, что к Telegram отношения не
+     * имеет, а разделять их было бы нечем.
+     *
+     * ПОРТЫ — те, на которых Telegram держит MTProto: 443 и 80 (обычные), 5222 (запасной у
+     * старых клиентов). UDP здесь нет: голос звонков в веб-сокет не заворачивается (см.
+     * spec.h), и пусть идёт своим путём.
+     *
+     * redirect, а не dnat на петлю: redirect подставляет адрес того интерфейса, откуда
+     * пришёл пакет, и обратный путь ядро собирает само. Исходный адрес назначения мост
+     * узнаёт у ядра через SO_ORIGINAL_DST — из него же выводится номер дата-центра. */
+    if (has_tgws()) {
+        fprintf(f, "\n    chain tgws_redirect {\n"
+                   "        type nat hook prerouting priority dstnat + 1; policy accept;\n");
+        for (size_t i = 0; i < g_out_n; i++) {
+            struct output *o = &g_out[i];
+            if (o->kind != OUT_TGWS) continue;
+            fprintf(f, "        meta mark and 0x%08x == 0x%08x tcp dport { 443, 80, 5222 } "
+                       "counter redirect to :%d comment \"steer:tgws:%s\"\n",
+                    STEER_MARK_MASK, o->mark, out_tgws_port(o), o->name);
+        }
+        fprintf(f, "    }\n");
     }
 
     if (has_domains()) {
@@ -2673,12 +2724,28 @@ int main(int argc, char **argv) {
         }
         return n ? 0 : 1;
     }
+    /* Что поднимать для выходов kind=tgws: имя и порт, по строке на выход. Тот же довод,
+     * что у zapret-instances выше, включая главный: порт выводит движок (out_tgws_port), а
+     * не считает init-скрипт — второй расчёт того же в shell разошёлся бы при первой
+     * правке, и мост слушал бы порт, на который ядро ничего не заворачивает. */
+    if (!strcmp(cmd, "tgws-instances")) {
+        load_spec(spec);
+        registry_assign();
+        int n = 0;
+        for (size_t i = 0; i < g_out_n; i++) {
+            if (g_out[i].kind != OUT_TGWS) continue;
+            printf("%s\t%d\n", g_out[i].name, out_tgws_port(&g_out[i]));
+            n++;
+        }
+        return n ? 0 : 1;
+    }
     if (!strcmp(cmd, "needs-dnsd")) {
         load_spec(spec);
         registry_assign();
         build_groups();
         return has_domains() ? 0 : 1;
     }
+    if (!strcmp(cmd, "tgws")) return cmd_tgws(spec, arg);
     if (!strcmp(cmd, "vless")) return cmd_vless(spec, arg);
     if (!strcmp(cmd, "vless-nodes")) return cmd_vless_nodes(spec, arg);
     if (!strcmp(cmd, "vless-probe")) return cmd_vless_probe(spec, arg, a.node, a.timeout);
