@@ -562,7 +562,7 @@ check "и predefrag без них тоже нет" "0" "$(printf '%s\n' "$out" |
 # пространстве соединение идёт через output и правило не срабатывает вовсе.
 cat > "$tmp/tgws.json" <<EOF
 { "schema": 1, "lan_devices": ["br-lan"],
-  "outputs": { "direct": { "kind": "direct" }, "tg": { "kind": "tgws" } },
+  "outputs": { "direct": { "kind": "direct" }, "tg": { "kind": "tgws", "domain": "ex.co.uk" } },
   "channels": [ { "name": "тг", "match": { "prefixes_file": "$tmp/a.lst" }, "out": "tg" } ] }
 EOF
 tout="$("$BIN" apply --dry-run --spec "$tmp/tgws.json" --state-dir "$tmp/state-t" 2>&1)"
@@ -588,16 +588,30 @@ check "без таких выходов код 1" "1" "$?"
 # Устройство у такого выхода — почти наверняка описка, и молча принять её значит обещать
 # маршрутизацию, которой не будет.
 cat > "$tmp/tgws-bad.json" <<EOF
-{ "schema": 1, "outputs": { "tg": { "kind": "tgws", "device": "eth0" } }, "channels": [] }
+{ "schema": 1, "outputs": { "tg": { "kind": "tgws", "domain": "ex.co.uk", "device": "eth0" } }, "channels": [] }
 EOF
 "$BIN" apply --dry-run --spec "$tmp/tgws-bad.json" --state-dir "$tmp/state-tb" >/dev/null 2>&1
 check "устройство у tgws отвергается" "2" "$?"
 # on_fail у него не выражается ничем: правило перехвата стоит в ядре всегда.
 cat > "$tmp/tgws-of.json" <<EOF
-{ "schema": 1, "outputs": { "tg": { "kind": "tgws", "on_fail": "direct" } }, "channels": [] }
+{ "schema": 1, "outputs": { "tg": { "kind": "tgws", "domain": "ex.co.uk", "on_fail": "direct" } }, "channels": [] }
 EOF
 "$BIN" apply --dry-run --spec "$tmp/tgws-of.json" --state-dir "$tmp/state-to" >/dev/null 2>&1
 check "on_fail=direct у tgws отвергается" "2" "$?"
+# Домена нет — выход отвергается: прямые точки Telegram отвечают только TLS 1.2 и стоят на
+# телеграмовских адресах, то есть на тех самых, которые режут. Подставить их молча значило бы
+# завести выход, который выглядит настроенным и не работает никогда.
+cat > "$tmp/tgws-nd.json" <<EOF
+{ "schema": 1, "outputs": { "tg": { "kind": "tgws" } }, "channels": [] }
+EOF
+"$BIN" apply --dry-run --spec "$tmp/tgws-nd.json" --state-dir "$tmp/state-tn" >/dev/null 2>&1
+check "tgws без domain отвергается" "2" "$?"
+# И наоборот: domain у чужого вида выхода — поле, принятое молча там, где оно ничего не значит.
+cat > "$tmp/tgws-alien.json" <<EOF
+{ "schema": 1, "outputs": { "d": { "kind": "direct", "domain": "ex.co.uk" } }, "channels": [] }
+EOF
+"$BIN" apply --dry-run --spec "$tmp/tgws-alien.json" --state-dir "$tmp/state-ta" >/dev/null 2>&1
+check "domain у чужого вида выхода отвергается" "2" "$?"
 
 # Что поднимать — спрашивают у движка, вместе с номером очереди и файлом ключей.
 zi="$("$BIN" zapret-instances --spec "$tmp/zap.json" --state-dir "$tmp/state-z" 2>&1)"

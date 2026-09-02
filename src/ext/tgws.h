@@ -7,4 +7,8 @@
 /* Поднять мост выхода kind=tgws с именем name. Не возвращается, пока жив. */
 int cmd_tgws(const char *spec, const char *name);
 
+/* Проверить путь до Telegram целиком: TLS, апгрейд веб-сокета и настоящий обмен MTProto
+ * (req_pq_multi → resPQ). 0 — дата-центр ответил. */
+int cmd_tgws_probe(int dc, int media);
+
 #endif

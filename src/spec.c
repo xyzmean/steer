@@ -482,6 +482,7 @@ static void parse_outputs(struct js *j) {
              * список ключей командной строки, и одно имя для двух разных вещей однажды
              * привело бы к попытке поднять туннель по стратегии обхода. */
             else if (!strcmp(key, "opts_file")) js_str(j, o.zp_opts, sizeof(o.zp_opts));
+            else if (!strcmp(key, "domain")) js_str(j, o.tg_domain, sizeof(o.tg_domain));
             /* Транспорт выхода xsteer. Полем спеки, а не только ключом командной строки,
              * потому что процесс поднимает procd: ключи ему передать негде, а настройка
              * обязана переживать перезагрузку. */
@@ -586,6 +587,13 @@ static void parse_outputs(struct js *j) {
         }
         else if (!strcmp(kind, "tgws")) {
             o.kind = OUT_TGWS;
+            /* Домен обязателен и умолчания у него нет НАРОЧНО. Прямые точки Telegram
+             * (web.telegram.org) отвечают только TLS 1.2 и стоят на телеграмовских адресах,
+             * то есть на тех самых, которые режут: подставить их молча значило бы завести
+             * выход, который выглядит настроенным и не работает никогда. */
+            if (!o.tg_domain[0])
+                die("outputs.%s: kind tgws нужен domain — имя за Cloudflare, у которого "
+                    "kwsN.<domain> ведёт на веб-точку Telegram", o.name);
             /* Устройства нет по той же причине, что у zapret: маршрут не меняется, меняется
              * то, куда уводится перехваченное соединение. Названное устройство — почти
              * наверняка описка, и принять её молча значило бы обещать маршрутизацию,
@@ -620,6 +628,8 @@ static void parse_outputs(struct js *j) {
          * kind, потому что у своего вида это поле выставляет умолчание. */
         if (o.zp_opts[0] && o.kind != OUT_ZAPRET)
             die("outputs.%s: opts_file есть только у kind=zapret", o.name);
+        if (o.tg_domain[0] && o.kind != OUT_TGWS)
+            die("outputs.%s: domain есть только у kind=tgws", o.name);
         /* on_fail=zapret у выхода kind=zapret — это «при отказе обхода включить обход».
          * Молча принять значило бы записать в настройку круг, который ничего не значит. */
         if (o.kind == OUT_ZAPRET && o.on_fail == FAIL_ZAPRET)

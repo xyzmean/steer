@@ -1,11 +1,13 @@
 /* Мост Telegram → WebSocket: приложение не настраивают, соединение перехватывают.
  *
  * ЗАЧЕМ. Telegram ходит в свои дата-центры по TCP на их адреса, и режут именно это. У
- * веб-клиента есть второй путь: тот же MTProto, завёрнутый в WebSocket поверх TLS к
- * `wss://kwsN.web.telegram.org/apiws`, а эти имена стоят за Cloudflare — блокировать их
- * значит блокировать Cloudflare. Готовые прокси (tg-ws-proxy и родня) этим и живут, но
- * требуют вписать адрес и секрет В КАЖДОМ КЛИЕНТЕ. Здесь то же самое делается прозрачно:
- * правило nat заворачивает соединение на этот мост, а он уводит его веб-сокетом.
+ * веб-клиента есть второй путь: тот же MTProto, завёрнутый в WebSocket поверх TLS к точке
+ * `/apiws`. Сама по себе она стоит на адресах Telegram и от блокировки не спасает — спасает
+ * то, что её можно поставить ЗА CLOUDFLARE: домен с записью `kwsN.<домен>` и включённым
+ * проксированием отвечает адресами Cloudflare, блокировать которые дорого. Готовые прокси
+ * (tg-ws-proxy и родня) так и устроены, но требуют вписать адрес и секрет В КАЖДОМ КЛИЕНТЕ.
+ * Здесь то же самое делается прозрачно: правило nat заворачивает соединение на этот мост, а
+ * он уводит его веб-сокетом.
  *
  * ПОЧЕМУ ЧУЖОЙ ПРОКСИ СЮДА НЕ ПОСТАВИТЬ. Он ждёт рукопожатие MTPROXY: там есть секрет, и из
  * него же берётся номер дата-центра. Приложение, идущее в дата-центр напрямую, шлёт другое
@@ -55,6 +57,7 @@
 #include <poll.h>
 #include <pthread.h>
 #include <signal.h>
+#include <time.h>
 #include <netdb.h>
 #include <arpa/inet.h>
 #include <netinet/in.h>
@@ -78,6 +81,23 @@
 #define BUF_N         16384     /* столько за раз переливаем в каждую сторону */
 #define MAX_CONNS     64        /* больше клиент не открывает; предел от утечки потоков */
 #define UP_TIMEOUT_S  10
+
+/* Домен точек веб-сокета. Прямой (web.telegram.org) НЕ работает у нас по двум причинам
+ * сразу, и обе выяснились пробой против настоящего Telegram, а не по документации:
+ *
+ *   1) kwsN.web.telegram.org отвечает ТОЛЬКО TLS 1.2 (сертификат GoDaddy, ECDHE-RSA-
+ *      AES128-GCM-SHA256), а наш клиент — строго TLS 1.3 и другим быть не должен: он же
+ *      носит облик Chrome, а Chrome к 1.2 здесь не опускается;
+ *   2) адреса у него телеграмовские — то есть ровно те, которые и режут. Гнать перехват
+ *      туда значило бы менять один заблокированный путь на другой.
+ *
+ * Работает путь через домен, стоящий за Cloudflare: `kwsN.<домен>` с записью на веб-точку
+ * Telegram и включённым проксированием. Такой домен отвечает TLS 1.3, а его адреса —
+ * адреса Cloudflare, блокировать которые дорого. Домен задаётся выходу в спеке (`domain`),
+ * потому что он ЧУЖОЙ: это либо домен самого владельца роутера, либо тот, который кто-то
+ * держит для сообщества, и зашивать его в движок значило бы решать за человека, чьим
+ * каналом он пользуется. */
+#define TGWS_DOMAIN_DEFAULT "web.telegram.org"
 
 /* ---- таблица дата-центров ---------------------------------------------------------
  *
@@ -143,6 +163,15 @@ static void dc_table_init(void) {
     if (added) fprintf(stderr, LOG_I "адресов ДЦ из %s: %zu\n", path, added);
 }
 
+/* Домен точек. Из спеки, а её может не быть (проба спеку не читает) — тогда из окружения,
+ * иначе прямой. */
+static char g_domain[128];
+static void domain_init(const char *from_spec) {
+    const char *env = getenv("STEER_TGWS_DOMAIN");
+    const char *d = (from_spec && *from_spec) ? from_spec : (env && *env ? env : TGWS_DOMAIN_DEFAULT);
+    snprintf(g_domain, sizeof(g_domain), "%s", d);
+}
+
 /* Номер ДЦ по адресу назначения. 0 — адрес неизвестен, перехватывать нельзя. */
 static short dc_of(uint32_t ip, short *media) {
     for (size_t i = 0; i < g_dc_n; i++)
@@ -193,6 +222,36 @@ static int hs_patch_dc(unsigned char hs[HS_LEN], short dc, short media, unsigned
     hs[DC_POS + 0] = d[0] ^ ks[DC_POS + 0];
     hs[DC_POS + 1] = d[1] ^ ks[DC_POS + 1];
     return 1;
+}
+
+/* Собрать init так, как его строит клиент: ключ и вектор — сырые байты пакета, в хвосте
+ * метка транспорта и номер ДЦ. Нужно ТОЛЬКО пробе: у моста init приходит от клиента готовым.
+ * Запрещённые начала — те же, что отвергает Telegram (приняв их за HTTP или TLS). */
+static int hs_build(unsigned char hs[HS_LEN], unsigned char tag, short dc, short media) {
+    static const unsigned char BAD4[][4] = {
+        { 'H','E','A','D' }, { 'P','O','S','T' }, { 'G','E','T',' ' },
+        { 0xee,0xee,0xee,0xee }, { 0xdd,0xdd,0xdd,0xdd }, { 0x16,0x03,0x01,0x02 },
+    };
+    for (int tries = 0; tries < 64; tries++) {
+        if (xc_random(hs, HS_LEN) != 0) return -1;
+        if (hs[0] == 0xef) continue;
+        int bad = 0;
+        for (size_t i = 0; i < sizeof(BAD4) / sizeof(BAD4[0]); i++)
+            if (!memcmp(hs, BAD4[i], 4)) bad = 1;
+        if (bad) continue;
+        if (!hs[4] && !hs[5] && !hs[6] && !hs[7]) continue;
+
+        unsigned char ks[HS_LEN];
+        if (hs_keystream(hs, ks) != 0) return -1;
+        int16_t idx = media ? (int16_t)-dc : (int16_t)dc;
+        unsigned char tail[8] = { tag, tag, tag, tag,
+                                  (unsigned char)(idx & 0xff), (unsigned char)((idx >> 8) & 0xff),
+                                  0, 0 };
+        if (xc_random(tail + 6, 2) != 0) return -1;
+        for (int i = 0; i < 8; i++) hs[TAG_POS + i] = tail[i] ^ ks[TAG_POS + i];
+        return 0;
+    }
+    return -1;
 }
 
 /* ---- транспорт: TLS либо голый сокет ----------------------------------------------
@@ -416,14 +475,17 @@ static int sid_random(void *ctx, unsigned char sid[32], const unsigned char *hs,
     return xc_random(sid, 32);
 }
 
+static int g_tls_rc;
 static int tls_start(struct upstream *u, const char *sni) {
     unsigned char priv[32], pub[32], hello[4096];
     size_t hello_n = 0;
     /* Постоянный ключ «сервера» не используется (см. sid_random), но сборщику Hello он нужен
-     * как вход: подставляем случайный. Секрет из него никуда не идёт. */
-    unsigned char fake_pbk[32];
+     * как вход. Подставляем ОДНОРАЗОВЫЙ, но настоящий: случайные 32 байта — не обязательно
+     * точка на кривой, и умножение на них отвергается (проверено: REALITY_ECRYPTO). Секрет,
+     * посчитанный с ним, никуда не идёт — session_id заполняет sid_random. */
+    unsigned char throwaway[32], fake_pbk[32];
     char pbk_b64[64];
-    if (xc_random(fake_pbk, sizeof(fake_pbk)) != 0) return -1;
+    if (xc_x25519_keypair(throwaway, fake_pbk) != 0) { g_tls_rc = -103; return -1; }
     b64(fake_pbk, sizeof(fake_pbk), pbk_b64);
     for (char *p = pbk_b64; *p; p++) {                /* base64url, как ждёт reality.c */
         if (*p == '+') *p = '-';
@@ -431,16 +493,17 @@ static int tls_start(struct upstream *u, const char *sni) {
         else if (*p == '=') { *p = '\0'; break; }
     }
 
-    if (xc_x25519_keypair(priv, pub) != 0) return -1;
+    if (xc_x25519_keypair(priv, pub) != 0) { g_tls_rc = -101; return -1; }
     struct reality_cfg cfg = { .sni = sni, .pbk = pbk_b64, .sid = "", .fp = "chrome",
                                .alpn = "http/1.1" };
     struct reality_state st;
     struct reality_carrier car = { .priv = priv, .pub = pub, .fill_sid = sid_random };
-    if (reality_build_hello_carry(&cfg, &st, &car, hello, sizeof(hello), &hello_n) != 0)
-        return -1;
-    if (up_write(u, hello, hello_n) < 0) return -1;
+    int hrc = reality_build_hello_carry(&cfg, &st, &car, hello, sizeof(hello), &hello_n);
+    if (hrc != 0) { g_tls_rc = -200 + hrc; return -1; }
+    if (up_write(u, hello, hello_n) < 0) { g_tls_rc = -102; return -1; }
     memset(&u->tls, 0, sizeof(u->tls));
-    if (tls13_handshake(&u->tls, u->fd, hello, hello_n, priv) != 0) return -1;
+    g_tls_rc = tls13_handshake(&u->tls, u->fd, hello, hello_n, priv);
+    if (g_tls_rc != 0) return -1;
     u->tls_on = 1;
     return 0;
 }
@@ -614,11 +677,12 @@ static void *serve(void *arg) {
         goto done;
     }
 
-    /* Куда идём. В бою — точка веб-сокета дата-центра; стенду адрес задают снаружи. */
-    char host[128], sni[128];
+    /* Куда идём. Имя точки — kwsN[-1].<домен>, оно же SNI и Host; АДРЕС подключения обычно
+     * тот же, но стенду его задают отдельно (там поднят свой сервер на петле). */
+    char host[160], sni[160];
     const char *port = "443";
     const char *ep = getenv("STEER_TGWS_ENDPOINT");
-    snprintf(sni, sizeof(sni), media ? "kws%d-1.web.telegram.org" : "kws%d.web.telegram.org", dc);
+    snprintf(sni, sizeof(sni), "kws%d%s.%s", dc, media ? "-1" : "", g_domain);
     if (ep) {
         snprintf(host, sizeof(host), "%s", ep);
         char *c = strchr(host, ':');
@@ -662,6 +726,177 @@ done:
     return NULL;
 }
 
+/* ---- проверка пути до Telegram -------------------------------------------------------
+ *
+ * ЗАЧЕМ ОТДЕЛЬНАЯ КОМАНДА. Стенд (tests/run-tgws.sh) закрывает половину пути — перехват,
+ * разбор рукопожатия, кадры веб-сокета, — но точку `apiws` он подделывает, а TLS в нём
+ * выключен. Вторая половина проверяется только против настоящего Telegram, и на роутере это
+ * единственный способ отличить «мост цел, узел закрыт» от «мост сломан». Без такой команды
+ * ответом на «Telegram не работает» было бы гадание.
+ *
+ * ЧТО СЧИТАЕТСЯ ОТВЕТОМ. Не 101 на апгрейд — его отдаст и посторонний веб-сервер, — а
+ * настоящий обмен MTProto: посылаем незашифрованный req_pq_multi и ждём resPQ. Это первое
+ * сообщение любого клиента Telegram, и ответить на него может только дата-центр.
+ *
+ * ЗДЕСЬ, В ОТЛИЧИЕ ОТ МОСТА, ПОТОК ШИФРУЕТСЯ НАМИ. Мост переливает чужой поток и ключей не
+ * касается; пробе шифровать нечем, кроме как самой: она сама себе клиент. Ключи по той же
+ * схеме — свои из [8..56] init, чужие из [8..56] ПЕРЕВЁРНУТОГО init. */
+
+struct obf {
+    mbedtls_aes_context enc, dec;
+    unsigned char nce[16], ncd[16], sbe[16], sbd[16];
+    size_t oe, od;
+};
+
+static int obf_init(struct obf *o, const unsigned char hs[HS_LEN]) {
+    unsigned char rev[HS_LEN];
+    for (int i = 0; i < HS_LEN; i++) rev[i] = hs[HS_LEN - 1 - i];
+    mbedtls_aes_init(&o->enc);
+    mbedtls_aes_init(&o->dec);
+    memcpy(o->nce, hs + 40, 16);
+    memcpy(o->ncd, rev + 40, 16);
+    o->oe = o->od = 0;
+    if (mbedtls_aes_setkey_enc(&o->enc, hs + 8, 256) != 0) return -1;
+    if (mbedtls_aes_setkey_enc(&o->dec, rev + 8, 256) != 0) return -1;
+    /* Первые 64 байта гаммы съедены самим init: он уходит в сеть как есть, а поток
+     * продолжается с 64-й позиции. Не промотать их — значит расшифровывать со сдвигом. */
+    unsigned char skip[HS_LEN], zero[HS_LEN];
+    memset(zero, 0, sizeof(zero));
+    if (mbedtls_aes_crypt_ctr(&o->enc, HS_LEN, &o->oe, o->nce, o->sbe, zero, skip) != 0)
+        return -1;
+    if (mbedtls_aes_crypt_ctr(&o->dec, HS_LEN, &o->od, o->ncd, o->sbd, zero, skip) != 0)
+        return -1;
+    return 0;
+}
+
+static void obf_free(struct obf *o) {
+    mbedtls_aes_free(&o->enc);
+    mbedtls_aes_free(&o->dec);
+}
+
+/* Транспорт intermediate (0xee): четыре байта длины, дальше тело. Взят он, а не padded, ровно
+ * потому, что набивки в нём нет — пробе нечего проверять в наполнителе. */
+static int probe_send(struct upstream *u, struct obf *o,
+                      const unsigned char *body, size_t n) {
+    unsigned char pkt[256], enc[256];
+    if (n + 4 > sizeof(pkt)) return -1;
+    pkt[0] = (unsigned char)(n & 0xff);
+    pkt[1] = (unsigned char)((n >> 8) & 0xff);
+    pkt[2] = (unsigned char)((n >> 16) & 0xff);
+    pkt[3] = (unsigned char)((n >> 24) & 0xff);
+    memcpy(pkt + 4, body, n);
+    if (mbedtls_aes_crypt_ctr(&o->enc, n + 4, &o->oe, o->nce, o->sbe, pkt, enc) != 0)
+        return -1;
+    return ws_send(u, enc, n + 4);
+}
+
+int cmd_tgws_probe(int dc, int media) {
+    if (dc < 1 || dc > 9) { fprintf(stderr, LOG_W "номер ДЦ: 1..5\n"); return 2; }
+    domain_init(NULL);
+
+    char sni[160], host[160];
+    const char *port = "443";
+    const char *ep = getenv("STEER_TGWS_ENDPOINT");
+    snprintf(sni, sizeof(sni), "kws%d%s.%s", dc, media ? "-1" : "", g_domain);
+    if (ep) {
+        snprintf(host, sizeof(host), "%s", ep);
+        char *c = strchr(host, ':');
+        if (c) { *c = '\0'; port = c + 1; }
+    } else {
+        snprintf(host, sizeof(host), "%s", sni);
+    }
+
+    struct upstream u;
+    memset(&u, 0, sizeof(u));
+    printf("точка:      %s:%s\n", host, port);
+    u.fd = tcp_connect(host, port, UP_TIMEOUT_S);
+    if (u.fd < 0) { printf("итог:       не соединиться (%s)\n", strerror(errno)); return 1; }
+    printf("соединение: есть\n");
+
+    if (!getenv("STEER_TGWS_PLAIN")) {
+        if (tls_start(&u, sni) != 0) {
+            printf("итог:       TLS не поднялся (код %d)\n", g_tls_rc);
+            close(u.fd);
+            return 1;
+        }
+        printf("TLS 1.3:    есть (SNI %s, сертификат не проверяется — см. tgws.c)\n", sni);
+    }
+    if (ws_upgrade(&u, sni) != 0) {
+        printf("итог:       апгрейд WebSocket отклонён\n");
+        if (u.tls_on) tls13_free(&u.tls);
+        close(u.fd);
+        return 1;
+    }
+    printf("WebSocket:  апгрейд принят (/apiws)\n");
+
+    unsigned char hs[HS_LEN];
+    struct obf o;
+    if (hs_build(hs, 0xee, (short)dc, (short)media) != 0 || obf_init(&o, hs) != 0) {
+        printf("итог:       не собрать рукопожатие\n");
+        goto bad;
+    }
+    if (ws_send(&u, hs, HS_LEN) < 0) { printf("итог:       init не ушёл\n"); goto bad; }
+
+    /* req_pq_multi#be7e8ef1 nonce:int128 — первое сообщение любого клиента, шлётся без
+     * шифрования прикладного слоя: auth_key_id = 0, дальше идентификатор сообщения, длина и
+     * тело. Идентификатор — время в старших 32 битах, кратный четырём (так требует протокол
+     * от клиента). */
+    unsigned char body[40], nonce[16];
+    if (xc_random(nonce, sizeof(nonce)) != 0) goto bad;
+    memset(body, 0, 8);                                  /* auth_key_id = 0 */
+    uint64_t mid = ((uint64_t)time(NULL) << 32) & ~3ull;
+    for (int i = 0; i < 8; i++) body[8 + i] = (unsigned char)(mid >> (8 * i));
+    body[16] = 20; body[17] = 0; body[18] = 0; body[19] = 0;   /* длина тела */
+    body[20] = 0xf1; body[21] = 0x8e; body[22] = 0x7e; body[23] = 0xbe;  /* req_pq_multi */
+    memcpy(body + 24, nonce, 16);
+    if (probe_send(&u, &o, body, 40) < 0) { printf("итог:       запрос не ушёл\n"); goto bad; }
+    printf("req_pq_multi: отправлен\n");
+
+    struct ws_rx rx;
+    rx.n = 0;
+    for (int round = 0; round < 40; round++) {
+        struct pollfd p = { .fd = u.fd, .events = POLLIN, .revents = 0 };
+        int wait = (u.tls_on && tls13_has_record(&u.tls)) ? 0 : 500;
+        if (wait && poll(&p, 1, wait) <= 0) continue;
+        int r = up_read(&u, rx.buf + rx.n, sizeof(rx.buf) - rx.n);
+        if (r <= 0) break;
+        rx.n += (size_t)r;
+        for (;;) {
+            unsigned char *pl;
+            size_t len;
+            int op;
+            int used = ws_frame(&rx, &pl, &len, &op);
+            if (used <= 0) break;
+            if (op == 0x2 && len > 8) {
+                unsigned char dec[512];
+                size_t n = len > sizeof(dec) ? sizeof(dec) : len;
+                if (mbedtls_aes_crypt_ctr(&o.dec, n, &o.od, o.ncd, o.sbd, pl, dec) != 0) goto bad;
+                /* resPQ#05162463 — первые четыре байта тела после заголовка сообщения:
+                 * 4 длины транспорта + 8 auth_key_id + 8 message_id + 4 длины. */
+                if (n >= 28 && dec[20] == 0x63 && dec[21] == 0x24 && dec[22] == 0x16 &&
+                    dec[23] == 0x05) {
+                    printf("ответ:      resPQ, %zu байт\n", n);
+                    printf("итог:       дата-центр %d%s отвечает через веб-сокет\n",
+                           dc, media ? " (медийный)" : "");
+                    obf_free(&o);
+                    if (u.tls_on) tls13_free(&u.tls);
+                    close(u.fd);
+                    return 0;
+                }
+                printf("ответ:      %zu байт, но это не resPQ\n", n);
+                goto bad;
+            }
+            ws_consume(&rx, (size_t)used);
+        }
+    }
+    printf("итог:       ответа нет (точка молчит)\n");
+bad:
+    obf_free(&o);
+    if (u.tls_on) tls13_free(&u.tls);
+    close(u.fd);
+    return 1;
+}
+
 /* ---- служба ------------------------------------------------------------------------- */
 
 int cmd_tgws(const char *spec, const char *name) {
@@ -679,6 +914,7 @@ int cmd_tgws(const char *spec, const char *name) {
     }
 
     dc_table_init();
+    domain_init(o->tg_domain);
     int port = out_tgws_port(o);
 
     int srv = socket(AF_INET, SOCK_STREAM, 0);
@@ -697,8 +933,8 @@ int cmd_tgws(const char *spec, const char *name) {
     }
     if (listen(srv, 32) != 0) { perror("listen"); close(srv); return 1; }
 
-    fprintf(stderr, LOG_I "%s: жду перехваченные соединения на :%d, адресов ДЦ %zu\n",
-            name, port, g_dc_n);
+    fprintf(stderr, LOG_I "%s: жду перехваченные соединения на :%d, домен %s, адресов ДЦ %zu\n",
+            name, port, g_domain, g_dc_n);
 
     signal(SIGPIPE, SIG_IGN);
     for (;;) {

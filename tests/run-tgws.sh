@@ -85,7 +85,7 @@ printf '%s/32\n' "$DCIP" > "$tmp/tg.lst"
 cat > "$tmp/spec.json" <<EOF
 { "schema": 1, "lan_devices": ["veth-r"],
   "outputs": { "direct": { "kind": "direct" },
-               "tg": { "kind": "tgws" } },
+               "tg": { "kind": "tgws", "domain": "stand.invalid" } },
   "channels": [ { "name": "телеграм", "match": { "prefixes_file": "$tmp/tg.lst" },
                   "out": "tg" } ] }
 EOF

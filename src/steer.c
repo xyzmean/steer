@@ -57,6 +57,7 @@ int cmd_vless_nodes(const char *spec_path, const char *out_name);
 int cmd_vless_probe(const char *spec_path, const char *out_name, int node, int timeout_s);
 /* Мост Telegram → веб-сокет; объяснение целиком — в src/ext/tgws.c. */
 int cmd_tgws(const char *spec_path, const char *out_name);
+int cmd_tgws_probe(int dc, int media);
 /* Скачивание и обработка подписки. Объявления — в src/ext/subfetch.h, там же и рассказ,
  * почему это работа движка, а не управляющего слоя. */
 #include "ext/subfetch.h"
@@ -98,6 +99,7 @@ static int cmd_tgws(const char *spec_path, const char *out_name) {
     (void)spec_path; (void)out_name;
     return no_vless();
 }
+static int cmd_tgws_probe(int dc, int media) { (void)dc; (void)media; return no_vless(); }
 #endif
 
 /* Клиент и хаб xsteer. Клиент — расширенная сборка, хаб — серверная: на роутере хабу делать
@@ -2746,6 +2748,8 @@ int main(int argc, char **argv) {
         return has_domains() ? 0 : 1;
     }
     if (!strcmp(cmd, "tgws")) return cmd_tgws(spec, arg);
+    if (!strcmp(cmd, "tgws-probe"))
+        return cmd_tgws_probe(a.node > 0 ? a.node : 2, arg && !strcmp(arg, "media"));
     if (!strcmp(cmd, "vless")) return cmd_vless(spec, arg);
     if (!strcmp(cmd, "vless-nodes")) return cmd_vless_nodes(spec, arg);
     if (!strcmp(cmd, "vless-probe")) return cmd_vless_probe(spec, arg, a.node, a.timeout);
