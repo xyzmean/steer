@@ -40,6 +40,33 @@
 
 int dnsd_main(int argc, char **argv);
 
+/* ИМЯ ТАБЛИЦЫ ПРАВИЛ — НЕ КОНСТАНТА, потому что движок на роутере бывает не один.
+ *
+ * Рядом с полным движком ставится микропакет tgws: своя спека, своё состояние, свой бинарник
+ * с другим именем. Таблица же у обоих называлась `steer`, а `nft -f` со своим определением
+ * таблицы ЗАМЕЩАЕТ её целиком — то есть кто применил спеку последним, тот и стёр правила
+ * другого. Из-за этого микропакет отказывался работать рядом с полным движком вовсе; отказ
+ * владелец потребовал убрать: «stgws должен работать параллельно со steer, не глядя,
+ * установлен он или нет».
+ *
+ * Имя берётся из STEER_NFT_TABLE, умолчание прежнее. Проверка символов не педантизм: имя
+ * уходит в командную строку nft, и пробел или кавычка в нём означали бы чужую команду. */
+static const char *nft_table(void) {
+    static const char *cached;
+    if (cached) return cached;
+    const char *e = getenv("STEER_NFT_TABLE");
+    cached = "steer";
+    if (e && *e && strlen(e) < 32) {
+        const char *p = e;
+        for (; *p; p++)
+            if (!((*p >= 'a' && *p <= 'z') || (*p >= 'A' && *p <= 'Z') ||
+                  (*p >= '0' && *p <= '9') || *p == '_' || *p == '-'))
+                break;
+        if (!*p) cached = e;
+    }
+    return cached;
+}
+
 /* Путь снимка состояния. Объявлен здесь потому, что apply его СНИМАЕТ (см. там же), а сам
  * снимок живёт ниже, рядом с тем, что его пишет. */
 static void status_snap_path(char *buf, size_t n);
@@ -699,7 +726,7 @@ static void emit_counter(FILE *f, const char *name, int down) {
 }
 
 static void generate(FILE *f) {
-    fprintf(f, "table inet steer {\n");
+    fprintf(f, "table inet %s {\n", nft_table());
     for (size_t i = 0; i < g_grp_n; i++) {
         struct group *g = &g_grp[i];
         /* `any`-группе набор не нужен; опустевшей — нужен, иначе её правило потеряет
@@ -1165,8 +1192,12 @@ static struct fwcheck fw_check(const char *device) {
     int in_steer = 0;
     while ((pos = dump_line(pos, line, sizeof(line))) != NULL) {
         /* Our own table mentions the device too; it proves nothing about NAT. */
-        if (strstr(line, "table inet steer")) in_steer = 1;
-        else if (!strncmp(line, "table ", 6)) in_steer = 0;
+        {
+            char want[80];
+            snprintf(want, sizeof(want), "table inet %s", nft_table());
+            if (strstr(line, want)) in_steer = 1;
+            else if (!strncmp(line, "table ", 6)) in_steer = 0;
+        }
         if (in_steer) continue;
 
         const char *c = strstr(line, "chain ");
@@ -1404,11 +1435,11 @@ static int nfqueue_supported(void) {
     if (!f) { close(fd); unlink(tmp); return 1; }
     /* Своё имя таблицы: `nft -c` ничего не создаёт, но столкнуться именем с чужой живой
      * таблицей всё равно нельзя — проверка тогда проверяла бы её содержимое. */
-    fprintf(f, "table inet steer_qprobe {\n"
+    fprintf(f, "table inet %s_qprobe {\n"
                "    chain c {\n"
                "        type filter hook output priority mangle + 10; policy accept;\n"
                "        meta mark and 0x%08x == 0x%08x queue num %d bypass\n"
-               "    }\n}\n", STEER_MARK_MASK, STEER_MARK_BASE, ZAPRET_QUEUE_BASE);
+               "    }\n}\n", nft_table(), STEER_MARK_MASK, STEER_MARK_BASE, ZAPRET_QUEUE_BASE);
     fclose(f);
     const char *check[] = { "nft", "-c", "-f", tmp, NULL };
     int rc = run_quiet(check);
@@ -1469,7 +1500,7 @@ static int cmd_apply(const char *spec, int dry) {
     /* Delete-then-load in ONE transaction: `nft -f` applies the whole file
      * atomically, so there is never a moment with our chain present and its sets
      * missing. The delete is tolerated failing on the very first apply. */
-    const char *del[] = { "nft", "delete", "table", "inet", "steer", NULL };
+    const char *del[] = { "nft", "delete", "table", "inet", nft_table(), NULL };
     run(del);
     const char *load[] = { "nft", "-f", tmp, NULL };
     int rc = run(load);
@@ -1872,8 +1903,9 @@ static int nft_has(const char *what) {
     /* --terse: ищутся цепочки, элементы наборов не нужны — а их дамп на большом
      * наборе стоит дороже всех остальных проверок diag вместе взятых. */
     snprintf(cmd, sizeof(cmd),
-             "{ nft -t list table inet steer 2>/dev/null || "
-             "nft list table inet steer 2>/dev/null; } | grep -qF '%s'", what);
+             "{ nft -t list table inet %s 2>/dev/null || "
+             "nft list table inet %s 2>/dev/null; } | grep -qF '%s'",
+             nft_table(), nft_table(), what);
     return system(cmd) == 0;
 }
 
@@ -2595,7 +2627,7 @@ static int cmd_explain(const char *spec, const char *what) {
                 fprintf(stderr, "checking %.63s\n", g_grp[i].name);
             snprintf(setname, sizeof(setname), "%.63s", g_grp[i].name);
             snprintf(elem, sizeof(elem), "{ %s }", addr);
-            const char *q[] = { "nft", "get", "element", "inet", "steer", setname, elem, NULL };
+            const char *q[] = { "nft", "get", "element", "inet", nft_table(), setname, elem, NULL };
             hit = run(q) == 0;
         }
         if (!hit) continue;

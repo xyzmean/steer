@@ -972,6 +972,35 @@ void registry_assign(void) {
                 }
         fclose(f);
     }
+    /* СВЕРХУ ИЛИ СНИЗУ. Обычно биты раздаются снизу: первый выход получает нулевой, второй
+     * первый и так далее. Но на роутере движок бывает не один — рядом с полным ставится
+     * микропакет tgws со своей спекой и своим состоянием, — и оба, начав с нуля, выдали бы
+     * своим выходам ОДНУ И ТУ ЖЕ метку. Метка живёт в пакете, а не в таблице: правило
+     * маршрутизации одного экземпляра увело бы трафик другого в свою таблицу, и вылечить это
+     * раздельными таблицами правил нельзя.
+     *
+     * Поэтому второй экземпляр запускается с STEER_MARK_ORDER=top и раздаёт биты сверху вниз.
+     * Из бита выводятся и метка, и номер таблицы маршрутизации, и порт моста, и очередь
+     * обхода, — значит одной этой переменной хватает, чтобы развести экземпляры целиком. */
+    int from_top = getenv("STEER_MARK_ORDER") &&
+                   !strcmp(getenv("STEER_MARK_ORDER"), "top");
+    if (from_top) {
+        int next_bit = (int)STEER_MARK_BITS - 1;
+        for (size_t i = 0; i < g_out_n; i++)
+            if (g_out[i].mark) {
+                int b = 0;
+                while ((MARK_BASE << b) < g_out[i].mark && b < (int)STEER_MARK_BITS) b++;
+                if (b - 1 < next_bit) next_bit = b - 1;
+            }
+        for (size_t i = 0; i < g_out_n; i++) {
+            if (g_out[i].kind == OUT_DIRECT || g_out[i].mark) continue;
+            if (next_bit < 0)
+                die("out of mark bits for output %s", g_out[i].name);
+            g_out[i].mark = MARK_BASE << next_bit;
+            g_out[i].table = TABLE_BASE + next_bit;
+            next_bit--;
+        }
+    } else {
     unsigned next_bit = 0;
     for (size_t i = 0; i < g_out_n; i++)
         if (g_out[i].mark) {
@@ -986,6 +1015,7 @@ void registry_assign(void) {
         g_out[i].mark = MARK_BASE << next_bit;
         g_out[i].table = TABLE_BASE + (int)next_bit;
         next_bit++;
+    }
     }
     /* Прежде чем писать — сравнить с тем, что уже на диске. registry_assign
      * зовут все подкоманды, включая status, который интерфейс опрашивает каждые
