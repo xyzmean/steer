@@ -76,6 +76,66 @@ static int bind_local(int fd, int port) {
     return bind(fd, (struct sockaddr *)&a, sizeof(a));
 }
 
+/* СТАРОЕ РУКОПОЖАТИЕ TLS 1.2 — второй облик пробы, и он не прихоть.
+ *
+ * Снято с живого роутера: приложение Discord висело на проверке обновлений, и в снимке
+ * трафика видно, что умирает ровно соединение к updates.discord.com. Его апдейтер шлёт
+ * ClientHello в 175 байт: версия 1.2, восемнадцать наборов шифров, шесть расширений — и всё.
+ * Современные рукопожатия (curl и наше браузерное) через ту же стратегию проходили, а это
+ * нет: стратегия режет пакет по позиции, и от размера пакета зависит, попадёт ли разрез
+ * туда, куда смотрит DPI.
+ *
+ * Поэтому проба умеет оба облика, а подбор считает цель открытой, только если прошли оба.
+ * Байты собраны по снимку, имя подставляется — остальное дословно. */
+static size_t hello12_build(const char *sni, unsigned char *out, size_t cap) {
+    static const unsigned char CIPHERS[] = {
+        0xc0,0x2c, 0xc0,0x2b, 0xc0,0x30, 0xc0,0x2f, 0xc0,0x24, 0xc0,0x23,
+        0xc0,0x28, 0xc0,0x27, 0xc0,0x0a, 0xc0,0x09, 0xc0,0x14, 0xc0,0x13,
+        0x00,0x9d, 0x00,0x9c, 0x00,0x3d, 0x00,0x3c, 0x00,0x35, 0x00,0x2f,
+    };
+    static const unsigned char TAIL[] = {
+        0x00,0x0a, 0x00,0x08, 0x00,0x06, 0x00,0x1d, 0x00,0x17, 0x00,0x18,   /* группы */
+        0x00,0x0b, 0x00,0x02, 0x01,0x00,                                    /* форматы точек */
+        0x00,0x0d, 0x00,0x1a, 0x00,0x18, 0x08,0x04, 0x08,0x05, 0x08,0x06,   /* подписи */
+        0x04,0x01, 0x05,0x01, 0x02,0x01, 0x04,0x03, 0x05,0x03, 0x02,0x03,
+        0x02,0x02, 0x06,0x01, 0x06,0x03,
+        0x00,0x23, 0x00,0x00,                                               /* билет сессии */
+        0x00,0x17, 0x00,0x00,                                               /* master secret */
+        0xff,0x01, 0x00,0x01, 0x00,                                         /* renegotiation */
+    };
+    size_t sni_n = strlen(sni);
+    size_t sni_ext = 2 + 2 + (2 + 1 + 2 + sni_n);          /* тип, длина, тело server_name */
+    size_t ext_n = sni_ext + sizeof(TAIL);
+    size_t body = 2 + 32 + 1 + 2 + sizeof(CIPHERS) + 2 + 2 + ext_n;
+    size_t total = 5 + 4 + body;
+    unsigned char *p = out;
+
+    if (cap < total || sni_n > 200) return 0;
+
+    *p++ = 0x16; *p++ = 0x03; *p++ = 0x03;                  /* запись рукопожатия */
+    *p++ = (unsigned char)((4 + body) >> 8); *p++ = (unsigned char)(4 + body);
+    *p++ = 0x01;                                            /* client_hello */
+    *p++ = (unsigned char)(body >> 16); *p++ = (unsigned char)(body >> 8); *p++ = (unsigned char)body;
+    *p++ = 0x03; *p++ = 0x03;                               /* версия 1.2 */
+    if (xc_random(p, 32) != 0) return 0;
+    p += 32;
+    *p++ = 0x00;                                            /* session_id пуст */
+    *p++ = (unsigned char)(sizeof(CIPHERS) >> 8); *p++ = (unsigned char)sizeof(CIPHERS);
+    memcpy(p, CIPHERS, sizeof(CIPHERS)); p += sizeof(CIPHERS);
+    *p++ = 0x01; *p++ = 0x00;                               /* сжатия нет */
+    *p++ = (unsigned char)(ext_n >> 8); *p++ = (unsigned char)ext_n;
+
+    *p++ = 0x00; *p++ = 0x00;                               /* server_name */
+    *p++ = (unsigned char)((sni_ext - 4) >> 8); *p++ = (unsigned char)(sni_ext - 4);
+    *p++ = (unsigned char)((sni_n + 3) >> 8); *p++ = (unsigned char)(sni_n + 3);
+    *p++ = 0x00;
+    *p++ = (unsigned char)(sni_n >> 8); *p++ = (unsigned char)sni_n;
+    memcpy(p, sni, sni_n); p += sni_n;
+
+    memcpy(p, TAIL, sizeof(TAIL)); p += sizeof(TAIL);
+    return (size_t)(p - out);
+}
+
 int cmd_tls_probe(const char *host, const char *addr, int port, int local_port, int quiet) {
     char portbuf[16];
     struct addrinfo hints, *res = NULL, *it;
@@ -118,15 +178,24 @@ int cmd_tls_probe(const char *host, const char *addr, int port, int local_port, 
     }
     pb64(fake_pbk, sizeof(fake_pbk), pbk);
 
-    struct reality_cfg cfg = { .sni = host, .pbk = pbk, .sid = "", .fp = "chrome",
-                               .alpn = "h2" };
-    struct reality_state st;
-    struct reality_carrier car = { .priv = priv, .pub = pub, .fill_sid = psid };
-    int hrc = reality_build_hello_carry(&cfg, &st, &car, hello, sizeof(hello), &hello_n);
-    if (hrc != 0) {
-        close(fd);
-        if (!quiet) printf("итог:       Hello не собрался (%d)\n", hrc);
-        return 2;
+    if (getenv("STEER_TLS_PROBE_LEGACY")) {
+        hello_n = hello12_build(host, hello, sizeof(hello));
+        if (!hello_n) {
+            close(fd);
+            if (!quiet) printf("итог:       Hello 1.2 не собрался\n");
+            return 2;
+        }
+    } else {
+        struct reality_cfg cfg = { .sni = host, .pbk = pbk, .sid = "", .fp = "chrome",
+                                   .alpn = "h2" };
+        struct reality_state st;
+        struct reality_carrier car = { .priv = priv, .pub = pub, .fill_sid = psid };
+        int hrc = reality_build_hello_carry(&cfg, &st, &car, hello, sizeof(hello), &hello_n);
+        if (hrc != 0) {
+            close(fd);
+            if (!quiet) printf("итог:       Hello не собрался (%d)\n", hrc);
+            return 2;
+        }
     }
 
     struct timespec t0, t1;
@@ -165,6 +234,7 @@ int cmd_tls_probe(const char *host, const char *addr, int port, int local_port, 
         if (!quiet) printf("итог:       ответ не рукопожатие (0x%02x)\n", head[0]);
         return 1;
     }
-    if (!quiet) printf("итог:       %s отвечает, %ld мс\n", host, ms);
+    if (!quiet) printf("итог:       %s отвечает %s рукопожатием, %ld мс\n", host,
+                       getenv("STEER_TLS_PROBE_LEGACY") ? "старым" : "браузерным", ms);
     return 0;
 }

@@ -55,3 +55,5 @@ build/bx-*
 build/mbedtls-host/
 build/asan-probe*
 build/devupmatch
+build/stgws-*
+build/msgsplitmatch

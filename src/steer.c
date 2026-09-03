@@ -51,14 +51,25 @@ void aggregate_usage_flags(FILE *out);
 /* Клиент VLESS есть только в расширенной сборке (steer-extended). В базовой команда
  * отвечает внятным отказом, а не отсутствует: «неизвестная команда» на steer vless
  * заставила бы искать опечатку вместо того, чтобы поставить нужный пакет. */
-#ifdef STEER_EXTENDED
-int cmd_vless(const char *spec_path, const char *out_name);
-int cmd_vless_nodes(const char *spec_path, const char *out_name);
-int cmd_vless_probe(const char *spec_path, const char *out_name, int node, int timeout_s);
+/* МИНИ-СБОРКА (STEER_TGWS) — это тот же движок без всего, кроме перехвата Telegram.
+ *
+ * Заводится она для отдельного микропакета tgws: там нужен ровно мост, спека с одним выходом
+ * и правила к нему, а клиент VLESS, звезда xsteer и работа с подпиской не нужны вовсе. На
+ * роутере с шестью с половиной мегабайтами overlay это не придирка: расширенная сборка весит
+ * три четверти мегабайта, мини — вдвое меньше, и в пакет с бинарником внутри это заметно.
+ *
+ * Подкоманды, которых в мини-сборке нет, отвечают той же внятной заглушкой, что и в базовой:
+ * «неизвестная команда» заставила бы искать опечатку вместо нужного пакета. */
+#if defined(STEER_EXTENDED) || defined(STEER_TGWS)
 /* Мост Telegram → веб-сокет; объяснение целиком — в src/ext/tgws.c. */
 int cmd_tgws(const char *spec_path, const char *out_name);
 int cmd_tgws_probe(int dc, int media);
 int cmd_tls_probe(const char *host, const char *addr, int port, int local_port, int quiet);
+#endif
+#ifdef STEER_EXTENDED
+int cmd_vless(const char *spec_path, const char *out_name);
+int cmd_vless_nodes(const char *spec_path, const char *out_name);
+int cmd_vless_probe(const char *spec_path, const char *out_name, int node, int timeout_s);
 /* Скачивание и обработка подписки. Объявления — в src/ext/subfetch.h, там же и рассказ,
  * почему это работа движка, а не управляющего слоя. */
 #include "ext/subfetch.h"
@@ -96,6 +107,7 @@ static int cmd_sub_quota(const char *url, const char *info_path) {
     return no_vless();
 }
 static int cmd_sub_hwid(void) { return no_vless(); }
+#ifndef STEER_TGWS
 static int cmd_tgws(const char *spec_path, const char *out_name) {
     (void)spec_path; (void)out_name;
     return no_vless();
@@ -104,6 +116,7 @@ static int cmd_tgws_probe(int dc, int media) { (void)dc; (void)media; return no_
 static int cmd_tls_probe(const char *host, const char *addr, int port, int local_port, int quiet) {
     (void)host; (void)addr; (void)port; (void)local_port; (void)quiet; return no_vless();
 }
+#endif
 #endif
 
 /* Клиент и хаб xsteer. Клиент — расширенная сборка, хаб — серверная: на роутере хабу делать

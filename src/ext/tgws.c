@@ -94,7 +94,12 @@
  * «Telegram не работает», причём молча. 192 — потому что стек потока выделяется лениво:
  * место под них резервируется в адресном пространстве, а не в памяти. */
 #define MAX_CONNS     192
-#define UP_TIMEOUT_S  10
+#define UP_TIMEOUT_S  10        /* на установление: точка либо отвечает, либо мертва */
+/* На затишье ВНУТРИ сессии. Прежние десять секунд оставались на сокетах и дальше, а MTProto
+ * молчит минутами: телефон в кармане не шлёт ничего, пока не придёт уведомление. Первое же
+ * затишье длиннее десяти секунд обрывало перелив, и клиент начинал всё заново — на компьютере
+ * почти незаметно, на телефоне это «постоянное обновление». */
+#define IDLE_TIMEOUT_S 300
 
 /* Домен точек веб-сокета. Прямой (web.telegram.org) НЕ работает у нас по двум причинам
  * сразу, и обе выяснились пробой против настоящего Telegram, а не по документации:
@@ -155,23 +160,16 @@ static const struct { const char *ip; short dc; short media; } DC_BUILTIN[] = {
     { "149.154.175.115", 3, 0 },
     { "149.154.167.50",  2, 0 },
     { "149.154.167.51",  2, 0 },
-    /* Медийные точки клиента. Они обслуживают файлы и картинки, у них своя точка kwsN-1, и
-     * отправленное на обычную точку того же ДЦ соединение авторизуется, а файлы не отдаёт —
-     * снаружи это ровно «переписка идёт, медиа не грузится». Адреса сверены с картой
-     * дата-центров Telegram (getProxyConfig: -2 и -4 живут в 149.154.161.x и 149.154.165.x). */
-    { "149.154.167.151", 2, 1 },
-    { "149.154.167.222", 2, 1 },
-    { "149.154.161.184", 2, 1 },
-    { "149.154.164.0/24", 4, 1 },
-    { "149.154.165.0/24", 4, 1 },
-    { "149.154.166.0/24", 4, 1 },
     { "149.154.167.91",  4, 0 },
     { "149.154.167.92",  4, 0 },
-    { "149.154.164.250", 4, 1 },
-    { "149.154.166.120", 4, 1 },
+    /* Подсети четвёртого ДЦ. */
+    { "149.154.164.0/24", 4, 0 },
+    { "149.154.165.0/24", 4, 0 },
+    { "149.154.166.0/24", 4, 0 },
+    /* МЕДИЙНЫМИ АДРЕСА НЕ ПОМЕЧАЮТСЯ: клиент называет дата-центр сам, см. hs_read_dc. */
     { "149.154.171.5",   5, 0 },
     { "91.108.56.130",   5, 0 },
-    { "91.108.56.140",   5, 1 },
+    { "91.108.56.140",   5, 0 },
 };
 
 /* Принимает и `1.2.3.4`, и `1.2.3.0/24`. Повторная запись с той же маской заменяет прежнюю:
@@ -349,7 +347,23 @@ static int hs_keystream(const unsigned char hs[HS_LEN], unsigned char out[HS_LEN
  * нет: тогда соединение переливается на исходный адрес без перехвата. Метка нужна не ради
  * порядка — по ней отличается настоящий клиент от постороннего, случайно попавшего под
  * правило: перехватить чужое и увести в Telegram значило бы сломать чужое соединение. */
-static int hs_patch_dc(unsigned char hs[HS_LEN], short dc, short media, unsigned char *tag) {
+
+/* Разбор рукопожатия: транспорт и НОМЕР ДАТА-ЦЕНТРА.
+ *
+ * КЛИЕНТ НАЗЫВАЕТ ДАТА-ЦЕНТР САМ, и это выяснилось дорого. Поле [60..62] считается незначащим
+ * у соединения напрямую в ДЦ, и мост клал туда свою догадку по адресу назначения. Журнал на
+ * живом роутере показал обратное: клиент кладёт туда осмысленный номер — «2», а для медийных
+ * соединений «-2», — и наша догадка его затирала. Медийное соединение уходило на обычный
+ * дата-центр, обычное — на угаданный по /24; сервер не находил ключ авторизации, отвечал
+ * ошибкой, клиент закрывал соединение и начинал заново. Снаружи это выглядело ровно так, как
+ * рассказал владелец: медиа работает, а чаты и «Обновление» висят.
+ *
+ * Поэтому: назвал клиент номер — уважаем и рукопожатие не трогаем вовсе. Не назвал (ноль или
+ * бессмыслица) — подставляем догадку по адресу: тогда её больше взять негде.
+ *
+ * 0 — это не MTProto. Иначе tag, dc и media — по слову клиента либо по догадке. */
+static int hs_read_dc(unsigned char hs[HS_LEN], short guess_dc, short guess_media,
+                      unsigned char *tag, short *out_dc, short *out_media) {
     unsigned char ks[HS_LEN];
     if (hs_keystream(hs, ks) != 0) return 0;
 
@@ -361,10 +375,20 @@ static int hs_patch_dc(unsigned char hs[HS_LEN], short dc, short media, unsigned
         return 0;
     *tag = t[0];
 
-    int16_t idx = media ? (int16_t)-dc : (int16_t)dc;
-    unsigned char d[2] = { (unsigned char)(idx & 0xff), (unsigned char)((idx >> 8) & 0xff) };
-    hs[DC_POS + 0] = d[0] ^ ks[DC_POS + 0];
-    hs[DC_POS + 1] = d[1] ^ ks[DC_POS + 1];
+    unsigned char o0 = hs[DC_POS + 0] ^ ks[DC_POS + 0];
+    unsigned char o1 = hs[DC_POS + 1] ^ ks[DC_POS + 1];
+    int16_t own = (int16_t)((unsigned)o0 | ((unsigned)o1 << 8));
+    if (own != 0 && own >= -5 && own <= 5) {
+        *out_dc = (short)(own < 0 ? -own : own);
+        *out_media = (short)(own < 0);
+        return 1;
+    }
+
+    *out_dc = guess_dc;
+    *out_media = guess_media;
+    int16_t idx = guess_media ? (int16_t)-guess_dc : (int16_t)guess_dc;
+    hs[DC_POS + 0] = (unsigned char)(idx & 0xff) ^ ks[DC_POS + 0];
+    hs[DC_POS + 1] = (unsigned char)((idx >> 8) & 0xff) ^ ks[DC_POS + 1];
     return 1;
 }
 
@@ -538,7 +562,12 @@ static int ws_upgrade(struct upstream *u, const char *host) {
     return 0;
 }
 
-/* Кадр от клиента ОБЯЗАН быть замаскирован (RFC 6455 §5.3) — сервер рвёт соединение иначе. */
+/* Кадр от клиента ОБЯЗАН быть замаскирован (RFC 6455 §5.3) — сервер рвёт соединение иначе.
+ *
+ * Одним кадром, без дробления по размеру: границы кадров задаёт нарезка на пакеты MTProto
+ * (см. msgsplit), и делить кадр ещё и по длине значило бы ломать ровно то правило, ради
+ * которого она появилась. Своими кадрами тут уходят рукопожатие обфускации и остаток
+ * сессии, если нарезка выключилась. */
 static int ws_send(struct upstream *u, const unsigned char *p, size_t n) {
     unsigned char hdr[14];
     size_t h = 0;
@@ -712,7 +741,261 @@ static int tls_start(struct upstream *u, const char *sni) {
  *
  * Обе стороны в одном цикле poll: отдельный поток на направление стоил бы второго стека и
  * согласования закрытия ради ровно той же работы. */
-static void pump(int cfd, struct upstream *u) {
+struct obf {
+    mbedtls_aes_context enc, dec;
+    unsigned char nce[16], ncd[16], sbe[16], sbd[16];
+    size_t oe, od;
+};
+
+static int obf_init(struct obf *o, const unsigned char hs[HS_LEN]) {
+    unsigned char rev[HS_LEN];
+    for (int i = 0; i < HS_LEN; i++) rev[i] = hs[HS_LEN - 1 - i];
+    mbedtls_aes_init(&o->enc);
+    mbedtls_aes_init(&o->dec);
+    memcpy(o->nce, hs + 40, 16);
+    memcpy(o->ncd, rev + 40, 16);
+    o->oe = o->od = 0;
+    if (mbedtls_aes_setkey_enc(&o->enc, hs + 8, 256) != 0) return -1;
+    if (mbedtls_aes_setkey_enc(&o->dec, rev + 8, 256) != 0) return -1;
+    /* Промотать 64 байта гаммы надо ТОЛЬКО шифрующему направлению: их съел наш собственный
+     * init, который ушёл в сеть. Поток сервера к нам начинается с нуля — он нам никакого
+     * init не слал. Промотав оба, получаешь расшифровку со сдвигом: снято пробой против
+     * настоящего Telegram — ответ приходил, но выглядел шумом. */
+    unsigned char skip[HS_LEN], zero[HS_LEN];
+    memset(zero, 0, sizeof(zero));
+    if (mbedtls_aes_crypt_ctr(&o->enc, HS_LEN, &o->oe, o->nce, o->sbe, zero, skip) != 0)
+        return -1;
+    return 0;
+}
+
+/* ---- нарезка потока клиента на пакеты MTProto ----------------------------------------
+ *
+ * ГЛАВНОЕ ПРАВИЛО ТОЧКИ apiws: ОДИН ПАКЕТ MTProto — ОДИН КАДР ВЕБ-СОКЕТА.
+ *
+ * Точка apiws сделана для веб-клиента Telegram, а тот отправляет каждый пакет отдельным
+ * вызовом send(), то есть отдельным кадром. Сервер на это и рассчитывает: границу кадра он
+ * считает границей пакета. Мост же берёт байты из TCP-сокета клиента, и границы там чужие —
+ * какие сложились у сетевого стека, а не какие имел в виду клиент.
+ *
+ * Чем это кончалось на живом роутере. Пока клиент писал по одному пакету за раз, совпадение
+ * было случайно верным: запрос куска файла — это один пакет, поэтому медиа грузилось
+ * прекрасно. Но при подключении телефон пишет подряд подтверждения, ping и
+ * updates.getDifference, TCP склеивает их в одно чтение, и в кадр уезжает несколько пакетов.
+ * Сервер разбирает первый, остальное для него мусор — и это ровно то, что владелец видел:
+ * «медиа отлично, а Обновление висит и сообщения не отправляются». На компьютере пакеты
+ * уходят по одному, поэтому там всё работало, и чужие пределы Cloudflare тут не при чём.
+ *
+ * Как читаются границы, не трогая содержимое. Префикс длины лежит в начале каждого пакета
+ * под обфускацией, поэтому рядом идёт ТЕНЕВОЙ шифр того же направления: он расшифровывает
+ * поток только чтобы прочитать длины. Наверх уходят исходные байты шифротекста —
+ * расшифровка нужна нам, а не серверу.
+ *
+ * Почему потоком, а не через буфер пакета. Длина известна из префикса, значит заголовок
+ * кадра можно выставить до того, как придёт тело. Иначе под каждую сессию понадобился бы
+ * буфер размером с самый большой пакет — при отправке файла это полмегабайта на сессию,
+ * чего на роутере со 128 МБ памяти делать нельзя.
+ *
+ * Если длина не читается (незнакомый транспорт, рассинхрон теневого шифра), нарезка молча
+ * выключается и остаток сессии переливается как раньше: испорченное соединение человека
+ * хуже неоптимального.
+ */
+static void obf_free(struct obf *o);   /* определён ниже, у пробы */
+
+#define MS_PKT_MAX (2u * 1024 * 1024)   /* больше настоящий пакет MTProto не бывает */
+
+struct msgsplit {
+    struct obf o;              /* теневой шифр: только для чтения префиксов длины */
+    int  on;                   /* нарезка включена */
+    unsigned char tag;         /* транспорт: 0xef сжатый, 0xee обычный, 0xdd с набивкой */
+    unsigned char hp[4];       /* префикс длины, расшифрованный — для разбора */
+    unsigned char hc[4];       /* он же шифротекстом — уходит в кадр как есть */
+    size_t hdr_n;              /* сколько байт префикса собрано */
+    size_t body;               /* сколько байт тела текущего пакета осталось передать */
+    unsigned char mask[4];     /* маска текущего кадра */
+    size_t mask_off;           /* позиция в кадре: маска зависит от неё */
+    unsigned long pkts;        /* сколько пакетов нарезано — для итога сессии */
+};
+
+static int ms_init(struct msgsplit *m, const unsigned char hs[HS_LEN], unsigned char tag) {
+    memset(m, 0, sizeof(*m));
+    if (obf_init(&m->o, hs) != 0) return -1;
+    m->tag = tag;
+    m->on = 1;
+    return 0;
+}
+
+/* Накопитель записи: кадры переписки мелкие и частые, и отдавать каждый отдельным up_write
+ * значит платить записью TLS за каждый. */
+struct ms_out { struct upstream *u; unsigned char b[2048]; size_t n; };
+
+static int mo_flush(struct ms_out *w) {
+    if (!w->n) return 0;
+    if (up_write(w->u, w->b, w->n) < 0) return -1;
+    w->n = 0;
+    return 0;
+}
+
+static int mo_put(struct ms_out *w, const unsigned char *p, size_t n) {
+    while (n) {
+        size_t room = sizeof(w->b) - w->n;
+        if (!room) { if (mo_flush(w) < 0) return -1; room = sizeof(w->b); }
+        size_t part = n < room ? n : room;
+        memcpy(w->b + w->n, p, part);
+        w->n += part;
+        p += part; n -= part;
+    }
+    return 0;
+}
+
+/* Тело кадра маскируется по позиции В КАДРЕ, поэтому смещение живёт в состоянии пакета:
+ * тело приходит несколькими чтениями, а маска обязана продолжаться, а не начинаться заново. */
+static int mo_masked(struct ms_out *w, struct msgsplit *m, const unsigned char *p, size_t n) {
+    unsigned char t[256];
+    while (n) {
+        size_t part = n < sizeof(t) ? n : sizeof(t);
+        for (size_t i = 0; i < part; i++)
+            t[i] = p[i] ^ m->mask[(m->mask_off + i) & 3];
+        if (mo_put(w, t, part) < 0) return -1;
+        m->mask_off += part;
+        p += part; n -= part;
+    }
+    return 0;
+}
+
+static int mo_head(struct ms_out *w, struct msgsplit *m, size_t total) {
+    unsigned char h[14];
+    size_t k = 0;
+    if (xc_random(m->mask, 4) != 0) return -1;
+    h[k++] = 0x82;                                    /* FIN + двоичный кадр */
+    if (total < 126) h[k++] = (unsigned char)(0x80 | total);
+    else if (total < 65536) {
+        h[k++] = 0x80 | 126;
+        h[k++] = (unsigned char)(total >> 8);
+        h[k++] = (unsigned char)(total & 0xff);
+    } else {
+        h[k++] = 0x80 | 127;
+        for (int i = 7; i >= 0; i--) h[k++] = (unsigned char)((uint64_t)total >> (i * 8));
+    }
+    memcpy(h + k, m->mask, 4); k += 4;
+    m->mask_off = 0;
+    return mo_put(w, h, k);
+}
+
+/* Длина тела по собранному префиксу: 1 — разобрано, 0 — префикса ещё мало, -1 — не годится.
+ *
+ * Сжатый транспорт: один байт длины в четвёрках, а 0x7f — признак длинной формы ещё на три
+ * байта. Обычный и с набивкой: четыре байта длины прямым порядком. Старший бит в обоих
+ * случаях — просьба клиента о быстром подтверждении, к длине он не относится. */
+static int ms_len(struct msgsplit *m, size_t *body) {
+    if (m->tag == 0xef) {
+        unsigned b = m->hp[0] & 0x7f;
+        if (b == 0x7f) {
+            if (m->hdr_n < 4) return 0;
+            *body = ((size_t)m->hp[1] | ((size_t)m->hp[2] << 8) |
+                     ((size_t)m->hp[3] << 16)) * 4;
+        } else {
+            *body = (size_t)b * 4;
+        }
+    } else {
+        if (m->hdr_n < 4) return 0;
+        uint32_t l = (uint32_t)m->hp[0] | ((uint32_t)m->hp[1] << 8) |
+                     ((uint32_t)m->hp[2] << 16) | ((uint32_t)m->hp[3] << 24);
+        *body = (size_t)(l & 0x7fffffffu);
+    }
+    if (*body == 0 || *body > MS_PKT_MAX) return -1;
+    return 1;
+}
+
+static int ms_feed(struct msgsplit *m, struct upstream *u,
+                   const unsigned char *p, size_t n) {
+    if (!m->on) return ws_send(u, p, n);
+
+    struct ms_out w = { .u = u, .n = 0 };
+    unsigned char pt[512];
+    size_t off = 0;
+
+    while (off < n) {
+        /* Гамма CTR тратится подряд, поэтому через теневой шифр обязаны пройти ВСЕ байты
+         * потока и ровно по одному разу — иначе разбор длин уедет со сдвигом. */
+        size_t slice = n - off;
+        if (slice > sizeof(pt)) slice = sizeof(pt);
+        if (mbedtls_aes_crypt_ctr(&m->o.enc, slice, &m->o.oe, m->o.nce, m->o.sbe,
+                                  p + off, pt) != 0)
+            goto give_up;
+
+        size_t i = 0;
+        while (i < slice) {
+            if (m->body == 0) {
+                if (m->hdr_n >= sizeof(m->hc)) goto give_up;
+                m->hc[m->hdr_n] = p[off + i];
+                m->hp[m->hdr_n] = pt[i];
+                m->hdr_n++;
+                i++;
+                size_t body = 0;
+                int r = ms_len(m, &body);
+                if (r == 0) continue;
+                if (r < 0) goto give_up;
+                if (mo_head(&w, m, m->hdr_n + body) < 0) return -1;
+                if (mo_masked(&w, m, m->hc, m->hdr_n) < 0) return -1;
+                m->body = body;
+                m->hdr_n = 0;
+                m->pkts++;
+                continue;
+            }
+            size_t take = slice - i;
+            if (take > m->body) take = m->body;
+            if (mo_masked(&w, m, p + off + i, take) < 0) return -1;
+            m->body -= take;
+            i += take;
+        }
+        off += slice;
+
+        continue;
+
+give_up:
+        /* Отдаём остаток как есть. Открытого кадра здесь быть не может: сюда попадаем
+         * только между пакетами, когда тело предыдущего уже дошло. */
+        m->on = 0;
+        fprintf(stderr, LOG_W "нарезка на пакеты выключена: длина не читается\n");
+        if (mo_flush(&w) < 0) return -1;
+        if (m->hdr_n && ws_send(u, m->hc, m->hdr_n) < 0) return -1;
+        m->hdr_n = 0;
+        {
+            size_t left = n - off;
+            return left ? ws_send(u, p + off, left) : 0;
+        }
+    }
+    return mo_flush(&w);
+}
+
+/* Итог сессии: почему кончилась и сколько байт прошло. СВОЙ У КАЖДОЙ, а не общий на процесс:
+ * мост обслуживает каждое соединение своим потоком, и общие счётчики однажды показали у всех
+ * сессий подряд одинаковые числа — по такой диагностике я и сделал неверный вывод. */
+struct pump_stat {
+    const char *why;
+    unsigned long up, down;
+    struct obf *dbg;            /* расшифровщик первых байт ответа, только для журнала */
+    unsigned char tag;          /* транспорт: 0xef сжатый, 0xee обычный, 0xdd с набивкой */
+    const char *dsts;
+};
+
+/* Мёртвого клиента замечает keepalive: телефон уходит из сети молча, а поток моста иначе
+ * висел бы на нём до срока затишья. Сроки мягкие — живость соединения наверх держать нечем
+ * (пинги веб-сокета точка apiws не терпит: каждая сессия, отправившая пинг, умирала сразу
+ * после него, и ни один пинг не получил ответа), так что торопиться незачем. */
+static void keepalive_on(int fd) {
+    int one = 1, idle = 240, intvl = 30, cnt = 4;
+    setsockopt(fd, SOL_SOCKET, SO_KEEPALIVE, &one, sizeof(one));
+#ifdef TCP_KEEPIDLE
+    setsockopt(fd, IPPROTO_TCP, TCP_KEEPIDLE, &idle, sizeof(idle));
+    setsockopt(fd, IPPROTO_TCP, TCP_KEEPINTVL, &intvl, sizeof(intvl));
+    setsockopt(fd, IPPROTO_TCP, TCP_KEEPCNT, &cnt, sizeof(cnt));
+#else
+    (void)idle; (void)intvl; (void)cnt;
+#endif
+}
+
+static void pump(int cfd, struct upstream *u, struct pump_stat *st, struct msgsplit *ms) {
     struct ws_rx rx;
     unsigned char buf[BUF_N];
     rx.n = 0;
@@ -734,8 +1017,17 @@ static void pump(int cfd, struct upstream *u) {
 
         if (p[0].revents & POLLIN) {
             ssize_t r = recv(cfd, buf, sizeof(buf), 0);
-            if (r <= 0) return;
-            if (ws_send(u, buf, (size_t)r) < 0) return;
+            if (r <= 0) {
+                st->why = r == 0 ? "клиент закрыл" : "чтение от клиента отказало";
+                return;
+            }
+            /* ОДИН ПАКЕТ — ОДИН КАДР: границы кадров задаёт клиент, а не сетевой стек
+             * (см. пояснение у msgsplit). */
+            if (ms_feed(ms, u, buf, (size_t)r) < 0) {
+                st->why = "запись наверх отказала";
+                return;
+            }
+            st->up += (unsigned long)r;
         }
 
         if ((p[1].revents & POLLIN) || wait == 0) {
@@ -752,6 +1044,31 @@ static void pump(int cfd, struct upstream *u) {
                 if (rx.pend) {
                     size_t take = rx.n < rx.pend ? rx.n : rx.pend;
                     if (!take) break;
+                    /* ПЕРВЫЕ БАЙТЫ ОТВЕТА — В ЖУРНАЛ, если это ошибка транспорта.
+                     *
+                     * MTProto отвечает на негодную заявку четырьмя байтами отрицательного
+                     * числа: -404 «ключ не с этого дата-центра», -429 «слишком часто» и так
+                     * далее. В журнале такой ответ выглядел просто как «вниз 169 байт», и
+                     * отличить его от полезных данных было нечем. */
+                    if (st->dbg) {
+                        unsigned char pk[8], dec[8];
+                        size_t n = take < sizeof(pk) ? take : sizeof(pk);
+                        memcpy(pk, rx.buf, n);
+                        if (mbedtls_aes_crypt_ctr(&st->dbg->dec, n, &st->dbg->od,
+                                                  st->dbg->ncd, st->dbg->sbd, pk, dec) == 0) {
+                            size_t off = (st->tag == 0xee) ? 4 : 1;
+                            if (n >= off + 4) {
+                                int32_t code = (int32_t)((unsigned)dec[off] |
+                                                         ((unsigned)dec[off + 1] << 8) |
+                                                         ((unsigned)dec[off + 2] << 16) |
+                                                         ((unsigned)dec[off + 3] << 24));
+                                if (code < 0 && code > -100000)
+                                    fprintf(stderr, LOG_W "%s: сервер ответил ошибкой транспорта %d\n",
+                                            st->dsts ? st->dsts : "?", code);
+                            }
+                        }
+                        st->dbg = NULL;             /* смотрим только начало сессии */
+                    }
                     if (rx.pend_op == 0x1 || rx.pend_op == 0x2 || rx.pend_op == 0x0) {
                         size_t off = 0;
                         while (off < take) {
@@ -760,6 +1077,7 @@ static void pump(int cfd, struct upstream *u) {
                             off += (size_t)w;
                         }
                     }
+                    st->down += (unsigned long)take;
                     ws_consume(&rx, take);
                     rx.pend -= take;
                     continue;
@@ -770,7 +1088,10 @@ static void pump(int cfd, struct upstream *u) {
                 int h = ws_head(&rx, &need, &len, &op);
                 if (h == 0) break;
                 if (h < 0) return;
-                if (op == 0x8) return;                /* close */
+                if (op == 0x8) {                      /* close */
+                    st->why = "точка закрыла веб-сокет";
+                    return;
+                }
                 if (op == 0x9) {                      /* ping — отвечаем тем же телом */
                     unsigned char pong[128];
                     size_t pn = len > sizeof(pong) ? sizeof(pong) : len;
@@ -846,6 +1167,263 @@ out:
     close(fd);
 }
 
+/* Дозвон до точки: выбор домена, TCP, TLS, апгрейд веб-сокета.
+ *
+ * РУКОПОЖАТИЕ КЛИЕНТА ЗДЕСЬ НЕ ОТПРАВЛЯЕТСЯ. Раньше оно уходило прямо в дозвоне, и это
+ * связывало соединение с клиентом навсегда. Теперь дозвон отдельно: тем же кодом наполняется
+ * ЗАПАС поднятых соединений (см. warm_*), и клиент, пришедший позже, получает готовое —
+ * без рукопожатия TLS и апгрейда в критическом пути.
+ *
+ * Зачем запас: на живом роутере треть соединений поднималась со второй-шестой попытки —
+ * общественные домены отвечают 503 почти на половину запросов. Каждый отказ стоит полного
+ * рукопожатия, и владелец видел это как «сообщения отправляются по полминуты». Отказы никуда
+ * не денутся, но переживать их должен наполнитель в фоне, а не человек. */
+static int dial_upstream(short dc, short media, struct upstream *u_out,
+                         char *sni_out, size_t sni_cap, int *tries_out) {
+    /* Куда идём. Имя точки — kwsN[-1].<домен>, оно же SNI и Host; АДРЕС подключения обычно
+     * тот же, но стенду его задают отдельно (там поднят свой сервер на петле). */
+    char cand[2][160];
+    const char *port = "443";
+    const char *ep = getenv("STEER_TGWS_ENDPOINT");
+    char epbuf[160];
+    /* Домены по порядку: свой, потом запасные. Больше трёх не пробуем — человек ждёт
+     * соединения, а не полного обхода списка. */
+    const char *doms[1 + MAX_ALT];
+    size_t didx[1 + MAX_ALT];
+    size_t dom_n = 0;
+    time_t now = time(NULL);
+
+    /* НАГРУЗКА РАСКЛАДЫВАЕТСЯ ПО ВСЕМУ ПУЛУ, а не сваливается на первый домен.
+     *
+     * Домены чужие и общественные, и 503 у них приходит не от неисправности, а от наплыва.
+     * Пока каждое соединение начинало с одного и того же домена, наплыв создавали мы сами: на
+     * живом роутере из двадцати двух попыток за минуту десять получали 503, и каждая стоила
+     * лишнего рукопожатия TLS перед уходом на запасной.
+     *
+     * Поэтому начальный домен сдвигается по кругу на каждое соединение: при двадцати доменах
+     * каждый получает двадцатую часть нагрузки. Домен со свежим отказом уходит в конец
+     * очереди, но из неё не выпадает — «все в отказе» это состояние сети, а не повод не
+     * пробовать. */
+    /* ПОРЯДОК: САМЫЙ БЫСТРЫЙ ИЗ ТЕХ, КТО НЕ В ОТКАЗЕ.
+     *
+     * Список приходит упорядоченным — сначала домены, у которых отвечает больше точек и
+     * меньше круг (см. `tgws pick`). Отсюда правило: берём первый не отставленный, а домен,
+     * ответивший 503, отходит в сторону на минуту, и нагрузка сама перетекает к следующему.
+     *
+     * Круговая раздача, которая была здесь до этого, оказалась хуже с обеих сторон: по кругу
+     * шли три самых быстрых, все три быстро уходили в отказ, а часть соединений уезжала к
+     * доменам с кругом в полторы секунды. На живом роутере это давало 131 отказ 503 против
+     * 181 успеха — и «сообщения отправляются по полминуты», потому что каждый отказ стоит
+     * полного рукопожатия TLS и повтора.
+     *
+     * Отставленные домены всё равно остаются в очереди последними: «все в отказе» — это
+     * состояние сети, а не повод не пробовать вовсе. */
+    const char *all[1 + MAX_ALT];
+    size_t all_i[1 + MAX_ALT];
+    size_t all_n = 0;
+    all[all_n] = g_domain; all_i[all_n++] = 0;
+    for (size_t i = 0; i < g_alt_n && all_n < 1 + MAX_ALT; i++) {
+        if (!strcmp(g_alt[i], g_domain)) continue;
+        all[all_n] = g_alt[i]; all_i[all_n++] = i + 1;
+    }
+
+    for (int pass = 0; pass < 2 && dom_n < 3; pass++) {
+        for (size_t i = 0; i < all_n && dom_n < 3; i++) {
+            if ((pass == 0) != (dom_ok_now(all_i[i], now) != 0)) continue;
+            doms[dom_n] = all[i]; didx[dom_n++] = all_i[i];
+        }
+    }
+    tgws_hosts(dc, media, cand);
+    if (ep) {
+        snprintf(epbuf, sizeof(epbuf), "%s", ep);
+        char *c = strchr(epbuf, ':');
+        if (c) { *c = '\0'; port = c + 1; }
+    }
+
+    struct upstream u;
+    int ok = 0;
+    const char *sni = cand[0];
+    /* Сколько стоило поднять соединение наверх и со скольких попыток. Владелец видит
+     * «сообщения отправляются по полминуты», и надо знать, где эта полминута: в рукопожатии к
+     * чужому домену или в повторах после отказов. */
+    int tries = 0;
+    for (size_t d = 0; d < dom_n && !ok; d++) {
+        if (d || doms[0] != g_domain) tgws_hosts_at(doms[d], dc, media, cand);
+        for (int i = 0; i < 2 && !ok; i++) {
+            sni = cand[i];
+            tries++;
+            memset(&u, 0, sizeof(u));
+            u.fd = tcp_connect(ep ? epbuf : sni, port, UP_TIMEOUT_S);
+            if (u.fd < 0) continue;
+            if (!getenv("STEER_TGWS_PLAIN") && tls_start(&u, sni) != 0) {
+                fprintf(stderr, LOG_W "%s: TLS не поднялся (код %d)\n", sni, g_tls_rc);
+                close(u.fd);
+                continue;
+            }
+            if (ws_upgrade(&u, sni) != 0) {
+                if (u.tls_on) tls13_free(&u.tls);
+                close(u.fd);
+                continue;
+            }
+            ok = 1;
+        }
+        if (!ok) g_bad[didx[d]] = time(NULL) + ALT_COOLDOWN_S;
+    }
+    if (!ok) {
+        fprintf(stderr, LOG_W "%s: точка ДЦ%d%s недоступна\n", cand[0], dc, media ? "m" : "");
+        return 0;
+    }
+    snprintf(sni_out, sni_cap, "%s", sni);
+    *u_out = u;
+    if (tries_out) *tries_out = tries;
+    return 1;
+}
+
+/* ЗАПАС ПОДНЯТЫХ СОЕДИНЕНИЙ.
+ *
+ * Клиент Telegram открывает новое соединение по любому поводу, а каждое стоит рукопожатия TLS
+ * к чужому домену плюс апгрейда веб-сокета — и это в лучшем случае. В худшем домен отвечает
+ * 503, и всё начинается заново: на живом роутере треть соединений поднималась со второй-шестой
+ * попытки. Платил за это человек: «сообщения отправляются по полминуты».
+ *
+ * Поэтому мост держит несколько соединений наготове и отдаёт их мгновенно. Отказы и повторы
+ * достаются наполнителю в фоне, а не клиенту.
+ *
+ * СРОК ЖИЗНИ КОРОТКИЙ. Молчащий веб-сокет точка закрывает сама — на живом роутере это ровно
+ * 92 секунды. Поэтому запас старше сорока секунд считается негодным: отдать клиенту тухлое
+ * соединение хуже, чем поднять новое. Если отданное всё же оказалось мёртвым (первая же
+ * запись отказала), мост честно дозванивается заново.
+ */
+#define WARM_SLOTS   8
+#define WARM_TTL_S   40
+#define WARM_PER_DC  2
+
+struct warm_slot {
+    int busy;                   /* 1 — занят готовым соединением */
+    short dc, media;
+    time_t born;
+    char sni[160];
+    struct upstream u;
+};
+
+static struct warm_slot g_warm[WARM_SLOTS];
+static pthread_mutex_t g_warm_mx = PTHREAD_MUTEX_INITIALIZER;
+
+/* Чего просят клиенты. Держать запас на все пять дата-центров сразу незачем: роутер обычно
+ * работает с одним-двумя, а лишние соединения — лишний повод для 503. */
+struct warm_want { short dc, media; time_t seen; };
+static struct warm_want g_want[10];
+
+static void warm_want_mark(short dc, short media) {
+    time_t now = time(NULL);
+    pthread_mutex_lock(&g_warm_mx);
+    for (size_t i = 0; i < sizeof(g_want) / sizeof(g_want[0]); i++) {
+        if (g_want[i].seen && g_want[i].dc == dc && g_want[i].media == media) {
+            g_want[i].seen = now;
+            pthread_mutex_unlock(&g_warm_mx);
+            return;
+        }
+    }
+    size_t oldest = 0;
+    for (size_t i = 1; i < sizeof(g_want) / sizeof(g_want[0]); i++)
+        if (g_want[i].seen < g_want[oldest].seen) oldest = i;
+    g_want[oldest].dc = dc;
+    g_want[oldest].media = media;
+    g_want[oldest].seen = now;
+    pthread_mutex_unlock(&g_warm_mx);
+}
+
+/* Взять готовое соединение. 1 — взяли (слот освобождён), 0 — запаса нет. */
+static int warm_take(short dc, short media, struct upstream *u_out, char *sni, size_t sni_cap) {
+    time_t now = time(NULL);
+    int got = 0;
+    pthread_mutex_lock(&g_warm_mx);
+    for (size_t i = 0; i < WARM_SLOTS; i++) {
+        if (!g_warm[i].busy || g_warm[i].dc != dc || g_warm[i].media != media) continue;
+        if (now - g_warm[i].born > WARM_TTL_S) continue;        /* тухлое — пусть уберут */
+        *u_out = g_warm[i].u;
+        snprintf(sni, sni_cap, "%s", g_warm[i].sni);
+        g_warm[i].busy = 0;
+        got = 1;
+        break;
+    }
+    pthread_mutex_unlock(&g_warm_mx);
+    return got;
+}
+
+/* Наполнитель. Отдельным потоком: его отказы и ожидания не должны задевать никого. */
+static void *warm_filler(void *arg) {
+    (void)arg;
+    for (;;) {
+        time_t now = time(NULL);
+
+        /* Тухлые слоты закрываем: соединение старше срока точка всё равно уже закрыла или
+         * закроет вот-вот. */
+        pthread_mutex_lock(&g_warm_mx);
+        for (size_t i = 0; i < WARM_SLOTS; i++) {
+            if (!g_warm[i].busy || now - g_warm[i].born <= WARM_TTL_S) continue;
+            struct upstream dead = g_warm[i].u;
+            g_warm[i].busy = 0;
+            pthread_mutex_unlock(&g_warm_mx);
+            if (dead.tls_on) tls13_free(&dead.tls);
+            close(dead.fd);
+            pthread_mutex_lock(&g_warm_mx);
+        }
+
+        /* Чего добрать. Список желаний копируем под замком и дозваниваемся уже без него:
+         * дозвон идёт секунды, держать на это время замок нельзя. */
+        struct warm_want want[sizeof(g_want) / sizeof(g_want[0])];
+        int have[sizeof(g_want) / sizeof(g_want[0])];
+        size_t want_n = 0;
+        for (size_t i = 0; i < sizeof(g_want) / sizeof(g_want[0]); i++) {
+            if (!g_want[i].seen || now - g_want[i].seen > 300) continue;
+            want[want_n] = g_want[i];
+            have[want_n] = 0;
+            for (size_t k = 0; k < WARM_SLOTS; k++)
+                if (g_warm[k].busy && g_warm[k].dc == g_want[i].dc &&
+                    g_warm[k].media == g_want[i].media)
+                    have[want_n]++;
+            want_n++;
+        }
+        pthread_mutex_unlock(&g_warm_mx);
+
+        int dialed = 0;
+        for (size_t i = 0; i < want_n && dialed < 2; i++) {
+            if (have[i] >= WARM_PER_DC) continue;
+            struct upstream u;
+            char sni[160] = "";
+            memset(&u, 0, sizeof(u));
+            if (!dial_upstream(want[i].dc, want[i].media, &u, sni, sizeof(sni), NULL)) continue;
+            dialed++;
+
+            int placed = 0;
+            pthread_mutex_lock(&g_warm_mx);
+            for (size_t k = 0; k < WARM_SLOTS; k++) {
+                if (g_warm[k].busy) continue;
+                g_warm[k].busy = 1;
+                g_warm[k].dc = want[i].dc;
+                g_warm[k].media = want[i].media;
+                g_warm[k].born = time(NULL);
+                snprintf(g_warm[k].sni, sizeof(g_warm[k].sni), "%s", sni);
+                g_warm[k].u = u;
+                placed = 1;
+                break;
+            }
+            pthread_mutex_unlock(&g_warm_mx);
+            if (!placed) {                       /* мест нет — соединение не бросаем открытым */
+                if (u.tls_on) tls13_free(&u.tls);
+                close(u.fd);
+            }
+        }
+
+        sleep(dialed ? 1 : 3);
+    }
+    return NULL;
+}
+
+
+
+
 /* ---- одно соединение ---------------------------------------------------------------- */
 
 struct job { int fd; };
@@ -857,8 +1435,9 @@ static void *serve(void *arg) {
     int cfd = j->fd;
     free(j);
 
-    struct sockaddr_in dst;
-    socklen_t dl = sizeof(dst);
+    struct sockaddr_in dst, src;
+    socklen_t dl = sizeof(dst), sl = sizeof(src);
+    char srcs[INET_ADDRSTRLEN] = "?";
     unsigned char hs[HS_LEN];
     size_t got = 0;
     short media = 0, dc = 0;
@@ -890,85 +1469,114 @@ static void *serve(void *arg) {
 
     char dsts[INET_ADDRSTRLEN] = "?";
     inet_ntop(AF_INET, &dst.sin_addr, dsts, sizeof(dsts));
+    /* Кто именно пришёл. Без этого в журнале компьютер и телефон неотличимы, а ведут они себя
+     * по-разному через один и тот же мост — сравнить их было нечем. */
+    if (getpeername(cfd, (struct sockaddr *)&src, &sl) == 0)
+        inet_ntop(AF_INET, &src.sin_addr, srcs, sizeof(srcs));
     dc = dc_of(dst.sin_addr.s_addr, &media);
     if (!dc) {
         fprintf(stderr, LOG_I "%s: не наш дата-центр — пропускаю как есть\n", dsts);
         relay_direct(cfd, &dst, hs, got);
         goto done;
     }
-    if (!hs_patch_dc(hs, dc, media, &tag)) {
-        fprintf(stderr, LOG_I "%s: это не MTProto — пропускаю как есть\n", dsts);
-        relay_direct(cfd, &dst, hs, got);
-        goto done;
+    /* Копия рукопожатия ДО возможной правки: из неё выводятся ключи обфускации, и по ним
+     * можно прочитать первые байты ответа сервера. Нужно ровно для диагностики: ошибку
+     * транспорта MTProto (например «ключ не с этого дата-центра») иначе не увидеть — поток
+     * зашифрован, и в журнале виден только размер ответа. */
+    unsigned char hs0[HS_LEN];
+    memcpy(hs0, hs, HS_LEN);
+
+    {
+        short want_dc = dc, want_media = media;
+        if (!hs_read_dc(hs, dc, media, &tag, &want_dc, &want_media)) {
+            fprintf(stderr, LOG_I "%s: это не MTProto — пропускаю как есть\n", dsts);
+            relay_direct(cfd, &dst, hs, got);
+            goto done;
+        }
+        /* Точку выбираем по слову клиента, а не по своей догадке: он знает, где лежит его
+         * ключ авторизации, а мы нет. */
+        dc = want_dc;
+        media = want_media;
     }
 
-    /* Куда идём. Имя точки — kwsN[-1].<домен>, оно же SNI и Host; АДРЕС подключения обычно
-     * тот же, но стенду его задают отдельно (там поднят свой сервер на петле). */
-    char cand[2][160];
-    const char *port = "443";
-    const char *ep = getenv("STEER_TGWS_ENDPOINT");
-    char epbuf[160];
-    /* Домены по порядку: свой, потом запасные. Больше трёх не пробуем — человек ждёт
-     * соединения, а не полного обхода списка. */
-    const char *doms[1 + MAX_ALT];
-    size_t didx[1 + MAX_ALT];
-    size_t dom_n = 0;
-    time_t now = time(NULL);
-    /* Два прохода: сначала домены без свежего отказа, потом остальные. Так очередь
-     * переупорядочивается, но ни один домен из неё не выпадает — «все в отказе» это
-     * состояние сети, а не повод не пробовать. */
-    for (int pass = 0; pass < 2 && dom_n < 3; pass++) {
-        if ((pass == 0) == (dom_ok_now(0, now) != 0)) { doms[dom_n] = g_domain; didx[dom_n++] = 0; }
-        for (size_t i = 0; i < g_alt_n && dom_n < 3; i++) {
-            if (!strcmp(g_alt[i], g_domain)) continue;
-            if ((pass == 0) != (dom_ok_now(i + 1, now) != 0)) continue;
-            doms[dom_n] = g_alt[i]; didx[dom_n++] = i + 1;
-        }
-    }
-    tgws_hosts(dc, media, cand);
-    if (ep) {
-        snprintf(epbuf, sizeof(epbuf), "%s", ep);
-        char *c = strchr(epbuf, ':');
-        if (c) { *c = '\0'; port = c + 1; }
-    }
+    /* Соединение наверх: сначала из запаса — оно уже поднято, и клиент не платит ни
+     * рукопожатием TLS, ни апгрейдом, ни повторами после 503. Запаса нет или отданное
+     * оказалось мёртвым — дозваниваемся сами. */
+    warm_want_mark(dc, media);
 
     struct upstream u;
-    int ok = 0;
-    const char *sni = cand[0];
-    for (size_t d = 0; d < dom_n && !ok; d++) {
-        if (d || doms[0] != g_domain) tgws_hosts_at(doms[d], dc, media, cand);
-        for (int i = 0; i < 2 && !ok; i++) {
-            sni = cand[i];
+    char sni_buf[160] = "";
+    const char *sni = sni_buf;
+    int tries = 0;
+    time_t t_dial = time(NULL);
+    int from_warm = 0;
+
+    memset(&u, 0, sizeof(u));
+    if (warm_take(dc, media, &u, sni_buf, sizeof(sni_buf))) {
+        from_warm = 1;
+        if (ws_send(&u, hs, HS_LEN) < 0) {
+            if (u.tls_on) tls13_free(&u.tls);
+            close(u.fd);
+            from_warm = 0;
             memset(&u, 0, sizeof(u));
-            u.fd = tcp_connect(ep ? epbuf : sni, port, UP_TIMEOUT_S);
-            if (u.fd < 0) continue;
-            if (!getenv("STEER_TGWS_PLAIN") && tls_start(&u, sni) != 0) {
-                fprintf(stderr, LOG_W "%s: TLS не поднялся (код %d)\n", sni, g_tls_rc);
-                close(u.fd);
-                continue;
-            }
-            if (ws_upgrade(&u, sni) != 0 || ws_send(&u, hs, HS_LEN) < 0) {
+        }
+    }
+    if (!from_warm) {
+        if (!dial_upstream(dc, media, &u, sni_buf, sizeof(sni_buf), &tries) ||
+            ws_send(&u, hs, HS_LEN) < 0) {
+            /* Пропустить насквозь — единственный честный ответ: точки нет, а отправить
+             * соединение в чужую значит сломать его наверняка. */
+            if (u.fd > 0) {
                 if (u.tls_on) tls13_free(&u.tls);
                 close(u.fd);
-                continue;
             }
-            ok = 1;
+            relay_direct(cfd, &dst, hs, got);
+            goto done;
         }
-        if (!ok) g_bad[didx[d]] = time(NULL) + ALT_COOLDOWN_S;
-    }
-    if (!ok) {
-        /* Пропустить насквозь — единственный честный ответ. Точки нет, а отправить
-         * соединение в чужую значит сломать его наверняка; напрямую же оно сломано только
-         * там, где провайдер этот адрес и правда режет. */
-        fprintf(stderr, LOG_W "%s: точка ДЦ%d%s недоступна — пропускаю как есть\n",
-                cand[0], dc, media ? "m" : "");
-        relay_direct(cfd, &dst, hs, got);
-        goto done;
     }
 
-    fprintf(stderr, LOG_I "%s -> ДЦ%d%s через %s (транспорт 0x%02x)\n",
-            dsts, dc, media ? "m" : "", sni, tag);
-    pump(cfd, &u);
+    fprintf(stderr, LOG_I "%s -> ДЦ%d%s через %s (транспорт 0x%02x, %s)\n",
+            dsts, dc, media ? "m" : "", sni, tag,
+            from_warm ? "из запаса" : "дозвон");
+    (void)t_dial; (void)tries;
+
+    /* Сроки на сессию — не те, что на установление: см. IDLE_TIMEOUT_S. */
+    {
+        struct timeval idle = { .tv_sec = IDLE_TIMEOUT_S, .tv_usec = 0 };
+        setsockopt(cfd, SOL_SOCKET, SO_RCVTIMEO, &idle, sizeof(idle));
+        setsockopt(cfd, SOL_SOCKET, SO_SNDTIMEO, &idle, sizeof(idle));
+        setsockopt(u.fd, SOL_SOCKET, SO_RCVTIMEO, &idle, sizeof(idle));
+        setsockopt(u.fd, SOL_SOCKET, SO_SNDTIMEO, &idle, sizeof(idle));
+        keepalive_on(cfd);
+    }
+
+    /* Расшифровщик первых байт ответа — только для журнала. Ключ обратного направления
+     * выводится из перевёрнутого рукопожатия, гамму мотать не надо: сервер нам init не слал. */
+    struct obf dbg;
+    int dbg_on = (obf_init(&dbg, hs0) == 0);
+
+    struct pump_stat st = { .why = "срок затишья вышел", .up = 0, .down = 0 };
+    st.dbg = dbg_on ? &dbg : NULL;
+    st.tag = tag;
+    st.dsts = dsts;
+
+    /* Нарезка потока клиента на пакеты. Ключи берутся из ИСХОДНОГО рукопожатия клиента:
+     * правка номера ДЦ трогает байты 60..62, а ключ и вектор лежат в 8..56, поэтому
+     * теневой шифр совпадает с тем, которым читает сервер. */
+    struct msgsplit ms;
+    if (ms_init(&ms, hs0, tag) != 0) {
+        fprintf(stderr, LOG_W "%s: теневой шифр не поднялся, нарезки на пакеты не будет\n", dsts);
+        memset(&ms, 0, sizeof(ms));
+        ms.on = 0;
+    }
+
+    time_t t_start = time(NULL);
+    pump(cfd, &u, &st, &ms);
+    fprintf(stderr, LOG_I "%s -> %s ДЦ%d%s: сессия %ld с, вверх %lu Б (%lu пакетов), вниз %lu Б — %s\n",
+            srcs, dsts, dc, media ? "m" : "", (long)(time(NULL) - t_start),
+            st.up, ms.pkts, st.down, st.why);
+    obf_free(&ms.o);
+    if (dbg_on) obf_free(&dbg);
     if (u.tls_on) tls13_free(&u.tls);
     close(u.fd);
 
@@ -996,32 +1604,6 @@ done:
  * касается; пробе шифровать нечем, кроме как самой: она сама себе клиент. Ключи по той же
  * схеме — свои из [8..56] init, чужие из [8..56] ПЕРЕВЁРНУТОГО init. */
 
-struct obf {
-    mbedtls_aes_context enc, dec;
-    unsigned char nce[16], ncd[16], sbe[16], sbd[16];
-    size_t oe, od;
-};
-
-static int obf_init(struct obf *o, const unsigned char hs[HS_LEN]) {
-    unsigned char rev[HS_LEN];
-    for (int i = 0; i < HS_LEN; i++) rev[i] = hs[HS_LEN - 1 - i];
-    mbedtls_aes_init(&o->enc);
-    mbedtls_aes_init(&o->dec);
-    memcpy(o->nce, hs + 40, 16);
-    memcpy(o->ncd, rev + 40, 16);
-    o->oe = o->od = 0;
-    if (mbedtls_aes_setkey_enc(&o->enc, hs + 8, 256) != 0) return -1;
-    if (mbedtls_aes_setkey_enc(&o->dec, rev + 8, 256) != 0) return -1;
-    /* Промотать 64 байта гаммы надо ТОЛЬКО шифрующему направлению: их съел наш собственный
-     * init, который ушёл в сеть. Поток сервера к нам начинается с нуля — он нам никакого
-     * init не слал. Промотав оба, получаешь расшифровку со сдвигом: снято пробой против
-     * настоящего Telegram — ответ приходил, но выглядел шумом. */
-    unsigned char skip[HS_LEN], zero[HS_LEN];
-    memset(zero, 0, sizeof(zero));
-    if (mbedtls_aes_crypt_ctr(&o->enc, HS_LEN, &o->oe, o->nce, o->sbe, zero, skip) != 0)
-        return -1;
-    return 0;
-}
 
 static void obf_free(struct obf *o) {
     mbedtls_aes_free(&o->enc);
@@ -1224,6 +1806,19 @@ int cmd_tgws(const char *spec, const char *name) {
             name, port, g_domain, g_dc_n);
 
     signal(SIGPIPE, SIG_IGN);
+    /* Наполнитель запаса — один поток на процесс. Он поднимает соединения заранее, чтобы
+     * клиенту не приходилось ждать рукопожатия и повторов после 503. */
+    {
+        pthread_t wt;
+        pthread_attr_t wa;
+        pthread_attr_init(&wa);
+        pthread_attr_setdetachstate(&wa, PTHREAD_CREATE_DETACHED);
+        pthread_attr_setstacksize(&wa, 320 * 1024);   /* наполнитель дозванивается тем же кодом */
+        if (pthread_create(&wt, &wa, warm_filler, NULL) != 0)
+            fprintf(stderr, LOG_W "запас соединений не заведён (%s)\n", strerror(errno));
+        pthread_attr_destroy(&wa);
+    }
+
     for (;;) {
         int fd = accept(srv, NULL, NULL);
         if (fd < 0) {
@@ -1248,7 +1843,16 @@ int cmd_tgws(const char *spec, const char *name) {
         pthread_attr_setdetachstate(&at, PTHREAD_CREATE_DETACHED);
         /* 128 КБ вместо восьми мегабайт по умолчанию: на роутере с 64 МБ памяти
          * шестьдесят четыре потока по умолчанию — это полтора гигабайта адресов. */
-        pthread_attr_setstacksize(&at, 128 * 1024);
+        /* СТЕК ПОТОКА: 320 КБ, а не 128.
+         *
+         * В потоке соединения лежат буфер чтения TLS (16 КБ), буфер разбора кадров
+         * (50 КБ), буфер отправки (16 КБ) и целая struct upstream — своя и ещё одна внутри
+         * дозвона. Со ста двадцатью восьмью килобайтами это держалось на волоске, и первая
+         * же добавленная диагностика уронила мост: он падал на каждом соединении и
+         * перезапускался по кругу, а в журнале это выглядело как «всё не MTProto».
+         * Память здесь виртуальная и выделяется страницами по мере обращения, так что запас
+         * ничего не стоит, а его отсутствие стоит дорого. */
+        pthread_attr_setstacksize(&at, 320 * 1024);
         if (pthread_create(&t, &at, serve, j) != 0) {
             pthread_mutex_lock(&g_mu);
             g_live--;

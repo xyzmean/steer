@@ -77,6 +77,14 @@ arm_cortex-a7_neon-vfpv4:arm-linux-musleabihf:cortex_a7
 x86_64:x86_64-linux-musl:baseline
 "
 
+# Во время отладки собирать все шесть архитектур незачем: это три бинарника на каждую и около
+# десяти минут ожидания. STEER_ARCH сужает список до нужной — полная сборка нужна только перед
+# выкладкой пакетов.
+if [ -n "${STEER_ARCH:-}" ]; then
+    ISAS="$(printf '%s\n' "$ISAS" | grep "^${STEER_ARCH}:")"
+    [ -n "$ISAS" ] || { echo "неизвестная архитектура: $STEER_ARCH" >&2; exit 1; }
+fi
+
 mkdir -p "$OUT" build/pkg
 
 # ---- две упаковки одного пакета: apk и opkg ----------------------------------
@@ -224,6 +232,38 @@ for spec in $ISAS; do
         rm -f "build/steer-$arch"
         echo "FAILED — $(grep -m1 error "build/$arch.err" || head -1 "build/$arch.err")"
         continue
+    fi
+
+    # Мини-вариант для микропакета tgws: только перехват Telegram и то, на чём он стоит.
+    # Нужен потому, что тот пакет носит бинарник внутри себя, и три четверти мегабайта там
+    # заметны: на 4/32 разница между «ставится» и «места нет».
+    printf '  %-26s ' "$arch (tgws)"
+    if docker run --rm -v "$PWD:/src" -w /src --entrypoint sh "$IMAGE" \
+            /src/build/build-ext.sh "$target" "$mcpu" "/src/build/steer-tgws-$arch" \
+            "$VERSION" tgws "$REV" \
+            2>"build/$arch-tgws.err"; then
+        echo "$(stat -c %s "build/steer-tgws-$arch") bytes"
+    else
+        rm -f "build/steer-tgws-$arch"
+        echo "FAILED — $(grep -m1 error "build/$arch-tgws.err" || head -1 "build/$arch-tgws.err")"
+    fi
+
+    # Мини-вариант для микропакета tgws: только перехват Telegram и то, на чём он стоит.
+    # Нужен потому, что тот пакет носит бинарник внутри себя, и три четверти мегабайта там
+    # заметны: на 4/32 разница между «ставится» и «места нет».
+    #
+    # ИМЯ ДРУГОЕ — stgws, а не steer. Микропакет ставится и туда, где полный движок уже стоит
+    # (его ставит splify2 или сам brb), и один путь на два разных бинарника означал бы, что
+    # установка микропакета молча подменяет полный движок урезанным.
+    printf '  %-26s ' "$arch (stgws)"
+    if docker run --rm -v "$PWD:/src" -w /src --entrypoint sh "$IMAGE" \
+            /src/build/build-ext.sh "$target" "$mcpu" "/src/build/stgws-$arch" \
+            "$VERSION" tgws "$REV" \
+            2>"build/$arch-tgws.err"; then
+        echo "$(stat -c %s "build/stgws-$arch") bytes"
+    else
+        rm -f "build/stgws-$arch"
+        echo "FAILED — $(grep -m1 error "build/$arch-tgws.err" || head -1 "build/$arch-tgws.err")"
     fi
 
     # Расширенный вариант: те же исходники плюс VLESS и mbedtls. Логика в отдельном

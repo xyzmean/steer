@@ -165,6 +165,12 @@ case "$ROLE" in
   # ни каналов, и клиентские подкоманды там обязаны отказывать штатной заглушкой, а не
   # ссылаться на код, которого в этой сборке нет.
   server) EXT="$XS_COMMON $EXT_SERVER"; ROLEDEF="-DSTEER_SERVER" ;;
+  # Мини-сборка для микропакета tgws: мост и то, на чём он стоит (записи TLS 1.3, примитивы
+  # Reality для браузерного Hello), и больше ничего. Ни клиента VLESS, ни звезды xsteer, ни
+  # подписки — их подкоманды отвечают штатной заглушкой, как в базовой сборке.
+  tgws) EXT="/src/src/ext/tls13.c /src/src/ext/reality.c /src/src/ext/chello.c \
+             /src/src/ext/tgws.c /src/src/ext/tlsprobe.c"
+        ROLEDEF="-DSTEER_TGWS" ;;
   *) echo "неизвестная роль: $ROLE (router|server)" >&2; exit 2 ;;
 esac
 
