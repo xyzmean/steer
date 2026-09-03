@@ -725,8 +725,13 @@ static void parse_channels(struct js *j) {
                         if (!strcmp(m, "realip")) c.realip = 1;
                         else if (strcmp(m, "fakeip") != 0) die("channels: unknown mode %s (want fakeip or realip)", m);
                     }
-                    else if (!strcmp(mk, "any")) { js_ws(j); c.any = (*j->p == 't'); js_skip(j); }
-                    else if (!strcmp(mk, "allow_all")) { js_ws(j); c.allow_all = (*j->p == 't'); js_skip(j); }
+                    /* «Да» — и `true`, и `1`. Спеку пишет не только человек: jshn у OpenWrt
+                     * в разных сборках выдаёт логическое значение то словом, то единицей, а
+                     * канал, чьё `any` не понято, объявляется «не подходящим ни к чему» и
+                     * роняет всю спеку. Ошибка при этом выглядит как «сплошной канал не
+                     * работает», хотя написан он верно. */
+                    else if (!strcmp(mk, "any")) { js_ws(j); c.any = (*j->p == 't' || *j->p == '1'); js_skip(j); }
+                    else if (!strcmp(mk, "allow_all")) { js_ws(j); c.allow_all = (*j->p == 't' || *j->p == '1'); js_skip(j); }
                     else js_skip(j);
                     js_ws(j);
                     if (*j->p == ',') { j->p++; js_ws(j); }
