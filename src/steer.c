@@ -58,6 +58,7 @@ int cmd_vless_probe(const char *spec_path, const char *out_name, int node, int t
 /* Мост Telegram → веб-сокет; объяснение целиком — в src/ext/tgws.c. */
 int cmd_tgws(const char *spec_path, const char *out_name);
 int cmd_tgws_probe(int dc, int media);
+int cmd_tls_probe(const char *host, const char *addr, int port, int local_port, int quiet);
 /* Скачивание и обработка подписки. Объявления — в src/ext/subfetch.h, там же и рассказ,
  * почему это работа движка, а не управляющего слоя. */
 #include "ext/subfetch.h"
@@ -100,6 +101,9 @@ static int cmd_tgws(const char *spec_path, const char *out_name) {
     return no_vless();
 }
 static int cmd_tgws_probe(int dc, int media) { (void)dc; (void)media; return no_vless(); }
+static int cmd_tls_probe(const char *host, const char *addr, int port, int local_port, int quiet) {
+    (void)host; (void)addr; (void)port; (void)local_port; (void)quiet; return no_vless();
+}
 #endif
 
 /* Клиент и хаб xsteer. Клиент — расширенная сборка, хаб — серверная: на роутере хабу делать
@@ -2748,6 +2752,18 @@ int main(int argc, char **argv) {
         return has_domains() ? 0 : 1;
     }
     if (!strcmp(cmd, "tgws")) return cmd_tgws(spec, arg);
+    if (!strcmp(cmd, "tls-probe")) {
+        /* ХОСТ[:ПОРТ]; адрес назначения — флагом --out, исходящий порт — флагом --node.
+         * Своих флагов не заводим: эти уже есть и значат ровно то, что нужно. */
+        char hb[256];
+        const char *h = arg ? arg : "";
+        int pt = 443;
+        snprintf(hb, sizeof(hb), "%s", h);
+        char *c = strrchr(hb, ':');
+        if (c) { *c = '\0'; pt = atoi(c + 1); }
+        if (!hb[0]) { fprintf(stderr, "нужно имя узла\n"); return 2; }
+        return cmd_tls_probe(hb, a.out_file, pt, a.node > 0 ? a.node : 0, 0);
+    }
     if (!strcmp(cmd, "tgws-probe"))
         return cmd_tgws_probe(a.node > 0 ? a.node : 2, arg && !strcmp(arg, "media"));
     if (!strcmp(cmd, "vless")) return cmd_vless(spec, arg);

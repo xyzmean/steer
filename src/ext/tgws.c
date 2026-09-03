@@ -244,6 +244,19 @@ static void dc_table_init(void) {
 static char g_alt[MAX_ALT][128];
 static size_t g_alt_n;
 
+/* Домен, только что ответивший 503, на минуту уходит в конец очереди.
+ *
+ * Без этого каждое новое соединение снова начинает с него: 503 у Cloudflare держится
+ * секундами, а платит за это КАЖДОЕ соединение — лишним рукопожатием TLS и лишним запросом
+ * перед тем, как уйти на запасной. Отсюда редкие, но заметные подвисания.
+ *
+ * Помечается домен, а не точка: 503 отдаёт край Cloudflare, и если он отказывает по kws2,
+ * то с большой вероятностью откажет и по kws4 того же домена. */
+#define ALT_COOLDOWN_S 60
+static time_t g_bad[1 + MAX_ALT];
+
+static int dom_ok_now(size_t i, time_t now) { return g_bad[i] <= now; }
+
 static void alt_init(void) {
     const char *path = getenv("STEER_TGWS_DOMAINS");
     if (!path) path = "/etc/steer/tgws-domains.lst";
@@ -544,16 +557,21 @@ static int ws_send(struct upstream *u, const unsigned char *p, size_t n) {
     }
     memcpy(hdr + h, mask, 4);
     h += 4;
-    if (up_write(u, hdr, h) < 0) return -1;
 
-    unsigned char buf[BUF_N];
+    /* Заголовок и тело — ОДНОЙ записью. Раздельно это две записи TLS и два сегмента TCP на
+     * каждый кадр: лишний круг на пустом месте там, где кадры мелкие и частые (а переписка
+     * такая и есть). */
+    unsigned char buf[BUF_N + sizeof(hdr)];
     size_t off = 0;
-    while (off < n) {
+    while (off < n || (off == 0 && n == 0)) {
         size_t part = n - off;
-        if (part > sizeof(buf)) part = sizeof(buf);
-        for (size_t i = 0; i < part; i++) buf[i] = p[off + i] ^ mask[(off + i) & 3];
-        if (up_write(u, buf, part) < 0) return -1;
+        if (part > BUF_N) part = BUF_N;
+        size_t at = 0;
+        if (off == 0) { memcpy(buf, hdr, h); at = h; }
+        for (size_t i = 0; i < part; i++) buf[at + i] = p[off + i] ^ mask[(off + i) & 3];
+        if (up_write(u, buf, at + part) < 0) return -1;
         off += part;
+        if (n == 0) break;
     }
     return 0;
 }
@@ -857,6 +875,12 @@ static void *serve(void *arg) {
     struct timeval tv = { .tv_sec = UP_TIMEOUT_S, .tv_usec = 0 };
     setsockopt(cfd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
     setsockopt(cfd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+    /* Без этого Nagle придерживает хвост каждой порции до подтверждения предыдущей, а
+     * задержанное подтверждение на той стороне добавляет к этому до двухсот миллисекунд.
+     * Соединению вверх NODELAY ставится в tcp_connect с самого начала, а вот принятому от
+     * клиента не ставился, и платил за это ровно тот трафик, который через мост идёт:
+     * снаружи это «часть картинки пришла, потом пауза на пару секунд, потом остальное». */
+    { int one = 1; setsockopt(cfd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one)); }
 
     while (got < HS_LEN) {
         ssize_t r = recv(cfd, hs + got, HS_LEN - got, 0);
@@ -887,10 +911,20 @@ static void *serve(void *arg) {
     /* Домены по порядку: свой, потом запасные. Больше трёх не пробуем — человек ждёт
      * соединения, а не полного обхода списка. */
     const char *doms[1 + MAX_ALT];
+    size_t didx[1 + MAX_ALT];
     size_t dom_n = 0;
-    doms[dom_n++] = g_domain;
-    for (size_t i = 0; i < g_alt_n && dom_n < 3; i++)
-        if (strcmp(g_alt[i], g_domain) != 0) doms[dom_n++] = g_alt[i];
+    time_t now = time(NULL);
+    /* Два прохода: сначала домены без свежего отказа, потом остальные. Так очередь
+     * переупорядочивается, но ни один домен из неё не выпадает — «все в отказе» это
+     * состояние сети, а не повод не пробовать. */
+    for (int pass = 0; pass < 2 && dom_n < 3; pass++) {
+        if ((pass == 0) == (dom_ok_now(0, now) != 0)) { doms[dom_n] = g_domain; didx[dom_n++] = 0; }
+        for (size_t i = 0; i < g_alt_n && dom_n < 3; i++) {
+            if (!strcmp(g_alt[i], g_domain)) continue;
+            if ((pass == 0) != (dom_ok_now(i + 1, now) != 0)) continue;
+            doms[dom_n] = g_alt[i]; didx[dom_n++] = i + 1;
+        }
+    }
     tgws_hosts(dc, media, cand);
     if (ep) {
         snprintf(epbuf, sizeof(epbuf), "%s", ep);
@@ -902,7 +936,7 @@ static void *serve(void *arg) {
     int ok = 0;
     const char *sni = cand[0];
     for (size_t d = 0; d < dom_n && !ok; d++) {
-        if (d) tgws_hosts_at(doms[d], dc, media, cand);
+        if (d || doms[0] != g_domain) tgws_hosts_at(doms[d], dc, media, cand);
         for (int i = 0; i < 2 && !ok; i++) {
             sni = cand[i];
             memset(&u, 0, sizeof(u));
@@ -920,6 +954,7 @@ static void *serve(void *arg) {
             }
             ok = 1;
         }
+        if (!ok) g_bad[didx[d]] = time(NULL) + ALT_COOLDOWN_S;
     }
     if (!ok) {
         /* Пропустить насквозь — единственный честный ответ. Точки нет, а отправить

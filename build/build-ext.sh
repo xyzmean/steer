@@ -156,7 +156,7 @@ XS_COMMON="/src/src/ext/xswire.c /src/src/ext/xsconf.c /src/src/ext/xslink.c /sr
            /src/src/ext/xsadmin.c"
 EXT_ROUTER="/src/src/ext/sub.c /src/src/ext/vless_proto.c /src/src/ext/vision.c \
             /src/src/ext/client.c /src/src/ext/tunnel.c /src/src/ext/rtx.c \
-            /src/src/ext/xsclient.c /src/src/ext/subfetch.c /src/src/ext/tgws.c"
+            /src/src/ext/xsclient.c /src/src/ext/subfetch.c /src/src/ext/tgws.c /src/src/ext/tlsprobe.c"
 EXT_SERVER="/src/src/ext/xshub.c"
 
 case "$ROLE" in
