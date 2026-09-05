@@ -78,6 +78,10 @@ int run_quiet(const char *const argv[]) {
     return WIFEXITED(st) ? WEXITSTATUS(st) : -1;
 }
 
+/* Идентификатор и описание устройства переехали в src/hwid.c (он входит и в базовую
+ * сборку). Стенд подключает его напрямую — так же, как подключает subfetch.c: проверять
+ * чистку значений заголовков надо там, где она живёт, а не через второй экземпляр. */
+#include "../src/hwid.c"
 #include "../src/ext/subfetch.c"
 /* base64 названия подписки и разбор узлов — из sub.c, той же функцией, которой их читает
  * подъём туннеля. Исходник включается тем же приёмом; mbedtls он не требует. */
@@ -140,12 +144,6 @@ static void mkiface(const char *name, const char *mac, int physical) {
     }
 }
 
-static void rmiface(const char *name) {
-    char p[512];
-    snprintf(p, sizeof p, "%s/sys/%s/address", T, name); unlink(p);
-    snprintf(p, sizeof p, "%s/sys/%s/device", T, name);  unlink(p);
-    snprintf(p, sizeof p, "%s/sys/%s", T, name);         rmdir(p);
-}
 
 /* Перехват stdout: ответы команд — это JSON в stdout, и проверять их надо целиком. */
 static int g_stdout_saved = -1;
@@ -168,71 +166,15 @@ static char *cap(int (*fn)(void)) {
  * JSON в стенде движка. */
 static int has(const char *hay, const char *needle) { return strstr(hay, needle) != NULL; }
 
-/* ---- проверки: идентификатор устройства -------------------------------------------- */
-
-static void t_hwid(void) {
-    char id[64];
-
-    /* Один физический порт. Проверяется ВХОД хеша: строка без завершающего перевода строки
-     * — ровно то, что делал `printf 'splify2:%s'` в оболочке. Один лишний байт здесь меняет
-     * идентификатор у всех установленных роутеров сразу. */
-    mkiface("eth0", "C4:41:1E:DD:EE:01", 1);
-    ck_true("один порт: идентификатор посчитан", hwid(id, sizeof id));
-    ck("хешируется ровно «splify2:<mac>»", "splify2:c4:41:1e:dd:ee:01", g_sha_in);
-    ck_num("и ни байтом больше", 25, (long long)g_sha_in_n);
-    ck_true("приставка на месте", !strncmp(id, "splify2-", 8));
-    ck_num("двадцать знаков хеша, не больше", 28, (long long)strlen(id));
-
-    /* MAC приводится к нижнему регистру: sysfs отдаёт его так, но не всякий драйвер. */
-    ck_true("в идентификаторе только строчные шестнадцатеричные",
-            strspn(id + 8, "0123456789abcdef") == 20);
-
-    /* Порядок портов ЖЁСТКИЙ. Без него идентификатор менялся бы от порядка обхода каталога,
-     * то есть от перезагрузки к перезагрузке. */
-    mkiface("wan", "c4:41:1e:dd:ee:03", 1);
-    mkiface("lan1", "c4:41:1e:dd:ee:02", 1);
-    hwid(id, sizeof id);
-    ck("eth* выигрывает у lan* и wan*", "splify2:c4:41:1e:dd:ee:01", g_sha_in);
-    rmiface("eth0");
-    hwid(id, sizeof id);
-    ck("без eth* берётся lan*", "splify2:c4:41:1e:dd:ee:02", g_sha_in);
-    rmiface("lan1");
-    hwid(id, sizeof id);
-    ck("без lan* берётся wan*", "splify2:c4:41:1e:dd:ee:03", g_sha_in);
-    rmiface("wan");
-
-    /* Виртуальный интерфейс не порт: у моста, туннеля и wifi-ap ссылки на устройство нет, а
-     * их MAC меняется вместе с настройкой. */
-    mkiface("br-lan", "c4:41:1e:dd:ee:10", 0);
-    mkiface("zz9", "c4:41:1e:dd:ee:11", 1);
-    hwid(id, sizeof id);
-    ck("мост без device пропущен", "splify2:c4:41:1e:dd:ee:11", g_sha_in);
-    rmiface("br-lan");
-    rmiface("zz9");
-
-    /* «Назначен локально» — адрес, который выдумало ядро: после перезагрузки он другой.
-     * Признак — вторая шестнадцатеричная цифра из 2,3,6,7,a,b,e,f. */
-    mkiface("eth0", "02:41:1e:dd:ee:20", 1);
-    ck_true("локально назначенный адрес не годится", !hwid(id, sizeof id));
-    rmiface("eth0");
-    mkiface("eth0", "ae:41:1e:dd:ee:21", 1);
-    ck_true("и в форме «ae:» тоже", !hwid(id, sizeof id));
-    rmiface("eth0");
-
-    /* Нули и широковещательный адрес — не идентификаторы, а признак того, что драйвер ещё
-     * не дал настоящего. */
-    mkiface("eth0", "00:00:00:00:00:00", 1);
-    ck_true("нулевой адрес не годится", !hwid(id, sizeof id));
-    rmiface("eth0");
-    mkiface("eth0", "ff:ff:ff:ff:ff:ff", 1);
-    ck_true("широковещательный не годится", !hwid(id, sizeof id));
-    rmiface("eth0");
-
-    /* Ни одного годного порта — пустой ответ, а не выдуманный идентификатор: заголовок тогда
-     * не уходит вовсе, и об этом говорится отдельным словом. */
-    char *out = cap(cmd_sub_hwid);
-    ck_true("без портов ответ пустой, а не выдуманный", has(out, "\"hwid\":\"\""));
-}
+/* ---- идентификатор устройства: проверки переехали ----------------------------------
+ *
+ * Были здесь и ушли в tests/hwidmatch.sh вместе с самим кодом (src/hwid.c). Причина не в
+ * аккуратности: здесь они стояли на ПОДДЕЛЬНОМ sha256 и проверяли рецептуру по входу хеша —
+ * «хешируется ровно splify2:<mac>, ни байтом больше». Это верная мысль при заглушке, но
+ * слабее того, что можно проверить теперь: hwidmatch сверяет ГОТОВОЕ значение с `sha256sum`
+ * оболочки, то есть с тем самым эталоном, которым идентификатор считался до движка. Лишний
+ * байт на входе такую сверку валит точно так же, а вдобавок она ловит расхождение в самом
+ * хешировании, которого заглушка не видела по построению. */
 
 /* ---- проверки: заголовки ответа ---------------------------------------------------- */
 
@@ -610,16 +552,16 @@ static void t_device_hdrs(void) {
     char v[80];
     char p[512];
 
-    dev_os(v, sizeof v);
+    steer_dev_os(v, sizeof v);
     ck("версия системы не искажается чисткой", "OpenWrt 25.12.5", v);
-    dev_model(v, sizeof v);
+    steer_dev_model(v, sizeof v);
     ck("модель не искажается чисткой", "Xiaomi AX3000T", v);
 
     /* Кириллица выбрасывается намеренно: в заголовке HTTP она приезжает панели байтами UTF-8
      * и показывается там мусором, поэтому лучше её отсутствие. */
     snprintf(p, sizeof p, "%s/model", T);
     wr(p, "тестAX3000T\n");
-    dev_model(v, sizeof v);
+    steer_dev_model(v, sizeof v);
     ck("кириллица в модели выбрасывается", "AX3000T", v);
 
     /* И то, ради чего чистка вообще существует: перевод строки внутри значения — это вставка
@@ -627,17 +569,17 @@ static void t_device_hdrs(void) {
      * ПОСТРОЧНО, поэтому всё после перевода строки не доходит до чистки вовсе. В оболочке так
      * не было — там значение бралось целиком через `cat`, и защитой была одна чистка. */
     wr(p, "aaa\nX-Evil: 1\n");
-    dev_model(v, sizeof v);
+    steer_dev_model(v, sizeof v);
     ck("после перевода строки в заголовок не попадает ничего", "aaa", v);
     /* И сама чистка на месте: строка без перевода, но с управляющим символом. */
     wr(p, "aaa\rX-Evil: 1\n");
-    dev_model(v, sizeof v);
+    steer_dev_model(v, sizeof v);
     ck("возврат каретки из значения убран", "aaaX-Evil: 1", v);
 
     /* Файла нет — честное умолчание, а не пустой заголовок: пустое значение панель показала бы
      * как устройство без имени. */
     unlink(p);
-    dev_model(v, sizeof v);
+    steer_dev_model(v, sizeof v);
     ck("без файла модели — честное умолчание", "router", v);
     wr(p, "Xiaomi AX3000T\n");
 
@@ -645,17 +587,17 @@ static void t_device_hdrs(void) {
     snprintf(p, sizeof p, "%s/model", T);
     wr(p, "0123456789012345678901234567890123456789"
           "0123456789012345678901234567890123456789\n");
-    dev_model(v, sizeof v);
+    steer_dev_model(v, sizeof v);
     ck_num("значение обрезано по пределу", 64, (long long)strlen(v));
     wr(p, "Xiaomi AX3000T\n");
 
     /* Версия системы читается из файла в кавычках — так её и пишет OpenWrt. */
     snprintf(p, sizeof p, "%s/openwrt_release", T);
     wr(p, "DISTRIB_ID='OpenWrt'\nDISTRIB_RELEASE=\"24.10.0\"\n");
-    dev_os(v, sizeof v);
+    steer_dev_os(v, sizeof v);
     ck("кавычки вокруг версии — часть формата, а не значение", "OpenWrt 24.10.0", v);
     unlink(p);
-    dev_os(v, sizeof v);
+    steer_dev_os(v, sizeof v);
     ck("без файла версии — просто OpenWrt", "OpenWrt", v);
     wr(p, "DISTRIB_RELEASE='25.12.5'\n");
 }
@@ -719,7 +661,6 @@ int main(void) {
     wr(p, "Xiaomi AX3000T\n");
     setenv("STEER_SYSINFO_MODEL", p, 1);
 
-    t_hwid();
     t_headers();
     t_ui_field();
     t_title();

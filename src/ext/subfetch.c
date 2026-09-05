@@ -48,9 +48,9 @@
 #include <dirent.h>
 #include <sys/stat.h>
 
-#include "mbedtls/sha256.h"
 #include "vless.h"
 #include "subfetch.h"
+#include "../hwid.h"
 
 /* Уровень в журнале — как в остальных файлах движка. Метка подсистемы «sub»: всё здесь
  * пишется при работе с подпиской. */
@@ -63,202 +63,22 @@ int run_quiet(const char *const argv[]);   /* из steer.c */
 /* Швы для стенда. На роутере ветка `:-` не выбирается никогда: движок запускают из procd и
  * из объекта rpcd, а те дают чистое окружение. Тот же приём, что у STEER_TUN_STATS и
  * STEER_EXPLAIN_TRACE. */
-static const char *env_or(const char *name, const char *dflt) {
-    const char *v = getenv(name);
-    return (v && *v) ? v : dflt;
-}
+/* env_or переехал в src/hwid.c вместе с идентификатором: там три шва стенда, здесь два, и
+ * две копии одной трёхстрочной функции — это два места, где решается, что считать пустым
+ * значением переменной окружения. Имя `env_or` оставлено локальным псевдонимом, чтобы не
+ * переписывать вызовы, которых к нему больше, чем строк в нём самом. */
+#define env_or steer_env_or
 
-/* ---- идентификатор устройства для панели подписки (HWID) ----------------------------
+/* ---- идентификатор устройства и описание системы ------------------------------------
  *
- * ЗАЧЕМ. Панели (Remnawave и родня) умеют привязывать подписку к устройствам и требуют,
- * чтобы клиент назвал себя заголовком `x-hwid`. Клиенту, который его не присылает, панель
- * отвечает не отказом, а ЗАГЛУШКОЙ: HTTP 200 и пара законных ссылок на `0.0.0.0:1`, где
- * сообщение человеку спрятано в ИМЯ узла («📱 Неправильный клиент», «🔌 Лимит устройств
- * достигнут»). То есть подписка скачалась, узлы есть, туннель не поднимется никогда — ровно
- * тот вид отказа, который в проекте называется тихим. Замерено на живой подписке: без
- * заголовка приезжает 556 байт заглушки, с заголовком — 15 КБ настоящих узлов.
+ * ПЕРЕЕХАЛИ В src/hwid.c. Здесь они завелись потому, что читатель был один — заголовок
+ * `x-hwid` для панели подписки, а панель бывает только в расширенной сборке. Читателей
+ * стало двое, и второй (телеметрия) обязан работать на роутере, где расширенной сборки нет.
+ * Значение при переезде не изменилось ни на шаг — иначе каждый заведённый в панели роутер
+ * стал бы новым устройством; это сторожит стенд hwidmatch, сверяя результат с `sha256sum`.
  *
- * ИЗ ЧЕГО СЧИТАЕТСЯ. Из MAC-адреса. Это единственный признак на роутере, который переживает
- * сброс к заводским настройкам: сброс стирает overlay, то есть весь /etc, а MAC живёт в
- * самом устройстве и приезжает от ядра. Любой идентификатор, сохранённый в файл (UUID,
- * случайное число), после сброса стал бы ДРУГИМ устройством — человек, сбросивший роутер,
- * потерял бы слот в панели и не понял бы, почему.
- *
- * MAC НАРУЖУ НЕ УХОДИТ: HWID — это хеш от него. Панели нужен постоянный идентификатор, а не
- * адрес железа; отдавать адрес значило бы рассказать чужому серверу больше, чем нужно для
- * его работы. Обратной дороги от хеша к адресу нет, а постоянство сохраняется.
- *
- * ЗНАЧЕНИЕ ОБЯЗАНО СОВПАДАТЬ С ПРЕЖНИМ, посчитанным в оболочке: `sha256sum` от строки
- * «splify2:<mac>» без завершающего перевода строки, первые двадцать шестнадцатеричных
- * знаков, приставка «splify2-». Изменить здесь хоть один шаг — значит объявить каждый уже
- * заведённый роутер новым устройством и отобрать у человека его слот в панели.
- */
-#define HWID_MAX_IFACES 64
-#define HWID_NAME_MAX 32
-
-static int read_line(const char *path, char *out, size_t n) {
-    FILE *f = fopen(path, "r");
-    if (!f) return 0;
-    if (!fgets(out, (int)n, f)) { fclose(f); return 0; }
-    fclose(f);
-    size_t l = strlen(out);
-    while (l && (out[l - 1] == '\n' || out[l - 1] == '\r' || out[l - 1] == ' ')) out[--l] = 0;
-    return l > 0;
-}
-
-/* Годен ли адрес как ПОСТОЯННЫЙ идентификатор.
- *
- * Адреса «назначен локально» отбрасываются: их выдумывает ядро (так бывает у некоторых
- * wifi-чипов и USB-адаптеров), и после перезагрузки они другие. Признак — второй младший
- * бит первого октета, то есть вторая шестнадцатеричная цифра из 2,3,6,7,a,b,e,f. */
-static int mac_usable(const char *m) {
-    if (strlen(m) != 17) return 0;
-    if (!strcmp(m, "00:00:00:00:00:00") || !strcmp(m, "ff:ff:ff:ff:ff:ff")) return 0;
-    if (m[2] != ':') return 0;
-    switch (m[1]) {
-        case '2': case '3': case '6': case '7':
-        case 'a': case 'b': case 'e': case 'f': return 0;
-        default: return 1;
-    }
-}
-
-/* Какой из MAC-адресов брать, если портов несколько.
- *
- * Порядок задан жёстко: сначала имена, которыми OpenWrt называет порты SoC (eth*, lan*,
- * wan*) по алфавиту, потом всё остальное физическое. Виртуальные интерфейсы исключены
- * признаком `device` — у моста, туннеля и wifi-ap ссылки на устройство нет.
- *
- * Имена СОРТИРУЮТСЯ. В оболочке это делал сам glob, а readdir отдаёт их в порядке
- * файловой системы — то есть без сортировки идентификатор менялся бы от перезагрузки к
- * перезагрузке на коробке с несколькими портами, и человек терял бы слот в панели без
- * всякого повода. */
-static int hwid_mac(char *out, size_t n) {
-    static const char *PFX[] = { "eth", "lan", "wan", "" };
-    /* Каталог копируется в буфер известного размера: дальше из него собираются пути, и
-     * компилятор обязан видеть, что они влезают. Молча обрезанный путь означал бы чтение
-     * чужого файла. Настоящий путь короткий (/sys/class/net), длинным он бывает только у
-     * шва стенда. */
-    char sysnet[288];
-    if (snprintf(sysnet, sizeof sysnet, "%s",
-                 env_or("STEER_SYSNET", "/sys/class/net")) >= (int)sizeof sysnet)
-        return 0;
-    char names[HWID_MAX_IFACES][HWID_NAME_MAX];
-    size_t nn = 0;
-
-    DIR *d = opendir(sysnet);
-    if (!d) return 0;
-    const struct dirent *e;
-    while ((e = readdir(d)) != NULL && nn < HWID_MAX_IFACES) {
-        if (e->d_name[0] == '.') continue;
-        if (strlen(e->d_name) >= HWID_NAME_MAX) continue;
-        snprintf(names[nn++], HWID_NAME_MAX, "%s", e->d_name);
-    }
-    closedir(d);
-
-    /* Сортировка вставками: имён на роутере десяток-полтора, и заводить ради них qsort с
-     * функцией сравнения было бы больше кода, чем сама сортировка. */
-    for (size_t i = 1; i < nn; i++)
-        for (size_t j = i; j && strcmp(names[j - 1], names[j]) > 0; j--) {
-            char t[HWID_NAME_MAX];
-            snprintf(t, sizeof t, "%s", names[j - 1]);
-            snprintf(names[j - 1], HWID_NAME_MAX, "%s", names[j]);
-            snprintf(names[j], HWID_NAME_MAX, "%s", t);
-        }
-
-    for (size_t k = 0; k < sizeof PFX / sizeof PFX[0]; k++) {
-        size_t pl = strlen(PFX[k]);
-        for (size_t i = 0; i < nn; i++) {
-            if (pl && strncmp(names[i], PFX[k], pl)) continue;
-            /* Имя через свой буфер известного размера: по `names[i]` компилятор не видит,
-             * где кончается строка внутри общего массива, и не может доказать, что путь
-             * влезает. Доказательство здесь дешевле подавленного предупреждения. */
-            char nm[HWID_NAME_MAX];
-            memcpy(nm, names[i], HWID_NAME_MAX);
-            nm[HWID_NAME_MAX - 1] = 0;
-            char p[384];
-            snprintf(p, sizeof p, "%s/%s/device", sysnet, nm);
-            if (access(p, F_OK) != 0) continue;   /* виртуальный интерфейс */
-            snprintf(p, sizeof p, "%s/%s/address", sysnet, nm);
-            char m[64];
-            if (!read_line(p, m, sizeof m)) continue;
-            for (char *q = m; *q; q++) if (*q >= 'A' && *q <= 'F') *q += 'a' - 'A';
-            if (!mac_usable(m)) continue;
-            snprintf(out, n, "%s", m);
-            return 1;
-        }
-    }
-    return 0;
-}
-
-/* Сам идентификатор. Приставка НЕ украшение: HWID человек видит в панели и в боте, и по
- * «splify2-…» он узнаёт свой роутер среди телефонов и ноутбуков — а именно там ему и надо
- * освобождать слот, когда устройств больше, чем позволено. */
-static int hwid(char *out, size_t n) {
-    char mac[64];
-    if (!hwid_mac(mac, sizeof mac)) return 0;
-    char msg[96];
-    int k = snprintf(msg, sizeof msg, "splify2:%s", mac);
-    if (k <= 0) return 0;
-    unsigned char dg[32];
-    if (mbedtls_sha256((const unsigned char *)msg, (size_t)k, dg, 0) != 0) return 0;
-    char hex[41];
-    for (int i = 0; i < 20; i++) snprintf(hex + i * 2, 3, "%02x", dg[i]);
-    hex[20] = 0;   /* ровно то, что брал `cut -c1-20` от вывода sha256sum */
-    snprintf(out, n, "splify2-%s", hex);
-    return 1;
-}
-
-/* ---- заголовки, которыми панель описывает устройство ------------------------------
- *
- * Значения честные: человеку в панели полезнее увидеть «OpenWrt · Xiaomi AX3000T», чем
- * выдуманный телефон, а нам незачем притворяться другим клиентом — заглушку панель отдаёт
- * не по User-Agent, а по отсутствию `x-hwid` (проверено: с User-Agent клиента Happ, но без
- * HWID приезжает та же заглушка).
- *
- * Значение чистится обязательно: перевод строки внутри заголовка — это вставка чужого
- * заголовка в запрос, а модель роутера приходит из файла, который пишет не наш код.
- * Оставляется печатаемый ASCII от пробела до тильды: он читаем в панели, а кириллица там
- * всё равно показывается байтами UTF-8, то есть мусором. */
-static void hdr_clean(const char *in, char *out, size_t n) {
-    size_t o = 0;
-    for (const unsigned char *p = (const unsigned char *)in; *p; p++) {
-        if (*p < ' ' || *p > '~') continue;
-        if (o + 1 >= n || o >= 64) break;
-        out[o++] = (char)*p;
-    }
-    out[o] = 0;
-}
-
-static void dev_os(char *out, size_t n) {
-    char ver[80] = "";
-    FILE *f = fopen(env_or("STEER_OPENWRT_RELEASE", "/etc/openwrt_release"), "r");
-    if (f) {
-        char line[256];
-        while (fgets(line, sizeof line, f)) {
-            static const char KEY[] = "DISTRIB_RELEASE=";
-            if (strncmp(line, KEY, sizeof KEY - 1)) continue;
-            char *v = line + sizeof KEY - 1;
-            /* Кавычки вокруг значения — часть формата файла, а не значение. */
-            if (*v == '\'' || *v == '"') v++;
-            size_t l = strlen(v);
-            while (l && (v[l - 1] == '\n' || v[l - 1] == '\r' ||
-                         v[l - 1] == '\'' || v[l - 1] == '"')) v[--l] = 0;
-            snprintf(ver, sizeof ver, "%s", v);
-            break;
-        }
-        fclose(f);
-    }
-    char raw[176];
-    snprintf(raw, sizeof raw, "OpenWrt%s%s", ver[0] ? " " : "", ver);
-    hdr_clean(raw, out, n);
-}
-
-static void dev_model(char *out, size_t n) {
-    char m[160] = "";
-    if (!read_line(env_or("STEER_SYSINFO_MODEL", "/tmp/sysinfo/model"), m, sizeof m))
-        snprintf(m, sizeof m, "router");
-    hdr_clean(m, out, n);
-}
+ * Здесь остались только читатели: hwid() для заголовка и dev_os()/dev_model() для тех
+ * заголовков, которыми панель описывает устройство человеку. */
 
 /* ---- разбор ответных заголовков ---------------------------------------------------- */
 
@@ -626,8 +446,8 @@ static int have(const char *name) {
 static int http_get(const char *url, const char *body, const char *hdr_path,
                     const char *id, int head, int *hwid_sent) {
     char os[80], model[80];
-    dev_os(os, sizeof os);
-    dev_model(model, sizeof model);
+    steer_dev_os(os, sizeof os);
+    steer_dev_model(model, sizeof model);
     char h_id[128], h_os[128], h_ver[128], h_model[128];
     snprintf(h_id, sizeof h_id, "x-hwid: %s", id ? id : "");
     snprintf(h_os, sizeof h_os, "x-device-os: %s", os);
@@ -766,7 +586,7 @@ int cmd_sub_fetch(const char *url, const char *out_path, const char *info_path) 
     else info_for(out_path, info, sizeof info);
 
     char id[64] = "";
-    int have_id = hwid(id, sizeof id);
+    int have_id = steer_hwid(id, sizeof id);
 
     char tmp[512], hdrp[512];
     snprintf(tmp, sizeof tmp, "%s.tmp", out_path);
@@ -897,7 +717,7 @@ int cmd_sub_quota(const char *url, const char *info_path) {
         return 2;
     }
     char id[64] = "";
-    int have_id = hwid(id, sizeof id);
+    int have_id = steer_hwid(id, sizeof id);
 
     static char hdrs[16384];
     struct quota q;
@@ -957,22 +777,7 @@ int cmd_sub_quota(const char *url, const char *info_path) {
     return 0;
 }
 
-/* ---- sub-hwid --------------------------------------------------------------------- */
-
-int cmd_sub_hwid(void) {
-    char id[64] = "";
-    int ok = hwid(id, sizeof id);
-    char os[80], model[80];
-    dev_os(os, sizeof os);
-    dev_model(model, sizeof model);
-    /* Пустая строка значит «не из чего считать» — ни одного физического порта с постоянным
-     * MAC. Тогда заголовок не уходит вовсе, и об этом говорит sub-fetch отдельным словом. */
-    printf("{\"hwid\":");
-    json_str(ok ? id : "");
-    printf(",\"os\":");
-    json_str(os);
-    printf(",\"model\":");
-    json_str(model);
-    printf("}\n");
-    return 0;
-}
+/* ---- sub-hwid ---------------------------------------------------------------------
+ *
+ * Подкоманда переехала в src/hwid.c вместе с самим идентификатором: она обязана отвечать и
+ * в базовой сборке, где этого файла нет вовсе. */

@@ -21,11 +21,11 @@ DEFS    := -DSTEER_VERSION='"$(VERSION)"' $(if $(REV),-DSTEER_REV='"$(REV)"',)
 all: $(BUILD)/steer
 
 $(BUILD)/steer: src/steer.c src/spec.c src/dnsd.c src/failover.c src/aggregate.c \
-                src/obfs.c src/cli.c src/srs.c src/puff.c src/spec.h src/obfs.h \
-                src/cli.h src/srs.h src/puff.h VERSION
+                src/obfs.c src/cli.c src/srs.c src/puff.c src/hwid.c src/spec.h src/obfs.h \
+                src/cli.h src/srs.h src/puff.h src/hwid.h VERSION
 	@mkdir -p $(BUILD)
 	$(CC) $(CFLAGS) $(DEFS) -o $@ src/steer.c src/spec.c src/dnsd.c src/failover.c \
-	      src/aggregate.c src/obfs.c src/cli.c src/srs.c src/puff.c
+	      src/aggregate.c src/obfs.c src/cli.c src/srs.c src/puff.c src/hwid.c
 
 test: all ext-syntax $(BUILD)/dnsmatch $(BUILD)/specmatch $(BUILD)/specmatch-ext $(BUILD)/xswirematch $(BUILD)/xsconnmatch $(BUILD)/xsstreammatch $(BUILD)/tungromatch $(BUILD)/tunnamematch $(BUILD)/xsconfmatch $(BUILD)/xslinkmatch $(BUILD)/xsroutematch $(BUILD)/chellomatch $(BUILD)/failovermatch $(BUILD)/dcmatch $(BUILD)/msgsplitmatch $(BUILD)/h2match $(BUILD)/submatch $(BUILD)/subfetchmatch $(BUILD)/fwmatch $(BUILD)/obfsmatch $(BUILD)/visionmatch $(BUILD)/diagsim
 	@sh tests/run.sh
@@ -58,18 +58,26 @@ test: all ext-syntax $(BUILD)/dnsmatch $(BUILD)/specmatch $(BUILD)/specmatch-ext
 	@$(BUILD)/xslinkmatch
 	@$(BUILD)/xsroutematch
 	@$(BUILD)/chellomatch
+	@sh tests/hwidmatch.sh
 
 # Движок, собранный как расширенный, но без самой расширенной части: нужен стенду
 # diagmatch, потому что спеку с `kind: vless` базовая сборка отвергает парсером, а
 # проверять диагностику интереснее всего именно на VLESS-выходе. Три подкоманды
 # расширенной сборки заменены заглушками — см. tests/vless-stub.c.
 $(BUILD)/diagsim: src/steer.c src/spec.c src/dnsd.c src/failover.c src/aggregate.c \
-                  src/obfs.c src/cli.c src/srs.c src/puff.c src/spec.h src/cli.h \
-                  src/srs.h src/puff.h tests/vless-stub.c
+                  src/obfs.c src/cli.c src/srs.c src/puff.c src/hwid.c src/spec.h src/cli.h \
+                  src/srs.h src/puff.h src/hwid.h tests/vless-stub.c
 	@mkdir -p $(BUILD)
 	$(CC) $(CFLAGS) $(DEFS) -DSTEER_EXTENDED -o $@ src/steer.c src/spec.c src/dnsd.c \
-	      src/failover.c src/aggregate.c src/obfs.c src/cli.c src/srs.c src/puff.c \
+	      src/failover.c src/aggregate.c src/obfs.c src/cli.c src/srs.c src/puff.c src/hwid.c \
 	      tests/vless-stub.c
+
+# SHA-256 движка против sha256sum оболочки. Отдельная цель, потому что стенду нужен ПОЛНЫЙ
+# хеш: в самом идентификаторе он обрезан до двадцати знаков, и расхождение в старших байтах
+# такой проверкой не поймать. Ни сети, ни mbedtls — файл вложенный и самодостаточный.
+$(BUILD)/hwidsum: tests/hwidsum.c src/hwid.c src/hwid.h
+	@mkdir -p $(BUILD)
+	$(CC) $(CFLAGS) -o $@ tests/hwidsum.c src/hwid.c
 
 # Синтаксическая проверка расширенного движка (R-014/I-024). Полная сборка src/ext идёт
 # только в build.sh через docker с mbedtls, поэтому локальный make test оставался зелёным,
@@ -144,11 +152,11 @@ $(BUILD)/failovermatch: tests/failovermatch.c src/failover.c
 # nft, и проверить эвристику можно только примерами. Стенд включает исходник движка и
 # подменяет popen на чтение из памяти — см. tests/fwmatch.c.
 $(BUILD)/fwmatch: tests/fwmatch.c src/steer.c src/spec.c src/dnsd.c src/failover.c \
-                  src/aggregate.c src/obfs.c src/cli.c src/srs.c src/puff.c \
+                  src/aggregate.c src/obfs.c src/cli.c src/srs.c src/puff.c src/hwid.c \
                   src/spec.h src/cli.h src/srs.h
 	@mkdir -p $(BUILD)
 	$(CC) $(CFLAGS) -o $@ tests/fwmatch.c src/spec.c src/dnsd.c src/failover.c \
-	      src/aggregate.c src/obfs.c src/cli.c src/srs.c src/puff.c
+	      src/aggregate.c src/obfs.c src/cli.c src/srs.c src/puff.c src/hwid.c
 
 # Управление потоком HTTP/2 проверяется в памяти: h2.c общается с сетью только через
 # struct h2_io, поэтому стенд подменяет его целиком. -Itests/stub нужен, чтобы не тянуть
@@ -183,6 +191,7 @@ $(BUILD)/submatch: tests/submatch.c src/ext/sub.c src/ext/vless.h \
 # docker он не требует и входит в обычный make test — при том что до переноса вся эта работа
 # жила в оболочке объекта rpcd и не проверялась ничем.
 $(BUILD)/subfetchmatch: tests/subfetchmatch.c src/ext/subfetch.c src/ext/subfetch.h \
+                  src/hwid.c src/hwid.h \
                   src/ext/sub.c src/ext/vless.h src/ext/vless_proto.c src/ext/vless_proto.h
 	@mkdir -p $(BUILD)
 	$(CC) $(CFLAGS) -Itests/stub -o $@ tests/subfetchmatch.c

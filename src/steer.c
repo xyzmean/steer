@@ -29,6 +29,7 @@
 #include <time.h>
 
 #include "spec.h"
+#include "hwid.h"
 #include "obfs.h"
 #include "cli.h"
 #include "srs.h"
@@ -134,7 +135,10 @@ static int cmd_sub_quota(const char *url, const char *info_path) {
     (void)url; (void)info_path;
     return no_vless();
 }
-static int cmd_sub_hwid(void) { return no_vless(); }
+/* ЕДИНСТВЕННАЯ ПОДКОМАНДА «VLESS», КОТОРАЯ ОТВЕЧАЕТ И ЗДЕСЬ. Идентификатор роутера считает
+ * src/hwid.c, входящий в обе сборки: читателей у него стало двое, и второй (телеметрия
+ * splify2) работает на роутере, где расширенной сборки нет. Заглушки поэтому нет — есть
+ * настоящая функция, объявленная в hwid.h. */
 #ifndef STEER_TGWS
 static int cmd_tgws(const char *spec_path, const char *out_name) {
     (void)spec_path; (void)out_name;
@@ -3046,6 +3050,7 @@ int main(int argc, char **argv) {
     if (!strcmp(cmd, "sub-fetch")) return cmd_sub_fetch(arg, a.out_file, a.info_file);
     if (!strcmp(cmd, "sub-quota")) return cmd_sub_quota(arg, a.info_file);
     if (!strcmp(cmd, "sub-hwid")) return cmd_sub_hwid();
+    if (!strcmp(cmd, "dev-id")) return cmd_dev_id();
     if (!strcmp(cmd, "srs-read")) return srs_dump(arg, a.out_file, a.prefixes_out, a.meta_out);
     if (!strcmp(cmd, "obfs")) {
         load_spec(spec);

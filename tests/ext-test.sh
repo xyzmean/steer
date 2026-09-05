@@ -175,9 +175,16 @@ $CC -O2 -w -Isrc $MBED_INC "$PRIV" -o "$BUILD/devupmatch" tests/devupmatch.c \
 # xsteer-hub — штатная заглушка «ставится из архива steer-hub». Список исходников повторяет
 # серверную половину из build/build-ext.sh; расходиться им негде — оба списка про один бинарник,
 # и стенд упадёт на неразрешённом имени, если половины разъедутся.
+#
+# И РАЗОШЛИСЬ. `src/srs.c` появился в движке 5 сентября, в этот список его не внесли, и с того
+# дня `make ext-test` не собирался вовсе — падал на `undefined reference to srs_dump`. Комментарий
+# выше при этом обещал обратное: «расходиться им негде». Обещание держалось на том, что кто-то
+# запустит цель, а её не запускали: она требует настоящей mbedtls и потому не входит в `make
+# test`. Урок ровно про это: барьер, который нужно ЗАПУСТИТЬ РУКАМИ, не барьер.
 echo "ext-test: собираю серверный бинарник для стенда зондирования..."
 $CC -O1 -w -Isrc $MBED_INC "$PRIV" -DSTEER_SERVER -o "$BUILD/steer-hub-native" \
 	src/steer.c src/spec.c src/dnsd.c src/failover.c src/aggregate.c src/obfs.c src/cli.c \
+	src/srs.c src/puff.c src/hwid.c \
 	src/ext/xswire.c src/ext/xsconf.c src/ext/xslink.c src/ext/xsroute.c src/ext/chello.c src/ext/xshake.c \
 	src/ext/xsconn.c src/ext/xsstream.c src/ext/xsepoch.c src/ext/tls13.c src/ext/reality.c \
 	src/ext/tun.c src/ext/h2.c src/ext/xsadmin.c src/ext/xshub.c \

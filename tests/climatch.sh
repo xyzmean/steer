@@ -198,7 +198,19 @@ ext_marker "splify2: sub-fetch без --info доходит до команды"
     "$BIN" sub-fetch https://p.example/s --out "$tmp/sub.txt"
 ext_marker "splify2: sub-quota <ссылка> --info доходит до команды" -- \
     "$BIN" sub-quota https://p.example/s --info "$tmp/sub.userinfo"
-ext_marker "splify2: sub-hwid доходит до команды" -- "$BIN" sub-hwid
+# sub-hwid И dev-id ОТВЕЧАЮТ В БАЗОВОЙ СБОРКЕ, а не отказывают «нужен steer-extended», — и
+# это ровно то свойство, ради которого идентификатор переехал в src/hwid.c. Прежде здесь
+# стояла проверка на отказ, и она была верна, пока читатель был один: панель подписки.
+# Телеметрии он нужен как раз на роутере, где расширенной части нет.
+out="$("$BIN" sub-hwid 2>/dev/null)"
+check "sub-hwid отвечает и в базовой сборке" "1" \
+    "$(printf '%s' "$out" | grep -c '"hwid":')"
+check "и отказа про steer-extended в нём нет" "0" \
+    "$("$BIN" sub-hwid 2>&1 >/dev/null | grep -c 'steer-extended')"
+check "dev-id отвечает и в базовой сборке" "1" \
+    "$(STEER_DEVID_ITERS=1000 "$BIN" dev-id 2>/dev/null | grep -c '"tid":')"
+check "и это ДРУГОЙ идентификатор, а не тот же" "0" \
+    "$(STEER_DEVID_ITERS=1000 "$BIN" dev-id 2>/dev/null | grep -c 'splify2-')"
 # Флаги подписки чужим командам не даются: список флагов команды — это данные, по которым
 # растут и справка, и разбор, и разойтись им негде.
 code "sub-fetch не принимает --spec" 2 -- "$BIN" sub-fetch https://p.example/s --spec /dev/null
