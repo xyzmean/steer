@@ -435,6 +435,94 @@ check "имя в набор адресом не уехало" "0" \
     "$("$BIN" apply --dry-run --spec "$tmp/dashspec.json" --state-dir "$tmp/state-dash" 2>/dev/null |
        grep -c 'my-site.example')"
 
+# ---- правило на устройство старше глобального ВСЕГДА --------------------------
+#
+# Порядок совпадения в цепочке и есть приоритет: правило заканчивается `return`, поэтому
+# побеждает первое совпавшее. Пока порядок читался только со спеки, правило «этот телефон
+# не маршрутизируем» работало ровно до тех пор, пока человек держал его выше глобальных —
+# стоило добавить новое глобальное и поставить первым, и исключение перестало действовать,
+# молча.
+#
+# Поэтому глобальное правило в спеке ниже стоит ПЕРВЫМ: проверяется, что приоритет — это
+# свойство правила, а не порядка в списке.
+cat > "$tmp/devspec.json" <<EOF
+{ "schema": 2, "from_default": ["192.168.1.0/24"],
+  "outputs": { "direct": { "kind": "direct" },
+               "vpn": { "kind": "interface", "device": "wg0" } },
+  "channels": [
+    { "name": "global", "out": "vpn", "match": { "prefixes_files": ["$tmp/p.lst"] } },
+    { "name": "laptop", "out": "direct", "scope": "device",
+      "from": ["192.168.1.55"], "match": { "any": true } },
+    { "name": "phone", "out": "vpn", "scope": "device",
+      "from": ["aa:bb:cc:dd:ee:ff"], "match": { "any": true } } ] }
+EOF
+devout="$("$BIN" apply --dry-run --spec "$tmp/devspec.json" --state-dir "$tmp/state-dev" 2>&1)"
+check "спека с правилами на устройство применяется" "0" \
+    "$("$BIN" apply --dry-run --spec "$tmp/devspec.json" --state-dir "$tmp/state-dev" \
+       >/dev/null 2>&1; echo $?)"
+# Порядок строк в цепочке — это и есть проверка приоритета.
+devseq="$(printf '%s\n' "$devout" | sed -n '/chain prerouting_mark/,/^    }/p' |
+          sed -n 's/.*comment "steer:\([a-z0-9_]*\)".*/\1/p' | tr '\n' ' ')"
+check "оба устройства впереди глобального, хотя в спеке оно первое" \
+    "direct_all_c1 vpn_all_c2 vpn_ip " "$devseq"
+# Ноутбук «мимо туннеля»: правило заканчивается return и НИЧЕГО не метит.
+check "правило «не маршрутизировать» метку не ставит" "0" \
+    "$(printf '%s\n' "$devout" | grep 'steer:direct_all_c1' | grep -c 'meta mark set')"
+# Телефон по MAC: ether saddr, а не ip saddr — адрес по DHCP сменится, MAC нет.
+check "правило по MAC ловит по ether saddr" "1" \
+    "$(printf '%s\n' "$devout" | grep -c 'ether saddr { aa:bb:cc:dd:ee:ff }')"
+# И его трафик уходит в туннель с чужим битом: обход его трогать не должен.
+check "весь трафик устройства уходит в туннель" "1" \
+    "$(printf '%s\n' "$devout" | grep 'ether saddr' | grep -c 'or 0x40100000')"
+
+# `any` без allow_all у правила на устройство ЗАКОНЕН: общий запрет заведён против «все
+# клиенты без интернета и починка с провода», а здесь цена ошибки — один хозяин.
+check "у правила на устройство any не требует allow_all" "0" \
+    "$(printf '%s\n' "$devout" | grep -ci 'allow_all')"
+# А у глобального по-прежнему требует.
+cat > "$tmp/allspec.json" <<EOF
+{ "schema": 2, "from_default": ["192.168.1.0/24"],
+  "outputs": { "vpn": { "kind": "interface", "device": "wg0" } },
+  "channels": [ { "name": "all", "out": "vpn", "match": { "any": true } } ] }
+EOF
+check "у глобального any по-прежнему требует allow_all" "1" \
+    "$("$BIN" apply --dry-run --spec "$tmp/allspec.json" --state-dir "$tmp/state-dev2" 2>&1 |
+       grep -c 'allow_all')"
+
+# ПОДСЕТЬ В ПРАВИЛЕ НА УСТРОЙСТВО — ОТКАЗ. Иначе приоритет достался бы не телефону, а
+# половине сети, и достался бы тихо: снаружи такое правило выглядит точно так же.
+cat > "$tmp/netspec.json" <<EOF
+{ "schema": 2, "from_default": ["192.168.1.0/24"],
+  "outputs": { "direct": { "kind": "direct" } },
+  "channels": [ { "name": "half", "out": "direct", "scope": "device",
+                  "from": ["192.168.1.0/24"], "match": { "any": true } } ] }
+EOF
+check "подсеть в правиле на устройство отвергнута" "1" \
+    "$("$BIN" apply --dry-run --spec "$tmp/netspec.json" --state-dir "$tmp/state-dev3" 2>&1 |
+       grep -c 'только одиночных')"
+# Пустой `from` — тоже отказ: правило «на устройство» без хозяина действует на всех, то есть
+# получает приоритет устройства, будучи глобальным. Самое опасное из недоразумений.
+cat > "$tmp/emptyspec.json" <<EOF
+{ "schema": 2, "from_default": ["192.168.1.0/24"],
+  "outputs": { "direct": { "kind": "direct" } },
+  "channels": [ { "name": "nohost", "out": "direct", "scope": "device",
+                  "match": { "any": true } } ] }
+EOF
+check "правило на устройство без хозяина отвергнуто" "1" \
+    "$("$BIN" apply --dry-run --spec "$tmp/emptyspec.json" --state-dir "$tmp/state-dev4" 2>&1 |
+       grep -c 'нет ни одного хозяина')"
+# И ключ `scope` — поле схемы 2: в спеке schema 1 он отвергается, а не игнорируется. Иначе
+# движок постарше положил бы правило в порядке спеки, и приоритет пропал бы молча.
+cat > "$tmp/s1spec.json" <<EOF
+{ "schema": 1, "from_default": ["192.168.1.0/24"],
+  "outputs": { "direct": { "kind": "direct" } },
+  "channels": [ { "name": "dev", "out": "direct", "scope": "device",
+                  "from": ["192.168.1.55"], "match": { "any": true } } ] }
+EOF
+check "scope в спеке schema 1 отвергнут" "1" \
+    "$("$BIN" apply --dry-run --spec "$tmp/s1spec.json" --state-dir "$tmp/state-dev5" 2>&1 |
+       grep -c 'schema 2')"
+
 # ---- группы с разными клиентами получают РАЗНЫЕ наборы -----------------------
 # Имя набора собиралось только из выхода и вида, а группы разделяются ещё и по `from` и по
 # режиму. Двум группам доставалось одно имя, ядро сливало наборы в один, и список,
@@ -950,7 +1038,11 @@ check "неизвестный on_fail отвергается" "2" "$?"
 # ---- refusals ---------------------------------------------------------------
 # Guessing at an unknown schema would mean compiling a config we do not understand
 # into firewall rules.
-sed 's/"schema": 1/"schema": 2/' "$tmp/spec.json" > "$tmp/s2.json"
+#
+# Число здесь ТРОЙКА, а не двойка: двойку движок теперь понимает (см. раздел про порты
+# ниже). Смысл проверки от этого не изменился — стеречь она обязана не конкретное число, а
+# отказ на major, которого сборка не знает.
+sed 's/"schema": 1/"schema": 3/' "$tmp/spec.json" > "$tmp/s2.json"
 "$BIN" apply --dry-run --spec "$tmp/s2.json" $S >/dev/null 2>&1
 check "refuses an unknown schema" "2" "$?"
 
@@ -1032,6 +1124,276 @@ EOF
 hout="$("$BIN" apply --dry-run --spec "$tmp/spec.json" --state-dir "$tmp/state-half" 2>/dev/null)"
 check "один из двух списков пропал: уцелевший доехал" "1" \
     "$(printf '%s\n' "$hout" | grep -c 'elements = { 203.0.113.0/24 }')"
+
+# ---- schema 2: у канала появилось измерение «протокол и порты» ---------------
+#
+# ЗАЧЕМ ЭТО ВООБЩЕ. Списки itdoginfo/allow-domains публикуются двоичными `.srs`, и из 25
+# файлов релиза 24 разбираются, а `discord.srs` отвергается с кодом 2: он описывает не
+# домены, а `network: udp` плюс `ip_cidr 104.16.0.0/12` плюс `port_range 50000:65535,
+# 19000:20000`. Взять его подсети и отбросить порты нельзя — 104.16.0.0/12 это Cloudflare,
+# и весь TCP к нему уехал бы в туннель молча.
+#
+# ЗАЧЕМ ЧИСЛО СХЕМЫ, А НЕ ПРОСТО НОВЫЙ КЛЮЧ. Неизвестный КЛЮЧ старый движок пропускает
+# (js_skip в spec.c), и это правильно для всего, что совпадение РАСШИРЯЕТ: не понял —
+# ничего не потерял. Порты совпадение СУЖАЮТ, и пропущенный ключ означает «сузить забыли»
+# — то есть ровно тот молчаливый весь-TCP-в-туннель, от которого мы отказывались в srs.c.
+# Поэтому major поднят: старый движок обязан отвергнуть спеку ЦЕЛИКОМ (exit 2), а не понять
+# её наполовину. Управляющий слой это переживает: spec_set проверяет спеку через
+# `apply --dry-run` ДО записи на диск, видит код 2 и говорит человеку «обновите движок».
+
+# Схема 2 сама по себе не меняет НИЧЕГО: та же спека с другим числом обязана дать
+# побайтово тот же набор правил. Иначе поднятие major стало бы вторым изменением поведения,
+# спрятанным за первым.
+spec <<'EOF'
+{ "schema": 1,
+  "from_default": ["192.168.1.0/24"],
+  "outputs": {
+    "direct": { "kind": "direct" },
+    "vpn":    { "kind": "interface", "device": "wg0" }
+  },
+  "channels": [
+    { "name": "keep",    "match": { "prefixes_file": "TMP/b.lst" }, "out": "direct" },
+    { "name": "blocked", "match": { "prefixes_file": "TMP/a.lst" }, "out": "vpn" }
+  ] }
+EOF
+cp "$tmp/spec.json" "$tmp/v1.json"
+sed 's/"schema": 1/"schema": 2/' "$tmp/v1.json" > "$tmp/v2.json"
+o1="$("$BIN" apply --dry-run --spec "$tmp/v1.json" --state-dir "$tmp/st-v1" 2>/dev/null)"
+o2="$("$BIN" apply --dry-run --spec "$tmp/v2.json" --state-dir "$tmp/st-v2" 2>/dev/null)"
+check "схема 2 принимается" "0" \
+    "$("$BIN" apply --dry-run --spec "$tmp/v2.json" --state-dir "$tmp/st-v2" >/dev/null 2>&1; echo $?)"
+check "схема 2 без новых полей даёт тот же набор правил" "$o1" "$o2"
+
+# Канал Discord: подсети плюс udp плюс два диапазона портов.
+printf '104.16.0.0/12\n' > "$tmp/dc.lst"
+spec <<'EOF'
+{ "schema": 2,
+  "from_default": ["192.168.1.0/24"],
+  "outputs": { "vpn": { "kind": "interface", "device": "wg0" } },
+  "channels": [
+    { "name": "discord", "out": "vpn",
+      "match": { "prefixes_files": ["TMP/dc.lst"],
+                 "proto": "udp", "ports": ["50000-65535", "19000-20000"] } }
+  ] }
+EOF
+dout="$("$BIN" apply --dry-run --spec "$tmp/spec.json" --state-dir "$tmp/st-dc" 2>/dev/null)"
+check "канал с портами компилируется" "0" "$?"
+# ОДНО правило, а не два: «tcp или udp» внутри правила nft не выражается, и если бы
+# протокол печатался словом `tcp dport`/`udp dport`, смесь пришлось бы разбивать на два
+# правила — с двумя счётчиками и с порядком, который спекой уже не читается. Поэтому
+# `meta l4proto` плюс `th dport`: одна форма и для одного протокола, и для двух.
+check "ограничение попало в правило разметки" "1" \
+    "$(printf '%s\n' "$dout" | grep -c 'meta l4proto udp th dport { 50000-65535, 19000-20000 }')"
+check "правило у канала по-прежнему одно" "1" \
+    "$(printf '%s\n' "$dout" | grep -c 'steer:vpn_ip_c0_p1"')"
+# `th dport` НИКОГДА не печатается без `meta l4proto` перед ним, и это не стиль. `th` —
+# это смещение в транспортном заголовке: у протокола без портов (icmp, esp, gre) по этому
+# смещению лежат чужие байты, и правило совпало бы на них. Протокол сужает раньше, чем
+# читается порт.
+check "порты без указания протокола не печатаются" "0" \
+    "$(printf '%s\n' "$dout" | grep 'th dport' | grep -vc 'meta l4proto')"
+# Встречный путь: клиент — ПОЛУЧАТЕЛЬ, значит порт сервера здесь исходящий. Без зеркала
+# счётчик скачанного считал бы и тот TCP, который правило разметки не берёт, — то есть
+# врал бы ровно на ту величину, ради которой заведены порты.
+check "встречная цепочка зеркалит порты как sport" "1" \
+    "$(printf '%s\n' "$dout" | grep -c 'meta l4proto udp th sport { 50000-65535, 19000-20000 }')"
+# Набор адресов остался обычным: порты — свойство ПРАВИЛА, а не элементов набора.
+check "набор канала на месте" "1" \
+    "$(printf '%s\n' "$dout" | grep -c 'elements = { 104.16.0.0/12 }')"
+
+# Протокол без портов — законное сужение («весь UDP к этим адресам»), и `th` тогда не
+# печатается вовсе.
+spec <<'EOF'
+{ "schema": 2,
+  "from_default": ["192.168.1.0/24"],
+  "outputs": { "vpn": { "kind": "interface", "device": "wg0" } },
+  "channels": [
+    { "name": "quic", "out": "vpn",
+      "match": { "prefixes_files": ["TMP/dc.lst"], "proto": "udp" } }
+  ] }
+EOF
+pout="$("$BIN" apply --dry-run --spec "$tmp/spec.json" --state-dir "$tmp/st-p" 2>/dev/null)"
+# Сужение стоит ПЕРЕД поиском по набору: сравнение одного байта протокола дешевле поиска в
+# наборе, и для канала «только UDP» оно отбрасывает весь TCP роутера до поиска, а не после.
+check "протокол без портов: сужение по протоколу есть" "1" \
+    "$(printf '%s\n' "$pout" | grep -c 'meta l4proto udp ip daddr @vpn_ip_c0_p1 meta mark set')"
+check "протокол без портов: порты не выдуманы" "0" \
+    "$(printf '%s\n' "$pout" | grep -c 'th dport')"
+
+# Порты без протокола — «и TCP, и UDP на этих портах». Одним правилом, потому что
+# `meta l4proto { tcp, udp }` это множество, а не «или».
+spec <<'EOF'
+{ "schema": 2,
+  "from_default": ["192.168.1.0/24"],
+  "outputs": { "vpn": { "kind": "interface", "device": "wg0" } },
+  "channels": [
+    { "name": "web", "out": "vpn",
+      "match": { "prefixes_files": ["TMP/dc.lst"], "ports": ["443"] } }
+  ] }
+EOF
+wout="$("$BIN" apply --dry-run --spec "$tmp/spec.json" --state-dir "$tmp/st-w" 2>/dev/null)"
+check "порты без протокола: оба протокола одним правилом" "1" \
+    "$(printf '%s\n' "$wout" | grep -c 'meta l4proto { tcp, udp } th dport 443')"
+# Один порт печатается без фигурных скобок — так же, как одно устройство в emit_ifs, и по
+# той же причине: так это печатает сам nft.
+check "один порт печатается без скобок" "0" \
+    "$(printf '%s\n' "$wout" | grep -c 'th dport { 443 }')"
+# Явное «both» — это ЗАПИСАННОЕ умолчание, а не третье поведение: сужения по протоколу из
+# него не выходит, только носитель для портов.
+sed 's/"ports": \["443"\]/"proto": "both", "ports": ["443"]/' "$tmp/spec.json" > "$tmp/both.json"
+bout="$("$BIN" apply --dry-run --spec "$tmp/both.json" --state-dir "$tmp/st-b" 2>/dev/null)"
+check "proto both значит то же, что отсутствие proto" "$wout" "$bout"
+
+# ---- поля схемы 2 в спеке schema 1 — ОТКАЗ, а не молчаливый пропуск ----------
+# Молчаливый пропуск здесь и есть та самая беда: человек написал порты, движок их не
+# понял, канал забрал весь трафик к Cloudflare, и сказать об этом было бы нечем.
+spec <<'EOF'
+{ "schema": 1,
+  "from_default": ["192.168.1.0/24"],
+  "outputs": { "vpn": { "kind": "interface", "device": "wg0" } },
+  "channels": [
+    { "name": "discord", "out": "vpn",
+      "match": { "prefixes_files": ["TMP/dc.lst"], "proto": "udp", "ports": ["50000-65535"] } }
+  ] }
+EOF
+msg="$("$BIN" apply --dry-run --spec "$tmp/spec.json" --state-dir "$tmp/st-o" 2>&1 >/dev/null)"
+check "поля схемы 2 при schema 1 отвергаются" "2" \
+    "$("$BIN" apply --dry-run --spec "$tmp/spec.json" --state-dir "$tmp/st-o" >/dev/null 2>&1; echo $?)"
+check "и сказано, что поднять" "1" "$(printf '%s' "$msg" | grep -c 'schema')"
+check "и назван канал" "1" "$(printf '%s' "$msg" | grep -c 'discord')"
+
+# ---- порты БЕЗ списка адресов — это недописанная настройка -------------------
+# «Канал ловит по портам» выразить нечем и не нужно: без списка адресов правило накрыло бы
+# весь трафик клиентов на этих портах. Проверка «matches nothing» обязана остаться в силе —
+# новые поля источником совпадения не являются.
+spec <<'EOF'
+{ "schema": 2,
+  "from_default": ["192.168.1.0/24"],
+  "outputs": { "vpn": { "kind": "interface", "device": "wg0" } },
+  "channels": [
+    { "name": "только порты", "out": "vpn",
+      "match": { "proto": "udp", "ports": ["50000-65535"] } }
+  ] }
+EOF
+nmsg="$("$BIN" apply --dry-run --spec "$tmp/spec.json" --state-dir "$tmp/st-n" 2>&1 >/dev/null)"
+check "порты без списка: отказ" "2" \
+    "$("$BIN" apply --dry-run --spec "$tmp/spec.json" --state-dir "$tmp/st-n" >/dev/null 2>&1; echo $?)"
+check "порты без списка: отказ тот же, что был" "1" \
+    "$(printf '%s' "$nmsg" | grep -c 'matches nothing')"
+
+# ---- каналы с РАЗНЫМИ портами не сливаются в одну группу ---------------------
+# Слияние здесь было бы молчаливой потерей смысла в обе стороны сразу: набор один, а
+# правило одно, и ограничение по портам либо распространилось бы на чужие адреса (сузили
+# то, чего не просили), либо пропало бы вовсе (весь TCP к Cloudflare в туннель). Поэтому
+# протокол и порты входят в ключ слияния наравне с выходом и списком клиентов.
+#
+# Имя набора при этом обязано РАЗОЙТИСЬ: ядро сливает одноимённые наборы молча, и без
+# различителя два канала одного выхода делили бы один набор адресов (см. from_disc в
+# spec.c — та же беда и то же лечение).
+spec <<'EOF'
+{ "schema": 2,
+  "from_default": ["192.168.1.0/24"],
+  "outputs": { "vpn": { "kind": "interface", "device": "wg0" } },
+  "channels": [
+    { "name": "youtube", "out": "vpn", "match": { "prefixes_files": ["TMP/a.lst"] } },
+    { "name": "discord", "out": "vpn",
+      "match": { "prefixes_files": ["TMP/dc.lst"], "proto": "udp", "ports": ["50000-65535"] } }
+  ] }
+EOF
+sout="$("$BIN" apply --dry-run --spec "$tmp/spec.json" --state-dir "$tmp/st-s" 2>/dev/null)"
+check "канал без портов сохранил прежнее имя набора" "1" \
+    "$(printf '%s\n' "$sout" | grep -c 'set vpn_ip {')"
+check "канал с портами получил свой набор" "1" \
+    "$(printf '%s\n' "$sout" | grep -c 'set vpn_ip_c0_p1 {')"
+check "правил стало два" "2" \
+    "$(printf '%s\n' "$sout" | grep -c 'steer:vpn_ip')"
+check "адреса не перемешались" "1" \
+    "$(printf '%s\n' "$sout" | grep -c 'elements = { 104.16.0.0/12 }')"
+check "ограничение стоит только у своего правила" "1" \
+    "$(printf '%s\n' "$sout" | grep -c 'th dport')"
+
+# ...а каналы с ОДИНАКОВЫМ сужением сливаются, как сливались всегда: иначе предел в 64
+# канала расходовался бы на то, что для ядра одно и то же правило.
+spec <<'EOF'
+{ "schema": 2,
+  "from_default": ["192.168.1.0/24"],
+  "outputs": { "vpn": { "kind": "interface", "device": "wg0" } },
+  "channels": [
+    { "name": "dc1", "out": "vpn",
+      "match": { "prefixes_files": ["TMP/a.lst"], "proto": "udp", "ports": ["50000-65535"] } },
+    { "name": "dc2", "out": "vpn",
+      "match": { "prefixes_files": ["TMP/dc.lst"], "proto": "udp", "ports": ["50000-65535"] } }
+  ] }
+EOF
+mout="$("$BIN" apply --dry-run --spec "$tmp/spec.json" --state-dir "$tmp/st-m" 2>/dev/null)"
+check "одинаковое сужение: правило одно" "1" \
+    "$(printf '%s\n' "$mout" | grep -c 'steer:vpn_ip_c0_p1"')"
+check "одинаковое сужение: набор один и общий" "1" \
+    "$(printf '%s\n' "$mout" | grep -c 'elements = { 203.0.113.0/24, 198.51.100.5, 104.16.0.0/12 }')"
+
+# ---- негодные записи портов отвергаются громко ------------------------------
+# Не педантизм: `nft -f` отвергает НАБОР ПРАВИЛ ЦЕЛИКОМ на одном плохом элементе, и тогда
+# на роутере остаются прежние правила, а человек видит, что его выбор не подействовал, без
+# единого намёка на причину. Тот же довод, что у check_address_lists в steer.c.
+portspec() {
+    sed "s|PORTS|$1|" > "$tmp/pp.json" <<EOF
+{ "schema": 2,
+  "from_default": ["192.168.1.0/24"],
+  "outputs": { "vpn": { "kind": "interface", "device": "wg0" } },
+  "channels": [
+    { "name": "p", "out": "vpn",
+      "match": { "prefixes_files": ["$tmp/dc.lst"], "ports": PORTS } }
+  ] }
+EOF
+    "$BIN" apply --dry-run --spec "$tmp/pp.json" --state-dir "$tmp/st-pp" >/dev/null 2>&1
+    echo $?
+}
+check "порт 0 отвергается"                    "2" "$(portspec '["0"]')"
+check "порт 65536 отвергается"                "2" "$(portspec '["65536"]')"
+check "перевёрнутый диапазон отвергается"     "2" "$(portspec '["9-1"]')"
+check "не число отвергается"                  "2" "$(portspec '["abc"]')"
+check "двоеточие вместо тире отвергается"     "2" "$(portspec '["50000:65535"]')"
+check "пустая строка отвергается"             "2" "$(portspec '[""]')"
+check "число вместо строки отвергается"       "2" "$(portspec '[443]')"
+check "висящая запятая отвергается"           "2" "$(portspec '["443",]')"
+# Пересечение и повтор — тоже отказ, и по той же причине, что негодная запись: nft не
+# принимает множество с накладывающимися интервалами и отвергает весь набор правил.
+check "повтор диапазона отвергается"          "2" "$(portspec '["443", "443"]')"
+check "пересечение диапазонов отвергается"    "2" "$(portspec '["1-100", "50-60"]')"
+check "соседние диапазоны законны"            "0" "$(portspec '["1-100", "101-200"]')"
+# Неизвестный протокол — отказ: угадать, что имел в виду человек, значит однажды не сузить
+# там, где он считает, что сузил.
+protospec() {
+    sed "s|PROTO|$1|" > "$tmp/pr.json" <<EOF
+{ "schema": 2,
+  "from_default": ["192.168.1.0/24"],
+  "outputs": { "vpn": { "kind": "interface", "device": "wg0" } },
+  "channels": [
+    { "name": "p", "out": "vpn",
+      "match": { "prefixes_files": ["$tmp/dc.lst"], "proto": "PROTO" } }
+  ] }
+EOF
+    "$BIN" apply --dry-run --spec "$tmp/pr.json" --state-dir "$tmp/st-pr" >/dev/null 2>&1
+    echo $?
+}
+check "неизвестный proto отвергается" "2" "$(protospec sctp)"
+check "proto tcp принимается"         "0" "$(protospec tcp)"
+
+# ---- explain не переоценивает совпадение ------------------------------------
+# Адрес лежит в наборе — но канал сужен по портам, и «идёт в туннель» верно не для всего
+# его трафика. Прежний ответ был бы правдой лишь наполовину, а по нему настраивают.
+spec <<'EOF'
+{ "schema": 2,
+  "from_default": ["192.168.1.0/24"],
+  "outputs": { "vpn": { "kind": "interface", "device": "wg0" } },
+  "channels": [
+    { "name": "весь udp", "out": "vpn",
+      "match": { "any": true, "allow_all": true, "proto": "udp", "ports": ["50000-65535"] } }
+  ] }
+EOF
+eout="$("$BIN" explain 104.16.0.1 --spec "$tmp/spec.json" --state-dir "$tmp/st-e" 2>/dev/null)"
+check "explain называет сужение канала" "1" \
+    "$(printf '%s\n' "$eout" | grep -c 'udp 50000-65535')"
 
 printf '\n%s passed, %s failed\n' "$pass" "$fail"
 [ "$fail" -eq 0 ]

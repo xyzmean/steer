@@ -2179,7 +2179,11 @@ int dnsd_main(int argc, char **argv) {
          * попадали туда же вместе. Разойтись двум формулам теперь негде — она одна. */
         size_t fn = g_ch[i].from_n ? g_ch[i].from_n : g_from_default_n;
         const char (*fr)[64] = g_ch[i].from_n ? g_ch[i].from : g_from_default;
-        group_set_name(set, sizeof(set), g_ch[i].out, "dom", fr, fn, g_ch[i].realip);
+        /* Сужение канала (протокол и порты) уходит в имя набора наравне с `from` и
+         * режимом: компилятор по нему РАЗДЕЛЯЕТ наборы, и резолвер, не передавший его,
+         * наполнял бы набор, которого нет. Ровно та беда, от которой эта функция общая. */
+        group_set_name(set, sizeof(set), g_ch[i].out, "dom", fr, fn, g_ch[i].realip,
+                       &g_ch[i].l4);
         size_t k = 0;
         for (; k < g_dch_n; k++)
             if (!strcmp(g_dch[k].set, set) && g_dch[k].realip == g_ch[i].realip) break;
