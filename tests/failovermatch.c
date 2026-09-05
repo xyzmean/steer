@@ -290,6 +290,22 @@ static int hyst_health(const struct output *o, const char *dev) {
     if (!strcmp(dev, "vspare")) return g_h_second;
     return 0;
 }
+/* Задержки кандидатов задаёт стенд — тем же приёмом, что и здоровье. Сокетов не надо:
+ * device_latency в бою мерит соединением TCP через устройство, а здесь шов отдаёт число. */
+static int g_ms_first = -1, g_ms_second = -1;
+static int lat_probe(const struct output *o, const char *dev) {
+    (void)o;
+    if (!strcmp(dev, "vpref"))  return g_ms_first;
+    if (!strcmp(dev, "vspare")) return g_ms_second;
+    return -1;
+}
+/* Файл замеров между проверками убираем: он живёт своим интервалом (умолчание 180 с), и
+ * без этого второй прогон взял бы прежние числа как свежие. */
+static void unlink_lat(void) {
+    char pth[288];
+    snprintf(pth, sizeof(pth), "%s/latency", g_state_dir);
+    unlink(pth);
+}
 static void out_set_two(void) {
     memset(g_out, 0, sizeof(g_out));
     g_out_n = 1;
@@ -735,6 +751,116 @@ int main(void) {
     if (g_fail) {
         fprintf(stderr, "failovermatch: провалено проверок: %d\n", g_fail);
         return 1;
+    }
+
+    /* ---- ВТОРАЯ ОСЬ: выбор по замеру задержки ---------------------------------------
+     *
+     * До запуска 65 сторож отвечал только на «жив ли»: `devices` — порядок предпочтения, и
+     * брался первый здоровый. Задержку мерил vless-probe, но его число не участвовало ни в
+     * одном решении, только показывалось в таблице.
+     *
+     * Проверяется, что режим не сваливается ни в одну из двух крайностей: не игнорирует
+     * замер (иначе он бесполезен) и не отменяет порядок человека (иначе включение режима
+     * означало бы «мой список больше ничего не значит»).
+     *
+     * Здоровье обоих кандидатов держим единицей — ось здоровья проверена выше. */
+    {
+        setenv("STEER_FAILOVER_HYST", "0", 1);
+        failover_hyst_reset_for_test();
+        g_health_probe = hyst_health;
+        g_latency_probe = lat_probe;
+        g_h_first = g_h_second = 1;
+        out_set_two();
+        g_out[0].prefer_latency = 1;
+        snprintf(g_dir, sizeof(g_dir), "/tmp/failovermatch-lat-XXXXXX");
+        if (!mkdtemp(g_dir)) { perror("mkdtemp"); return 1; }
+        g_state_dir = g_dir;
+        char dev[32];
+
+        g_ms_first = 200; g_ms_second = 20;
+        cmd_failover(NULL, 0);
+        active_dev(dev, sizeof(dev));
+        check("замер: уходим на заметно более быстрый запас", !strcmp(dev, "vspare"), 1);
+
+        g_ms_first = 15; g_ms_second = 90;
+        unlink_lat();
+        cmd_failover(NULL, 0);
+        active_dev(dev, sizeof(dev));
+        check("замер: возвращаемся, когда предпочтение быстрее", !strcmp(dev, "vpref"), 1);
+
+        /* Разница В ПРЕДЕЛАХ ДОПУСКА порядок не отменяет: 40 против 20 при допуске 50 —
+         * это «не хуже», и решает список человека. Без этой ветки сторож дёргал бы
+         * устройство на каждом дрожании, а смена устройства — это смена выходного адреса
+         * и обрыв соединений через прежнее. */
+        g_ms_first = 40; g_ms_second = 20;
+        unlink_lat();
+        cmd_failover(NULL, 0);
+        active_dev(dev, sizeof(dev));
+        check("замер: разница внутри допуска решается порядком", !strcmp(dev, "vpref"), 1);
+
+        g_out[0].lat_tolerance_ms = 10;
+        unlink_lat();
+        cmd_failover(NULL, 0);
+        active_dev(dev, sizeof(dev));
+        check("замер: свой допуск делает ту же разницу значимой", !strcmp(dev, "vspare"), 1);
+        g_out[0].lat_tolerance_ms = 0;
+
+        /* И ОБРАТНАЯ СТОРОНА ДОПУСКА: с текущего не уходим ради выигрыша внутри него.
+         *
+         * Это ОТДЕЛЬНАЯ ветка, а не та же: перебор кандидатов идёт по порядку и берёт
+         * первого, кто не хуже лучшего на допуск, то есть при свободном выборе побеждает
+         * предпочтение. Но когда трафик УЖЕ идёт через запас, «предпочтение чуть лучше» не
+         * повод его двигать — смена устройства это смена выходного адреса и обрыв
+         * соединений. Проверка ставится потому, что мутация ветки прошла незамеченной:
+         * прежние проверки все шли из состояния «текущее и есть предпочтительное», где
+         * ветка не исполняется вовсе.
+         *
+         * Сначала уводим трафик на запас настоящей разницей, потом делаем предпочтение
+         * лучше В ПРЕДЕЛАХ допуска и ждём, что остались на запасе. */
+        g_ms_first = 300; g_ms_second = 20;
+        unlink_lat();
+        cmd_failover(NULL, 0);
+        active_dev(dev, sizeof(dev));
+        check("замер: подготовка — трафик на запасе", !strcmp(dev, "vspare"), 1);
+        g_ms_first = 20; g_ms_second = 40;
+        unlink_lat();
+        cmd_failover(NULL, 0);
+        active_dev(dev, sizeof(dev));
+        check("замер: с текущего не уходим ради выигрыша внутри допуска",
+              !strcmp(dev, "vspare"), 1);
+        /* А ради выигрыша БОЛЬШЕ допуска — уходим. */
+        g_ms_first = 20; g_ms_second = 400;
+        unlink_lat();
+        cmd_failover(NULL, 0);
+        active_dev(dev, sizeof(dev));
+        check("замер: ради выигрыша больше допуска уходим", !strcmp(dev, "vpref"), 1);
+
+        /* Здоровье СТАРШЕ замера: самый быстрый, но мёртвый, не выбирается. */
+        g_ms_first = 5; g_ms_second = 300;
+        g_h_first = 0; g_h_second = 1;
+        unlink_lat();
+        cmd_failover(NULL, 0);
+        active_dev(dev, sizeof(dev));
+        check("замер: мёртвый быстрый не выбирается", !strcmp(dev, "vspare"), 1);
+        g_h_first = 1;
+
+        /* Ни одного замера — режим молча становится прежним, по порядку. Ровно так выглядит
+         * выход kind=xsteer, который не меряется никогда. */
+        g_ms_first = -1; g_ms_second = -1;
+        unlink_lat();
+        cmd_failover(NULL, 0);
+        active_dev(dev, sizeof(dev));
+        check("замер: без замеров выбор по порядку", !strcmp(dev, "vpref"), 1);
+
+        g_out[0].prefer_latency = 0;
+        g_ms_first = 500; g_ms_second = 5;
+        unlink_lat();
+        cmd_failover(NULL, 0);
+        active_dev(dev, sizeof(dev));
+        check("без режима замер не влияет", !strcmp(dev, "vpref"), 1);
+
+        g_latency_probe = NULL;
+        g_health_probe = NULL;
     }
 
     printf("OK\n");

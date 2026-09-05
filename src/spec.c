@@ -513,6 +513,33 @@ static void parse_outputs(struct js *j) {
                 else if (!strcmp(m, "zapret")) o.on_fail = FAIL_ZAPRET;
                 else die("outputs.%s: unknown on_fail (want drop, direct or zapret)", o.name);
             }
+            /* Вторая ось сторожа. Значение по умолчанию — `order`, то есть сегодняшнее
+             * поведение; см. рассуждение у поля prefer_latency в spec.h. */
+            else if (!strcmp(key, "prefer")) {
+                char m[16];
+                js_str(j, m, sizeof(m));
+                if (!strcmp(m, "latency")) o.prefer_latency = 1;
+                else if (strcmp(m, "order") != 0)
+                    die("outputs.%s: unknown prefer (want order or latency)", o.name);
+            }
+            else if (!strcmp(key, "latency_tolerance_ms")) {
+                long v = js_num(j);
+                /* Ноль законен и означает «переключаться на любое улучшение». Отрицательное
+                 * — нет: оно означало бы «переключаться на ухудшение», и это не настройка, а
+                 * опечатка, которую надо назвать. */
+                if (v < 0 || v > 60000)
+                    die("outputs.%s: latency_tolerance_ms — от 0 до 60000", o.name);
+                o.lat_tolerance_ms = (int)v;
+            }
+            else if (!strcmp(key, "latency_interval_s")) {
+                long v = js_num(j);
+                /* Нижний предел не косметика: замер опрашивает ВСЕХ кандидатов, и интервал
+                 * короче тика сторожа означал бы замер на каждом тике — то есть таймаут за
+                 * каждого мёртвого кандидата каждую минуту. */
+                if (v < 30 || v > 86400)
+                    die("outputs.%s: latency_interval_s — от 30 до 86400", o.name);
+                o.lat_interval_s = (int)v;
+            }
             else js_skip(j);
             js_ws(j);
             if (*j->p == ',') { j->p++; js_ws(j); }

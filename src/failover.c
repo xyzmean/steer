@@ -99,7 +99,18 @@ static int device_present(const char *dev) {
  * SO_BINDTODEVICE привязывает сокет именно к этому устройству, не полагаясь на метки и
  * таблицы маршрутизации: проба обязана идти тем путём, который мы проверяем. Неблокирующий
  * connect с poll — чтобы на чёрной дыре не стоять дольше таймаута. */
-static int tcp_reachable(const char *dev, const char *host, int port, int timeout_s) {
+/* ЧЕТВЁРТЫЙ АРГУМЕНТ — задержка в миллисекундах, необязателен (NULL — не мерить).
+ *
+ * Мера берётся ЗДЕСЬ, а не рядом с вызовом: интересует время до установления соединения, а
+ * не время работы функции. На неудачном кандидате разница между ними — целый таймаут.
+ *
+ * CLOCK_MONOTONIC, а не время суток: подводка часов ntpd на только что поднявшемся роутере —
+ * обычное дело, и замер по стенным часам дал бы отрицательную задержку. */
+static int tcp_reachable(const char *dev, const char *host, int port, int timeout_s,
+                         int *out_ms) {
+    if (out_ms) *out_ms = -1;
+    struct timespec t0;
+    clock_gettime(CLOCK_MONOTONIC, &t0);
     struct in_addr a;
     if (inet_aton(host, &a) == 0) return 0;
     int fd = socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
@@ -122,6 +133,14 @@ static int tcp_reachable(const char *dev, const char *host, int port, int timeou
         }
     }
     close(fd);
+    if (ok && out_ms) {
+        struct timespec t1;
+        clock_gettime(CLOCK_MONOTONIC, &t1);
+        long ms = (t1.tv_sec - t0.tv_sec) * 1000 + (t1.tv_nsec - t0.tv_nsec) / 1000000;
+        if (ms < 0) ms = 0;
+        if (ms > 1000000) ms = 1000000;
+        *out_ms = (int)ms;
+    }
     return ok;
 }
 
@@ -179,6 +198,40 @@ static int device_healthy(const char *dev) {
 #define TCP_PROBE_PORT 80
 #define TCP_PROBE_TIMEOUT 4
 
+/* Шов замера — симметрично шву здоровья и по той же причине: стенду нужно задавать
+ * задержки кандидатов, не поднимая сокетов. В бою указатель NULL и меряет device_latency. */
+static int (*g_latency_probe)(const struct output *, const char *);
+
+/* ЗАДЕРЖКА КАНДИДАТА в миллисекундах, -1 — не измерилась.
+ *
+ * Меряется соединением TCP через само устройство (SO_BINDTODEVICE) к PROBE_TARGETS — тем же
+ * механизмом, которым уже проверяется здоровье выхода kind=vless. Не ping'ом: тот идёт через
+ * временное правило ip rule, и время его установки и снятия перекрыло бы измеряемое. И не
+ * своим протоколом: время до установления соединения — ровно то, что меряет urltest у
+ * sing-box запросом на generate_204.
+ *
+ * Берётся ЛУЧШИЙ из целей, а не первый ответивший: цели в разных сетях, и «первая ответила
+ * за 300 мс» на канале, где вторая отвечает за 20, — это не задержка канала.
+ *
+ * xsteer не меряется НИКОГДА, и это то же решение, что у его здоровья: PROBE_TARGETS — это
+ * проверка интернета У ХАБА, а хаб полной звезды имеет право маршрутизировать только между
+ * пирами. Замер дал бы -1 на исправном туннеле, то есть выбросил бы его из сравнения.
+ * Возврат -1 честнее: вызывающий на нём откатывается к порядку. */
+static int device_latency(const struct output *o, const char *dev) {
+    if (g_latency_probe) return g_latency_probe(o, dev);
+    if (!device_present(dev)) return -1;
+    o = out_for_device(o, dev);
+    if (o->kind == OUT_XSTEER) return -1;
+    int best = -1;
+    for (int i = 0; PROBE_TARGETS[i]; i++) {
+        int ms = -1;
+        if (tcp_reachable(dev, PROBE_TARGETS[i], TCP_PROBE_PORT, TCP_PROBE_TIMEOUT, &ms) &&
+            ms >= 0 && (best < 0 || ms < best))
+            best = ms;
+    }
+    return best;
+}
+
 /* Владелец устройства. Объяснение — у объявления в spec.h; там же сказано, почему функция
  * объявлена рядом со спекой, а живёт здесь (тот же случай, что bind_device). */
 const struct output *device_owner(const char *dev) {
@@ -230,7 +283,7 @@ static int device_healthy_for(const struct output *o, const char *dev) {
     if (o->kind == OUT_XSTEER) return 1;
     if (o->kind == OUT_VLESS) {
         for (int i = 0; PROBE_TARGETS[i]; i++)
-            if (tcp_reachable(dev, PROBE_TARGETS[i], TCP_PROBE_PORT, TCP_PROBE_TIMEOUT))
+            if (tcp_reachable(dev, PROBE_TARGETS[i], TCP_PROBE_PORT, TCP_PROBE_TIMEOUT, NULL))
                 return 1;
         return 0;
     }
@@ -755,6 +808,67 @@ static void failover_hyst_reset_for_test(void) { g_hyst_cache = -2; }
  * счётчик уедет в имя следующего выхода. Старый файл без счётчика читается как ноль. */
 static int g_streak[MAX_OUTPUTS];
 
+/* ---- состояние замеров задержки -----------------------------------------------------
+ *
+ * ОТДЕЛЬНЫМ ФАЙЛОМ, а не четвёртым полем в `active`. Тот читается fscanf по трём полям, и у
+ * него уже есть оговорка про запись без третьего поля; четвёртое означало бы правку формата,
+ * который пишут и читают в трёх местах. Отдельный файл вдобавок необязателен сам по себе:
+ * нет его — значит не мерили, и это законное начальное состояние.
+ *
+ * Строка: `выход устройство мс отметка`. Отметка — CLOCK_MONOTONIC в секундах, то есть время
+ * с загрузки: по стенным часам сравнивать нельзя, ntpd на только что поднявшемся роутере
+ * подводит их на годы, и любой замер выглядел бы свежим или древним. Цена — перезагрузка
+ * обнуляет отсчёт и первый тик после неё меряет заново, что и правильно. */
+#define LAT_TOLERANCE_MS 50
+#define LAT_INTERVAL_S   180
+
+static void lat_path(char *buf, size_t n) {
+    snprintf(buf, n, "%s/latency", g_state_dir);
+}
+
+static long mono_now(void) {
+    struct timespec t;
+    clock_gettime(CLOCK_MONOTONIC, &t);
+    return (long)t.tv_sec;
+}
+
+static int lat_get(const char *out, const char *dev, int *ms, long *age) {
+    char path[256];
+    lat_path(path, sizeof(path));
+    FILE *f = fopen(path, "r");
+    if (!f) return 0;
+    char o[32], d[32];
+    int v = 0; long at = 0, found = 0;
+    while (fscanf(f, "%31s %31s %d %ld", o, d, &v, &at) == 4)
+        if (!strcmp(o, out) && !strcmp(d, dev)) { *ms = v; *age = mono_now() - at; found = 1; }
+    fclose(f);
+    return (int)found;
+}
+
+/* Записать замеры выхода, оставив записи остальных на месте. Через временный файл и rename:
+ * обрыв на середине оставил бы половину строк, а половина замеров ХУЖЕ их отсутствия — по
+ * ней сторож переключился бы на кандидата, чей замер уцелел. */
+static void lat_put(const char *out, char devs[][32], int *ms, size_t n) {
+    char path[256], tmp[288];
+    lat_path(path, sizeof(path));
+    snprintf(tmp, sizeof(tmp), "%s.tmp", path);
+    FILE *old = fopen(path, "r");
+    FILE *f = fopen(tmp, "w");
+    if (!f) { if (old) fclose(old); return; }
+    if (old) {
+        char o[32], d[32];
+        int v; long at;
+        while (fscanf(old, "%31s %31s %d %ld", o, d, &v, &at) == 4)
+            if (strcmp(o, out) != 0) fprintf(f, "%s %s %d %ld\n", o, d, v, at);
+        fclose(old);
+    }
+    long now = mono_now();
+    for (size_t k = 0; k < n; k++)
+        if (ms[k] >= 0) fprintf(f, "%s %s %d %ld\n", out, devs[k], ms[k], now);
+    fclose(f);
+    if (rename(tmp, path) != 0) unlink(tmp);
+}
+
 static int active_streak_get(const char *out) {
     char path[256];
     active_path(path, sizeof(path));
@@ -1006,7 +1120,79 @@ int cmd_failover(const char *spec, int verbose) {
         const char *chosen = NULL;
         int streak = active_streak_get(o->name);
         int new_streak = 0;
-        if (first_h >= 0) {
+
+        /* ---- ВЫБОР ПО ЗАМЕРУ, если выход этого просит --------------------------------
+         *
+         * Работает НЕ на каждом тике, и это главное в устройстве. Выше сторож нарочно
+         * останавливается на первом здоровом: пробить пробой каждого мёртвого запаса стоит
+         * таймаут, и на восьми кандидатах это двадцать секунд на тик. Замер же требует
+         * опросить ВСЕХ — иначе сравнивать не с чем. Поэтому у него свой, длинный интервал
+         * (умолчание 180 с против тика в 60), а между замерами выход ведёт себя как прежде,
+         * то есть по порядку предпочтения.
+         *
+         * Допуск (умолчание 50 мс) — гистерезис в единицах самого замера. Без него сторож
+         * менял бы устройство на каждом дрожании в пару миллисекунд, а смена устройства
+         * здесь это смена выходного адреса и обрыв соединений через прежнее.
+         *
+         * Оба числа взяты у sing-box (interval 3m, tolerance 50), где эта задача решена
+         * давно и проверена на несравнимо большем числе установок, чем наша.
+         *
+         * Порядок предпочтения человека НЕ отменяется, а становится решающим при равенстве:
+         * кандидат, чей замер не хуже лучшего на допуск, считается равным, и из таких
+         * берётся самый предпочтительный. Иначе включение режима означало бы «мой список
+         * больше ничего не значит». */
+        if (o->prefer_latency && first_h >= 0 && o->devices_n > 1) {
+            int tol = o->lat_tolerance_ms > 0 ? o->lat_tolerance_ms : LAT_TOLERANCE_MS;
+            long iv  = o->lat_interval_s  > 0 ? o->lat_interval_s  : LAT_INTERVAL_S;
+            int ms[MAX_DEVICES];
+            int have = 0, stale = 0;
+            for (size_t k = 0; k < o->devices_n; k++) {
+                long age = 0;
+                ms[k] = -1;
+                if (lat_get(o->name, o->devices[k], &ms[k], &age)) {
+                    if (age > iv || age < 0) stale = 1;
+                } else stale = 1;
+            }
+            if (stale) {
+                /* Меряем ВСЕХ, включая тех, что ниже first_h: смысл режима ровно в том,
+                 * чтобы узнать про них. */
+                for (size_t k = 0; k < o->devices_n; k++)
+                    ms[k] = device_latency(o, o->devices[k]);
+                lat_put(o->name, o->devices, ms, o->devices_n);
+            }
+            for (size_t k = 0; k < o->devices_n; k++) if (ms[k] >= 0) have++;
+            if (have > 0) {
+                int best = -1;
+                for (size_t k = 0; k < o->devices_n; k++)
+                    if (ms[k] >= 0 && (best < 0 || ms[k] < best)) best = ms[k];
+                int pick = -1;
+                for (size_t k = 0; k < o->devices_n; k++)
+                    if (ms[k] >= 0 && ms[k] - best <= tol) { pick = (int)k; break; }
+                if (pick >= 0) {
+                    /* Уходить с ЖИВОГО текущего только если выигрыш больше допуска. Мёртвое
+                     * текущее уступает сразу: здоровье старше замера. */
+                    if (cur >= 0 && cur != pick && ms[cur] >= 0 &&
+                        health_of(o, o->devices[cur]) && ms[cur] - ms[pick] <= tol)
+                        pick = cur;
+                    if (!health_of(o, o->devices[pick])) pick = -1;
+                }
+                if (pick >= 0) {
+                    chosen = o->devices[pick];
+                    if (verbose)
+                        fprintf(stderr, LOG_I "%s: по замеру выбран %s (%d мс, лучший %d, "
+                                        "допуск %d)\n",
+                                o->name, o->devices[pick], ms[pick], best, tol);
+                }
+            } else if (verbose) {
+                /* Ни один замер не удался — режим молча становится прежним. Сказать надо:
+                 * иначе человек думает, что выбор идёт по задержке, а он идёт по списку.
+                 * Так бывает у выхода kind=xsteer, который не меряется никогда. */
+                fprintf(stderr, LOG_W "%s: задержку измерить не удалось ни у одного "
+                                "устройства — выбираю по порядку\n", o->name);
+            }
+        }
+
+        if (!chosen && first_h >= 0) {
             if (cur > first_h) {
                 /* Трафик сейчас на менее предпочтительном устройстве, а более
                  * предпочтительное ожило. Уходить с текущего, если оно ещё живо, спешить
