@@ -31,6 +31,7 @@
 #include "spec.h"
 #include "obfs.h"
 #include "cli.h"
+#include "srs.h"
 
 /* Уровень в журнале — см. одноимённые макросы в failover.c и obfs.c. Метка подсистемы
  * здесь «apply»: все строки ниже пишутся при компиляции и применении спеки. Отказы
@@ -2817,6 +2818,7 @@ int main(int argc, char **argv) {
     if (!strcmp(cmd, "sub-fetch")) return cmd_sub_fetch(arg, a.out_file, a.info_file);
     if (!strcmp(cmd, "sub-quota")) return cmd_sub_quota(arg, a.info_file);
     if (!strcmp(cmd, "sub-hwid")) return cmd_sub_hwid();
+    if (!strcmp(cmd, "srs-read")) return srs_dump(arg, a.out_file, a.prefixes_out);
     if (!strcmp(cmd, "obfs")) {
         load_spec(spec);
         struct output *o = out_by_name(arg);

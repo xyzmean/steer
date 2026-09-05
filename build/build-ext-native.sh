@@ -133,6 +133,7 @@ esac
     -o "$OUT" \
     "$SRC"/src/steer.c "$SRC"/src/spec.c "$SRC"/src/dnsd.c "$SRC"/src/failover.c \
     "$SRC"/src/aggregate.c "$SRC"/src/obfs.c "$SRC"/src/cli.c \
+    "$SRC"/src/srs.c "$SRC"/src/puff.c \
     $EXT -L"$WORK" -lmbedcrypto -lpthread
 
 printf '%s: %s байт\n' "$OUT" "$(stat -c %s "$OUT")"

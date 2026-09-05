@@ -21,10 +21,11 @@ DEFS    := -DSTEER_VERSION='"$(VERSION)"' $(if $(REV),-DSTEER_REV='"$(REV)"',)
 all: $(BUILD)/steer
 
 $(BUILD)/steer: src/steer.c src/spec.c src/dnsd.c src/failover.c src/aggregate.c \
-                src/obfs.c src/cli.c src/spec.h src/obfs.h src/cli.h VERSION
+                src/obfs.c src/cli.c src/srs.c src/puff.c src/spec.h src/obfs.h \
+                src/cli.h src/srs.h src/puff.h VERSION
 	@mkdir -p $(BUILD)
 	$(CC) $(CFLAGS) $(DEFS) -o $@ src/steer.c src/spec.c src/dnsd.c src/failover.c \
-	      src/aggregate.c src/obfs.c src/cli.c
+	      src/aggregate.c src/obfs.c src/cli.c src/srs.c src/puff.c
 
 test: all ext-syntax $(BUILD)/dnsmatch $(BUILD)/specmatch $(BUILD)/specmatch-ext $(BUILD)/xswirematch $(BUILD)/xsconnmatch $(BUILD)/xsstreammatch $(BUILD)/tungromatch $(BUILD)/tunnamematch $(BUILD)/xsconfmatch $(BUILD)/xslinkmatch $(BUILD)/xsroutematch $(BUILD)/chellomatch $(BUILD)/failovermatch $(BUILD)/dcmatch $(BUILD)/msgsplitmatch $(BUILD)/h2match $(BUILD)/submatch $(BUILD)/subfetchmatch $(BUILD)/fwmatch $(BUILD)/obfsmatch $(BUILD)/visionmatch $(BUILD)/diagsim
 	@sh tests/run.sh
@@ -34,6 +35,7 @@ test: all ext-syntax $(BUILD)/dnsmatch $(BUILD)/specmatch $(BUILD)/specmatch-ext
 	@sh tests/diagmatch.sh
 	@sh tests/statusmatch.sh
 	@sh tests/buildmatch.sh
+	@sh tests/srsmatch.sh
 	@sh tests/vpsfetch.sh
 	@$(BUILD)/dnsmatch
 	@$(BUILD)/specmatch
@@ -62,10 +64,12 @@ test: all ext-syntax $(BUILD)/dnsmatch $(BUILD)/specmatch $(BUILD)/specmatch-ext
 # проверять диагностику интереснее всего именно на VLESS-выходе. Три подкоманды
 # расширенной сборки заменены заглушками — см. tests/vless-stub.c.
 $(BUILD)/diagsim: src/steer.c src/spec.c src/dnsd.c src/failover.c src/aggregate.c \
-                  src/obfs.c src/cli.c src/spec.h src/cli.h tests/vless-stub.c
+                  src/obfs.c src/cli.c src/srs.c src/puff.c src/spec.h src/cli.h \
+                  src/srs.h src/puff.h tests/vless-stub.c
 	@mkdir -p $(BUILD)
 	$(CC) $(CFLAGS) $(DEFS) -DSTEER_EXTENDED -o $@ src/steer.c src/spec.c src/dnsd.c \
-	      src/failover.c src/aggregate.c src/obfs.c src/cli.c tests/vless-stub.c
+	      src/failover.c src/aggregate.c src/obfs.c src/cli.c src/srs.c src/puff.c \
+	      tests/vless-stub.c
 
 # Синтаксическая проверка расширенного движка (R-014/I-024). Полная сборка src/ext идёт
 # только в build.sh через docker с mbedtls, поэтому локальный make test оставался зелёным,
@@ -140,10 +144,11 @@ $(BUILD)/failovermatch: tests/failovermatch.c src/failover.c
 # nft, и проверить эвристику можно только примерами. Стенд включает исходник движка и
 # подменяет popen на чтение из памяти — см. tests/fwmatch.c.
 $(BUILD)/fwmatch: tests/fwmatch.c src/steer.c src/spec.c src/dnsd.c src/failover.c \
-                  src/aggregate.c src/obfs.c src/cli.c src/spec.h src/cli.h
+                  src/aggregate.c src/obfs.c src/cli.c src/srs.c src/puff.c \
+                  src/spec.h src/cli.h src/srs.h
 	@mkdir -p $(BUILD)
 	$(CC) $(CFLAGS) -o $@ tests/fwmatch.c src/spec.c src/dnsd.c src/failover.c \
-	      src/aggregate.c src/obfs.c src/cli.c
+	      src/aggregate.c src/obfs.c src/cli.c src/srs.c src/puff.c
 
 # Управление потоком HTTP/2 проверяется в памяти: h2.c общается с сетью только через
 # struct h2_io, поэтому стенд подменяет его целиком. -Itests/stub нужен, чтобы не тянуть
