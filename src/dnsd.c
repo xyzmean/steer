@@ -344,6 +344,12 @@ static int load_rules_into(const char *path, struct ruleset *rs) {
     char line[512];
     while (fgets(line, sizeof(line), f)) {
         if (!clean_line(line)) continue;
+        /* Адресные строки — не наши: их из этого же файла возьмёт компилятор набора правил
+         * (emit_elements). Пропуск обязателен, а не косметичен: без него `8.8.8.0/24` стал
+         * бы доменным правилом RULE_NAMESPACE для имени «8.8.8.0/24», то есть правилом,
+         * которое не совпадёт ни с одним запросом и займёт место в индексе. На списке из
+         * девятнадцати тысяч префиксов таких правил было бы девятнадцать тысяч. */
+        if (spec_line_is_addr(line)) continue;
         ruleset_add(rs, line);
     }
     fclose(f);
@@ -2149,8 +2155,23 @@ int dnsd_main(int argc, char **argv) {
      * names here ARE the sets it generated. Domain channels that share an output, the
      * same clients and the same mode are one set — which is why this groups by
      * (out, realip) rather than walking channels one by one. */
+    /* ГИБРИДНЫЕ СПИСКИ: канал попадает сюда и по адресным файлам тоже.
+     *
+     * Прежде здесь стоял пропуск канала без `domains_files`, и это был не гейт по цене, а
+     * решение о смысле: доменность канала определялась ИМЕНЕМ КЛЮЧА в спеке. Из этого
+     * следовало, что человек выбирает не сервис, а вид списка — тот самый довод, по
+     * которому в spec.c уже снят запрет на адреса и домены в одном правиле.
+     *
+     * Теперь оба массива читаются одинаково, а кому какая СТРОКА принадлежит, решает
+     * spec_line_is_addr на месте чтения: адресные строки берёт компилятор набора, доменные
+     * — резолвер. Один файл может содержать и то и другое, и «движок сам разберётся»
+     * означает буквально это.
+     *
+     * Разбирается он, впрочем, не в один механизм, а в два: `8.8.8.0/24` ляжет в набор
+     * настоящим префиксом, а `youtube.com` — поддельным адресом плюс правилом DNAT. Набор
+     * с `flags interval,timeout` держит и то и то (проверено опытом, см. spec.c). */
     for (size_t i = 0; i < g_ch_n; i++) {
-        if (!g_ch[i].domains_n) continue;
+        if (!g_ch[i].domains_n && !g_ch[i].prefixes_n) continue;
         char set[64];
         /* Имя считает ОБЩАЯ функция, та же, что у компилятора: своя формула здесь была
          * `%.24s_dom` и не знала ни про список клиентов, ни про режим, поэтому доменные
@@ -2171,6 +2192,11 @@ int dnsd_main(int argc, char **argv) {
         }
         for (size_t f = 0; f < g_ch[i].domains_n && g_dch[k].rules_n < MAX_FILES; f++)
             g_dch[k].rules_path[g_dch[k].rules_n++] = g_ch[i].domains_files[f];
+        /* Адресные файлы того же канала — сюда же: доменные строки в них есть у половины
+         * категорий издателя (список «Хостинги и CDN» лежит в адресных и целиком состоит
+         * из имён), и раньше они пропадали с предупреждением. */
+        for (size_t f = 0; f < g_ch[i].prefixes_n && g_dch[k].rules_n < MAX_FILES; f++)
+            g_dch[k].rules_path[g_dch[k].rules_n++] = g_ch[i].prefixes_files[f];
     }
     if (!g_dch_n) {
         fprintf(stderr, "steer dnsd: no channel in %s matches domains — nothing to do\n", spec);
