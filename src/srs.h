@@ -19,6 +19,11 @@
  * ненулевых случаях причина печатается в stderr, и напечатанное на stdout НЕ годится
  * к применению: половина набора — это не набор.
  */
-int srs_dump(const char *path, const char *dom_path, const char *pfx_path);
+/* `meta_path` — третий выход: сужение канала по протоколу и портам (`proto=`, `ports=`),
+ * если набор его несёт. NULL означает «не нужно», и тогда набор С СУЖЕНИЕМ отвергается
+ * кодом 2: отдать его подсети, потеряв «только udp 50000-65535», значит увести в туннель
+ * весь TCP к 104.16.0.0/12 — молча. */
+int srs_dump(const char *path, const char *dom_path, const char *pfx_path,
+             const char *meta_path);
 
 #endif

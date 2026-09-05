@@ -65,6 +65,7 @@ static const struct cli_flag FLAGS[] = {
                                         "движок только открывает его"},
     {"--out",       NULL, "ФАЙЛ",       "куда положить скачанное"},
     {"--prefixes-out", NULL, "ФАЙЛ",   "куда положить подсети (srs-read)"},
+    {"--meta-out",  NULL, "ФАЙЛ",       "куда положить сужение по протоколу и портам (srs-read)"},
     {"--info",      NULL, "ФАЙЛ",       "где держать остаток трафика подписки "
                                         "(по умолчанию рядом с ней)"},
     {"--stream",     NULL, NULL,        "вести записи по НАСТОЯЩЕМУ TCP вместо поддельного: "
@@ -262,7 +263,7 @@ static const struct cli_cmd CMDS[] = {
  "он описывает не домены, а подсеть Cloudflare с ограничением по протоколу и портам, а\n"
  "у канала в спеке нет ни того измерения, ни другого. Взять его подсети и отбросить\n"
  "порты значило бы увести в туннель весь TCP к 104.16.0.0/12 — молча.",
- "--out --prefixes-out", 1, 0, 0, 0, 0},
+ "--out --prefixes-out --meta-out", 1, 0, 0, 0, 0},
 
 {"sub-quota", "VLESS", "<ссылка>",
  "спросить у панели остаток трафика, не подменяя подписку",
@@ -672,6 +673,7 @@ void cli_parse(const struct cli_cmd *cmd, int argc, char **argv, int from,
         else if (!strcmp(f->name, "--device"))     out->device = val;
         else if (!strcmp(f->name, "--out"))        out->out_file = val;
         else if (!strcmp(f->name, "--prefixes-out")) out->prefixes_out = val;
+        else if (!strcmp(f->name, "--meta-out")) out->meta_out = val;
         else if (!strcmp(f->name, "--info"))       out->info_file = val;
         else if (!strcmp(f->name, "--dry-run"))    out->dry_run = 1;
         else if (!strcmp(f->name, "--verbose"))    out->verbose = 1;

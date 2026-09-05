@@ -50,14 +50,26 @@
  * запись даёт две строки списка, и они не противоречат друг другу — `=x.com` плюс `*.x.com`
  * это ровно то же множество имён, что `x.com`.
  *
- * ЧЕГО МЫ ВЫРАЗИТЬ НЕ МОЖЕМ — и почему тогда отказываемся целиком. У канала в спеке есть
- * `prefixes_files`, `domains_files`, `from` и `any`; ни протокола, ни портов среди них нет
- * (spec.h). А `discord.srs` — единственный файл без доменов вовсе: `network: udp` плюс
- * `ip_cidr 104.16.0.0/12` плюс `port_range 50000:65535, 19000:20000`. Взять его подсети и
- * отбросить порты нельзя: 104.16.0.0/12 это Cloudflare, и весь TCP к нему уехал бы в туннель
- * молча. Поэтому такой набор мы не «читаем как можем», а отвергаем с кодом 2 и внятной
- * строкой: пусть управляющий слой возьмёт Discord из плоского списка подсетей, где портов
- * нет и не подразумевается.
+ * ПРОТОКОЛ И ПОРТЫ — ТРЕТИЙ ВЫХОД, а не отказ. `discord.srs` — единственный файл этого
+ * издателя без доменов вовсе: `network: udp` плюс `ip_cidr 104.16.0.0/12` плюс
+ * `port_range 50000:65535, 19000:20000`. Взять его подсети и отбросить порты нельзя:
+ * 104.16.0.0/12 это Cloudflare, и весь TCP к нему уехал бы в туннель молча.
+ *
+ * До схемы 2 у канала не было ни протокола, ни портов, и такой набор отвергался целиком с
+ * кодом 2 — «понят, но не выразим». Теперь измерение есть (`proto` и `ports` в match, см.
+ * spec.h), поэтому сужение НЕ выбрасывается и не остаётся догадкой управляющего слоя: оно
+ * печатается третьим потоком (`--meta-out`) в виде `proto=` и `ports=`, готовом к переносу
+ * в канал.
+ *
+ * ПОЧЕМУ ОТДЕЛЬНЫМ ПОТОКОМ, а не строкой в списке. Список читают dnsd и компилятор набора
+ * правил, и обоим `proto=udp` — мусор: первый сочтёт это доменным правилом, второй
+ * пропустит как не-адрес. Сужение принадлежит КАНАЛУ, а не списку: один и тот же список
+ * подсетей может быть подключён к каналу с портами и к каналу без них.
+ *
+ * ЧЕГО МЫ ВЫРАЗИТЬ ПО-ПРЕЖНЕМУ НЕ МОЖЕМ (и отвергаем целиком, кодом 2): правило с
+ * `invert` (список исключений у нас не выражается), `source_ip_cidr` (это `from` канала, а
+ * не назначение), логические правила «и»/«или», и всё, что про процессы, пакеты и Wi-Fi.
+ * Половина набора — это не набор, поэтому такие файлы не «читаются как можем».
  */
 #include <stdio.h>
 #include <stdlib.h>
@@ -377,12 +389,100 @@ static int emit_string_list(struct rd *r, FILE *out, const char *prefix, const c
 
 /* ---- правила ------------------------------------------------------------------------ */
 
+#define MAX_META_PORTS 32
+#define META_PORT_LEN  16
+
 struct ctx {
-    FILE *dom, *pfx;
+    FILE *dom, *pfx, *meta;
     int unsupported;        /* встретилось выразимое, но не выражаемое у нас */
     const char *why;        /* чем именно */
     int saw_v6;
+    /* Сужение канала: протокол и порты назначения. Копится ЗДЕСЬ, а не печатается на месте,
+     * потому что набор может нести и то и другое разными элементами, а вывести надо две
+     * строки, а не четыре. */
+    int have_tcp, have_udp;
+    char ports[MAX_META_PORTS][META_PORT_LEN];
+    size_t ports_n;
+    int ports_over;         /* портов больше, чем мы берём — это отказ, а не усечение */
 };
+
+/* Добавить один порт или диапазон в нашей записи. Повторы отбрасываются: у sing-box один и
+ * тот же диапазон встречается в двух элементах, а nft на дубле в множестве отвергает весь
+ * набор правил. */
+static void meta_port_add(struct ctx *c, const char *s) {
+    if (c->ports_over) return;
+    for (size_t i = 0; i < c->ports_n; i++)
+        if (!strcmp(c->ports[i], s)) return;
+    if (c->ports_n >= MAX_META_PORTS) { c->ports_over = 1; return; }
+    snprintf(c->ports[c->ports_n], META_PORT_LEN, "%s", s);
+    c->ports_n++;
+}
+
+/* `network`: строки «tcp» и «udp». Что-то третье — отказ: транспорт, которого мы не знаем,
+ * нельзя ни выразить, ни отбросить (отбросив, мы расширили бы совпадение). */
+static int collect_network(struct rd *r, struct ctx *c) {
+    uint64_t n = rd_uvarint(r);
+    if (r->err || n > 64) { r->err = 1; return -1; }
+    for (uint64_t i = 0; i < n; i++) {
+        uint64_t l = rd_uvarint(r);
+        const unsigned char *q = rd_take(r, (size_t)l);
+        if (!q) return -1;
+        if (l == 3 && !memcmp(q, "tcp", 3)) c->have_tcp = 1;
+        else if (l == 3 && !memcmp(q, "udp", 3)) c->have_udp = 1;
+        else if (!c->unsupported) {
+            c->unsupported = 1;
+            c->why = "network: транспорт не tcp и не udp";
+        }
+    }
+    return 0;
+}
+
+/* `port_range`: строки вида «50000:65535» у sing-box. Переводим в нашу запись через тире —
+ * ту же, которой у нас записан диапазон адресов. Одиночное число тоже законно. */
+static int collect_port_range(struct rd *r, struct ctx *c) {
+    uint64_t n = rd_uvarint(r);
+    if (r->err || n > 10000u) { r->err = 1; return -1; }
+    for (uint64_t i = 0; i < n; i++) {
+        uint64_t l = rd_uvarint(r);
+        const unsigned char *q = rd_take(r, (size_t)l);
+        if (!q) return -1;
+        char buf[META_PORT_LEN];
+        if (l >= sizeof(buf)) {
+            if (!c->unsupported) { c->unsupported = 1; c->why = "port_range: запись длиннее нашей"; }
+            continue;
+        }
+        size_t w = 0;
+        for (size_t k = 0; k < (size_t)l && w + 1 < sizeof(buf); k++)
+            buf[w++] = q[k] == ':' ? '-' : (char)q[k];
+        buf[w] = '\0';
+        /* Открытые с одной стороны диапазоны sing-box пишет как «:1000» или «1000:». У нас
+         * такой записи нет, и додумывать границу нельзя: «1000-» это либо один порт, либо
+         * все до 65535, и разница — весь остальной трафик. */
+        if (w == 0 || buf[0] == '-' || buf[w - 1] == '-') {
+            if (!c->unsupported) {
+                c->unsupported = 1;
+                c->why = "port_range: диапазон открыт с одной стороны, границу додумывать нельзя";
+            }
+            continue;
+        }
+        meta_port_add(c, buf);
+    }
+    return 0;
+}
+
+/* `port`: одиночные порты числами по два байта. */
+static int collect_ports(struct rd *r, struct ctx *c) {
+    uint64_t n = rd_uvarint(r);
+    if (r->err || n > 10000u) { r->err = 1; return -1; }
+    for (uint64_t i = 0; i < n; i++) {
+        const unsigned char *q = rd_take(r, 2);
+        if (!q) return -1;
+        char buf[META_PORT_LEN];
+        snprintf(buf, sizeof(buf), "%u", (unsigned)((q[0] << 8) | q[1]));
+        meta_port_add(c, buf);
+    }
+    return 0;
+}
 
 static int read_rule(struct rd *r, struct ctx *c, int depth);
 
@@ -423,26 +523,49 @@ static int read_default_rule(struct rd *r, struct ctx *c) {
                     c->why = "source_ip_cidr: набор описывает клиентов, а не назначение";
                 }
                 break;
-            case IT_NETWORK: case IT_PORT_RANGE: case IT_SOURCE_PORT_RANGE:
+            case IT_NETWORK:
+                /* `tcp`, `udp` или оба. Больше одного значения означает «оба», и наш
+                 * `both` — ровно это; третьего вида транспорта в наборах не встречается. */
+                if (collect_network(r, c) != 0) return -1;
+                break;
+            case IT_PORT_RANGE:
+                /* Форма у sing-box `50000:65535`, у нас `50000-65535`. Переводим ЗДЕСЬ,
+                 * при чтении чужого файла: спека не обязана знать чужую запись. */
+                if (collect_port_range(r, c) != 0) return -1;
+                break;
+            case IT_SOURCE_PORT_RANGE:
+                /* Порт ИСТОЧНИКА — это про клиента, а не про назначение, и у канала такого
+                 * измерения нет. Смешать с портом назначения нельзя: получился бы канал,
+                 * ловящий не то, что описано. */
+                if (skip_string_list(r) != 0) return -1;
+                if (!c->unsupported) {
+                    c->unsupported = 1;
+                    c->why = "source_port_range: набор сужен по порту клиента, а не назначения";
+                }
+                break;
             case IT_PROCESS_NAME: case IT_PROCESS_PATH: case IT_PACKAGE_NAME:
             case IT_WIFI_SSID: case IT_WIFI_BSSID: case IT_PROCESS_PATH_REGEX:
             case IT_NETWORK_TYPE: case IT_PACKAGE_NAME_REGEX:
                 if (skip_string_list(r) != 0) return -1;
                 if (!c->unsupported) {
                     c->unsupported = 1;
-                    c->why = (t == IT_NETWORK)    ? "network: у канала нет измерения «протокол»"
-                           : (t == IT_PORT_RANGE) ? "port_range: у канала нет измерения «порты»"
-                                                  : "правило про процесс, пакет или Wi-Fi";
+                    c->why = "правило про процесс, пакет или Wi-Fi";
                 }
                 break;
-            case IT_QUERY_TYPE: case IT_PORT: case IT_SOURCE_PORT: {
+            case IT_PORT: {
+                /* Одиночные порты — то же измерение, что диапазоны, только записанные
+                 * числами по два байта. В наш вид (`443`) переводятся здесь же. */
+                if (collect_ports(r, c) != 0) return -1;
+                break;
+            }
+            case IT_QUERY_TYPE: case IT_SOURCE_PORT: {
                 uint64_t n = rd_uvarint(r);
                 if (r->err || n > 10000000u) { r->err = 1; return -1; }
                 if (!rd_take(r, (size_t)n * 2)) return -1;
                 if (!c->unsupported) {
                     c->unsupported = 1;
                     c->why = (t == IT_QUERY_TYPE) ? "query_type: набор описывает вид DNS-запроса"
-                                                  : "port: у канала нет измерения «порты»";
+                                                  : "source_port: сужение по порту клиента";
                 }
                 break;
             }
@@ -525,7 +648,7 @@ static int read_rule(struct rd *r, struct ctx *c, int depth) {
 
 /* ---- вход --------------------------------------------------------------------------- */
 
-static int srs_dump_to(const char *path, FILE *dom, FILE *pfx) {
+static int srs_dump_to(const char *path, FILE *dom, FILE *pfx, FILE *meta) {
     FILE *f = fopen(path, "rb");
     if (!f) { fprintf(stderr, "steer: srs: не открылся %s\n", path); return 1; }
     if (fseek(f, 0, SEEK_END) != 0) { fclose(f); fprintf(stderr, "steer: srs: не файл\n"); return 1; }
@@ -592,7 +715,7 @@ static int srs_dump_to(const char *path, FILE *dom, FILE *pfx) {
     struct rd r = { body, body + got, 0 };
     struct ctx c;
     memset(&c, 0, sizeof(c));
-    c.dom = dom; c.pfx = pfx;
+    c.dom = dom; c.pfx = pfx; c.meta = meta;
 
     uint64_t nrules = rd_uvarint(&r);
     int bad = r.err || nrules > 100000u;
@@ -612,8 +735,34 @@ static int srs_dump_to(const char *path, FILE *dom, FILE *pfx) {
     if (c.saw_v6)
         fprintf(stderr, "steer[warn] srs: в наборе есть подсети IPv6 — они пропущены, "
                         "правила работают по IPv4\n");
+    if (c.ports_over && !c.unsupported) {
+        c.unsupported = 1;
+        c.why = "портов в наборе больше, чем канал может сузить";
+    }
     if (c.unsupported) {
         fprintf(stderr, "steer: srs: набор понят, но не выразим списком — %s\n", c.why);
+        return 2;
+    }
+    /* Сужение печатается ПОСЛЕ разбора и только целиком: элементы `network` и `port_range`
+     * идут в наборе врозь, и печатать их на месте значило бы отдать четыре строки вместо
+     * двух — а вызывающему нужен готовый к переносу в канал вид. */
+    if (c.meta) {
+        if (c.have_tcp && c.have_udp) fprintf(c.meta, "proto=both\n");
+        else if (c.have_tcp)          fprintf(c.meta, "proto=tcp\n");
+        else if (c.have_udp)          fprintf(c.meta, "proto=udp\n");
+        if (c.ports_n) {
+            fprintf(c.meta, "ports=");
+            for (size_t i = 0; i < c.ports_n; i++)
+                fprintf(c.meta, "%s%s", i ? "," : "", c.ports[i]);
+            fprintf(c.meta, "\n");
+        }
+    }
+    /* Сужение есть, а печатать его некуда — это ОТКАЗ, а не мелочь. Отдать подсети
+     * Cloudflare без «только udp 50000-65535» значит увести в туннель весь TCP к
+     * 104.16.0.0/12, и вызывающий об этом даже не узнает. */
+    if (!c.meta && (c.have_tcp || c.have_udp || c.ports_n)) {
+        fprintf(stderr, "steer: srs: набор сужен по протоколу или портам — нужен --meta-out, "
+                        "иначе сужение потеряется, а подсети уедут в туннель целиком\n");
         return 2;
     }
     return 0;
@@ -621,8 +770,9 @@ static int srs_dump_to(const char *path, FILE *dom, FILE *pfx) {
 
 /* Открыть оба выхода, разобрать, закрыть. Оба открываются ДО разбора: файл, который не
  * удалось создать, надо назвать раньше, чем половина набора уехала в другой. */
-int srs_dump(const char *path, const char *dom_path, const char *pfx_path) {
-    FILE *dom = stdout, *pfx = stdout;
+int srs_dump(const char *path, const char *dom_path, const char *pfx_path,
+             const char *meta_path) {
+    FILE *dom = stdout, *pfx = stdout, *meta = NULL;
     if (dom_path && !(dom = fopen(dom_path, "w"))) {
         fprintf(stderr, "steer: srs: не создался %s\n", dom_path);
         return 1;
@@ -632,7 +782,13 @@ int srs_dump(const char *path, const char *dom_path, const char *pfx_path) {
         if (dom != stdout) fclose(dom);
         return 1;
     }
-    int rc = srs_dump_to(path, dom, pfx);
+    if (meta_path && !(meta = fopen(meta_path, "w"))) {
+        fprintf(stderr, "steer: srs: не создался %s\n", meta_path);
+        if (dom != stdout) fclose(dom);
+        if (pfx != stdout && pfx != dom) fclose(pfx);
+        return 1;
+    }
+    int rc = srs_dump_to(path, dom, pfx, meta);
     /* Закрытие проверяется: на полном overlay ошибка приходит именно здесь, при сбросе
      * буфера, и «список записан» без этой проверки было бы неправдой. */
     if (dom != stdout && fclose(dom) != 0) {
@@ -641,6 +797,10 @@ int srs_dump(const char *path, const char *dom_path, const char *pfx_path) {
     }
     if (pfx != stdout && pfx != dom && fclose(pfx) != 0) {
         fprintf(stderr, "steer: srs: %s не записался до конца\n", pfx_path);
+        rc = rc ? rc : 1;
+    }
+    if (meta && fclose(meta) != 0) {
+        fprintf(stderr, "steer: srs: %s не записался до конца\n", meta_path);
         rc = rc ? rc : 1;
     }
     return rc;
