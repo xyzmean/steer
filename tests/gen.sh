@@ -42,7 +42,12 @@ out="$("$BIN" apply --dry-run --spec "$tmp/spec.json" $S)"
 # «сохраняются ли чужие биты»: слово метки общее с mwan3 (маска 0x3F00), pbr и sqm, и
 # перезапись выключала их политику молча, а чужая перезапись — нашу (I-135).
 check "метка ставится без затирания чужих бит" "1" \
-    "$(printf '%s\n' "$out" | grep -c 'meta mark set mark and 0xf00fffff or 0x00100000')"
+    "$(printf '%s\n' "$out" | grep -c 'meta mark set mark and 0xf00fffff or 0x40100000')"
+# В метке ДВА бита, и второй (0x40000000) чужой: им системный обход zapret узнаёт «этот
+# трафик не мой». Стоит он у всякого выхода, кроме direct — см. отдельный раздел ниже.
+# Маска при этом та же: 0xf00fffff это ~0x0ff00000, наши восемь бит и ничего больше.
+check "и вместе с ней стоит бит «не для общего обхода»" "1" \
+    "$(printf '%s\n' "$out" | grep -c 'or 0x40100000')"
 # Метка СОЕДИНЕНИЯ рядом с меткой пакета. Без неё запись conntrack не связана с выходом
 # вообще (в дампе mark=0), и сделать с уже установленным соединением нельзя ничего: ни
 # понять, каким выходом оно идёт, ни снять его при смене маршрута. Замер на роутере показал,
@@ -74,7 +79,7 @@ table inet steer {
     chain prerouting_mark {
         type filter hook prerouting priority mangle + 1; policy accept;
         ip saddr { 192.168.1.0/24 } ip daddr @direct_ip counter return comment "steer:direct_ip"
-        ip saddr { 192.168.1.0/24 } ip daddr @vpn_ip meta mark set mark and 0xf00fffff or 0x00100000 ct mark set mark counter return comment "steer:vpn_ip"
+        ip saddr { 192.168.1.0/24 } ip daddr @vpn_ip meta mark set mark and 0xf00fffff or 0x40100000 ct mark set mark counter return comment "steer:vpn_ip"
     }
 
     chain postrouting_down {
@@ -141,7 +146,7 @@ cat > "$tmp/bin/nft" <<'NFT'
 # Порядок нарочно обратный порядку каналов в спеке: перенос обязан идти по имени.
 case "$*" in
 *prerouting_mark*)
-    echo '  ip saddr { 192.168.1.0/24 } ip daddr @vpn_ip meta mark set meta mark & 0xf01fffff | 0x00100000 counter packets 7 bytes 700 return comment "steer:vpn_ip"'
+    echo '  ip saddr { 192.168.1.0/24 } ip daddr @vpn_ip meta mark set meta mark & 0xf01fffff | 0x40100000 counter packets 7 bytes 700 return comment "steer:vpn_ip"'
     echo '  ip saddr { 192.168.1.0/24 } ip daddr @direct_ip counter packets 3 bytes 300 return comment "steer:direct_ip"'
     ;;
 esac
@@ -482,6 +487,58 @@ check "any рядом со списком остаётся отдельным п
     "$(printf '%s\n' "$amout" | grep -c 'comment \"steer:vpn_all\"')"
 check "и это правило безусловное — набор оно не проверяет" "0" \
     "$(printf '%s\n' "$amout" | grep 'steer:vpn_all' | grep -c 'daddr @')"
+
+# ---- трафик в туннель общий обход не трогает ----------------------------------
+#
+# Бит ZAPRET_SKIP_MARK (0x40000000) — чужой: это тот бит, по которому цепочка системного
+# zapret говорит «этот пакет не мой» (её условие входа — `meta mark & 0x40000000 == 0`).
+# До запуска 65 мы ставили его ТОЛЬКО выходу kind=zapret, и трафик, уходящий в туннель,
+# по-прежнему проходил через общий обход.
+#
+# Почему это вредно, а не просто бесполезно: пакет, уходящий в туннель, DPI видит снаружи
+# как сам туннель — полезной нагрузки там не разобрать, — но nfqws при этом рассинхронизирует
+# и режет ВНЕШНИЕ пакеты, то есть трогает транспорт туннеля, и рукопожатие может не сойтись.
+#
+# kind=direct — единственное исключение, и оно же смысл прямого канала: там общий обход
+# обязан работать.
+#
+# Выходов в фикстуре ТРИ, и мост Telegram здесь не для полноты: у него причина та же, что у
+# kind=zapret (его трафик разбирает наш собственный обработчик, и второй разбиратель поверх —
+# это два обхода на один пакет), но вид выхода другой, и забытым `case` он оказался бы первым.
+# kind=vless и kind=xsteer базовая сборка не принимает вовсе, поэтому их доля правила
+# проверяется по самой функции — см. out_skips_zapret в tests/specmatch.c.
+printf '203.0.113.0/24\n' > "$tmp/p.lst"
+printf '104.16.0.0/12\n' > "$tmp/p2.lst"
+cat > "$tmp/skipspec.json" <<EOF
+{ "schema": 1, "from_default": ["192.168.1.0/24"],
+  "outputs": { "direct": { "kind": "direct" },
+               "vpn": { "kind": "interface", "device": "wg0" },
+               "tg": { "kind": "tgws", "domain": "ex.co.uk" } },
+  "channels": [ { "name": "t", "out": "vpn", "match": { "prefixes_files": ["$tmp/p.lst"] } },
+                { "name": "g", "out": "tg", "match": { "prefixes_files": ["$tmp/p2.lst"] } },
+                { "name": "d", "out": "direct", "match": { "prefixes_files": ["$tmp/p.lst"] } } ] }
+EOF
+skipout="$("$BIN" apply --dry-run --spec "$tmp/skipspec.json" --state-dir "$tmp/state-skip" 2>/dev/null)"
+# 0x40100000 = метка выхода 0x00100000 плюс чужой бит 0x40000000.
+check "туннельному выходу ставится бит «не мой» для zapret" "1" \
+    "$(printf '%s\n' "$skipout" | grep 'steer:vpn_ip' | grep -c 'or 0x40100000')"
+check "мосту telegram — тот же бит" "1" \
+    "$(printf '%s\n' "$skipout" | grep 'steer:tg_ip' | grep -c 'or 0x40200000')"
+# И маска остальных бит не пострадала: своё слово мы по-прежнему затираем целиком, а чужие
+# (mwan3, pbr, sqm) сохраняем чтением-модификацией.
+check "и маска своего слова осталась прежней" "2" \
+    "$(printf '%s\n' "$skipout" | grep -c 'mark and 0xf00fffff or 0x4')"
+# У прямого канала разметки нет вовсе (он заканчивается `return`), поэтому чужого бита у него
+# быть не может ни в каком виде.
+check "прямой канал метку не ставит" "0" \
+    "$(printf '%s\n' "$skipout" | grep 'steer:direct_ip' | grep -c 'meta mark set')"
+check "прямому каналу чужой бит не ставится" "0" \
+    "$(printf '%s\n' "$skipout" | grep 'steer:direct_ip' | grep -c '0x40')"
+# ГЛАВНАЯ ПРОВЕРКА ПРАВИЛА, и она нарочно НЕ перечисляет виды выхода: перечисли — и стенд
+# знал бы про виды ровно столько же, сколько забытый `case`, из-за которого правка и
+# понадобилась. Спрашивается свойство: раз метка ставится, чужой бит обязан стоять.
+check "метку без чужого бита не ставит никто" "0" \
+    "$(printf '%s\n' "$skipout" | grep 'meta mark set mark and' | grep -vc 'or 0x4')"
 
 # ---- does the spec need the resolver ----------------------------------------
 # The init script asks the engine this. It used to grep the spec for the literal
