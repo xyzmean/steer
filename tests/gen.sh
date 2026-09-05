@@ -82,6 +82,11 @@ table inet steer {
         ip daddr { 192.168.1.0/24 } ip saddr @direct_ip counter comment "steer-down:direct_ip"
         ip daddr { 192.168.1.0/24 } ip saddr @vpn_ip counter comment "steer-down:vpn_ip"
     }
+    chain prerouting_dns {
+        type nat hook prerouting priority dstnat; policy accept;
+        ip saddr 192.168.1.0/24 udp dport 53 counter redirect to :5300
+        meta nfproto ipv6 iifname "br-lan" udp dport 53 counter redirect to :5300
+    }
 }
 EOF
 )"
@@ -98,7 +103,21 @@ check "generates the expected ruleset" "$want" "$out"
 # интерфейсе, которые легко списать на «ещё не качали».
 check "встречная цепочка считает в postrouting" "1" \
     "$(printf '%s\n' "$out" | grep -c 'hook postrouting priority srcnat + 10')"
-check "и ни одной считающей цепочки в prerouting сверх метки" "1" \
+# Цепочек в prerouting теперь две, и это не ослабление проверки, а её уточнение.
+#
+# Первая — метка, она в filter и проходит КАЖДЫЙ пакет; ради этого проверка и стоит.
+# Вторая — перенаправление DNS, и с запуска 65 она стоит всегда, а не по факту доменных
+# каналов (решение владельца: резолвер держим постоянно, иначе доменность зависит от
+# содержимого списков и может перевернуться ночным обновлением). Цена у неё другого
+# порядка: хук nat, то есть только первый пакет соединения, и внутри сразу `udp dport 53`.
+#
+# Проверяется поэтому не число, а СОСТАВ: считающая цепочка ровно одна, вторая — именно
+# DNS, и никакой третьей. Появится третья — стенд покраснеет так же, как раньше.
+check "считающая цепочка в prerouting ровно одна" "1" \
+    "$(printf '%s\n' "$out" | grep -c 'filter hook prerouting')"
+check "и вторая — это перенаправление DNS" "1" \
+    "$(printf '%s\n' "$out" | grep -c 'chain prerouting_dns')"
+check "и больше в prerouting никого" "2" \
     "$(printf '%s\n' "$out" | grep -c 'hook prerouting')"
 check "и не ставит метку" "0" \
     "$(printf '%s\n' "$out" | sed -n '/chain postrouting_down/,/^    }/p' | grep -c 'meta mark set')"
@@ -457,10 +476,25 @@ check "и это правило безусловное — набор оно н�
 # `"domains_file"`, and when the plural `domains_files` arrived the match stopped
 # matching: the resolver did not start while apply still installed the DNS redirect,
 # so every LAN query went to a closed port. DNS died on a live router.
+#
+# С ЗАПУСКА 65 ОТВЕТ ВСЕГДА «ДА», и это решение владельца, а не упрощение стенда.
+# Перенаправление DNS стоит постоянно, значит резолвер, к которому оно ведёт, обязан
+# существовать постоянно вместе с ним — иначе воспроизводится ровно та беда, ради которой
+# эта проверка и заведена: правило есть, слушать некому, запросы уходят в закрытый порт.
+#
+# Почему ответ перестал зависеть от спеки: доменность канала стала зависеть от СОДЕРЖИМОГО
+# файлов списков (домен и подсеть лежат в одном файле), то есть могла бы перевернуться
+# ночным обновлением списков, которое зовёт apply напрямую, минуя синхронизацию force_dns
+# в управляющем слое. Постоянный резолвер убирает переменную, а с ней и гонку.
 "$BIN" needs-dnsd --spec "$tmp/dspec.json" --state-dir "$tmp/state-n" >/dev/null 2>&1
 check "needs-dnsd: yes for a domain channel" "0" "$?"
 "$BIN" needs-dnsd --spec "$tmp/spec.json" --state-dir "$tmp/state-n" >/dev/null 2>&1
-check "needs-dnsd: no for address channels only" "1" "$?"
+check "needs-dnsd: yes for address channels too" "0" "$?"
+# Отказ на непонятой спеке обязан остаться: init-скрипт не должен поднимать резолвер под
+# конфигурацию, которую apply отвергнет.
+printf '%s' '{"schema":99,"outputs":{},"channels":[]}' > "$tmp/badschema.json"
+"$BIN" needs-dnsd --spec "$tmp/badschema.json" --state-dir "$tmp/state-n" >/dev/null 2>&1
+check "needs-dnsd: отказ на непонятой спеке" "2" "$?"
 
 # And the shipped init script must ASK rather than guess, or the same trap returns
 # the next time a key is renamed.
