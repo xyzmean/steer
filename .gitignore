@@ -57,3 +57,4 @@ build/asan-probe*
 build/devupmatch
 build/stgws-*
 build/msgsplitmatch
+build/hwidsum
