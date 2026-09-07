@@ -416,8 +416,15 @@ int reality_build_hello_carry(const struct reality_cfg *cfg, struct reality_stat
     /* Первым — GREASE, пустой. */
     px[pn].type = g_ext_a; px[pn].body = NULL; px[pn].n = 0; pn++;
 
-    /* server_name: список(2) + тип(1) + длина(2) + имя. */
-    {
+    /* server_name: список(2) + тип(1) + длина(2) + имя.
+     *
+     * ИМЕНИ НЕТ — РАСШИРЕНИЯ НЕТ ВОВСЕ, а не пустое имя. Reality сверяет присланное имя со
+     * своим списком `serverNames`, и пустая строка там законна: сервер тогда ждёт
+     * ClientHello без этого расширения, ровно как его шлёт Xray с пустым `serverName`.
+     * Расширение с именем нулевой длины — не то же самое: такого ClientHello не строит ни
+     * один браузер и ни один клиент, и сверка на сервере его не узнаёт. Живой пример —
+     * подписка, где узел объявлен без `sni` во всех форматах разом (см. sub.c). */
+    if (cfg->sni[0]) {
         size_t sni_len = strlen(cfg->sni);
         struct buf sb = { b_sni, 0, sizeof(b_sni) };
         put16(&sb, (unsigned)(sni_len + 3));

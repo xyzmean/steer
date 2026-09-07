@@ -119,7 +119,17 @@ int main(void) {
 
         check_n("reality без pbk: пропущен",
                 1, vless_parse_url("vless://u@h:443?security=reality&sni=a.com#x", &n));
-        check("reality без pbk: причина названа", "reality без pbk или sni", n.skip_reason);
+        check("reality без pbk: причина названа", "reality без pbk", n.skip_reason);
+
+        /* А ВОТ БЕЗ SNI — ПРИГОДЕН. Reality сверяет имя со списком `serverNames`, и пустая
+         * строка там законна: сервер ждёт ClientHello без расширения server_name, и Xray
+         * его так и шлёт. Живая подписка владельца отдаёт такой узел во всех форматах
+         * разом, а мы объявляли её пустой. */
+        check_n("reality без sni: узел пригоден", 0,
+                vless_parse_url("vless://u@h:443?security=reality&pbk=" 
+                                "Zm9vYmFyZm9vYmFyZm9vYmFyZm9vYmFyZm9vYmFyMDA&sid=ab12"
+                                "&flow=xtls-rprx-vision#x", &n));
+        check("и имя у него пустое", "", n.sni);
 
         check_n("транспорт ws: пропущен",
                 1, vless_parse_url("vless://u@h:443?security=none&type=ws#x", &n));

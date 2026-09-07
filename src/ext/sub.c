@@ -266,8 +266,17 @@ static int node_usable(struct vless_node *n) {
                  n->security);
         return 1;
     }
-    if (!strcmp(n->security, "reality") && (!n->pbk[0] || !n->sni[0])) {
-        snprintf(n->skip_reason, sizeof(n->skip_reason), "reality без pbk или sni");
+    /* Ключ сервера обязателен: без него Reality нечем проверить, и узел не поднимется.
+     *
+     * А ВОТ ИМЯ (sni) — НЕТ, и раньше его отсутствие тоже отбраковывало узел. Reality
+     * сверяет присланное имя со своим списком `serverNames`, и пустая строка в этом списке
+     * законна: тогда сервер ждёт ClientHello БЕЗ расширения server_name, а клиенты Xray его
+     * и не шлют. Снято на живой подписке владельца: панель во всех форматах разом — ссылка
+     * vless://, вариант для Happ, YAML для Clash — отдаёт узел без `sni`, то есть это выбор
+     * владельца сервера, а не потеря по дороге. Мы такой узел объявляли непригодным, и
+     * подписка из одного узла выглядела пустой. ClientHello без имени собирает reality.c. */
+    if (!strcmp(n->security, "reality") && !n->pbk[0]) {
+        snprintf(n->skip_reason, sizeof(n->skip_reason), "reality без pbk");
         return 1;
     }
     if (strcmp(n->type, "tcp") != 0 && strcmp(n->type, "grpc") != 0 &&
