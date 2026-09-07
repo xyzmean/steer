@@ -1309,6 +1309,19 @@ static int dial_upstream(short dc, short media, struct upstream *u_out,
 #define WARM_TTL_S   40
 #define WARM_PER_DC  2
 
+/* СКОЛЬКО ПОМНИТЬ ЖЕЛАНИЕ — и почему это не мелочь.
+ *
+ * Запас наполняется под то, чего просили клиенты. Пока желание помнится, наполнитель держит
+ * пару соединений живыми, а живут они сорок секунд — то есть каждые сорок секунд полное
+ * рукопожатие TLS к чужому домену, даже если Telegram давно закрыт. С прежними пятью минутами
+ * это семь-восемь рукопожатий вхолостую после каждого разговора; владелец увидел их в трафике
+ * и справедливо спросил, зачем они. Минута — это ровно та пауза, после которой человек уже не
+ * «переключился в другое окно», а закончил, и платить за его возможное возвращение
+ * постоянными соединениями наружу незачем: следующее обращение поднимет соединение само,
+ * заплатив те же полсекунды один раз.
+ */
+#define WANT_TTL_S   60
+
 struct warm_slot {
     int busy;                   /* 1 — занят готовым соединением */
     short dc, media;
@@ -1406,7 +1419,7 @@ static int warm_pass(warm_dial_fn dial) {
     int free_n = 0;
     for (size_t k = 0; k < WARM_SLOTS; k++) if (!g_warm[k].busy) free_n++;
     for (size_t i = 0; i < sizeof(g_want) / sizeof(g_want[0]); i++) {
-        if (!g_want[i].seen || now - g_want[i].seen > 300) continue;
+        if (!g_want[i].seen || now - g_want[i].seen > WANT_TTL_S) continue;
         want[want_n] = g_want[i];
         have[want_n] = 0;
         for (size_t k = 0; k < WARM_SLOTS; k++)
@@ -1450,12 +1463,31 @@ static int warm_pass(warm_dial_fn dial) {
     return dialed;
 }
 
-/* Наполнитель. Отдельным потоком: его отказы и ожидания не должны задевать никого. */
+/* Есть ли кого греть: хоть одно непросроченное желание. Считается под тем же замком, что и
+ * сами желания, — наполнитель спрашивает это между проходами, чтобы решить, как долго спать. */
+static int wants_live(void) {
+    time_t now = time(NULL);
+    int live = 0;
+    pthread_mutex_lock(&g_warm_mx);
+    for (size_t i = 0; i < sizeof(g_want) / sizeof(g_want[0]); i++)
+        if (g_want[i].seen && now - g_want[i].seen <= WANT_TTL_S) live++;
+    pthread_mutex_unlock(&g_warm_mx);
+    return live;
+}
+
+/* Наполнитель. Отдельным потоком: его отказы и ожидания не должны задевать никого.
+ *
+ * Пауза между проходами зависит от того, есть ли работа. Дозвонился — секунда, добирать
+ * остальное надо сразу. Есть кого греть, но не дозвонился — три секунды, как было. А греть
+ * нечего (Telegram молчит дольше WANT_TTL_S) — пятнадцать: просыпаться каждые три секунды
+ * ради пустого прохода незачем, а первое же обращение клиента отметит желание само, и
+ * задержка до следующего прохода стоит ему ровно одного дозвона, который он и так бы сделал. */
 static void *warm_filler(void *arg) {
     (void)arg;
     for (;;) {
         int dialed = warm_pass(dial_upstream);
-        sleep(dialed ? 1 : 3);
+        if (dialed) sleep(1);
+        else sleep(wants_live() ? 3 : 15);
     }
     return NULL;
 }
