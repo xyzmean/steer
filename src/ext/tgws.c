@@ -1355,6 +1355,8 @@ static int warm_take(short dc, short media, struct upstream *u_out, char *sni, s
         *u_out = g_warm[i].u;
         snprintf(sni, sni_cap, "%s", g_warm[i].sni);
         g_warm[i].busy = 0;
+        g_warm[i].u.fd = -1;            /* владелец теперь один — тот, кому отдали */
+        g_warm[i].u.tls_on = 0;
         got = 1;
         break;
     }
@@ -1382,6 +1384,8 @@ static int warm_pass(warm_dial_fn dial) {
         if (!g_warm[i].busy || now - g_warm[i].born <= WARM_TTL_S) continue;
         struct upstream dead = g_warm[i].u;
         g_warm[i].busy = 0;
+        g_warm[i].u.fd = -1;            /* закрывать и освобождать будет эта ветка, не слот */
+        g_warm[i].u.tls_on = 0;
         pthread_mutex_unlock(&g_warm_mx);
         if (dead.tls_on) tls13_free(&dead.tls);
         close(dead.fd);
