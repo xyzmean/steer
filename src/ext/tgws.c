@@ -1362,71 +1362,86 @@ static int warm_take(short dc, short media, struct upstream *u_out, char *sni, s
     return got;
 }
 
+/* ОДИН ПРОХОД наполнителя: убрать тухлые слоты, добрать недостающее. Возвращает число
+ * поднятых за проход соединений — по нему наполнитель выбирает паузу.
+ *
+ * Вынесено из тела потока ради стенда (tests/warmmatch.c). Чередований потоков в проверках
+ * запаса не участвует вовсе: стенд зовёт проход из главного потока. По той же причине дозвон
+ * передаётся указателем, а не зовётся напрямую — настоящий дозвон уходит в сеть, а проверять
+ * надо не его, а РЕШЕНИЕ прохода: дозваниваться или нет. */
+typedef int (*warm_dial_fn)(short dc, short media, struct upstream *u_out,
+                            char *sni_out, size_t sni_cap, int *tries_out);
+
+static int warm_pass(warm_dial_fn dial) {
+    time_t now = time(NULL);
+
+    /* Тухлые слоты закрываем: соединение старше срока точка всё равно уже закрыла или
+     * закроет вот-вот. */
+    pthread_mutex_lock(&g_warm_mx);
+    for (size_t i = 0; i < WARM_SLOTS; i++) {
+        if (!g_warm[i].busy || now - g_warm[i].born <= WARM_TTL_S) continue;
+        struct upstream dead = g_warm[i].u;
+        g_warm[i].busy = 0;
+        pthread_mutex_unlock(&g_warm_mx);
+        if (dead.tls_on) tls13_free(&dead.tls);
+        close(dead.fd);
+        pthread_mutex_lock(&g_warm_mx);
+    }
+
+    /* Чего добрать. Список желаний копируем под замком и дозваниваемся уже без него:
+     * дозвон идёт секунды, держать на это время замок нельзя. */
+    struct warm_want want[sizeof(g_want) / sizeof(g_want[0])];
+    int have[sizeof(g_want) / sizeof(g_want[0])];
+    size_t want_n = 0;
+    for (size_t i = 0; i < sizeof(g_want) / sizeof(g_want[0]); i++) {
+        if (!g_want[i].seen || now - g_want[i].seen > 300) continue;
+        want[want_n] = g_want[i];
+        have[want_n] = 0;
+        for (size_t k = 0; k < WARM_SLOTS; k++)
+            if (g_warm[k].busy && g_warm[k].dc == g_want[i].dc &&
+                g_warm[k].media == g_want[i].media)
+                have[want_n]++;
+        want_n++;
+    }
+    pthread_mutex_unlock(&g_warm_mx);
+
+    int dialed = 0;
+    for (size_t i = 0; i < want_n && dialed < 2; i++) {
+        if (have[i] >= WARM_PER_DC) continue;
+        struct upstream u;
+        char sni[160] = "";
+        memset(&u, 0, sizeof(u));
+        if (!dial(want[i].dc, want[i].media, &u, sni, sizeof(sni), NULL)) continue;
+        dialed++;
+
+        int placed = 0;
+        pthread_mutex_lock(&g_warm_mx);
+        for (size_t k = 0; k < WARM_SLOTS; k++) {
+            if (g_warm[k].busy) continue;
+            g_warm[k].busy = 1;
+            g_warm[k].dc = want[i].dc;
+            g_warm[k].media = want[i].media;
+            g_warm[k].born = time(NULL);
+            snprintf(g_warm[k].sni, sizeof(g_warm[k].sni), "%s", sni);
+            g_warm[k].u = u;
+            placed = 1;
+            break;
+        }
+        pthread_mutex_unlock(&g_warm_mx);
+        if (!placed) {                       /* мест нет — соединение не бросаем открытым */
+            if (u.tls_on) tls13_free(&u.tls);
+            close(u.fd);
+        }
+    }
+
+    return dialed;
+}
+
 /* Наполнитель. Отдельным потоком: его отказы и ожидания не должны задевать никого. */
 static void *warm_filler(void *arg) {
     (void)arg;
     for (;;) {
-        time_t now = time(NULL);
-
-        /* Тухлые слоты закрываем: соединение старше срока точка всё равно уже закрыла или
-         * закроет вот-вот. */
-        pthread_mutex_lock(&g_warm_mx);
-        for (size_t i = 0; i < WARM_SLOTS; i++) {
-            if (!g_warm[i].busy || now - g_warm[i].born <= WARM_TTL_S) continue;
-            struct upstream dead = g_warm[i].u;
-            g_warm[i].busy = 0;
-            pthread_mutex_unlock(&g_warm_mx);
-            if (dead.tls_on) tls13_free(&dead.tls);
-            close(dead.fd);
-            pthread_mutex_lock(&g_warm_mx);
-        }
-
-        /* Чего добрать. Список желаний копируем под замком и дозваниваемся уже без него:
-         * дозвон идёт секунды, держать на это время замок нельзя. */
-        struct warm_want want[sizeof(g_want) / sizeof(g_want[0])];
-        int have[sizeof(g_want) / sizeof(g_want[0])];
-        size_t want_n = 0;
-        for (size_t i = 0; i < sizeof(g_want) / sizeof(g_want[0]); i++) {
-            if (!g_want[i].seen || now - g_want[i].seen > 300) continue;
-            want[want_n] = g_want[i];
-            have[want_n] = 0;
-            for (size_t k = 0; k < WARM_SLOTS; k++)
-                if (g_warm[k].busy && g_warm[k].dc == g_want[i].dc &&
-                    g_warm[k].media == g_want[i].media)
-                    have[want_n]++;
-            want_n++;
-        }
-        pthread_mutex_unlock(&g_warm_mx);
-
-        int dialed = 0;
-        for (size_t i = 0; i < want_n && dialed < 2; i++) {
-            if (have[i] >= WARM_PER_DC) continue;
-            struct upstream u;
-            char sni[160] = "";
-            memset(&u, 0, sizeof(u));
-            if (!dial_upstream(want[i].dc, want[i].media, &u, sni, sizeof(sni), NULL)) continue;
-            dialed++;
-
-            int placed = 0;
-            pthread_mutex_lock(&g_warm_mx);
-            for (size_t k = 0; k < WARM_SLOTS; k++) {
-                if (g_warm[k].busy) continue;
-                g_warm[k].busy = 1;
-                g_warm[k].dc = want[i].dc;
-                g_warm[k].media = want[i].media;
-                g_warm[k].born = time(NULL);
-                snprintf(g_warm[k].sni, sizeof(g_warm[k].sni), "%s", sni);
-                g_warm[k].u = u;
-                placed = 1;
-                break;
-            }
-            pthread_mutex_unlock(&g_warm_mx);
-            if (!placed) {                       /* мест нет — соединение не бросаем открытым */
-                if (u.tls_on) tls13_free(&u.tls);
-                close(u.fd);
-            }
-        }
-
+        int dialed = warm_pass(dial_upstream);
         sleep(dialed ? 1 : 3);
     }
     return NULL;
