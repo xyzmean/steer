@@ -2885,7 +2885,14 @@ int cmd_vless_probe(const char *spec_path, const char *out_name, int node, int t
     struct output *o = NULL;
     size_t cnt = 0;
     struct vless_sub_stats st;
-    int rc = load_nodes(spec_path, out_name, &o, &cnt, &st);
+    /* Вместо имени выхода — путь к файлу подписки, как у vless-nodes и по той же причине:
+     * узлы выбирают там, где выход собирают, и подписке, на которую ещё не заведён ни один
+     * выход, иначе нечем было бы ответить «какой из этих узлов живой». Без выхода нет и
+     * порядка предпочтения, поэтому `--node -1` здесь значит «все по порядку подписки», а
+     * не «как поднимется выход». */
+    int by_file = out_name && out_name[0] == '/';
+    int rc = by_file ? load_nodes_file(out_name, &cnt, &st)
+                     : load_nodes(spec_path, out_name, &o, &cnt, &st);
     if (rc) return rc;
     if (!cnt) {
         printf("{\"ok\":false,\"error\":\"в подписке нет пригодных узлов\","
@@ -2905,7 +2912,9 @@ int cmd_vless_probe(const char *spec_path, const char *out_name, int node, int t
     static int sel[MAX_NODES];
     size_t sel_n = 0;
     if (node >= 0) { sel[0] = node; sel_n = 1; }
-    else {
+    else if (by_file) {
+        for (size_t i = 0; i < cnt && i < MAX_NODES; i++) sel[sel_n++] = (int)i;
+    } else {
         sel_n = out_node_list(o, cnt, sel, MAX_NODES);
         if (!sel_n) {
             printf("{\"ok\":false,\"error\":\"выбранных узлов нет в подписке, "
@@ -2915,7 +2924,9 @@ int cmd_vless_probe(const char *spec_path, const char *out_name, int node, int t
     }
     int found = -1;
     printf("{\"output\":");
-    json_str(out_name);
+    json_str(by_file ? "" : out_name);
+    printf(",\"sub_file\":");
+    json_str(by_file ? out_name : o->sub_file);
     printf(",\"results\":[");
     for (size_t k = 0; k < sel_n; k++) {
         size_t i = (size_t)sel[k];
