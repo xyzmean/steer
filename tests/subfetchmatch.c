@@ -355,18 +355,26 @@ static void make_fake_curl(void) {
     wr(p,
        "#!/bin/sh\n"
        "# Заглушка curl для стенда: тело и заголовки берутся из файлов песочницы.\n"
-       "hdr=''; out=''; url=''; head=0\n"
+       "hdr=''; out=''; url=''; head=0; ua=''; cookies=no\n"
        "while [ $# -gt 0 ]; do\n"
        "    case \"$1\" in\n"
        "        -D) hdr=\"$2\"; shift 2 ;;\n"
        "        -o) out=\"$2\"; shift 2 ;;\n"
        "        -H) shift 2 ;;\n"
+       "        -A) ua=\"$2\"; shift 2 ;;\n"
+       "        -b) cookies=yes; shift 2 ;;\n"
+       "        --max-redirs) shift 2 ;;\n"
        "        --max-time) shift 2 ;;\n"
        "        -fsSI) head=1; shift ;;\n"
        "        -fsSL) shift ;;\n"
        "        *) url=\"$1\"; shift ;;\n"
        "    esac\n"
        "done\n"
+       "# Чем движок представился и включал ли cookie-движок — в песочницу: панель за\n"
+       "# DDoS-Guard отвечает пустотой клиенту по имени curl, а панель за cookie-проверкой\n"
+       "# без cookie водит по кругу редиректов.\n"
+       "printf '%s' \"$ua\" > \"$SANDBOX/seen.ua\"\n"
+       "printf '%s' \"$cookies\" > \"$SANDBOX/seen.cookies\"\n"
        "case \"$url\" in\n"
        "    */json) key=json ;;\n"
        "    *) key=main ;;\n"
@@ -427,6 +435,18 @@ static void t_fetch(void) {
     ck_true("и он ушёл в запрос", has(out, "\"hwid_sent\":true"));
     ck_true("файл узлов на месте", strstr(rd(g_out), "vless://") != NULL);
     ck_true("остаток записан рядом", strstr(rd(g_info), "total=1000") != NULL);
+
+    /* КАК МЫ ПРЕДСТАВЛЯЕМСЯ ПАНЕЛИ. Обе проверки — про живые отказы, а не про оформление
+     * запроса. Панель за DDoS-Guard отвечает клиенту по имени `curl` кодом 200 с пустым
+     * телом (отказ, который не выглядит отказом), а панель за cookie-проверкой отвечает 302
+     * на тот же адрес и без cookie водит по кругу до предела редиректов. */
+    char up[640], seen[256];
+    snprintf(up, sizeof up, "%s/seen.ua", T);
+    snprintf(seen, sizeof seen, "%s", rd(up));
+    ck_true("движок называет себя своим именем", strncmp(seen, "steer/", 6) == 0);
+    ck_true("и не выдаёт себя за чужой клиент", !has(seen, "v2ray") && !has(seen, "Mozilla"));
+    snprintf(up, sizeof up, "%s/seen.cookies", T);
+    ck_true("cookie-движок включён", strcmp(rd(up), "yes") == 0);
 
     /* Временные файлы убраны. Оставленный `.hdr` — это заголовки панели, лежащие в /etc
      * навсегда; оставленный `.tmp` — половина подписки, которую следующий запуск примет за
