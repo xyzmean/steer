@@ -421,6 +421,56 @@ static int has_tgws(void) {
     return 0;
 }
 
+/* КАРТА ПОДМЕНЫ fake→real ЗАСЕВАЕТСЯ ПРЯМО В НАБОРЕ ПРАВИЛ — из файла состояния резолвера
+ * (<state-dir>/fakeip.state, строки «домен\tподдельный\tнастоящий»), а не остаётся пустой до
+ * перезапуска dnsd.
+ *
+ * ЗАЧЕМ. apply пересобирает таблицу целиком, и карта на мгновение исчезала вместе с ней; dnsd
+ * восстанавливал её только при своём перезапуске, секундой позже. Запрос, пришедший в это окно,
+ * не мог добавить подмену (карты нет), и dnsd по правилу fail-open отдавал клиенту НАСТОЯЩИЙ
+ * адрес: сайт, который человек велел вести в туннель, уходил напрямую, а клиент запоминал этот
+ * адрес на весь TTL записи. Снято с живого роутера: после «Применить» посреди просмотра YouTube
+ * узел googlevideo остался в состоянии без настоящего адреса, а ролики не открывались до
+ * перезапуска браузера — уже при исправном туннеле. С засеянной картой окна нет: пакеты к
+ * поддельным адресам переводятся тем же набором правил, который их и метит.
+ *
+ * Только строки с настоящим адресом: без него подменять нечего, и dnsd такую запись тоже не
+ * восстанавливает. Повтор поддельного адреса пропускается — nft отвергает набор с двойным
+ * ключом целиком, а в файле повторы законны (первая раздача побеждает, как у dnsd). Файла нет —
+ * карта пустая, как и раньше: так на роутере, где резолвер ещё ничего не раздал. */
+static void emit_fakeip_elements(FILE *f) {
+    char path[512];
+    if (snprintf(path, sizeof(path), "%s/fakeip.state", g_state_dir) >= (int)sizeof(path)) return;
+    FILE *s = fopen(path, "r");
+    if (!s) return;
+    static uint8_t seen[131072 / 8];       /* 198.18.0.0/15 — бит на адрес */
+    memset(seen, 0, sizeof(seen));
+    char line[1024];
+    int n = 0;
+    while (fgets(line, sizeof(line), s)) {
+        char *t1 = strchr(line, '\t');
+        if (!t1) continue;
+        char *fake = t1 + 1;
+        char *t2 = strchr(fake, '\t');
+        if (!t2) continue;
+        *t2 = '\0';
+        char *real = t2 + 1;
+        char *end = real + strcspn(real, "\t\r\n");
+        *end = '\0';
+        struct in_addr a, b;
+        if (inet_aton(fake, &a) == 0 || inet_aton(real, &b) == 0 || b.s_addr == 0) continue;
+        uint32_t fh = ntohl(a.s_addr);
+        if ((fh & 0xfffe0000u) != 0xc6120000u) continue;   /* вне 198.18.0.0/15 — не наше */
+        uint32_t idx = fh - 0xc6120000u;
+        if (seen[idx >> 3] & (uint8_t)(1u << (idx & 7))) continue;
+        seen[idx >> 3] |= (uint8_t)(1u << (idx & 7));
+        fprintf(f, n ? ",\n            %s : %s" : "        elements = { %s : %s", fake, real);
+        n++;
+    }
+    if (n) fprintf(f, " }\n");
+    fclose(s);
+}
+
 static int has_fakeip(void) {
     for (size_t i = 0; i < g_grp_n; i++)
         if (g_grp[i].domains && !g_grp[i].realip) return 1;
@@ -1196,7 +1246,9 @@ static void generate(FILE *f) {
      * чужой ключ от него не зависит. */
     if (has_domains()) {
         if (has_fakeip()) {
-            fprintf(f, "\n    map fakeip { type ipv4_addr : ipv4_addr; }\n");
+            fprintf(f, "\n    map fakeip {\n        type ipv4_addr : ipv4_addr;\n");
+            emit_fakeip_elements(f);
+            fprintf(f, "    }\n");
             fprintf(f, "    chain prerouting_dnat {\n"
                        "        type nat hook prerouting priority dstnat; policy accept;\n"
                        "        ip daddr 198.18.0.0/15 dnat ip to ip daddr map @fakeip\n"

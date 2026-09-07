@@ -1769,6 +1769,40 @@ static int handle_upstream_response(void) {
                     sendto(g_listen_fd, out, len, 0, (struct sockaddr *)&p->client, p->client_len);
                     return 1;
                 }
+            } else if (g_nlk_fd >= 0) {
+                /* Ядро НЕ ПРИНЯЛО подмену при живом netlink — так бывает ровно в тот миг,
+                 * когда apply пересобирает таблицу и карты ещё нет. Прежний ответ здесь был
+                 * fail-open: клиенту уходил настоящий адрес. Для домена, который человек велел
+                 * вести в туннель, это не «открыто», а «мимо»: сайт идёт напрямую (у
+                 * заблокированного — не идёт вовсе), и клиент запоминает настоящий адрес на
+                 * весь TTL записи — минуты, а браузер ещё держит на нём соединения. Снято с
+                 * живого роутера: после «Применить» посреди YouTube ролики не открывались до
+                 * перезапуска браузера уже при исправном туннеле.
+                 *
+                 * SERVFAIL честнее: клиент повторит запрос через секунду-две, к этому времени
+                 * карта на месте, и ответом будет поддельный адрес с работающей подменой.
+                 * Кэшировать SERVFAIL резолверы не имеют права дольше пары секунд. Без
+                 * netlink вовсе (g_nlk_fd < 0) поведение прежнее — там подмены нет и не
+                 * будет, и настоящий адрес лучше тишины. */
+                if (!quiet) {
+                    uint8_t out[512];
+                    size_t len = build_rewritten_response(buf, qend, out, sizeof(out), 0, 0);
+                    if (len) {
+                        make_response_flags(out);
+                        out[3] = (uint8_t)((out[3] & 0xf0) | 0x02);   /* RCODE 2 — SERVFAIL */
+                        sendto(g_listen_fd, out, len, 0,
+                               (struct sockaddr *)&p->client, p->client_len);
+                    }
+                }
+                static time_t warned;
+                time_t now = time(NULL);
+                if (now - warned > 60) {
+                    warned = now;
+                    fprintf(stderr, "steer dnsd: подмена для %s не встала в ядро (rc=%d) — "
+                                    "клиенту отвечено SERVFAIL, а не настоящим адресом\n",
+                            qname, maprc);
+                }
+                return 1;
             }
         }
     }

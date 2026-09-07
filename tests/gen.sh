@@ -18,6 +18,7 @@ check() {
 }
 
 printf '203.0.113.0/24\n198.51.100.5\n' > "$tmp/a.lst"
+
 printf '198.51.100.5\n' > "$tmp/b.lst"
 
 spec() { sed "s|TMP|$tmp|g" > "$tmp/spec.json"; }
@@ -274,7 +275,19 @@ cat > "$tmp/dspec.json" <<EOF
   "outputs": { "geo": { "kind": "interface", "device": "tun0" } },
   "channels": [ { "name": "dom", "match": { "domains_file": "$tmp/d.lst" }, "out": "geo" } ] }
 EOF
+# Раздача поддельных адресов резолвером: apply засевает ею карту подмены (emit_fakeip_elements),
+# чтобы пересборка таблицы не оставляла карту пустой до перезапуска dnsd. Строка без настоящего
+# адреса, повтор поддельного и адрес вне 198.18.0.0/15 — пропускаются.
+mkdir -p "$tmp/state-dom"
+printf 'a.example\t198.18.0.1\t203.0.113.10\nb.example\t198.18.0.2\nc.example\t198.18.0.1\t203.0.113.11\nd.example\t10.0.0.1\t203.0.113.12\ne.example\t198.18.0.3\t203.0.113.13\n' > "$tmp/state-dom/fakeip.state"
 dout="$("$BIN" apply --dry-run --spec "$tmp/dspec.json" --state-dir "$tmp/state-dom")"
+check "карта подмены засеяна раздачей резолвера" "1" \
+    "$(printf '%s\n' "$dout" | grep -c '198.18.0.1 : 203.0.113.10')"
+check "и последней строкой тоже" "1" "$(printf '%s\n' "$dout" | grep -c '198.18.0.3 : 203.0.113.13')"
+check "запись без настоящего адреса в карту не попала" "0" "$(printf '%s\n' "$dout" | grep -c '198.18.0.2')"
+check "повтор поддельного адреса пропущен — nft отверг бы двойной ключ" "0" \
+    "$(printf '%s\n' "$dout" | grep -c '203.0.113.11')"
+check "адрес вне 198.18.0.0/15 в карту не попал" "0" "$(printf '%s\n' "$dout" | grep -c '10.0.0.1 :')"
 check "domain channel still tests its set" "1" \
     "$(printf '%s\n' "$dout" | grep 'steer:geo_dom' | grep -c 'ip daddr @geo_dom')"
 check "domain set is declared empty, with timeouts" "1" \
