@@ -1393,6 +1393,14 @@ static int warm_pass(warm_dial_fn dial) {
     struct warm_want want[sizeof(g_want) / sizeof(g_want[0])];
     int have[sizeof(g_want) / sizeof(g_want[0])];
     size_t want_n = 0;
+    /* Сколько слотов свободно — считаем здесь же, под тем же замком, что и have[]. Ёмкость
+     * запаса это WARM_SLOTS / WARM_PER_DC = четыре пары, а желаний бывает десять: пятой паре
+     * места не будет, и дозвон ради неё — полное рукопожатие TLS к общественному домену,
+     * которое тут же выбрасывается. Свободных слотов между снимком и укладкой становится
+     * только больше (занимает их один наполнитель, освобождает warm_take), поэтому число
+     * годится как оценка снизу. */
+    int free_n = 0;
+    for (size_t k = 0; k < WARM_SLOTS; k++) if (!g_warm[k].busy) free_n++;
     for (size_t i = 0; i < sizeof(g_want) / sizeof(g_want[0]); i++) {
         if (!g_want[i].seen || now - g_want[i].seen > 300) continue;
         want[want_n] = g_want[i];
@@ -1406,7 +1414,7 @@ static int warm_pass(warm_dial_fn dial) {
     pthread_mutex_unlock(&g_warm_mx);
 
     int dialed = 0;
-    for (size_t i = 0; i < want_n && dialed < 2; i++) {
+    for (size_t i = 0; i < want_n && dialed < 2 && free_n > 0; i++) {
         if (have[i] >= WARM_PER_DC) continue;
         struct upstream u;
         char sni[160] = "";
@@ -1425,6 +1433,7 @@ static int warm_pass(warm_dial_fn dial) {
             snprintf(g_warm[k].sni, sizeof(g_warm[k].sni), "%s", sni);
             g_warm[k].u = u;
             placed = 1;
+            free_n--;
             break;
         }
         pthread_mutex_unlock(&g_warm_mx);
