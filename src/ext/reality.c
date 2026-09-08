@@ -262,10 +262,13 @@ int reality_build_hello_carry(const struct reality_cfg *cfg, struct reality_stat
                               const struct reality_carrier *car,
                               unsigned char *out, size_t out_n, size_t *out_len) {
     unsigned char pbk[32], sid[16];
-    int pbk_n = b64url_decode(cfg->pbk, pbk, sizeof(pbk));
-    if (pbk_n != 32) return REALITY_EBADKEY;
-    int sid_n = cfg->sid[0] ? hex_decode(cfg->sid, sid, sizeof(sid)) : 0;
-    if (sid_n < 0) return REALITY_EBADKEY;
+    int sid_n = 0;
+    if (!cfg->plain) {
+        int pbk_n = b64url_decode(cfg->pbk, pbk, sizeof(pbk));
+        if (pbk_n != 32) return REALITY_EBADKEY;
+        sid_n = cfg->sid[0] ? hex_decode(cfg->sid, sid, sizeof(sid)) : 0;
+        if (sid_n < 0) return REALITY_EBADKEY;
+    }
 
     if (car && car->priv) {
         /* Пара пришла снаружи: xsteer выводит из неё общий секрет ещё до сборки Hello,
@@ -273,21 +276,32 @@ int reality_build_hello_carry(const struct reality_cfg *cfg, struct reality_stat
         memcpy(st->priv, car->priv, 32);
         memcpy(st->pub, car->pub, 32);
     } else if (x25519_keypair(st->priv, st->pub) != 0) return REALITY_ECRYPTO;
-    if (x25519_shared(st->priv, pbk, st->shared) != 0) return REALITY_ECRYPTO;
+    /* Общий секрет с ПОСТОЯННЫМ ключом сервера нужен только аутентификатору. У обычного TLS
+     * его не существует: там есть лишь эфемерный обмен с серверной половиной key_share, и
+     * считает его tls13.c уже по ServerHello. */
+    if (!cfg->plain && x25519_shared(st->priv, pbk, st->shared) != 0) return REALITY_ECRYPTO;
 
     /* Аутентификатор считается ПОСЛЕ сборки Hello — см. ниже, где он вписывается на
      * место. Причина: он подписывает весь ClientHello целиком, поэтому раньше его
      * посчитать нечем. Здесь только заготовка: 16 значимых байт и 16 нулей под тег. */
     unsigned char sess[32] = {0};
-    /* Версия клиента Reality — из core.Version_{x,y,z} Xray. Сервер её не проверяет
-     * строго, но она входит в подписываемые 16 байт, так что должна быть осмысленной. */
-    sess[0] = 26; sess[1] = 9; sess[2] = 8; sess[3] = 0;
-    uint32_t now = (uint32_t)time(NULL);
-    sess[4] = (unsigned char)(now >> 24);
-    sess[5] = (unsigned char)(now >> 16);
-    sess[6] = (unsigned char)(now >> 8);
-    sess[7] = (unsigned char)now;
-    if (sid_n > 0) memcpy(sess + 8, sid, (size_t)(sid_n > 8 ? 8 : sid_n));
+    if (cfg->plain) {
+        /* Браузер шлёт в legacy_session_id 32 случайных байта — со времён TLS 1.2, где это
+         * был идентификатор для возобновления. TLS 1.3 их не использует (сервер обязан
+         * вернуть их как есть), но пустого поля у современного клиента не бывает, и нулевое
+         * стало бы отпечатком не хуже любого другого. */
+        if (fill_random(sess, sizeof(sess)) != 0) return REALITY_ECRYPTO;
+    } else {
+        /* Версия клиента Reality — из core.Version_{x,y,z} Xray. Сервер её не проверяет
+         * строго, но она входит в подписываемые 16 байт, так что должна быть осмысленной. */
+        sess[0] = 26; sess[1] = 9; sess[2] = 8; sess[3] = 0;
+        uint32_t now = (uint32_t)time(NULL);
+        sess[4] = (unsigned char)(now >> 24);
+        sess[5] = (unsigned char)(now >> 16);
+        sess[6] = (unsigned char)(now >> 8);
+        sess[7] = (unsigned char)now;
+        if (sid_n > 0) memcpy(sess + 8, sid, (size_t)(sid_n > 8 ? 8 : sid_n));
+    }
     memcpy(st->session_id, sess, 32);
 
     /* ---- собственно Hello ---- */
@@ -454,10 +468,28 @@ int reality_build_hello_carry(const struct reality_cfg *cfg, struct reality_stat
         px[pn].type = 0x0010; px[pn].body = b_alpn; px[pn].n = ab.len; pn++;
     }
 
-    /* compress_certificate: brotli (2). */
-    { struct buf cb = { b_cc, 0, sizeof(b_cc) };
-      put8(&cb, 2); put16(&cb, 0x0002);
-      px[pn].type = 0x001B; px[pn].body = b_cc; px[pn].n = cb.len; pn++; }
+    /* compress_certificate: brotli (2) — но НЕ у обычного TLS.
+     *
+     * Расширение обещает серверу, что мы разожмём сжатый сертификат (RFC 8879). Reality это
+     * обещание может себе позволить: сертификат он не читает вовсе, а сообщение
+     * CompressedCertificate ложится в транскрипт теми же байтами, что и обычное. У
+     * security=tls всё наоборот — сертификат там единственное доказательство подлинности, и
+     * прочитать его обязательно, а brotli у нас нет и тащить его ради этого некуда.
+     *
+     * Снято на живом сервере: Cloudflare (1.1.1.1:443) обещание принимает и присылает
+     * CompressedCertificate, после чего проверять становится нечего — узел выглядел
+     * неисправным. Google в тех же условиях прислал обычный Certificate, поэтому первый же
+     * опыт прошёл, а второй нет: сжимать или нет решает сервер.
+     *
+     * Что теряется. Hello обычного TLS отличается от Chrome на одно расширение. Для Reality
+     * это было бы недопустимо — по составу расширений его и опознают, — но у security=tls
+     * маскировки под браузер нет по смыслу: там настоящее имя в SNI и настоящий сертификат.
+     * Байты Reality-Hello при этом не меняются ни на бит, и это стережёт hellofreeze.c. */
+    if (!cfg->plain) {
+        struct buf cb = { b_cc, 0, sizeof(b_cc) };
+        put8(&cb, 2); put16(&cb, 0x0002);
+        px[pn].type = 0x001B; px[pn].body = b_cc; px[pn].n = cb.len; pn++;
+    }
 
     /* encrypted_client_hello — НАБИВКА, а не настоящий ECH.
      *
@@ -612,6 +644,11 @@ int reality_build_hello_carry(const struct reality_cfg *cfg, struct reality_stat
      * AAD и есть причина, по которой это делается здесь: пока Hello не собран, подписывать
      * нечего. Сервер повторит тот же расчёт своим приватным ключом и сверит тег — так он и
      * отличает нас от постороннего, не отвечая при этом ничего отличимого. */
+    /* Обычному TLS подписывать нечего: session_id уже случаен и уехал в Hello как есть.
+     * Ранний возврат ЗДЕСЬ, а не проверкой внутри: ниже лежит расчёт, у которого без
+     * постоянного ключа сервера нет ни одного осмысленного входа. */
+    if (cfg->plain) return 0;
+
     {
         const unsigned char *raw = out + 5;              /* handshake без заголовка записи */
         const unsigned char *random = raw + 4 + 2;       /* после type+len24+version */

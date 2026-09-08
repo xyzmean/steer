@@ -113,9 +113,29 @@ int main(void) {
     /* ---- непригодные узлы: пропущены с причиной, а не выброшены ------------ */
     {
         struct vless_node n;
-        check_n("security=tls: пропущен",
-                1, vless_parse_url("vless://u@h:443?security=tls#x", &n));
-        check("security=tls: причина названа", "security=tls не поддержан", n.skip_reason);
+        /* security=tls ПРИГОДЕН: подлинность доказывается сертификатом, и проверка есть
+         * (certverify.c). Раньше он отбраковывался целиком — узел с обычным TLS выглядел
+         * неисправным, хотя неисправен был клиент. */
+        check_n("security=tls по имени: пригоден",
+                0, vless_parse_url("vless://u@node.example.org:443?security=tls#x", &n));
+        check("security=tls: security сохранён", "tls", n.security);
+
+        /* А вот адрес без sni — непригоден, и по своей причине: сертификат выдают на имя,
+         * и проверять его тут не против чего. Отдельная причина, а не «security не
+         * поддержан»: это разные разговоры с человеком. */
+        check_n("security=tls по адресу без sni: пропущен",
+                1, vless_parse_url("vless://u@9.9.9.9:443?security=tls#x", &n));
+        check("security=tls по адресу без sni: причина названа",
+              "tls по адресу без sni: нечем сверить", n.skip_reason);
+
+        /* Адрес, но с sni — пригоден: имя есть, проверять против чего. */
+        check_n("security=tls по адресу с sni: пригоден",
+                0, vless_parse_url("vless://u@9.9.9.9:443?security=tls&sni=node.example.org#x", &n));
+
+        /* xtls остаётся непригодным: это не «TLS с проверкой», а свой обмен. */
+        check_n("security=xtls: пропущен",
+                1, vless_parse_url("vless://u@h:443?security=xtls#x", &n));
+        check("security=xtls: причина названа", "security=xtls не поддержан", n.skip_reason);
 
         check_n("reality без pbk: пропущен",
                 1, vless_parse_url("vless://u@h:443?security=reality&sni=a.com#x", &n));
@@ -281,8 +301,8 @@ int main(void) {
      *
      * Проверяется не наличие поля, а два свойства, на которых оно живёт: причины
      * СХОДЯТСЯ (сумма count равна skipped — иначе часть узлов пропала бы уже в
-     * объяснении) и СХЛОПЫВАЮТСЯ по тексту (три tls-узла — одна строка со счётчиком,
-     * а не три одинаковых). */
+     * объяснении) и СХЛОПЫВАЮТСЯ по тексту (три tls-узла без имени — одна строка со
+     * счётчиком, а не три одинаковых). */
     {
         struct vless_node nodes[16];
         struct vless_sub_stats st;
@@ -305,7 +325,8 @@ int main(void) {
 
         /* Порядок — по первому появлению, поэтому он предсказуем и его можно
          * проверять: иначе стенд молчал бы о том, что причины перепутались. */
-        check("первая причина: security=tls", "security=tls не поддержан",
+        check("первая причина: tls без имени",
+              "tls по адресу без sni: нечем сверить",
               st.reasons[0].reason);
         check_n("tls схлопнут в одну строку со счётчиком 3", 3, (long)st.reasons[0].count);
         check("tls: пример — имя первого узла", "Первый", st.reasons[0].example);

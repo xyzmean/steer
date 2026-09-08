@@ -19,4 +19,8 @@ int mbedtls_md_hmac(const mbedtls_md_info_t *md_info,
                     const unsigned char *key, size_t keylen,
                     const unsigned char *input, size_t ilen,
                     unsigned char *output);
+/* Нужны certverify.c: размер хеша по типу и разовый расчёт хеша. */
+unsigned char mbedtls_md_get_size(const mbedtls_md_info_t *md_info);
+int mbedtls_md(const mbedtls_md_info_t *md_info, const unsigned char *input, size_t ilen,
+               unsigned char *output);
 #endif

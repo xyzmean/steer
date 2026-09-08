@@ -465,11 +465,28 @@ int vless_connect(const struct vless_node *node, struct vless_conn *conn, int ti
         return rc_h2;
     }
 
+    /* security=tls — обычный TLS, без Reality.
+     *
+     * Отличий от ветки Reality ровно три, и все три обязательны. ClientHello без
+     * аутентификатора (иначе сервер увидел бы в session_id мусор — безвредный, но
+     * бессмысленный). ИМЯ обязано быть: у Reality пустой SNI законен (сервер ждёт Hello без
+     * расширения), а обычному TLS без имени нечего предъявить и нечем проверить сертификат.
+     * И сама проверка сертификата — единственное, что здесь доказывает подлинность сервера.
+     *
+     * Имя берётся из sni, а host — только запасным: sni это то, что мы просим у сервера, и
+     * проверять сертификат надо против него же. Узел, объявленный одним адресом без имени,
+     * проверяется против адреса — и не пройдёт, если сертификат выдан не на него. Это
+     * правильный отказ, а не наша строгость: ровно так же поступает Xray. */
+    int is_tls = strcmp(node->security, "tls") == 0;
+    const char *verify_host = node->sni[0] ? node->sni : node->host;
+
     struct reality_cfg cfg = {
-        .sni = node->sni, .pbk = node->pbk, .sid = node->sid, .fp = node->fp,
+        .sni = is_tls ? verify_host : node->sni,
+        .pbk = node->pbk, .sid = node->sid, .fp = node->fp,
         /* ALPN просим ровно тогда, когда он нужен. Для tcp его нет — и Hello остаётся
          * тем самым, который проверен на живых узлах. */
         .alpn = conn->tr == VT_RAW ? NULL : "h2",
+        .plain = is_tls,
     };
     unsigned char hello[2048];
     size_t hello_n = 0;
@@ -489,7 +506,10 @@ int vless_connect(const struct vless_node *node, struct vless_conn *conn, int ti
 
     /* Передаётся наш ПРИВАТНЫЙ ключ, а не готовый секрет: TLS-расписание строится на
      * обмене с эфемерным ключом сервера, который приедет только в ServerHello. */
-    rc = tls13_handshake(&conn->tls, fd, hello, hello_n, conn->rst.priv);
+    rc = is_tls
+             ? tls13_handshake_verify(&conn->tls, fd, hello, hello_n, conn->rst.priv,
+                                      verify_host, NULL)
+             : tls13_handshake(&conn->tls, fd, hello, hello_n, conn->rst.priv);
     if (rc) { close(fd); conn->fd = -1; return rc; }
 
     if (conn->tr != VT_RAW) {
@@ -786,6 +806,16 @@ const char *vless_strerror(int rc) {
          * выглядит блокировка по имени в SNI, лежачий узел и потерянный пакет — то есть
          * причина снаружи движка, и текст обязан отправлять смотреть туда. */
         case TLS13_ETIMEOUT: return "узел не ответил на ClientHello (таймаут)";
+        /* Причина у отказа проверки одна на код, но РАЗНАЯ по сути — «нечем проверить» это
+         * не то же самое, что «проверили и не сошлось». Точный текст приносит tls13.c, и
+         * общее слово добавляется здесь, чтобы человек видел, о чём вообще речь. */
+        case TLS13_ECERT: {
+            static __thread char why[128];
+            const char *d = tls13_verify_reason();
+            snprintf(why, sizeof why, "сервер не доказал подлинность%s%s",
+                     d && d[0] ? ": " : "", d && d[0] ? d : "");
+            return why;
+        }
         default: return "неизвестная ошибка";
     }
 }

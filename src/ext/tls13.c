@@ -34,6 +34,7 @@
 #include "mbedtls/gcm.h"
 #include "mbedtls/chachapoly.h"
 
+#include "certverify.h"
 #include "tls13.h"
 
 /* Из reality.c: тот же X25519, но со вторым множителем из ServerHello. Общая функция, а
@@ -314,11 +315,27 @@ static int aead_seal_once(const struct tls13_keys *src, uint64_t seq,
 }
 
 /* ---- рукопожатие ----------------------------------------------------------- */
-/* Принимает уже отправленный ClientHello (для транскрипта) и общий секрет из Reality.
+
+/* Почему отказ проверки лежит В ПОТОКЕ, а не в struct tls13. К моменту, когда вызывающий
+ * захочет назвать причину, соединение уже закрыто и структура очищена: путь отказа в
+ * client.c — vless_close, а он обнуляет всё. Поток же переживает и закрытие, и следующую
+ * попытку того же соединителя, а разные соединители своих причин друг другу не портят. */
+static __thread char g_verify_reason[96];
+
+const char *tls13_verify_reason(void) { return g_verify_reason; }
+
+/* Принимает уже отправленный ClientHello (для транскрипта) и общий секрет.
+ *
+ * host != NULL включает проверку подлинности сервера по сертификату (security=tls). При
+ * host == NULL сообщения Certificate и CertificateVerify по-прежнему попадают в транскрипт,
+ * но не разбираются — это путь Reality, и объяснение, почему там проверять нечего, стоит в
+ * заголовке reality.c.
+ *
  * Возвращается с готовыми ключами трафика. */
-int tls13_handshake(struct tls13 *t, int fd,
-                    const unsigned char *client_hello, size_t hello_n,
-                    const unsigned char *our_priv) {
+static int handshake(struct tls13 *t, int fd,
+                     const unsigned char *client_hello, size_t hello_n,
+                     const unsigned char *our_priv,
+                     const char *host, const char *roots) {
     memset(t, 0, sizeof(*t));
     t->fd = fd;
     /* md и H заполняются после разбора ServerHello: они зависят от набора шифров. */
@@ -462,6 +479,20 @@ int tls13_handshake(struct tls13 *t, int fd,
     static __thread unsigned char hsbuf[40960];
     size_t hs_have = 0;
 
+    /* Сообщения, нужные проверке подлинности. Копируются, а не запоминаются указателем:
+     * hsbuf сдвигается по мере разбора, и к моменту проверки на прежнем месте лежало бы
+     * начало следующего сообщения. Цепочка бывает и восьмикилобайтной (см. выше про
+     * маскировочный сайт с Certificate в 8273 байта), поэтому буфер тех же размеров, что и
+     * hsbuf, но выделяется ТОЛЬКО когда проверка включена: у Reality он был бы 40 КБ на
+     * поток, которые никто не читает. */
+    static __thread unsigned char certbuf[40960];
+    size_t cert_n = 0;
+    unsigned char cv_buf[1024];
+    size_t cv_n = 0;
+    unsigned char cv_transcript[48];
+    size_t cv_thash_n = 0;
+    g_verify_reason[0] = '\0';
+
     /* Проходов больше шестнадцати: одна запись — не одно сообщение, и длинная цепочка
      * сертификатов приезжает несколькими записями. */
     for (int guard = 0; guard < 64 && !got_finished; guard++) {
@@ -518,6 +549,31 @@ int tls13_handshake(struct tls13 *t, int fd,
                     }
                 }
             }
+            if (host && msg == 0x19) {          /* CompressedCertificate (RFC 8879) */
+                /* Сюда попасть можно только если сервер сжал сертификат, которого мы не
+                 * просили сжимать: расширение compress_certificate у security=tls не
+                 * посылается вовсе (см. reality.c). Отдельная причина, а не «не
+                 * разобрался»: разница между «сервер прислал не то» и «мы не поняли то, что
+                 * прислали» — это разные разговоры и с человеком, и с владельцем сервера. */
+                snprintf(g_verify_reason, sizeof(g_verify_reason),
+                         "сервер сжал сертификат, о чём его не просили");
+                return TLS13_ECERT;
+            }
+            if (host && msg == 0x0B && cert_n == 0) {   /* Certificate */
+                if (mlen > sizeof(certbuf)) return TLS13_ETOOBIG;
+                memcpy(certbuf, hsbuf + p + 4, mlen);
+                cert_n = mlen;
+            }
+            if (host && msg == 0x0F && cv_n == 0) {     /* CertificateVerify */
+                /* Хеш снимается ЗДЕСЬ, до tr_add этого же сообщения: сервер подписывал
+                 * транскрипт по Certificate включительно, и ни байтом больше. Снять его
+                 * позже нельзя — транскрипт необратим. */
+                if (mlen > sizeof(cv_buf)) return TLS13_ETOOBIG;
+                tr_hash(t, cv_transcript);
+                cv_thash_n = H;
+                memcpy(cv_buf, hsbuf + p + 4, mlen);
+                cv_n = mlen;
+            }
             if (msg == 0x14) {                  /* Finished */
                 /* Проверяем ДО добавления в транскрипт: сервер считал его от хеша
                  * предыдущих сообщений. */
@@ -540,6 +596,33 @@ int tls13_handshake(struct tls13 *t, int fd,
         }
     }
     if (!got_finished) return TLS13_EFINISHED;
+
+    /* Проверка подлинности — ПОСЛЕ серверного Finished и ДО нашего.
+     *
+     * После: Finished доказывает, что транскрипт у нас с сервером один, а значит и та его
+     * часть, которую подписал CertificateVerify, не подменена по дороге. Проверять подпись
+     * над транскриптом, в котором мы ещё не уверены, значит проверять не то.
+     *
+     * До: свой Finished — это первое, что уходит на сервер под ключами сессии, и отправлять
+     * его тому, кто подлинности не доказал, незачем. */
+    if (host) {
+        if (!cert_n || !cv_n) {
+            /* Рукопожатие сошлось, а доказательства не было. Так отвечает сервер, который
+             * ждал сертификат ОТ НАС (client auth) или возобновил сессию — ни того, ни
+             * другого мы не умеем и не просили. Причина названа отдельно: «сертификата не
+             * прислали» и «сертификат не сошёлся» — не одно и то же. */
+            snprintf(g_verify_reason, sizeof(g_verify_reason),
+                     "сервер не прислал %s", cert_n ? "подпись" : "сертификат");
+            return TLS13_ECERT;
+        }
+        int vrc = cert_verify_server(certbuf, cert_n, cv_buf, cv_n,
+                                     cv_transcript, cv_thash_n, host, roots);
+        if (vrc != 0) {
+            snprintf(g_verify_reason, sizeof(g_verify_reason), "%s",
+                     cert_verify_strerror(vrc));
+            return TLS13_ECERT;
+        }
+    }
 
     /* Свой Finished — от транскрипта, включающего серверный. */
     unsigned char th2[48], cfkey[48], chash[48], cfin[48];
@@ -589,6 +672,23 @@ int tls13_handshake(struct tls13 *t, int fd,
     t->wr_seq = t->rd_seq = 0;
     t->ready = 1;
     return 0;
+}
+
+int tls13_handshake(struct tls13 *t, int fd,
+                    const unsigned char *client_hello, size_t hello_n,
+                    const unsigned char *our_priv) {
+    return handshake(t, fd, client_hello, hello_n, our_priv, NULL, NULL);
+}
+
+int tls13_handshake_verify(struct tls13 *t, int fd,
+                           const unsigned char *client_hello, size_t hello_n,
+                           const unsigned char *our_priv,
+                           const char *host, const char *roots) {
+    /* Пустое имя — это НЕ «проверять нечем», это ошибка вызывающего: проверка без имени
+     * пропустила бы любой действительный сертификат на свете, то есть выглядела бы работой,
+     * ничего не проверяя. */
+    if (!host || !host[0]) return TLS13_ECERT;
+    return handshake(t, fd, client_hello, hello_n, our_priv, host, roots);
 }
 
 int tls13_has_record(const struct tls13 *t) {
