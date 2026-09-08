@@ -105,11 +105,42 @@ echo "ext-test: mbedtls ${MBED_VER:-неизвестной версии}, фла
 echo "ext-test: ВНИМАНИЕ — релиз собирается docker'ом с mbedtls 3.x; зелёное здесь"
 echo "ext-test:            не равно зелёному в релизе (R-058)."
 
+# ---- разбор X.509: отдельная библиотека там, где она отдельная -----------------
+# certverify.c зовёт mbedtls_x509_crt_* — единственное место в src/ext, где нужен разбор
+# сертификатов, и появилось оно вместе с security=tls. В образе сборщика вся библиотека
+# сложена в один libmbedcrypto.a (build/ext-test-image.sh: объекты всех модулей в один
+# архив), и добавлять там нечего. В системной mbedtls она разделена на три —
+# crypto, x509, tls, — и стенды падали на неопределённых mbedtls_x509_crt_init.
+#
+# ПРОБА, А НЕ ДОГАДКА: тот же приём, что ниже у AddressSanitizer, и по той же причине. Путь
+# к библиотеке приходит четырьмя разными способами (см. выше), и «-lmbedx509 всегда»
+# сломало бы ровно образ сборщика, где такой библиотеки не существует.
+x509p="$BUILD/x509-probe"
+printf '%s\n' '#include "mbedtls/x509_crt.h"' \
+	'int main(void){mbedtls_x509_crt c;mbedtls_x509_crt_init(&c);mbedtls_x509_crt_free(&c);return 0;}' \
+	> "$x509p.c"
+# shellcheck disable=SC2086
+if ! $CC -O0 -w $MBED_INC "$PRIV" -o "$x509p" "$x509p.c" $MBED_LIB >/dev/null 2>&1; then
+	# shellcheck disable=SC2086
+	if $CC -O0 -w $MBED_INC "$PRIV" -o "$x509p" "$x509p.c" -lmbedx509 $MBED_LIB >/dev/null 2>&1; then
+		MBED_LIB="-lmbedx509 $MBED_LIB"
+		echo "ext-test: разбор X.509 — отдельной библиотекой (-lmbedx509)"
+	else
+		# Громкий пропуск, как и при ненайденной библиотеке: без X.509 не компонуется ни
+		# один стенд, потому что tls13.c зовёт certverify.c во всех сборках.
+		echo "ext-test: в этой mbedtls нет разбора X.509 — ПРОПУСК (это не падение)."
+		echo "ext-test:   Debian/Ubuntu: apt-get install libmbedtls-dev (в нём libmbedx509)."
+		rm -f "$x509p" "$x509p.c"
+		exit 0
+	fi
+fi
+rm -f "$x509p" "$x509p.c"
+
 # xsloop — рукопожатие целиком.
 echo "ext-test: собираю и прогоняю xsloop..."
 $CC -O2 -w -Isrc $MBED_INC "$PRIV" -o "$BUILD/xsloop" tests/xsloop.c \
 	src/ext/xshake.c src/ext/chello.c src/ext/xswire.c src/ext/reality.c \
-	src/ext/tls13.c src/ext/h2.c $MBED_LIB
+	src/ext/tls13.c src/ext/certverify.c src/ext/h2.c $MBED_LIB
 "$BUILD/xsloop"
 
 # spokematch — освобождение ключей при неудаче, под AddressSanitizer.
@@ -145,7 +176,7 @@ $CC -O1 -g -w -Isrc $ASAN $MBED_INC "$PRIV" -o "$BUILD/spokematch" \
 	tests/spokematch.c \
 	src/ext/xsconn.c src/ext/xswire.c src/ext/xsepoch.c src/ext/xsroute.c \
 	src/ext/xsconf.c src/ext/xslink.c src/ext/xsstream.c src/ext/xshake.c src/ext/chello.c \
-	src/ext/reality.c src/ext/tls13.c src/ext/h2.c src/ext/tun.c src/obfs.c \
+	src/ext/reality.c src/ext/tls13.c src/ext/certverify.c src/ext/h2.c src/ext/tun.c src/obfs.c \
 	src/spec.c $MBED_LIB -lpthread
 "$BUILD/spokematch"
 
@@ -154,14 +185,14 @@ echo "ext-test: собираю и прогоняю hubmatch..."
 $CC -O2 -w -Isrc $MBED_INC "$PRIV" -o "$BUILD/hubmatch" tests/hubmatch.c \
 	src/ext/xsconn.c src/ext/xswire.c src/ext/xsepoch.c src/ext/xsroute.c \
 	src/ext/xsconf.c src/ext/xslink.c src/ext/xsstream.c src/ext/xshake.c src/ext/chello.c \
-	src/ext/reality.c src/ext/tls13.c src/ext/h2.c src/ext/tun.c src/obfs.c \
+	src/ext/reality.c src/ext/tls13.c src/ext/certverify.c src/ext/h2.c src/ext/tun.c src/obfs.c \
 	src/spec.c $MBED_LIB -lpthread
 "$BUILD/hubmatch"
 
 # devupmatch — подъём устройства туннеля называет свои отказы (I-114).
 echo "ext-test: собираю и прогоняю devupmatch..."
 $CC -O2 -w -Isrc $MBED_INC "$PRIV" -o "$BUILD/devupmatch" tests/devupmatch.c \
-	src/ext/client.c src/ext/vless_proto.c src/ext/vision.c src/ext/tls13.c \
+	src/ext/client.c src/ext/vless_proto.c src/ext/vision.c src/ext/tls13.c src/ext/certverify.c \
 	src/ext/reality.c src/ext/h2.c src/ext/tun.c src/ext/rtx.c src/ext/sub.c \
 	src/spec.c $MBED_LIB -lpthread
 "$BUILD/devupmatch"
@@ -186,7 +217,7 @@ $CC -O1 -w -Isrc $MBED_INC "$PRIV" -DSTEER_SERVER -o "$BUILD/steer-hub-native" \
 	src/steer.c src/spec.c src/dnsd.c src/failover.c src/aggregate.c src/obfs.c src/cli.c \
 	src/srs.c src/puff.c src/hwid.c \
 	src/ext/xswire.c src/ext/xsconf.c src/ext/xslink.c src/ext/xsroute.c src/ext/chello.c src/ext/xshake.c \
-	src/ext/xsconn.c src/ext/xsstream.c src/ext/xsepoch.c src/ext/tls13.c src/ext/reality.c \
+	src/ext/xsconn.c src/ext/xsstream.c src/ext/xsepoch.c src/ext/tls13.c src/ext/certverify.c src/ext/reality.c \
 	src/ext/tun.c src/ext/h2.c src/ext/xsadmin.c src/ext/xshub.c \
 	$MBED_LIB -lpthread
 echo "ext-test: прогоняю probe (зондирование порта хаба)..."

@@ -149,15 +149,20 @@ fi
 # настоящему TCP и ратчет эпох нужны обеим сторонам звезды, и держать их у одной значило бы,
 # что вторую придётся писать заново — то есть двумя способами ошибиться в формате, который
 # обязан совпадать до байта.
+# certverify.c лежит в ОБЩЕЙ половине, хотя проверка цепочки нужна только клиенту: её зовёт
+# tls13.c, и зовёт безусловно, а не под #ifdef. Значит файл обязан быть везде, где
+# компилируется tls13.c, — то есть во всех трёх ролях. Внесённый только в EXT_ROUTER, он
+# оставил роли server и tgws с неопределёнными ссылками на cert_verify_server: сборка
+# роутерного пакета при этом шла как обычно, и заметить это было нечем, кроме релиза.
 XS_COMMON="/src/src/ext/xswire.c /src/src/ext/xsconf.c /src/src/ext/xslink.c /src/src/ext/xsroute.c \
            /src/src/ext/chello.c /src/src/ext/xshake.c /src/src/ext/xsconn.c \
            /src/src/ext/xsstream.c /src/src/ext/xsepoch.c \
-           /src/src/ext/tls13.c /src/src/ext/reality.c /src/src/ext/tun.c /src/src/ext/h2.c \
+           /src/src/ext/tls13.c /src/src/ext/certverify.c \
+           /src/src/ext/reality.c /src/src/ext/tun.c /src/src/ext/h2.c \
            /src/src/ext/xsadmin.c"
 EXT_ROUTER="/src/src/ext/sub.c /src/src/ext/vless_proto.c /src/src/ext/vision.c \
             /src/src/ext/client.c /src/src/ext/tunnel.c /src/src/ext/rtx.c \
-            /src/src/ext/xsclient.c /src/src/ext/subfetch.c /src/src/ext/tgws.c /src/src/ext/tlsprobe.c \
-            /src/src/ext/certverify.c"
+            /src/src/ext/xsclient.c /src/src/ext/subfetch.c /src/src/ext/tgws.c /src/src/ext/tlsprobe.c"
 EXT_SERVER="/src/src/ext/xshub.c"
 
 case "$ROLE" in
@@ -169,8 +174,8 @@ case "$ROLE" in
   # Мини-сборка для микропакета tgws: мост и то, на чём он стоит (записи TLS 1.3, примитивы
   # Reality для браузерного Hello), и больше ничего. Ни клиента VLESS, ни звезды xsteer, ни
   # подписки — их подкоманды отвечают штатной заглушкой, как в базовой сборке.
-  tgws) EXT="/src/src/ext/tls13.c /src/src/ext/reality.c /src/src/ext/chello.c \
-             /src/src/ext/tgws.c /src/src/ext/tlsprobe.c"
+  tgws) EXT="/src/src/ext/tls13.c /src/src/ext/certverify.c /src/src/ext/reality.c \
+             /src/src/ext/chello.c /src/src/ext/tgws.c /src/src/ext/tlsprobe.c"
         ROLEDEF="-DSTEER_TGWS" ;;
   *) echo "неизвестная роль: $ROLE (router|server)" >&2; exit 2 ;;
 esac
