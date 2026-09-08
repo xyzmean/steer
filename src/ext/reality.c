@@ -281,7 +281,7 @@ int reality_build_hello_carry(const struct reality_cfg *cfg, struct reality_stat
     unsigned char sess[32] = {0};
     /* Версия клиента Reality — из core.Version_{x,y,z} Xray. Сервер её не проверяет
      * строго, но она входит в подписываемые 16 байт, так что должна быть осмысленной. */
-    sess[0] = 26; sess[1] = 7; sess[2] = 28; sess[3] = 0;
+    sess[0] = 26; sess[1] = 9; sess[2] = 8; sess[3] = 0;
     uint32_t now = (uint32_t)time(NULL);
     sess[4] = (unsigned char)(now >> 24);
     sess[5] = (unsigned char)(now >> 16);
