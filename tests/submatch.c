@@ -581,6 +581,86 @@ int main(void) {
         check("конфиг Xray: одиночный — имя", "one", nodes[0].name);
     }
     {
+        /* ---- имя из remarks, а не из tag -----------------------------------------
+         *
+         * Форма снята с живой панели (ответ клиенту Happ) и воспроизведена в главном:
+         * remarks стоит ПОСЛЕ outbounds, у обычных узлов tag один на всех — «proxy», а у
+         * конфига с балансировщиком два исходящих с tag'ами, где хвост случаен и меняется
+         * от запроса к запросу. Без remarks список узлов выглядел бы как «proxy, proxy,
+         * proxy» плюс два имени, которые завтра будут другими. */
+        struct vless_node nodes[16];
+        struct vless_sub_stats st;
+        const char *cfg =
+            "[{\"outbounds\":["
+            "  {\"tag\":\"proxy\",\"protocol\":\"vless\","
+            "   \"settings\":{\"vnext\":[{\"address\":\"de.example.org\",\"port\":443,"
+            "     \"users\":[{\"id\":\"11111111-2222-3333-4444-555555555555\"}]}]},"
+            "   \"streamSettings\":{\"network\":\"tcp\",\"security\":\"reality\","
+            "     \"realitySettings\":{\"serverName\":\"a.example\",\"publicKey\":\"P1\"}}},"
+            "  {\"tag\":\"direct\",\"protocol\":\"freedom\",\"settings\":{}}],"
+            " \"remarks\":\"🇩🇪 Германия\"},"
+            " {\"outbounds\":["
+            "  {\"tag\":\"tl-8-1-43al6bgvgg4\",\"protocol\":\"vless\","
+            "   \"settings\":{\"vnext\":[{\"address\":\"de.example.org\",\"port\":443,"
+            "     \"users\":[{\"id\":\"11111111-2222-3333-4444-555555555555\"}]}]},"
+            "   \"streamSettings\":{\"network\":\"tcp\",\"security\":\"reality\","
+            "     \"realitySettings\":{\"serverName\":\"a.example\",\"publicKey\":\"P2\"}}},"
+            "  {\"tag\":\"tl-8-2-8mj546dasfg\",\"protocol\":\"vless\","
+            "   \"settings\":{\"vnext\":[{\"address\":\"backup.example.org\",\"port\":443,"
+            "     \"users\":[{\"id\":\"11111111-2222-3333-4444-555555555555\"}]}]},"
+            "   \"streamSettings\":{\"network\":\"tcp\",\"security\":\"reality\","
+            "     \"realitySettings\":{\"serverName\":\"a.example\",\"publicKey\":\"P3\"}}}],"
+            " \"remarks\":\"МОБИЛЬНЫЙ АВТО\"},"
+            " {\"outbounds\":["
+            "  {\"tag\":\"proxy\",\"protocol\":\"vless\","
+            "   \"settings\":{\"vnext\":[{\"address\":\"fi.example.org\",\"port\":443,"
+            "     \"users\":[{\"id\":\"11111111-2222-3333-4444-555555555555\"}]}]},"
+            "   \"streamSettings\":{\"network\":\"tcp\",\"security\":\"reality\","
+            "     \"realitySettings\":{\"serverName\":\"a.example\",\"publicKey\":\"P4\"}}}],"
+            " \"remarks\":\"🇫🇮 Финляндия\"}]";
+        size_t n = vless_parse_sub(cfg, nodes, 16, &st);
+        check_n("remarks: взято узлов", 4, (long)n);
+        check("remarks: имя вместо tag «proxy»", "🇩🇪 Германия", nodes[0].name);
+        check("remarks: имя видно, хотя стоит после outbounds", "🇫🇮 Финляндия", nodes[3].name);
+        check("remarks: первый узел конфига без номера", "МОБИЛЬНЫЙ АВТО", nodes[1].name);
+        check("remarks: второй узел того же конфига пронумерован",
+              "МОБИЛЬНЫЙ АВТО (2)", nodes[2].name);
+        check("remarks: узел под своим адресом", "backup.example.org", nodes[2].host);
+    }
+    {
+        /* remarks нет — имя остаётся из tag: панели, у которых tag осмысленный, ничего не
+         * теряют. Проверяется отдельно от главного случая, потому что это ровно та граница,
+         * на которой предпросмотр обязан промолчать, а не подставить пустое имя. */
+        struct vless_node nodes[4];
+        struct vless_sub_stats st;
+        const char *cfg =
+            "[{\"outbounds\":[{\"protocol\":\"vless\",\"tag\":\"ch01_tcp\","
+            "  \"settings\":{\"vnext\":[{\"address\":\"1.2.3.4\",\"port\":443,"
+            "    \"users\":[{\"id\":\"11111111-2222-3333-4444-555555555555\"}]}]},"
+            "  \"streamSettings\":{\"network\":\"tcp\",\"security\":\"reality\","
+            "    \"realitySettings\":{\"serverName\":\"a.example\",\"publicKey\":\"P\"}}}],"
+            " \"remarks\":\"\"}]";
+        size_t n = vless_parse_sub(cfg, nodes, 4, &st);
+        check_n("remarks пустой: узел взят", 1, (long)n);
+        check("remarks пустой: имя осталось из tag", "ch01_tcp", nodes[0].name);
+    }
+    {
+        /* Непригодный узел из конфига с remarks объясняется ИМЕНЕМ ИЗ ПАНЕЛИ: человек
+         * ищет в списке панели то слово, которое ему показали, а не «proxy». */
+        struct vless_node nodes[4];
+        struct vless_sub_stats st;
+        const char *cfg =
+            "[{\"outbounds\":[{\"protocol\":\"vless\",\"tag\":\"proxy\","
+            "  \"settings\":{\"vnext\":[{\"address\":\"0.0.0.0\",\"port\":1,"
+            "    \"users\":[{\"id\":\"00000000-0000-0000-0000-000000000000\"}]}]},"
+            "  \"streamSettings\":{\"network\":\"tcp\",\"security\":\"none\"}}],"
+            " \"remarks\":\"🇱🇻 Латвия\"}]";
+        size_t n = vless_parse_sub(cfg, nodes, 4, &st);
+        check_n("remarks: непригодный не взят", 0, (long)n);
+        check_n("remarks: непригодный посчитан", 1, (long)st.skipped);
+        check("remarks: пример пропуска — имя из панели", "🇱🇻 Латвия", st.reasons[0].example);
+    }
+    {
         /* Непригодный узел в конфиге объясняется так же, как непригодная ссылка: правило
          * пригодности у обоих путей одно (node_usable). Здесь — заглушка панели, которую
          * она отдаёт клиенту без идентификатора устройства. */
