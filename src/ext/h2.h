@@ -65,6 +65,12 @@ struct h2 {
      * следующий, и планировать окна между потоками не нужно. Кадры, опоздавшие от уже
      * закрытого потока, узнаются по номеру и отбрасываются — см. разбор заголовка кадра. */
     uint32_t sid;
+
+    /* Каким клиентом представляться в заголовках: 0 — gRPC (te: trailers и его User-Agent),
+     * 1 — браузер (облик Chrome для xhttp, см. put_headers в h2.c). Живёт в СОСТОЯНИИ, а не
+     * в аргументах: у packet-up запросов череда, и передавать признак в каждый значило бы
+     * место, где однажды забудут. Ставится один раз при открытии соединения. */
+    int browser;
 };
 
 /* Сколько места обязан дать вызывающий h2_read. В одной записи TLS приезжает до 16384
@@ -86,7 +92,7 @@ int h2_start(struct h2 *h, const struct h2_io *io, const char *authority,
  * end_stream нужен GET: у него нет тела, и сервер ждёт END_STREAM прямо на HEADERS. */
 int h2_start_ex(struct h2 *h, const struct h2_io *io, const char *authority,
                 const char *path, const char *content_type, const char *referer,
-                int method, int end_stream);
+                int method, int end_stream, int browser);
 
 /* СЛЕДУЮЩИЙ запрос на том же соединении: новый номер потока, свежее состояние потока,
  * настройки и окно соединения не пересылаются. Нужен packet-up, где каждый кусок выгрузки —

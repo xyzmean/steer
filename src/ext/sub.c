@@ -161,6 +161,49 @@ static void set_name(char *dst, size_t n, const char *src) {
     utf8_trim_tail(dst);
 }
 
+/* Длина набивки xhttp из значения `xPaddingBytes`.
+ *
+ * Значение бывает двух видов, и оба законны у Xray: одно число («512») или диапазон
+ * («50-150»). Разбирается вручную, без sscanf: строка приходит из интернета, а sscanf на
+ * мусоре ведёт себя тем интереснее, чем мусор изобретательнее.
+ *
+ * Ничего не понято — поля не трогаются, и дальше работает умолчание. Молчание здесь верно:
+ * набивка, которую мы не сумели прочитать, не повод объявлять узел негодным — умолчание
+ * Xray подойдёт большинству серверов. */
+static void pad_range(struct vless_node *n, const char *v) {
+    unsigned a = 0, b = 0;
+    const char *p = v;
+    while (*p == ' ' || *p == '"') p++;
+    if (*p < '0' || *p > '9') return;
+    while (*p >= '0' && *p <= '9') { a = a * 10 + (unsigned)(*p - '0'); p++; if (a > 65535) return; }
+    if (*p == '-') {
+        p++;
+        if (*p < '0' || *p > '9') return;
+        while (*p >= '0' && *p <= '9') { b = b * 10 + (unsigned)(*p - '0'); p++; if (b > 65535) return; }
+    } else {
+        b = a;
+    }
+    if (b < a) return;
+    n->pad_from = (uint16_t)a;
+    n->pad_to = (uint16_t)b;
+}
+
+/* `extra` ссылки — это кусок настроек транспорта в JSON, и нас в нём занимает ровно одно
+ * поле. Полного разбора здесь нет намеренно: остальное (xmux, сроки переиспользования
+ * соединений) относится к мультиплексору, которого у нас нет, и разбирать его значило бы
+ * читать чужие настройки, чтобы их выбросить.
+ *
+ * Поиск по имени поля, а не разбор объекта: `extra` приезжает уже раскодированным из
+ * процентной формы, вложенность в нём одна, и вытащить одно число дешевле, чем заводить
+ * второй разбор JSON рядом с тем, что уже есть в этом файле. */
+static void parse_extra(struct vless_node *n, const char *extra) {
+    const char *k = strstr(extra, "\"xPaddingBytes\"");
+    if (!k) return;
+    k = strchr(k + 15, ':');
+    if (!k) return;
+    pad_range(n, k + 1);
+}
+
 /* Пригодность разобранного узла — общее правило для обоих путей разбора; тело ниже. */
 static int node_usable(struct vless_node *n);
 
@@ -215,6 +258,14 @@ int vless_parse_url(const char *url, struct vless_node *n) {
                 else if (klen == 4 && !strncmp(k, "path", 4)) { set_field(n->path, sizeof(n->path), v, vlen); pct_decode(n->path); }
                 else if (klen == 11 && !strncmp(k, "serviceName", 11)) { set_field(n->service, sizeof(n->service), v, vlen); pct_decode(n->service); }
                 else if (klen == 4 && !strncmp(k, "mode", 4)) set_field(n->mode, sizeof(n->mode), v, vlen);
+                /* extra — настройки транспорта в JSON. Читается ради длины набивки: сервер
+                 * её ПРОВЕРЯЕТ и на чужую отвечает 400 (см. pad_range). */
+                else if (klen == 5 && !strncmp(k, "extra", 5)) {
+                    char ex[256];
+                    set_field(ex, sizeof(ex), v, vlen);
+                    pct_decode(ex);
+                    parse_extra(n, ex);
+                }
             }
             if (!amp) break;
             k = amp + 1;
@@ -528,6 +579,13 @@ static void xray_stream(struct sj *j, struct vless_node *n) {
             while (sj_obj_key(j, &f2, k2, sizeof(k2)) == 0) {
                 if (!strcmp(k2, "path")) sj_str(j, n->path, sizeof(n->path));
                 else if (!strcmp(k2, "mode")) sj_str(j, n->mode, sizeof(n->mode));
+                /* В конфигурации это поле лежит прямо здесь, а не в `extra`: `extra` — форма
+                 * ССЫЛКИ, в которую те же настройки заворачивают, когда конфигурации нет. */
+                else if (!strcmp(k2, "xPaddingBytes")) {
+                    char pb[32];
+                    sj_str(j, pb, sizeof(pb));
+                    pad_range(n, pb);
+                }
                 else sj_skip(j);
             }
         } else sj_skip(j);

@@ -95,6 +95,10 @@ struct vless_conn {
     uint64_t seq;              /* номер куска packet-up, с нуля */
     char authority[128];       /* повторяется в каждом запросе череды */
     char up_path[288];         /* путь с идентификатором сессии, без номера куска */
+    /* Длина набивки, объявленная узлом. Запоминается здесь, потому что запросы выгрузки
+     * (packet-up) собираются уже без узла на руках, а набивка нужна каждому: сервер
+     * проверяет её у КАЖДОГО запроса, а не только у первого. */
+    uint16_t pad_from, pad_to;
 };
 
 int vless_connect(const struct vless_node *node, struct vless_conn *conn, int timeout_s);

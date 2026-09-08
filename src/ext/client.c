@@ -171,10 +171,33 @@ static void session_id(char *out, size_t cap) {
  * одинаковая длина набивки во всех превратила бы саму набивку в признак — то есть в ровно
  * то, против чего она заведена. Диапазон 100..1000 знаков задан сервером Xray
  * (GetNormalizedXPaddingBytes), и выйти за него значит получить отказ. */
-static int xhttp_referer(char *out, size_t cap, const char *authority, const char *path) {
+static int xhttp_referer_r(char *out, size_t cap, const char *authority, const char *path,
+                           uint16_t pf, uint16_t pt);
+
+static int xhttp_referer(char *out, size_t cap, const char *authority, const char *path,
+                         const struct vless_node *n) {
+    return xhttp_referer_r(out, cap, authority, path, n ? n->pad_from : 0, n ? n->pad_to : 0);
+}
+
+static int xhttp_referer_r(char *out, size_t cap, const char *authority, const char *path,
+                           uint16_t pf, uint16_t pt) {
+    /* ДЛИНУ ЗАДАЁТ СЕРВЕР, А НЕ МЫ. Она приезжает в ссылке полем `xPaddingBytes` (см.
+     * pad_range в sub.c), и сервер её ПРОВЕРЯЕТ: не попал в диапазон — 400 и всё.
+     *
+     * Прежде здесь стояло жёсткое 150…660. Оно укладывается в умолчание Xray (100…1000) и
+     * потому работало почти везде — а на подписке, где продавец объявил «50-150», отвечали
+     * отказом ВСЕ его узлы xhttp. Выглядело это как «узлы мёртвые»: TLS проходит, Reality
+     * признаёт, и только потом 400.
+     *
+     * Пусто — умолчание Xray 100…1000 (GetNormalizedXPaddingBytes), а не прежние 150…660:
+     * повторяем upstream, чтобы у нас и у него совпадали не только границы, но и середина. */
+    size_t lo = pt ? pf : 100;
+    size_t hi = pt ? pt : 1000;
     unsigned char r = 0;
     if (getrandom(&r, 1, 0) != 1) r = 128;
-    size_t pad = 150 + (size_t)r * 2;               /* 150…660 */
+    size_t pad = lo + (size_t)r * (hi - lo + 1) / 256;
+    if (pad < lo) pad = lo;
+    if (pad > hi) pad = hi;
     int k = snprintf(out, cap, "https://%s%s?x_padding=", authority, path);
     if (k < 0 || (size_t)k + pad + 1 > cap) return H2_ETOOBIG;
     memset(out + k, 'X', pad);
@@ -260,16 +283,20 @@ static int h2_open(struct vless_conn *c, const struct vless_node *n) {
 
     xhttp_path(n, path, sizeof(path));
     snprintf(c->authority, sizeof(c->authority), "%s", authority);
+    c->pad_from = n->pad_from;
+    c->pad_to = n->pad_to;
 
     /* __thread: буфер живёт между вызовами, но потоков теперь несколько, и один общий
      * массив они переписывали бы друг под другом. Своя копия на поток — 1,4 КБ. */
     static __thread char ref[1400];
 
     if (c->xh == XH_STREAM_ONE) {
-        if (xhttp_referer(ref, sizeof(ref), authority, path)) return H2_ETOOBIG;
-        /* Content-Type: application/grpc и здесь — так делает Xray, и посредники по нему
-         * не пытаются буферизовать поток. */
-        return h2_start(&c->h2, &io, authority, path, "application/grpc", ref);
+        if (xhttp_referer(ref, sizeof(ref), authority, path, n)) return H2_ETOOBIG;
+        /* Content-Type: application/grpc и здесь — так делает Xray (FillStreamRequest ставит
+         * его на любой запрос С ТЕЛОМ), и посредники по нему не пытаются буферизовать поток.
+         * Всё остальное в заголовках — облик БРАУЗЕРА, а не gRPC: см. put_headers в h2.c. */
+        return h2_start_ex(&c->h2, &io, authority, path, "application/grpc", ref,
+                           H2_POST, 0, 1);
     }
 
     /* Два оставшихся режима начинаются одинаково: сессия получает имя, и по этому имени
@@ -284,8 +311,8 @@ static int h2_open(struct vless_conn *c, const struct vless_node *n) {
      * сервер отличает выгрузку от загрузки именно им (hub.go: GET без номера куска — это
      * stream-down). POST без тела сервер счёл бы выгрузкой и стал бы ждать байт, которых
      * не будет, а вниз не отдал бы ничего. */
-    if (xhttp_referer(ref, sizeof(ref), authority, c->up_path)) return H2_ETOOBIG;
-    return h2_start_ex(&c->h2, &io, authority, c->up_path, NULL, ref, H2_GET, 1);
+    if (xhttp_referer(ref, sizeof(ref), authority, c->up_path, n)) return H2_ETOOBIG;
+    return h2_start_ex(&c->h2, &io, authority, c->up_path, NULL, ref, H2_GET, 1, 1);
 }
 
 /* Установление TCP живёт ниже по файлу: там же, где разрешение имени и happy-eyeballs.
@@ -358,11 +385,12 @@ static int up_request(struct vless_conn *c, long long seq) {
     else         snprintf(path, sizeof(path), "%s/%lld", c->up_path, seq);
 
     static __thread char ref[1400];
-    if (xhttp_referer(ref, sizeof(ref), c->authority, path)) return H2_ETOOBIG;
+    if (xhttp_referer_r(ref, sizeof(ref), c->authority, path, c->pad_from, c->pad_to))
+        return H2_ETOOBIG;
 
     if (!u->started) {
         int rc = h2_start_ex(&u->h2, &io, c->authority, path, "application/grpc", ref,
-                             H2_POST, 0);
+                             H2_POST, 0, 1);
         if (rc) return rc;
         u->started = 1;
         return 0;

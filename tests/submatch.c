@@ -631,6 +631,44 @@ int main(void) {
         check("конфиг Xray: одиночный — имя", "one", nodes[0].name);
     }
     {
+        /* ---- длина набивки xhttp объявляется сервером ------------------------------
+         *
+         * Сервер xhttp ПРОВЕРЯЕТ длину x_padding и на чужую отвечает 400. Диапазон приезжает
+         * в ссылке полем `xPaddingBytes` внутри `extra`. Пока мы его не читали, наши жёсткие
+         * 150…660 не попадали в объявленные продавцом «50-150», и ВСЕ его узлы xhttp
+         * отвечали отказом — при исправных TLS и Reality. Снято на живой подписке. */
+        struct vless_node n;
+        char url[512];
+        const char *base = "vless://u@h:443?type=xhttp&security=reality&pbk=K&sni=a.com&path=%2Fx";
+
+        snprintf(url, sizeof(url), "%s#x", base);
+        check_n("без extra: диапазон не объявлен", 0, (int)(vless_parse_url(url, &n), n.pad_to));
+
+        /* Форма ровно та, что приезжает от продавца: JSON в процентной форме. */
+        snprintf(url, sizeof(url),
+                 "%s&extra=%%7B%%22xmux%%22%%3A%%7B%%22maxConcurrency%%22%%3A%%2216-32%%22%%7D%%2C"
+                 "%%22xPaddingBytes%%22%%3A%%2250-150%%22%%7D#x", base);
+        vless_parse_url(url, &n);
+        check_n("extra: нижняя граница", 50, (int)n.pad_from);
+        check_n("extra: верхняя граница", 150, (int)n.pad_to);
+
+        /* Одно число — тоже законная форма: диапазон из самого себя. */
+        snprintf(url, sizeof(url), "%s&extra=%%7B%%22xPaddingBytes%%22%%3A512%%7D#x", base);
+        vless_parse_url(url, &n);
+        check_n("extra: одно число — нижняя", 512, (int)n.pad_from);
+        check_n("extra: одно число — верхняя", 512, (int)n.pad_to);
+
+        /* Мусор не портит узел и не выдумывает границ: дальше работает умолчание. */
+        snprintf(url, sizeof(url), "%s&extra=%%7B%%22xPaddingBytes%%22%%3A%%22ой%%22%%7D#x", base);
+        check_n("extra: мусор — узел пригоден", 0, vless_parse_url(url, &n));
+        check_n("extra: мусор — границ не выдумали", 0, (int)n.pad_to);
+
+        /* Перевёрнутый диапазон — тоже мусор: из него нельзя выбрать длину. */
+        snprintf(url, sizeof(url), "%s&extra=%%7B%%22xPaddingBytes%%22%%3A%%22900-100%%22%%7D#x", base);
+        vless_parse_url(url, &n);
+        check_n("extra: перевёрнутый диапазон отвергнут", 0, (int)n.pad_to);
+    }
+    {
         /* ---- режимы xhttp -------------------------------------------------------
          *
          * Пригодность режима решается ЗДЕСЬ, а не при подключении: непригодный узел не

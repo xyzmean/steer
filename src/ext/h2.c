@@ -83,6 +83,39 @@ static uint32_t get32(const unsigned char *p) {
 #define HP_CONTENT_TYPE 31
 #define HP_REFERER     51
 #define HP_USER_AGENT  58
+#define HP_ACCEPT      19
+#define HP_ACCEPT_LANG 17
+#define HP_CACHE_CTRL  24
+
+/* ---- облик браузера для xhttp -------------------------------------------------------
+ *
+ * ЗАЧЕМ ЭТО ЗДЕСЬ. Транспорт xhttp — это обычный HTTP-запрос к обычному на вид адресу, и
+ * ходить по нему полагается тем, кем мы уже притворились в ClientHello, — браузером. Мы же
+ * до сих пор слали в КАЖДОМ запросе `te: trailers` и `user-agent: grpc-go/1.60.0`: заголовки
+ * gRPC, к xhttp отношения не имеющие.
+ *
+ * Чем это плохо не в теории. Снято на живой подписке: четыре узла xhttp из четырёх отвечали
+ * RST/GOAWAY, притом что Reality нас признавал — то есть сервер наш, а запрос отвергался уже
+ * после. Путь у этих узлов вида `/static/v1/cache/<хеш>`, то есть сделан похожим на путь
+ * кеша CDN; `grpc-go` в такой не стучится никто, и что-то перед сервером это резало.
+ *
+ * Набор взят у Xray (transport/internet/splithttp/config.go: GetRequestHeader →
+ * TryDefaultHeadersWith(header, "fetch") → applyMasqueradedHeaders(chrome, fetch)) и повторён
+ * поимённо. Версия Chrome у Xray считается от даты: 144 на 13.01.2026 плюс единица за 35
+ * дней; на сентябрь 2026 это 149. Заголовок sec-ch-ua собран его же правилом — три марки,
+ * одна поддельная, перемешанные по номеру версии (seed=149 даёт именно такой порядок).
+ *
+ * ЧИСЛО ЗАШИТО, А НЕ СЧИТАЕТСЯ ОТ ЧАСОВ. Считать значило бы, что роутер с уехавшими часами
+ * (а на роутере без батарейки это обычное дело) представляется Chrome из будущего или из
+ * позапрошлого года — приметнее, чем слегка отставшая версия. Обновляется вместе с
+ * остальными приметами облика, когда обновляют ClientHello. */
+#define UA_CHROME_MAJOR "149"
+#define UA_CHROME \
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) " \
+    "Chrome/" UA_CHROME_MAJOR ".0.0.0 Safari/537.36"
+#define UA_CH_CHROME \
+    "\"Google Chrome\";v=\"" UA_CHROME_MAJOR "\", \"Chromium\";v=\"" UA_CHROME_MAJOR \
+    "\", \"Not)A;Brand\";v=\"24\""
 
 struct wbuf { unsigned char *p; size_t n, cap; };
 
@@ -155,18 +188,42 @@ static int frame_out(struct h2 *h, unsigned char type, unsigned char flags, uint
 static int put_headers(struct h2 *h, struct wbuf *b, const char *authority,
                        const char *path, const char *content_type, const char *referer,
                        int method, int end_stream) {
-    static __thread unsigned char hb[2048];
+    const int browser = h->browser;
+    /* 4 КБ, а не 2: облик браузера — это дюжина заголовков, и рядом с ними едет Referer с
+     * набивкой до 1400 байт. В прежние 2 КБ они вместе не влезали, а отказ по размеру
+     * выглядел бы как «узел не работает». Буфер свой на поток, платится он один раз. */
+    static __thread unsigned char hb[4096];
     struct wbuf hp = { hb, 0, sizeof(hb) };
     hp_indexed(&hp, method == H2_GET ? HP_METHOD_GET : HP_METHOD_POST);
     hp_indexed(&hp, HP_SCHEME_HTTPS);
     hp_field(&hp, HP_PATH, path);
     hp_field(&hp, HP_AUTHORITY, authority);
     if (content_type) hp_field(&hp, HP_CONTENT_TYPE, content_type);
-    if (referer) hp_field(&hp, HP_REFERER, referer);
-    /* te: trailers — единственный заголовок из «запрещённых для HTTP/2», который
-     * разрешён явно, и gRPC его требует. */
-    hp_new(&hp, "te", "trailers");
-    hp_field(&hp, HP_USER_AGENT, "grpc-go/1.60.0");
+    if (browser) {
+        /* Порядок — как у Chrome: приметы клиента, потом кто он, потом чего хочет и откуда
+         * пришёл. Referer здесь же, среди прочих, а не отдельно: в нём едет набивка xhttp, и
+         * стоять он должен там, где браузер его и ставит. */
+        hp_new(&hp, "sec-ch-ua", UA_CH_CHROME);
+        hp_new(&hp, "sec-ch-ua-mobile", "?0");
+        hp_new(&hp, "sec-ch-ua-platform", "\"Windows\"");
+        hp_new(&hp, "dnt", "1");
+        hp_field(&hp, HP_USER_AGENT, UA_CHROME);
+        hp_field(&hp, HP_ACCEPT, "*/*");
+        hp_new(&hp, "sec-fetch-site", "same-origin");
+        hp_new(&hp, "sec-fetch-mode", "cors");
+        hp_new(&hp, "sec-fetch-dest", "empty");
+        if (referer) hp_field(&hp, HP_REFERER, referer);
+        hp_field(&hp, HP_ACCEPT_LANG, "en-US,en;q=0.9");
+        hp_new(&hp, "priority", "u=1, i");
+        hp_field(&hp, HP_CACHE_CTRL, "no-cache");
+        hp_new(&hp, "pragma", "no-cache");
+    } else {
+        if (referer) hp_field(&hp, HP_REFERER, referer);
+        /* te: trailers — единственный заголовок из «запрещённых для HTTP/2», который
+         * разрешён явно, и gRPC его требует. */
+        hp_new(&hp, "te", "trailers");
+        hp_field(&hp, HP_USER_AGENT, "grpc-go/1.60.0");
+    }
     if (hp.n > sizeof(hb)) return -1;
 
     /* END_STREAM по требованию вызывающего. У постоянного потока его нет: тело запроса —
@@ -186,9 +243,10 @@ static int put_headers(struct h2 *h, struct wbuf *b, const char *authority,
 
 int h2_start_ex(struct h2 *h, const struct h2_io *io, const char *authority,
                 const char *path, const char *content_type, const char *referer,
-                int method, int end_stream) {
+                int method, int end_stream, int browser) {
     memset(h, 0, sizeof(*h));
     h->io = *io;
+    h->browser = browser;
     h->sid = 1;                          /* первый поток клиента — всегда первый нечётный */
     h->send_win = 65535;                 /* до SETTINGS сервера — значение по умолчанию */
     h->send_win_conn = 65535;
@@ -240,7 +298,7 @@ int h2_start(struct h2 *h, const struct h2_io *io, const char *authority,
              const char *path, const char *content_type, const char *referer) {
     /* Прежнее поведение слово в слово: POST с открытым телом. Так ходят grpc, xhttp в
      * режиме stream-one и выгружающий поток stream-up. */
-    return h2_start_ex(h, io, authority, path, content_type, referer, H2_POST, 0);
+    return h2_start_ex(h, io, authority, path, content_type, referer, H2_POST, 0, 0);
 }
 
 int h2_next(struct h2 *h, const char *authority, const char *path,
@@ -360,6 +418,10 @@ static int ctl_handle(struct h2 *h) {
  * отдаёт «:status 200» индексом 8 — один байт 0x88. Если встретилось что-то другое,
  * ставим -1 и НЕ считаем это ошибкой: догадка о статусе хуже, чем его отсутствие, а
  * пришли данные или нет — покажет чтение. */
+/* Код последнего чужого статуса — для объяснения отказа. В потоке: соединители работают
+ * параллельно, и общий на всех перетирался бы. */
+static __thread int g_last_status;
+
 static void status_peek(struct h2 *h, const unsigned char *p, size_t n) {
     size_t i = 0;
     /* Обновление размера динамической таблицы (001xxxxx) идёт первым, если вообще есть.
@@ -481,7 +543,7 @@ int h2_read(struct h2 *h, unsigned char *out, size_t cap, size_t *got) {
         }
     }
 
-    if (h->status > 0 && h->status != 200) return H2_ESTATUS;
+    if (h->status > 0 && h->status != 200) { g_last_status = h->status; return H2_ESTATUS; }
     rc = window_refill(h);
     if (rc) return rc;
     /* Ноль байт — это законный результат: в записи мог приехать только PING или SETTINGS.
@@ -529,7 +591,16 @@ const char *h2_strerror(int rc) {
     switch (rc) {
         case H2_EIO: return "обрыв HTTP/2";
         case H2_EPROTO: return "неожиданный кадр HTTP/2";
-        case H2_ESTATUS: return "сервер ответил не 200";
+        /* КОД НАЗЫВАЕТСЯ, а не прячется за словами «не 200». Разница между 404, 403 и 502
+         * — это разница между «путь не тот», «нас не пустили» и «за сервером ничего нет», то
+         * есть между тремя совершенно разными разговорами с владельцем узла. Без кода все
+         * три выглядели одинаково, и на живом узле пришлось гадать. */
+        case H2_ESTATUS: {
+            static __thread char st[48];
+            if (g_last_status > 0) snprintf(st, sizeof st, "сервер ответил %d, а не 200", g_last_status);
+            else                   snprintf(st, sizeof st, "сервер ответил не 200");
+            return st;
+        }
         case H2_ERESET: return "поток закрыт сервером (RST/GOAWAY)";
         case H2_ETOOBIG: return "кадр не влез";
         case H2_EWINDOW: return "окно HTTP/2 закрыто";
