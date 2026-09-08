@@ -44,7 +44,6 @@
 #define FLAG_ACK         0x01
 #define FLAG_END_HEADERS 0x04
 
-#define STREAM_ID        1u
 
 /* Наше окно приёма. Большое намеренно: при 65535 по умолчанию каждые 64 КБ загрузки
  * требуют обмена WINDOW_UPDATE, и на канале с задержкой 100 мс это режет скорость до
@@ -77,6 +76,7 @@ static uint32_t get32(const unsigned char *p) {
  * Индексы статической таблицы (RFC 7541, приложение A) выписаны числами, потому что
  * таблица неизменна — это часть протокола, а не настройка. */
 #define HP_AUTHORITY   1
+#define HP_METHOD_GET  2   /* статическая таблица HPACK, RFC 7541 приложение A */
 #define HP_METHOD_POST 3
 #define HP_PATH        4
 #define HP_SCHEME_HTTPS 7
@@ -146,10 +146,50 @@ static int frame_out(struct h2 *h, unsigned char type, unsigned char flags, uint
     return h->io.write(h->io.ctx, one, 9 + n);
 }
 
-int h2_start(struct h2 *h, const struct h2_io *io, const char *authority,
-             const char *path, const char *content_type, const char *referer) {
+/* HEADERS одного запроса. Псевдозаголовки обязаны идти первыми и в этом порядке.
+ *
+ * Вынесено из h2_start потому, что запросов на соединении стало больше одного: packet-up
+ * шлёт череду коротких POST, и заголовки для второго и дальше собираются тем же кодом. Два
+ * места, собирающих заголовки, однажды разошлись бы — и симптомом был бы не отказ сборки, а
+ * сервер, который на первый запрос отвечает, а на второй нет. */
+static int put_headers(struct h2 *h, struct wbuf *b, const char *authority,
+                       const char *path, const char *content_type, const char *referer,
+                       int method, int end_stream) {
+    static __thread unsigned char hb[2048];
+    struct wbuf hp = { hb, 0, sizeof(hb) };
+    hp_indexed(&hp, method == H2_GET ? HP_METHOD_GET : HP_METHOD_POST);
+    hp_indexed(&hp, HP_SCHEME_HTTPS);
+    hp_field(&hp, HP_PATH, path);
+    hp_field(&hp, HP_AUTHORITY, authority);
+    if (content_type) hp_field(&hp, HP_CONTENT_TYPE, content_type);
+    if (referer) hp_field(&hp, HP_REFERER, referer);
+    /* te: trailers — единственный заголовок из «запрещённых для HTTP/2», который
+     * разрешён явно, и gRPC его требует. */
+    hp_new(&hp, "te", "trailers");
+    hp_field(&hp, HP_USER_AGENT, "grpc-go/1.60.0");
+    if (hp.n > sizeof(hb)) return -1;
+
+    /* END_STREAM по требованию вызывающего. У постоянного потока его нет: тело запроса —
+     * это канал наверх, и он живёт всё соединение. У GET-запроса скачивания тела нет вовсе,
+     * и сервер ждёт закрытия прямо здесь. END_HEADERS ставим всегда: продолжений не бывает,
+     * заголовки короткие. */
+    unsigned char hdr[9];
+    hdr[0] = (unsigned char)(hp.n >> 16); hdr[1] = (unsigned char)(hp.n >> 8);
+    hdr[2] = (unsigned char)hp.n;
+    hdr[3] = FR_HEADERS;
+    hdr[4] = (unsigned char)(FLAG_END_HEADERS | (end_stream ? FLAG_END_STREAM : 0));
+    put32(hdr + 5, h->sid);
+    wb(b, hdr, 9);
+    wb(b, hb, hp.n);
+    return 0;
+}
+
+int h2_start_ex(struct h2 *h, const struct h2_io *io, const char *authority,
+                const char *path, const char *content_type, const char *referer,
+                int method, int end_stream) {
     memset(h, 0, sizeof(*h));
     h->io = *io;
+    h->sid = 1;                          /* первый поток клиента — всегда первый нечётный */
     h->send_win = 65535;                 /* до SETTINGS сервера — значение по умолчанию */
     h->send_win_conn = 65535;
     h->peer_init_win = 65535;            /* то же умолчание, от него считается сдвиг */
@@ -182,33 +222,8 @@ int h2_start(struct h2 *h, const struct h2_io *io, const char *authority,
         wb(&b, wu, 4);
     }
 
-    /* HEADERS. Псевдозаголовки обязаны идти первыми и в этом порядке. */
-    {
-        static __thread unsigned char hb[2048];
-        struct wbuf hp = { hb, 0, sizeof(hb) };
-        hp_indexed(&hp, HP_METHOD_POST);
-        hp_indexed(&hp, HP_SCHEME_HTTPS);
-        hp_field(&hp, HP_PATH, path);
-        hp_field(&hp, HP_AUTHORITY, authority);
-        if (content_type) hp_field(&hp, HP_CONTENT_TYPE, content_type);
-        if (referer) hp_field(&hp, HP_REFERER, referer);
-        /* te: trailers — единственный заголовок из «запрещённых для HTTP/2», который
-         * разрешён явно, и gRPC его требует. */
-        hp_new(&hp, "te", "trailers");
-        hp_field(&hp, HP_USER_AGENT, "grpc-go/1.60.0");
-        if (hp.n > sizeof(hb)) return H2_ETOOBIG;
-
-        /* END_STREAM НЕ ставим: тело запроса — это наш канал наверх, и он живёт всё
-         * соединение. END_HEADERS ставим: продолжений не бывает, заголовки короткие. */
-        unsigned char hdr[9];
-        hdr[0] = (unsigned char)(hp.n >> 16); hdr[1] = (unsigned char)(hp.n >> 8);
-        hdr[2] = (unsigned char)hp.n;
-        hdr[3] = FR_HEADERS;
-        hdr[4] = FLAG_END_HEADERS;
-        put32(hdr + 5, STREAM_ID);
-        wb(&b, hdr, 9);
-        wb(&b, hb, hp.n);
-    }
+    if (put_headers(h, &b, authority, path, content_type, referer, method, end_stream) != 0)
+        return H2_ETOOBIG;
 
     if (b.n > sizeof(buf)) return H2_ETOOBIG;
     /* Всё одной записью: преамбула, настройки и запрос уезжают вместе, как это делает
@@ -221,13 +236,54 @@ int h2_start(struct h2 *h, const struct h2_io *io, const char *authority,
     return h->io.write(h->io.ctx, buf, b.n);
 }
 
+int h2_start(struct h2 *h, const struct h2_io *io, const char *authority,
+             const char *path, const char *content_type, const char *referer) {
+    /* Прежнее поведение слово в слово: POST с открытым телом. Так ходят grpc, xhttp в
+     * режиме stream-one и выгружающий поток stream-up. */
+    return h2_start_ex(h, io, authority, path, content_type, referer, H2_POST, 0);
+}
+
+int h2_next(struct h2 *h, const char *authority, const char *path,
+            const char *content_type, const char *referer, int method) {
+    if (!h->started) return H2_EPROTO;
+
+    /* Номер растёт на два: у клиента потоки нечётные (RFC 7540 §5.1.1), а переиспользовать
+     * номер закрытого потока нельзя — сервер ответит на такое ошибкой соединения, а не
+     * потока, и связь оборвётся целиком. */
+    h->sid += 2;
+
+    /* Состояние ПОТОКА свежее, состояние СОЕДИНЕНИЯ нетронуто. Разница существенная: окно
+     * соединения и настройки сервера общие для всех запросов, а окно потока сервер выдаёт
+     * заново — начальным значением из его же SETTINGS. Сбросить общее вместе с частным
+     * значило бы забыть, сколько нам уже разрешили, и переполнить окно соединения. */
+    h->status = 0;
+    h->done = 0;
+    h->send_win = h->peer_init_win;
+    h->recv_credit = 0;
+
+    static __thread unsigned char buf[2048];
+    struct wbuf b = { buf, 0, sizeof(buf) };
+    if (put_headers(h, &b, authority, path, content_type, referer, method, 0) != 0)
+        return H2_ETOOBIG;
+    if (b.n > sizeof(buf)) return H2_ETOOBIG;
+    return h->io.write(h->io.ctx, buf, b.n);
+}
+
+int h2_end_stream(struct h2 *h) {
+    if (!h->started) return H2_EPROTO;
+    /* Пустой DATA с END_STREAM. Отдельным кадром, а не признаком на последнем куске данных:
+     * кусок мог не влезть в окно и уехать по частям, и тогда END_STREAM оказался бы не на
+     * последней из них. */
+    return frame_out(h, FR_DATA, FLAG_END_STREAM, h->sid, NULL, 0);
+}
+
 /* Пополнить окно приёма, если накопилось достаточно. Оба уровня сразу: соединение и
  * поток считаются отдельно, и забыть один — значит остановиться на его пределе. */
 static int window_refill(struct h2 *h) {
     if (h->recv_credit < WINDOW_REFILL) return 0;
     unsigned char wu[4];
     put32(wu, (uint32_t)h->recv_credit);
-    int rc = frame_out(h, FR_WINDOW_UPDATE, 0, STREAM_ID, wu, 4);
+    int rc = frame_out(h, FR_WINDOW_UPDATE, 0, h->sid, wu, 4);
     if (rc) return rc;
     rc = frame_out(h, FR_WINDOW_UPDATE, 0, 0, wu, 4);
     if (rc) return rc;
@@ -404,7 +460,12 @@ int h2_read(struct h2 *h, unsigned char *out, size_t cap, size_t *got) {
         h->frame_type = rec[p + 3];
         h->frame_flags = rec[p + 4];
         uint32_t sid = get32(rec + p + 5) & 0x7FFFFFFF;
-        h->frame_ours = (sid == STREAM_ID);
+        /* «Наш» — только ТЕКУЩИЙ поток. У packet-up позади остаются закрытые потоки
+         * прежних кусков, и сервер вправе досылать по ним HEADERS и END_STREAM уже после
+         * того, как мы открыли следующий. Такие кадры считаются в окно соединения (это
+         * делает общий разбор ниже) и отбрасываются: их содержимое — пустой ответ 200 на
+         * выгрузку, читать в нём нечего. */
+        h->frame_ours = (sid == h->sid);
         h->frame_left = len;
         h->ctl_n = 0;
         p += 9;
@@ -454,7 +515,7 @@ int h2_write(struct h2 *h, const unsigned char *d, size_t n) {
 
     while (n) {
         size_t chunk = n > DEFAULT_MAX_FRAME ? DEFAULT_MAX_FRAME : n;
-        int rc = frame_out(h, FR_DATA, 0, STREAM_ID, d, chunk);
+        int rc = frame_out(h, FR_DATA, 0, h->sid, d, chunk);
         if (rc) return rc;
         h->send_win -= (int32_t)chunk;
         h->send_win_conn -= (int32_t)chunk;

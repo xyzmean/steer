@@ -346,14 +346,21 @@ static int node_usable(struct vless_node *n) {
     /* Режим xhttp, которого мы не умеем, называется ЗДЕСЬ, а не выясняется при
      * подключении: непригодный узел не должен попадать в кандидаты и тратить попытки.
      *
-     * Поддержан stream-one: один запрос POST, тело запроса — поток наверх, тело ответа —
-     * вниз. Его же выбирает и сам Xray при reality с mode=auto, поэтому «auto» пригоден.
-     * packet-up и stream-up требуют второго запроса и нумерации кусков — заметно больше
-     * кода ради того же результата с худшей задержкой. */
+     * Поддержаны все три ходовых:
+     *
+     *   stream-one — один запрос POST, тело запроса наверх, тело ответа вниз. Дешевле
+     *     всех, и его же выбирает сам Xray при reality с mode=auto, поэтому «auto» ведёт
+     *     сюда же;
+     *   stream-up  — GET за загрузкой и длинный POST под выгрузку;
+     *   packet-up  — GET за загрузкой и череда коротких POST по куску в каждом.
+     *
+     * Остаётся неподдержанным «stream-down» и всё незнакомое: у первого нет выгрузки
+     * вовсе, он половина связки с отдельным download-сервером, которой у нас нет. */
     if (!strcmp(n->type, "xhttp") && n->mode[0] &&
-        strcmp(n->mode, "auto") != 0 && strcmp(n->mode, "stream-one") != 0) {
+        strcmp(n->mode, "auto") != 0 && strcmp(n->mode, "stream-one") != 0 &&
+        strcmp(n->mode, "stream-up") != 0 && strcmp(n->mode, "packet-up") != 0) {
         snprintf(n->skip_reason, sizeof(n->skip_reason),
-                 "xhttp mode=%s: нужен auto или stream-one", n->mode);
+                 "xhttp mode=%s не поддержан", n->mode);
         return 1;
     }
     return 0;

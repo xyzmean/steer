@@ -631,6 +631,42 @@ int main(void) {
         check("конфиг Xray: одиночный — имя", "one", nodes[0].name);
     }
     {
+        /* ---- режимы xhttp -------------------------------------------------------
+         *
+         * Пригодность режима решается ЗДЕСЬ, а не при подключении: непригодный узел не
+         * должен попадать в кандидаты и тратить попытки сторожа. Проверяется вся тройка,
+         * которую мы умеем, и отказ на том, чего не умеем. */
+        struct vless_node n;
+        const char *base = "vless://u@h:443?type=xhttp&security=reality&pbk=K&sni=a.com"
+                           "&path=%2Fx";
+        char url[256];
+
+        snprintf(url, sizeof(url), "%s#x", base);
+        check_n("xhttp без mode: пригоден", 0, vless_parse_url(url, &n));
+
+        snprintf(url, sizeof(url), "%s&mode=auto#x", base);
+        check_n("xhttp mode=auto: пригоден", 0, vless_parse_url(url, &n));
+
+        snprintf(url, sizeof(url), "%s&mode=stream-one#x", base);
+        check_n("xhttp mode=stream-one: пригоден", 0, vless_parse_url(url, &n));
+        check("xhttp mode=stream-one: режим сохранён", "stream-one", n.mode);
+
+        snprintf(url, sizeof(url), "%s&mode=stream-up#x", base);
+        check_n("xhttp mode=stream-up: пригоден", 0, vless_parse_url(url, &n));
+        check("xhttp mode=stream-up: режим сохранён", "stream-up", n.mode);
+
+        snprintf(url, sizeof(url), "%s&mode=packet-up#x", base);
+        check_n("xhttp mode=packet-up: пригоден", 0, vless_parse_url(url, &n));
+        check("xhttp mode=packet-up: режим сохранён", "packet-up", n.mode);
+
+        /* stream-down — половина связки с отдельным download-сервером, выгрузки в нём нет
+         * вовсе. Отбраковывается с названной причиной, а не молча. */
+        snprintf(url, sizeof(url), "%s&mode=stream-down#x", base);
+        check_n("xhttp mode=stream-down: пропущен", 1, vless_parse_url(url, &n));
+        check("xhttp mode=stream-down: причина названа",
+              "xhttp mode=stream-down не поддержан", n.skip_reason);
+    }
+    {
         /* ---- имя из remarks, а не из tag -----------------------------------------
          *
          * Форма снята с живой панели (ответ клиенту Happ) и воспроизведена в главном:

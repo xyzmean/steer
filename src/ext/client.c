@@ -135,6 +135,116 @@ static void xhttp_path(const struct vless_node *n, char *out, size_t cap) {
              len && p[len - 1] == '/' ? "" : "/");
 }
 
+/* Режим xhttp узла. Пусто и «auto» — stream-one: его же выбирает Xray при reality, и он
+ * дешевле всех. Всё остальное названо в ссылке явно, и разбор подписки уже отсеял то, чего
+ * мы не умеем (sub.c), так что сюда доходят только эти три. */
+static enum xhttp_mode xhttp_mode_of(const struct vless_node *n) {
+    if (!strcmp(n->mode, "packet-up")) return XH_PACKET_UP;
+    if (!strcmp(n->mode, "stream-up")) return XH_STREAM_UP;
+    return XH_STREAM_ONE;
+}
+
+/* Идентификатор сессии. Ровно им сервер связывает запрос выгрузки с запросом загрузки, и
+ * поэтому он обязан быть непредсказуемым: угадав его, посторонний влил бы свои байты в чужую
+ * сессию. Форма — как у Xray по умолчанию, строка UUID: она же встречается в путях обычных
+ * приложений и ничем не выделяется. */
+static void session_id(char *out, size_t cap) {
+    unsigned char r[16];
+    if (getrandom(r, sizeof r, 0) != (ssize_t)sizeof r) {
+        /* Источник случайности отказал. Нули здесь были бы ХУЖЕ отказа: сессия стала бы
+         * предсказуемой, оставаясь на вид рабочей. Пусть будет заведомо негодная строка —
+         * сервер её примет, но такой узел не поднимется, и это заметят. */
+        snprintf(out, cap, "00000000-0000-0000-0000-000000000000");
+        return;
+    }
+    r[6] = (unsigned char)((r[6] & 0x0F) | 0x40);   /* версия 4 */
+    r[8] = (unsigned char)((r[8] & 0x3F) | 0x80);   /* вариант   */
+    snprintf(out, cap,
+             "%02x%02x%02x%02x-%02x%02x-%02x%02x-%02x%02x-%02x%02x%02x%02x%02x%02x",
+             r[0], r[1], r[2], r[3], r[4], r[5], r[6], r[7],
+             r[8], r[9], r[10], r[11], r[12], r[13], r[14], r[15]);
+}
+
+/* Referer с набивкой для одного запроса.
+ *
+ * Своя длина у КАЖДОГО запроса, а не одна на соединение: у packet-up запросов череда, и
+ * одинаковая длина набивки во всех превратила бы саму набивку в признак — то есть в ровно
+ * то, против чего она заведена. Диапазон 100..1000 знаков задан сервером Xray
+ * (GetNormalizedXPaddingBytes), и выйти за него значит получить отказ. */
+static int xhttp_referer(char *out, size_t cap, const char *authority, const char *path) {
+    unsigned char r = 0;
+    if (getrandom(&r, 1, 0) != 1) r = 128;
+    size_t pad = 150 + (size_t)r * 2;               /* 150…660 */
+    int k = snprintf(out, cap, "https://%s%s?x_padding=", authority, path);
+    if (k < 0 || (size_t)k + pad + 1 > cap) return H2_ETOOBIG;
+    memset(out + k, 'X', pad);
+    out[k + pad] = '\0';
+    return 0;
+}
+
+static int up_write(void *ctx, const unsigned char *d, size_t n) {
+    struct vless_up *u = ctx;
+    if (u->plain) {
+        size_t sent = 0;
+        while (sent < n) {
+            ssize_t w = write(u->fd, d + sent, n - sent);
+            if (w <= 0) {
+                if (w < 0 && errno == EINTR) continue;
+                return VLESS_CONN_EIO;
+            }
+            sent += (size_t)w;
+        }
+        return 0;
+    }
+    return tls13_write(&u->tls, d, n);
+}
+
+static int up_read(void *ctx, unsigned char *d, size_t cap, size_t *got) {
+    struct vless_up *u = ctx;
+    /* Прямого копирования здесь не бывает: Vision живёт на потоке ЗАГРУЗКИ, а эта связь
+     * только пишет. Ответы сервера на выгрузку — пустые 200, и читаются они лишь затем,
+     * чтобы разобрать служебные кадры HTTP/2 и не переполнить окно.
+     *
+     * ЖДАТЬ ЗДЕСЬ НЕЛЬЗЯ. Слив ответов делается попутно с отправкой, и блокирующее чтение
+     * остановило бы выгрузку до прихода ответа — то есть превратило бы поток в череду
+     * «отправил и жду». Поверх TLS ожидания и нет: tls13_read опрашивает сокет с нулевым
+     * сроком и отдаёт ноль байт, когда записи ещё нет. На голом сокете (security=none)
+     * такого поведения нет, и опрос приходится ставить самим. */
+    if (u->plain) {
+        struct pollfd p = { .fd = u->fd, .events = POLLIN };
+        if (poll(&p, 1, 0) <= 0 || !(p.revents & POLLIN)) { *got = 0; return 0; }
+        ssize_t r = read(u->fd, d, cap);
+        if (r == 0) return VLESS_CONN_ECLOSED;
+        if (r < 0) {
+            if (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR) { *got = 0; return 0; }
+            return VLESS_CONN_EIO;
+        }
+        *got = (size_t)r;
+        return 0;
+    }
+    return tls13_read(&u->tls, d, cap, got);
+}
+
+/* Слить то, что сервер ответил на выгрузку.
+ *
+ * ЗАЧЕМ ЭТО ВООБЩЕ НАДО. На каждый кусок packet-up сервер отвечает пустым 200: заголовки,
+ * пустой DATA, END_STREAM — десятки байт. Не читать их значит копить в приёмном буфере
+ * сокета; когда он заполнится, сервер перестанет писать, а следом застрянет и разбор его
+ * стороны — выгрузка встанет, причём тем позже, чем больше буфер, то есть «иногда и на
+ * больших файлах». Заодно этот же вызов забирает служебные кадры HTTP/2 (SETTINGS,
+ * WINDOW_UPDATE, PING) — без них окно соединения не пополнялось бы вовсе.
+ *
+ * Ничего не ждёт и ничего не отдаёт: прочитанное выбрасывается. */
+static void up_drain(struct vless_up *u) {
+    if (!u->started) return;
+    static __thread unsigned char sink[H2_MIN_READ_CAP];
+    for (int i = 0; i < 4; i++) {
+        size_t got = 0;
+        if (h2_read(&u->h2, sink, sizeof(sink), &got) != 0) return;
+        if (!got) return;
+    }
+}
+
 static int h2_open(struct vless_conn *c, const struct vless_node *n) {
     struct h2_io io = { .ctx = c, .write = io_write, .read = io_read };
     /* Имя хоста в :authority — маскировочный домен, как и в SNI: сервер прикрывается им,
@@ -149,22 +259,133 @@ static int h2_open(struct vless_conn *c, const struct vless_node *n) {
     }
 
     xhttp_path(n, path, sizeof(path));
-    /* Набивка: сервер требует от 100 до 1000 символов x_padding. Длина случайная — иначе
-     * постоянная длина запроса сама становится признаком, ради устранения которого эта
-     * набивка и придумана. */
+    snprintf(c->authority, sizeof(c->authority), "%s", authority);
+
     /* __thread: буфер живёт между вызовами, но потоков теперь несколько, и один общий
      * массив они переписывали бы друг под другом. Своя копия на поток — 1,4 КБ. */
     static __thread char ref[1400];
-    unsigned char r = 0;
-    if (getrandom(&r, 1, 0) != 1) r = 128;
-    size_t pad = 150 + (size_t)r * 2;               /* 150…660 */
-    int k = snprintf(ref, sizeof(ref), "https://%s%s?x_padding=", authority, path);
-    if (k < 0 || (size_t)k + pad + 1 > sizeof(ref)) return H2_ETOOBIG;
-    memset(ref + k, 'X', pad);
-    ref[k + pad] = '\0';
-    /* Content-Type: application/grpc и здесь — так делает Xray, и посредники по нему
-     * не пытаются буферизовать поток. */
-    return h2_start(&c->h2, &io, authority, path, "application/grpc", ref);
+
+    if (c->xh == XH_STREAM_ONE) {
+        if (xhttp_referer(ref, sizeof(ref), authority, path)) return H2_ETOOBIG;
+        /* Content-Type: application/grpc и здесь — так делает Xray, и посредники по нему
+         * не пытаются буферизовать поток. */
+        return h2_start(&c->h2, &io, authority, path, "application/grpc", ref);
+    }
+
+    /* Два оставшихся режима начинаются одинаково: сессия получает имя, и по этому имени
+     * сервер потом свяжет с ней запросы выгрузки. Имя дописывается к пути — так у Xray
+     * задано по умолчанию (session placement = path), и так его читает hub.go. */
+    char sid[40];
+    session_id(sid, sizeof(sid));
+    if (snprintf(c->up_path, sizeof(c->up_path), "%s%s", path, sid) >= (int)sizeof(c->up_path))
+        return H2_ETOOBIG;
+
+    /* ЭТА связь — за загрузкой, и запрос у неё GET без тела. Метод здесь не украшение:
+     * сервер отличает выгрузку от загрузки именно им (hub.go: GET без номера куска — это
+     * stream-down). POST без тела сервер счёл бы выгрузкой и стал бы ждать байт, которых
+     * не будет, а вниз не отдал бы ничего. */
+    if (xhttp_referer(ref, sizeof(ref), authority, c->up_path)) return H2_ETOOBIG;
+    return h2_start_ex(&c->h2, &io, authority, c->up_path, NULL, ref, H2_GET, 1);
+}
+
+/* Установление TCP живёт ниже по файлу: там же, где разрешение имени и happy-eyeballs.
+ * Объявление здесь, а не перенос функции — перенос сдвинул бы полтораста строк и утопил бы
+ * в диффе смысл правки. */
+static int tcp_connect(const char *host, uint16_t port, int timeout_s);
+
+/* Поднять вторую связь — под выгрузку. Тот же путь установления, что и у первой: TCP, и
+ * дальше либо ничего (security=none), либо Reality, либо обычный TLS с проверкой. */
+static int up_connect(struct vless_conn *c, const struct vless_node *n, int timeout_s) {
+    struct vless_up *u = &c->up;
+    memset(u, 0, sizeof(*u));
+    u->fd = -1;
+
+    int fd = tcp_connect(n->host, n->port, timeout_s);
+    if (fd < 0) return fd;
+    u->fd = fd;
+
+    if (!strcmp(n->security, "none")) { u->plain = 1; return 0; }
+
+    int is_tls = strcmp(n->security, "tls") == 0;
+    const char *verify_host = n->sni[0] ? n->sni : n->host;
+    struct reality_cfg cfg = {
+        .sni = is_tls ? verify_host : n->sni,
+        .pbk = n->pbk, .sid = n->sid, .fp = n->fp,
+        .alpn = "h2",
+        .plain = is_tls,
+    };
+    struct reality_state rst;
+    unsigned char hello[2048];
+    size_t hello_n = 0;
+    int rc = reality_build_hello(&cfg, &rst, hello, sizeof(hello), &hello_n);
+    if (rc) { close(fd); u->fd = -1; return rc; }
+
+    size_t sent = 0;
+    while (sent < hello_n) {
+        ssize_t w = write(fd, hello + sent, hello_n - sent);
+        if (w <= 0) {
+            if (w < 0 && errno == EINTR) continue;
+            close(fd); u->fd = -1;
+            return VLESS_CONN_EIO;
+        }
+        sent += (size_t)w;
+    }
+
+    struct tls13_auth auth = { 0 };
+    if (is_tls) auth.host = verify_host;
+    else        auth.reality_key = rst.authkey;
+
+    rc = tls13_handshake_auth(&u->tls, fd, hello, hello_n, rst.priv, &auth);
+    if (rc) { close(fd); u->fd = -1; return rc; }
+    if (u->tls.alpn[0] && strcmp(u->tls.alpn, "h2") != 0) {
+        tls13_free(&u->tls); close(fd); u->fd = -1;
+        return VLESS_CONN_ENOH2;
+    }
+    return 0;
+}
+
+/* Поднять выгрузку, если она нужна этому режиму. Для stream-one не делает ничего: там
+ * выгрузка идёт телом того же единственного запроса. */
+static int up_open(struct vless_conn *c, const struct vless_node *n, int timeout_s);
+
+/* Открыть очередной запрос выгрузки. seq < 0 — постоянный поток stream-up (номера у него
+ * нет), иначе номер куска packet-up. */
+static int up_request(struct vless_conn *c, long long seq) {
+    struct vless_up *u = &c->up;
+    struct h2_io io = { .ctx = u, .write = up_write, .read = up_read };
+    char path[320];
+    if (seq < 0) snprintf(path, sizeof(path), "%s", c->up_path);
+    else         snprintf(path, sizeof(path), "%s/%lld", c->up_path, seq);
+
+    static __thread char ref[1400];
+    if (xhttp_referer(ref, sizeof(ref), c->authority, path)) return H2_ETOOBIG;
+
+    if (!u->started) {
+        int rc = h2_start_ex(&u->h2, &io, c->authority, path, "application/grpc", ref,
+                             H2_POST, 0);
+        if (rc) return rc;
+        u->started = 1;
+        return 0;
+    }
+    return h2_next(&u->h2, c->authority, path, "application/grpc", ref, H2_POST);
+}
+
+static int up_open(struct vless_conn *c, const struct vless_node *n, int timeout_s) {
+    if (c->tr != VT_XHTTP || c->xh == XH_STREAM_ONE) return 0;
+
+    int rc = up_connect(c, n, timeout_s);
+    if (rc) return rc;
+
+    /* stream-up открывает свой POST сразу и держит его открытым до конца соединения: тело
+     * этого запроса и есть канал наверх.
+     *
+     * packet-up НЕ открывает ничего заранее. Запрос там живёт ровно один кусок, и открыть
+     * его до того, как кусок появился, значило бы держать на сервере пустую выгрузку —
+     * причём с номером 0, который потом пришлось бы пропустить. Первый запрос откроется в
+     * первой же отправке. */
+    if (c->xh == XH_STREAM_UP) return up_request(c, -1);
+    c->seq = 0;
+    return 0;
 }
 
 /* Обернуть данные в сообщение gRPC. */
@@ -451,6 +672,9 @@ int vless_connect(const struct vless_node *node, struct vless_conn *conn, int ti
      * поэтому он не «частный случай reality», а отдельная ветка: ставить TLS там, где
      * его нет, значило бы просто не соединиться. */
     conn->tr = transport_of(node);
+    /* Режим определяется ЗДЕСЬ, один раз: дальше он читается и при открытии потоков, и при
+     * каждой отправке, и три независимых разбора строки разошлись бы. */
+    if (conn->tr == VT_XHTTP) conn->xh = xhttp_mode_of(node);
 
     if (strcmp(node->security, "none") == 0) {
         conn->plain = 1;
@@ -461,8 +685,10 @@ int vless_connect(const struct vless_node *node, struct vless_conn *conn, int ti
         /* Единственная ветка отказа в этой функции, которая дескриптор НЕ закрывала —
          * все соседние закрывают. Узел security=none с транспортом grpc/xhttp, который
          * не отвечает по h2, за сутки опроса упирал процесс в RLIMIT_NOFILE. */
-        if (rc_h2) { close(fd); conn->fd = -1; }
-        return rc_h2;
+        if (rc_h2) { close(fd); conn->fd = -1; return rc_h2; }
+        rc_h2 = up_open(conn, node, timeout_s);
+        if (rc_h2) { vless_close(conn); return rc_h2; }
+        return 0;
     }
 
     /* security=tls — обычный TLS, без Reality.
@@ -548,6 +774,8 @@ int vless_connect(const struct vless_node *node, struct vless_conn *conn, int ti
         }
         rc = h2_open(conn, node);
         if (rc) { vless_close(conn); return rc; }
+        rc = up_open(conn, node, timeout_s);
+        if (rc) { vless_close(conn); return rc; }
     }
     return 0;
 }
@@ -558,6 +786,33 @@ int vless_connect(const struct vless_node *node, struct vless_conn *conn, int ti
 int vless_send(struct vless_conn *c, const unsigned char *d, size_t n) {
     switch (c->tr) {
         case VT_XHTTP:
+            switch (c->xh) {
+                case XH_STREAM_ONE:
+                    return h2_write(&c->h2, d, n);
+                case XH_STREAM_UP:
+                    /* Один длинный POST на всё соединение: пишем в него и попутно
+                     * забираем то, что сервер успел ответить. */
+                    { int rc = h2_write(&c->up.h2, d, n); up_drain(&c->up); return rc; }
+                case XH_PACKET_UP: {
+                    /* Кусок = отдельный запрос: открыть, записать, закрыть свою половину.
+                     *
+                     * БЕЗ НАКОПЛЕНИЯ. Xray собирает мелкие записи в куски до мегабайта и
+                     * прямо пишет, что без этого полоса «крайне ограничена». У нас копить
+                     * нечем: накопитель требует срока сброса, то есть таймера или своего
+                     * потока на каждое соединение, — а туннель зовёт отправку сам и о
+                     * времени ничего не знает. Поэтому один запрос на один вызов, и это
+                     * честная плата за режим, который выбирают тогда, когда другие не
+                     * проходят вовсе. */
+                    int rc = up_request(c, (long long)c->seq);
+                    if (rc) return rc;
+                    rc = h2_write(&c->up.h2, d, n);
+                    if (rc) return rc;
+                    rc = h2_end_stream(&c->up.h2);
+                    c->seq++;
+                    up_drain(&c->up);
+                    return rc;
+                }
+            }
             return h2_write(&c->h2, d, n);
         case VT_GRPC: {
             static __thread unsigned char msg[H2_MIN_READ_CAP + 16];
@@ -780,6 +1035,16 @@ void vless_close(struct vless_conn *c) {
      * тысячах соединений. */
     if (!c->plain) tls13_free(&c->tls);
     c->tls.ready = 0;
+
+    /* Вторая связь закрывается ЗДЕСЬ ЖЕ и по тому же доводу. Забыть её значило бы утечку
+     * ровно вдвое злее обычной: на соединение приходится и лишний дескриптор, и лишний
+     * набор контекстов AES. Существует она только у stream-up и packet-up; у остальных
+     * fd равен нулю после memset, поэтому проверка на «больше нуля», а не «не -1». */
+    if (c->up.fd > 0) close(c->up.fd);
+    c->up.fd = -1;
+    if (!c->up.plain) tls13_free(&c->up.tls);
+    c->up.tls.ready = 0;
+    c->up.started = 0;
 }
 
 const char *vless_strerror(int rc) {
