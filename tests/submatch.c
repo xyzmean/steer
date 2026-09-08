@@ -209,15 +209,43 @@ int main(void) {
     {
         struct vless_node nodes[4];
         struct vless_sub_stats st;
-        char big[4096];
+        char big[16384];
         int k = snprintf(big, sizeof(big), "vless://u@h:443?sni=");
-        memset(big + k, 'x', 2200);
-        big[k + 2200] = '\0';
+        memset(big + k, 'x', 9000);
+        big[k + 9000] = '\0';
         size_t n = vless_parse_sub(big, nodes, 4, &st);
         check_n("слишком длинная ссылка: не взята", 0, (long)n);
         check_n("слишком длинная ссылка: учтена как непригодная", 1, (long)st.skipped);
-        check("слишком длинная ссылка: причина названа", "ссылка длиннее 2048 байт",
+        check("слишком длинная ссылка: причина названа", "ссылка длиннее 8191 байт",
               st.reasons[0].reason);
+    }
+
+    /* Ссылка постквантового Reality. Длина взята с живой подписки: Xray-core 25.9+ кладёт
+     * в ссылку `pqv` — ключ ML-KEM целиком, и одна такая ссылка весит 2860 байт. При
+     * прежнем пределе в 2048 подписка ровно из неё давала ноль узлов: выход собрать не из
+     * чего, притом что подписка скачалась и верна. Проверяется не сам `pqv` (движок его не
+     * читает — параметр ему незнаком и пропускается, как любой другой), а то, что длина
+     * такой ссылки больше не отбрасывает узел целиком. */
+    {
+        struct vless_node nodes[4];
+        struct vless_sub_stats st;
+        char big[16384];
+        int k = snprintf(big, sizeof(big),
+                         "vless://11111111-2222-3333-4444-555555555555@150.241.72.190:443"
+                         "?encryption=none&flow=xtls-rprx-vision&fp=firefox&security=reality"
+                         "&sni=www.nvidia.com&sid=0da048326ed2&type=tcp&pbk=PBK&pqv=");
+        memset(big + k, 'Z', 2603);
+        k += 2603;
+        k += snprintf(big + k, sizeof(big) - (size_t)k, "#Unlim");
+        big[k] = '\0';
+        size_t n = vless_parse_sub(big, nodes, 4, &st);
+        /* Важна не круглая цифра, а сторона границы: ссылка ЗАВЕДОМО длиннее прежних
+         * 2048 байт — то есть проверяется тот самый случай, на котором узел пропадал. */
+        check_n("постквантовая ссылка: длиннее прежнего предела", 1, k > 2048);
+        check_n("постквантовая ссылка: узел взят", 1, (long)n);
+        check_n("постквантовая ссылка: непригодных нет", 0, (long)st.skipped);
+        check("постквантовая ссылка: имя на месте", "Unlim", nodes[0].name);
+        check("постквантовая ссылка: адрес на месте", "150.241.72.190", nodes[0].host);
     }
 
     /* ТА ЖЕ ВЕТКА, НО ССЫЛКА ЧУЖОГО ПРОТОКОЛА — и вот она исчезала бесследно.
@@ -231,11 +259,11 @@ int main(void) {
     {
         struct vless_node nodes[4];
         struct vless_sub_stats st;
-        char big[4096];
+        char big[16384];
         int k = snprintf(big, sizeof(big), "vless://u@h:443?security=none&type=tcp#ok\n"
                                            "hy2://u@h:443?x=");
-        memset(big + k, 'y', 2200);
-        big[k + 2200] = '\0';
+        memset(big + k, 'y', 9000);
+        big[k + 9000] = '\0';
         size_t n = vless_parse_sub(big, nodes, 4, &st);
         check_n("длинная чужая ссылка: узел vless взят", 1, (long)n);
         check_n("длинная чужая ссылка: учтена как чужая", 1, (long)st.foreign);
