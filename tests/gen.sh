@@ -279,7 +279,7 @@ EOF
 # чтобы пересборка таблицы не оставляла карту пустой до перезапуска dnsd. Строка без настоящего
 # адреса, повтор поддельного и адрес вне 198.18.0.0/15 — пропускаются.
 mkdir -p "$tmp/state-dom"
-printf 'a.example\t198.18.0.1\t203.0.113.10\nb.example\t198.18.0.2\nc.example\t198.18.0.1\t203.0.113.11\nd.example\t10.0.0.1\t203.0.113.12\ne.example\t198.18.0.3\t203.0.113.13\n' > "$tmp/state-dom/fakeip.state"
+printf 'a.example\t198.18.0.1\t203.0.113.10\nb.example\t198.18.0.2\nc.example\t198.18.0.1\t203.0.113.11\nd.example\t10.0.0.1\t203.0.113.12\nf.example\t0xc6120009\t203.0.113.20\ne.example\t198.18.0.3\t203.0.113.13\n' > "$tmp/state-dom/fakeip.state"
 dout="$("$BIN" apply --dry-run --spec "$tmp/dspec.json" --state-dir "$tmp/state-dom")"
 check "карта подмены засеяна раздачей резолвера" "1" \
     "$(printf '%s\n' "$dout" | grep -c '198.18.0.1 : 203.0.113.10')"
@@ -288,6 +288,13 @@ check "запись без настоящего адреса в карту не 
 check "повтор поддельного адреса пропущен — nft отверг бы двойной ключ" "0" \
     "$(printf '%s\n' "$dout" | grep -c '203.0.113.11')"
 check "адрес вне 198.18.0.0/15 в карту не попал" "0" "$(printf '%s\n' "$dout" | grep -c '10.0.0.1 :')"
+# В карту едет РАЗОБРАННЫЙ адрес, а не байты файла. inet_aton принимает не только точечную
+# запись: «0xc6120009» — то же самое 198.18.0.9, и проверку диапазона такая строка проходит. Но
+# nft такого ключа не понимает, а `nft -f` отвергает набор ЦЕЛИКОМ — то есть одна строка файла
+# состояния оставила бы роутер вообще без правил.
+check "нетипичная запись адреса приведена к точечной" "1" \
+    "$(printf '%s\n' "$dout" | grep -c '198.18.0.9 : 203.0.113.20')"
+check "и байты файла в набор не уехали" "0" "$(printf '%s\n' "$dout" | grep -c '0xc6120009')"
 check "domain channel still tests its set" "1" \
     "$(printf '%s\n' "$dout" | grep 'steer:geo_dom' | grep -c 'ip daddr @geo_dom')"
 check "domain set is declared empty, with timeouts" "1" \
