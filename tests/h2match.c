@@ -60,6 +60,34 @@ static void h2_open(struct h2 *h, struct fake_io *io) {
     io->sent_n = 0;                      /* преамбула и HEADERS дальше не интересны */
 }
 
+/* Кадр DATA на поток sid с телом из len байт. Возвращает полную длину кадра. */
+static size_t put_data(unsigned char *out, uint32_t sid, size_t len) {
+    out[0] = (unsigned char)(len >> 16); out[1] = (unsigned char)(len >> 8);
+    out[2] = (unsigned char)len;
+    out[3] = FR_DATA; out[4] = 0;
+    put32(out + 5, sid);
+    memset(out + 9, 'q', len);
+    return 9 + len;
+}
+
+/* Сумма прибавок во всех WINDOW_UPDATE, ушедших на поток sid. Считается по тому, что
+ * реально уехало в сеть: поля состояния скажут, сколько мы НАМЕРЕНЫ вернуть, а сервер
+ * видит только кадры. */
+static uint32_t wu_sum(const struct fake_io *io, uint32_t sid) {
+    uint32_t sum = 0;
+    size_t p = 0;
+    while (p + 9 <= io->sent_n) {
+        uint32_t len = ((uint32_t)io->sent[p] << 16) | ((uint32_t)io->sent[p + 1] << 8) |
+                       io->sent[p + 2];
+        unsigned char type = io->sent[p + 3];
+        uint32_t fsid = get32(io->sent + p + 5) & 0x7FFFFFFF;
+        if (type == FR_WINDOW_UPDATE && fsid == sid && len == 4)
+            sum += get32(io->sent + p + 9) & 0x7FFFFFFF;
+        p += 9 + len;
+    }
+    return sum;
+}
+
 /* Кадр SETTINGS с одной настройкой. */
 static size_t settings_frame(unsigned char *out, uint16_t id, uint32_t v) {
     out[0] = 0; out[1] = 0; out[2] = 6;
@@ -237,6 +265,70 @@ int main(void) {
         size_t got = 99;
         check("кадр прежнего потока: не ошибка", 0, h2_read(&h, out, sizeof(out), &got));
         check("кадр прежнего потока: в тело не попал", 0, (int)got);
+    }
+
+    {
+        /* ---- окно ПРИЁМА: соединение считается отдельно от потока ----------------
+         *
+         * Окно приёма пополняется кадром WINDOW_UPDATE, и уровней у него два: поток и
+         * соединение. Байты, полученные по любому потоку, тратят ОБА, поэтому вернуть их
+         * серверу надо тоже на оба — иначе окно, которое мы объявили, монотонно сходится к
+         * нулю, и сервер перестаёт писать. Снаружи это выглядит как «выгрузка встала на
+         * большом файле», причём тем позже, чем больше окно.
+         *
+         * У packet-up на этом расходятся два случая, и стенд проверяет оба:
+         *
+         *   1) кадр DATA от УЖЕ ЗАКРЫТОГО потока прежнего куска — в тело он не идёт (это
+         *      проверено выше), но окно соединения он уже потратил;
+         *   2) переход к следующему куску (h2_next) — состояние ПОТОКА свежее, а долг
+         *      перед окном СОЕДИНЕНИЯ переходит вместе с соединением.
+         *
+         * Проверяется поведение, а не поле: сумма прибавок во всех WINDOW_UPDATE, которые
+         * ушли на нулевой поток, обязана сойтись с числом полученных байт DATA. */
+        struct h2 h;
+        struct fake_io io;
+        static unsigned char feed[2 * (9 + 16384)];
+        unsigned char out[H2_MIN_READ_CAP];
+        size_t got = 0;
+
+        /* --- случай 1: кадр прежнего потока тратит окно соединения --- */
+        h2_open(&h, &io);
+        /* 16384 байт по текущему потоку: до порога пополнения (32 КБ) не дотягивает, и
+         * ни одного WINDOW_UPDATE пока не должно быть. */
+        put_data(feed, h.sid, 16384);
+        io.feed = feed; io.feed_n = 9 + 16384; io.feed_pos = 0;
+        io.sent_n = 0;
+        while (io.feed_pos < io.feed_n)
+            if (h2_read(&h, out, sizeof(out), &got) != 0) break;
+        check("до порога: пополнения окна нет", 0, (int)wu_sum(&io, 0));
+
+        /* Ещё столько же, но от ЗАКРЫТОГО прежнего потока: в тело не идёт, окно тратит. */
+        check("следующий кусок: без ошибки",
+              0, h2_next(&h, "example.org", "/x/sid/1", "application/grpc", NULL, H2_POST));
+        io.sent_n = 0;
+        put_data(feed, 1, 16384);
+        io.feed = feed; io.feed_n = 9 + 16384; io.feed_pos = 0;
+        while (io.feed_pos < io.feed_n)
+            if (h2_read(&h, out, sizeof(out), &got) != 0) break;
+        check("кадр прежнего потока: окно соединения возвращено целиком",
+              32768, (int)wu_sum(&io, 0));
+        check("и окну потока чужие байты не приписаны", 0, (int)wu_sum(&io, h.sid));
+
+        /* --- случай 2: h2_next не теряет долг перед окном соединения --- */
+        h2_open(&h, &io);
+        put_data(feed, h.sid, 16384);
+        io.feed = feed; io.feed_n = 9 + 16384; io.feed_pos = 0;
+        io.sent_n = 0;
+        while (io.feed_pos < io.feed_n)
+            if (h2_read(&h, out, sizeof(out), &got) != 0) break;
+        h2_next(&h, "example.org", "/x/sid/1", "application/grpc", NULL, H2_POST);
+        io.sent_n = 0;
+        put_data(feed, h.sid, 16384);
+        io.feed = feed; io.feed_n = 9 + 16384; io.feed_pos = 0;
+        while (io.feed_pos < io.feed_n)
+            if (h2_read(&h, out, sizeof(out), &got) != 0) break;
+        check("после h2_next: долг перед окном соединения не потерян",
+              32768, (int)wu_sum(&io, 0));
     }
 
     printf("\n%s\n", fails ? "ЕСТЬ ПРОВАЛЫ" : "все проверки прошли");

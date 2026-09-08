@@ -317,6 +317,9 @@ int h2_next(struct h2 *h, const char *authority, const char *path,
     h->status = 0;
     h->done = 0;
     h->send_win = h->peer_init_win;
+    /* Обнуляется долг перед окном ПОТОКА: прежний поток закрыт, растить его окно незачем.
+     * recv_credit_conn при этом НЕ трогается — он про соединение, и переходит вместе с ним;
+     * обнулить его здесь значило бы не вернуть серверу уже потраченное окно. */
     h->recv_credit = 0;
 
     static __thread unsigned char buf[2048];
@@ -338,14 +341,22 @@ int h2_end_stream(struct h2 *h) {
 /* Пополнить окно приёма, если накопилось достаточно. Оба уровня сразу: соединение и
  * поток считаются отдельно, и забыть один — значит остановиться на его пределе. */
 static int window_refill(struct h2 *h) {
-    if (h->recv_credit < WINDOW_REFILL) return 0;
     unsigned char wu[4];
-    put32(wu, (uint32_t)h->recv_credit);
-    int rc = frame_out(h, FR_WINDOW_UPDATE, 0, h->sid, wu, 4);
-    if (rc) return rc;
-    rc = frame_out(h, FR_WINDOW_UPDATE, 0, 0, wu, 4);
-    if (rc) return rc;
-    h->recv_credit = 0;
+    /* Порог у каждого уровня СВОЙ, и прибавка тоже: у соединения долг больше, потому что в
+     * него входят и кадры закрытых потоков. Прежде оба кадра уходили с одним числом —
+     * числом потока, — и окно соединения пополнялось на меньше, чем было потрачено. */
+    if (h->recv_credit >= WINDOW_REFILL) {
+        put32(wu, (uint32_t)h->recv_credit);
+        int rc = frame_out(h, FR_WINDOW_UPDATE, 0, h->sid, wu, 4);
+        if (rc) return rc;
+        h->recv_credit = 0;
+    }
+    if (h->recv_credit_conn >= WINDOW_REFILL) {
+        put32(wu, (uint32_t)h->recv_credit_conn);
+        int rc = frame_out(h, FR_WINDOW_UPDATE, 0, 0, wu, 4);
+        if (rc) return rc;
+        h->recv_credit_conn = 0;
+    }
     return 0;
 }
 
@@ -480,11 +491,18 @@ int h2_read(struct h2 *h, unsigned char *out, size_t cap, size_t *got) {
     while (p < avail) {
         if (h->frame_left) {
             size_t take = h->frame_left < avail - p ? h->frame_left : avail - p;
-            if (h->frame_type == FR_DATA && h->frame_ours) {
-                if (*got + take > cap) return H2_ETOOBIG;
-                memcpy(out + *got, rec + p, take);
-                *got += take;
-                h->recv_credit += (int32_t)take;
+            if (h->frame_type == FR_DATA) {
+                /* Окну СОЕДИНЕНИЯ байты зачитываются всегда, даже когда кадр пришёл от уже
+                 * закрытого потока прежнего куска: из общего окна они вычтены, и вернуть их
+                 * обязаны мы. Раньше такой кадр не считался нигде — он попадал в ветку
+                 * служебных, где его тело копировалось в h->ctl и выбрасывалось. */
+                h->recv_credit_conn += (int32_t)take;
+                if (h->frame_ours) {
+                    if (*got + take > cap) return H2_ETOOBIG;
+                    memcpy(out + *got, rec + p, take);
+                    *got += take;
+                    h->recv_credit += (int32_t)take;
+                }
             } else if (h->frame_type == FR_HEADERS) {
                 if (h->frame_ours && h->status == 0) status_peek(h, rec + p, take);
             } else {
