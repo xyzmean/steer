@@ -217,6 +217,119 @@ int cert_verify_server(const unsigned char *cert_body, size_t cert_n,
     return rc;
 }
 
+/* ---- Reality: сервер доказывает подлинность нам ------------------------------------
+ *
+ * Механика описана в certverify.h. Здесь — разбор, и он намеренно СВОЙ, а не через
+ * mbedtls_x509_crt_parse_der: сертификат Reality подписан ключом Ed25519, а mbedtls его не
+ * знает вовсе (в 3.6 нет ни кривой, ни алгоритма) и отказывается разбирать такой сертификат
+ * целиком. То есть библиотечный разбор здесь не «дороже», а невозможен.
+ *
+ * Нужны ровно два поля, и оба лежат на предсказуемых местах DER.
+ */
+
+/* Один шаг по DER: тег, длина, значение. Возвращает 0 и двигает *p за значение; длину и
+ * начало значения кладёт в *val/*val_n. Длиннее четырёх байт длина не бывает у сертификата,
+ * который влез в сообщение рукопожатия. */
+static int der_next(const unsigned char **p, const unsigned char *end,
+                    unsigned char *tag, const unsigned char **val, size_t *val_n) {
+    if (*p + 2 > end) return -1;
+    *tag = *(*p)++;
+    size_t n = *(*p)++;
+    if (n & 0x80) {
+        size_t k = n & 0x7F;
+        if (k == 0 || k > 4 || *p + k > end) return -1;
+        n = 0;
+        while (k--) n = (n << 8) | *(*p)++;
+    }
+    if ((size_t)(end - *p) < n) return -1;
+    *val = *p;
+    *val_n = n;
+    *p += n;
+    return 0;
+}
+
+/* Открытый ключ Ed25519 из SubjectPublicKeyInfo.
+ *
+ * У Ed25519 эта структура имеет ЕДИНСТВЕННЫЙ возможный вид, потому что у алгоритма нет
+ * параметров, а ключ всегда 32 байта:
+ *
+ *     30 2A            SEQUENCE (44 байта)
+ *        30 05         SEQUENCE (алгоритм)
+ *           06 03 2B 65 70   OID 1.3.101.112 (id-Ed25519)
+ *        03 21 00      BIT STRING, 33 байта, ноль неиспользованных бит
+ *        <32 байта>
+ *
+ * Поэтому ключ ищется по этой самой последовательности, а не обходом семи полей TBS. Это не
+ * срезание угла: у формы нет вариантов, а обход был бы длиннее и имел бы больше мест, где
+ * ошибиться. Если сертификат не Ed25519 — последовательности нет, и это ровно тот ответ,
+ * который нужен: перед нами не Reality. */
+static const unsigned char *find_ed25519_pub(const unsigned char *b, size_t n) {
+    static const unsigned char SPKI[] = {
+        0x30, 0x2A, 0x30, 0x05, 0x06, 0x03, 0x2B, 0x65, 0x70, 0x03, 0x21, 0x00
+    };
+    if (n < sizeof(SPKI) + 32) return NULL;
+    for (size_t i = 0; i + sizeof(SPKI) + 32 <= n; i++)
+        if (memcmp(b + i, SPKI, sizeof(SPKI)) == 0) return b + i + sizeof(SPKI);
+    return NULL;
+}
+
+/* Поле подписи — последний элемент внешней SEQUENCE сертификата:
+ *     Certificate ::= SEQUENCE { tbsCertificate, signatureAlgorithm, signatureValue }
+ * Здесь обход настоящий: длина tbsCertificate переменная, и «искать по образцу» нечего. */
+static int find_signature(const unsigned char *der, size_t n,
+                          const unsigned char **sig, size_t *sig_n) {
+    const unsigned char *p = der, *end = der + n, *v;
+    unsigned char tag;
+    size_t vn;
+    if (der_next(&p, end, &tag, &v, &vn) != 0 || tag != 0x30) return -1;  /* Certificate */
+    const unsigned char *ip = v, *iend = v + vn;
+    if (der_next(&ip, iend, &tag, &v, &vn) != 0 || tag != 0x30) return -1;  /* tbs */
+    if (der_next(&ip, iend, &tag, &v, &vn) != 0 || tag != 0x30) return -1;  /* algid */
+    if (der_next(&ip, iend, &tag, &v, &vn) != 0 || tag != 0x03) return -1;  /* BIT STRING */
+    if (vn < 2 || v[0] != 0) return -1;      /* неиспользованных бит быть не должно */
+    *sig = v + 1;
+    *sig_n = vn - 1;
+    return 0;
+}
+
+int cert_reality_check(const unsigned char *cert_body, size_t cert_n,
+                       const unsigned char *authkey) {
+    if (!cert_body || !authkey) return CERTV_EPARSE;
+
+    /* Первый сертификат списка — тот самый. Разбор общий с проверкой цепочки, но здесь
+     * нужен не разобранный объект, а СЫРЫЕ БАЙТЫ: и ключ, и подпись читаются из DER. */
+    if (cert_n < 1) return CERTV_EPARSE;
+    size_t p = 1 + cert_body[0];
+    if (p + 3 > cert_n) return CERTV_EPARSE;
+    size_t list = ((size_t)cert_body[p] << 16) | ((size_t)cert_body[p + 1] << 8) | cert_body[p + 2];
+    p += 3;
+    if (p + 3 > cert_n || list < 3) return CERTV_EPARSE;
+    size_t clen = ((size_t)cert_body[p] << 16) | ((size_t)cert_body[p + 1] << 8) | cert_body[p + 2];
+    p += 3;
+    if (clen == 0 || p + clen > cert_n) return CERTV_EPARSE;
+    const unsigned char *der = cert_body + p;
+
+    const unsigned char *pub = find_ed25519_pub(der, clen);
+    if (!pub) return CERTV_ENOTREALITY;      /* не Ed25519 — значит маскировочный сайт */
+
+    const unsigned char *sig;
+    size_t sig_n;
+    if (find_signature(der, clen, &sig, &sig_n) != 0) return CERTV_EPARSE;
+
+    const mbedtls_md_info_t *mi = mbedtls_md_info_from_type(MBEDTLS_MD_SHA512);
+    if (!mi) return CERTV_EALG;
+    unsigned char want[64];
+    if (mbedtls_md_hmac(mi, authkey, 32, pub, 32, want) != 0) return CERTV_ESIG;
+
+    /* Сравнение постоянного времени. Утечка здесь ничего не открывает — обе стороны байты
+     * и так видят, — но сравнивать секретозависимое memcmp'ом это привычка, которую в этом
+     * файле заводить не стоит. */
+    if (sig_n != sizeof(want)) return CERTV_ENOTREALITY;
+    unsigned char diff = 0;
+    for (size_t i = 0; i < sizeof(want); i++) diff |= (unsigned char)(want[i] ^ sig[i]);
+    return diff ? CERTV_ENOTREALITY : 0;
+}
+
 const char *cert_verify_strerror(int rc) {
     switch (rc) {
         case 0:              return "";
@@ -225,6 +338,9 @@ const char *cert_verify_strerror(int rc) {
         case CERTV_ECHAIN:   return "сертификат не сошёлся с корнями или выдан не на это имя";
         case CERTV_ESIG:     return "подпись сервера неверна";
         case CERTV_EALG:     return "сервер подписал алгоритмом, которого мы не предлагали";
+        /* Формулировка про ключ, а не про сервер: узел жив и отвечает, просто нас на нём не
+         * узнали — почти всегда это разошедшиеся pbk/sid или чужая подписка. */
+        case CERTV_ENOTREALITY: return "узел не признал ключ (ответил маскировочный сайт)";
         default:             return "проверка сертификата не удалась";
     }
 }

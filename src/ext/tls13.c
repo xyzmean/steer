@@ -335,7 +335,12 @@ const char *tls13_verify_reason(void) { return g_verify_reason; }
 static int handshake(struct tls13 *t, int fd,
                      const unsigned char *client_hello, size_t hello_n,
                      const unsigned char *our_priv,
-                     const char *host, const char *roots) {
+                     const struct tls13_auth *auth) {
+    /* Нужен ли нам сертификат вообще. Считается один раз: дальше признак стоит в трёх
+     * местах горячего разбора, и три разных условия там разошлись бы. */
+    const char *host = auth ? auth->host : NULL;
+    const unsigned char *rkey = auth ? auth->reality_key : NULL;
+    const int want_cert = (host != NULL) || (rkey != NULL);
     memset(t, 0, sizeof(*t));
     t->fd = fd;
     /* md и H заполняются после разбора ServerHello: они зависят от набора шифров. */
@@ -549,17 +554,24 @@ static int handshake(struct tls13 *t, int fd,
                     }
                 }
             }
-            if (host && msg == 0x19) {          /* CompressedCertificate (RFC 8879) */
-                /* Сюда попасть можно только если сервер сжал сертификат, которого мы не
-                 * просили сжимать: расширение compress_certificate у security=tls не
-                 * посылается вовсе (см. reality.c). Отдельная причина, а не «не
-                 * разобрался»: разница между «сервер прислал не то» и «мы не поняли то, что
-                 * прислали» — это разные разговоры и с человеком, и с владельцем сервера. */
-                snprintf(g_verify_reason, sizeof(g_verify_reason),
-                         "сервер сжал сертификат, о чём его не просили");
+            if (want_cert && msg == 0x19) {     /* CompressedCertificate (RFC 8879) */
+                /* Смысл у этого сообщения разный, и сказать надо разное.
+                 *
+                 * У security=tls расширение compress_certificate не посылается вовсе (см.
+                 * reality.c), поэтому сжатый сертификат означает сервер, который сжал без
+                 * спроса — так и говорим.
+                 *
+                 * У Reality расширение посылается: облик Chrome без него неполон. Но сервер
+                 * Reality, ПРИЗНАВШИЙ клиента, отвечает своим временным сертификатом и не
+                 * сжимает его. Сжатый — значит отвечает не он, а маскировочный сайт, куда
+                 * нас передали; это ровно «не признал ключ», и незачем пугать человека
+                 * словом про сжатие, к которому он не имеет отношения. */
+                snprintf(g_verify_reason, sizeof(g_verify_reason), "%s",
+                         rkey ? cert_verify_strerror(CERTV_ENOTREALITY)
+                              : "сервер сжал сертификат, о чём его не просили");
                 return TLS13_ECERT;
             }
-            if (host && msg == 0x0B && cert_n == 0) {   /* Certificate */
+            if (want_cert && msg == 0x0B && cert_n == 0) {   /* Certificate */
                 if (mlen > sizeof(certbuf)) return TLS13_ETOOBIG;
                 memcpy(certbuf, hsbuf + p + 4, mlen);
                 cert_n = mlen;
@@ -605,6 +617,21 @@ static int handshake(struct tls13 *t, int fd,
      *
      * До: свой Finished — это первое, что уходит на сервер под ключами сессии, и отправлять
      * его тому, кто подлинности не доказал, незачем. */
+    /* Reality: доказательством служит поле подписи временного сертификата, и цепочка тут ни
+     * при чём. Проверка стоит ДО ветки security=tls, а не вместо неё: настроек, где заданы
+     * оба доказательства, не бывает, но порядок в коде должен быть определён однозначно. */
+    if (rkey) {
+        if (!cert_n) {
+            snprintf(g_verify_reason, sizeof(g_verify_reason), "сервер не прислал сертификат");
+            return TLS13_ECERT;
+        }
+        int rrc = cert_reality_check(certbuf, cert_n, rkey);
+        if (rrc != 0) {
+            snprintf(g_verify_reason, sizeof(g_verify_reason), "%s", cert_verify_strerror(rrc));
+            return TLS13_ECERT;
+        }
+    }
+
     if (host) {
         if (!cert_n || !cv_n) {
             /* Рукопожатие сошлось, а доказательства не было. Так отвечает сервер, который
@@ -616,7 +643,7 @@ static int handshake(struct tls13 *t, int fd,
             return TLS13_ECERT;
         }
         int vrc = cert_verify_server(certbuf, cert_n, cv_buf, cv_n,
-                                     cv_transcript, cv_thash_n, host, roots);
+                                     cv_transcript, cv_thash_n, host, auth->roots);
         if (vrc != 0) {
             snprintf(g_verify_reason, sizeof(g_verify_reason), "%s",
                      cert_verify_strerror(vrc));
@@ -677,18 +704,18 @@ static int handshake(struct tls13 *t, int fd,
 int tls13_handshake(struct tls13 *t, int fd,
                     const unsigned char *client_hello, size_t hello_n,
                     const unsigned char *our_priv) {
-    return handshake(t, fd, client_hello, hello_n, our_priv, NULL, NULL);
+    return handshake(t, fd, client_hello, hello_n, our_priv, NULL);
 }
 
-int tls13_handshake_verify(struct tls13 *t, int fd,
-                           const unsigned char *client_hello, size_t hello_n,
-                           const unsigned char *our_priv,
-                           const char *host, const char *roots) {
-    /* Пустое имя — это НЕ «проверять нечем», это ошибка вызывающего: проверка без имени
-     * пропустила бы любой действительный сертификат на свете, то есть выглядела бы работой,
-     * ничего не проверяя. */
-    if (!host || !host[0]) return TLS13_ECERT;
-    return handshake(t, fd, client_hello, hello_n, our_priv, host, roots);
+int tls13_handshake_auth(struct tls13 *t, int fd,
+                         const unsigned char *client_hello, size_t hello_n,
+                         const unsigned char *our_priv,
+                         const struct tls13_auth *auth) {
+    /* Пустое имя при заданной проверке по сертификату — это НЕ «проверять нечем», это ошибка
+     * вызывающего: проверка без имени пропустила бы любой действительный сертификат на
+     * свете, то есть выглядела бы работой, ничего не проверяя. */
+    if (auth && auth->host && !auth->host[0]) return TLS13_ECERT;
+    return handshake(t, fd, client_hello, hello_n, our_priv, auth);
 }
 
 int tls13_has_record(const struct tls13 *t) {

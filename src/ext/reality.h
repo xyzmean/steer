@@ -47,6 +47,13 @@ struct reality_state {
     unsigned char pub[32];         /* он же публичный — уезжает в key_share */
     unsigned char shared[32];      /* общий секрет с сервером */
     unsigned char session_id[32];  /* аутентификатор, он же legacy_session_id */
+
+    /* Ключ аутентификатора: HKDF-SHA256(ikm = общий секрет, salt = Random[0..20),
+     * info = "REALITY"). Тем же ключом сервер ПОДПИСЫВАЕТ свой временный сертификат, и
+     * этим доказывает подлинность НАМ — см. tls13_handshake_auth и reality.go в Xray.
+     * Поэтому он не остаётся внутри сборщика Hello, как раньше, а живёт до конца
+     * рукопожатия. Нулевой при plain: у обычного TLS его не существует. */
+    unsigned char authkey[32];
 };
 
 int reality_build_hello(const struct reality_cfg *cfg, struct reality_state *st,

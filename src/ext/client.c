@@ -506,10 +506,14 @@ int vless_connect(const struct vless_node *node, struct vless_conn *conn, int ti
 
     /* Передаётся наш ПРИВАТНЫЙ ключ, а не готовый секрет: TLS-расписание строится на
      * обмене с эфемерным ключом сервера, который приедет только в ServerHello. */
-    rc = is_tls
-             ? tls13_handshake_verify(&conn->tls, fd, hello, hello_n, conn->rst.priv,
-                                      verify_host, NULL)
-             : tls13_handshake(&conn->tls, fd, hello, hello_n, conn->rst.priv);
+    /* Чем доказывать подлинность — решается видом узла, и вариант всегда ровно один.
+     * У обычного TLS это цепочка и имя, у Reality — HMAC в поле подписи временного
+     * сертификата на ключе, который есть только у владельца постоянной пары. */
+    struct tls13_auth auth = { 0 };
+    if (is_tls) auth.host = verify_host;
+    else        auth.reality_key = conn->rst.authkey;
+
+    rc = tls13_handshake_auth(&conn->tls, fd, hello, hello_n, conn->rst.priv, &auth);
     if (rc) { close(fd); conn->fd = -1; return rc; }
 
     if (conn->tr != VT_RAW) {

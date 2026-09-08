@@ -696,7 +696,10 @@ int reality_build_hello_carry(const struct reality_cfg *cfg, struct reality_stat
             return 0;
         }
 
-        unsigned char authkey[32];
+        /* Ключ уезжает в st, а не остаётся местной переменной: им же сервер подписывает
+         * свой сертификат, и проверка этой подписи — единственное, чем он доказывает
+         * подлинность нам (tls13.c). Раньше ключ здесь и умирал, и доказательства не было. */
+        unsigned char *authkey = st->authkey;
         const mbedtls_md_info_t *md = mbedtls_md_info_from_type(MBEDTLS_MD_SHA256);
         if (!md) return REALITY_ECRYPTO;
         if (mbedtls_hkdf(md, random, 20, st->shared, 32,
