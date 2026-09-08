@@ -320,6 +320,27 @@ static int h2_open(struct vless_conn *c, const struct vless_node *n) {
  * в диффе смысл правки. */
 static int tcp_connect(const char *host, uint16_t port, int timeout_s);
 
+/* Шов установления TCP — симметрично g_latency_probe в failover.c и по той же причине:
+ * стенду нужно провести рукопожатие с собеседником, которого он держит сам, не поднимая
+ * ни сокета наружу, ни настоящего узла. В бою указатель NULL, и соединяет tcp_connect.
+ *
+ * Почему шов появился именно здесь. У ветвей отказа vless_connect не было НИ ОДНОГО
+ * стенда: tests/fake-vless.py говорит только security=none и до TLS не доходит, а
+ * tests/run-reality.sh требует sing-box, root и сетевых пространств и потому не входит ни
+ * в `make test`, ни в `make ext-test`. Всё, что охраняло здесь освобождение ключей и
+ * дескриптора, — чтение кода глазами, тогда как у xsteer на ту же болезнь (I-067) стенд
+ * стоит под AddressSanitizer с запуска 42. Шов дешевле поддельного сервера: адрес узла
+ * перестаёт быть обязан быть настоящим, и дальше рукопожатие идёт по socketpair
+ * (tests/vlessmatch.c, R-114).
+ *
+ * Возвращает то же, что tcp_connect: дескриптор либо отрицательный код VLESS_CONN_*. */
+static int (*g_tcp_dial)(const char *host, uint16_t port, int timeout_s);
+
+static int dial(const char *host, uint16_t port, int timeout_s) {
+    if (g_tcp_dial) return g_tcp_dial(host, port, timeout_s);
+    return tcp_connect(host, port, timeout_s);
+}
+
 /* Поднять вторую связь — под выгрузку. Тот же путь установления, что и у первой: TCP, и
  * дальше либо ничего (security=none), либо Reality, либо обычный TLS с проверкой. */
 static int up_connect(struct vless_conn *c, const struct vless_node *n, int timeout_s) {
@@ -327,7 +348,7 @@ static int up_connect(struct vless_conn *c, const struct vless_node *n, int time
     memset(u, 0, sizeof(*u));
     u->fd = -1;
 
-    int fd = tcp_connect(n->host, n->port, timeout_s);
+    int fd = dial(n->host, n->port, timeout_s);
     if (fd < 0) return fd;
     u->fd = fd;
 
@@ -692,7 +713,7 @@ int vless_connect(const struct vless_node *node, struct vless_conn *conn, int ti
     conn->fd = -1;
     int rc_h2;
 
-    int fd = tcp_connect(node->host, node->port, timeout_s);
+    int fd = dial(node->host, node->port, timeout_s);
     if (fd < 0) return fd;
     conn->fd = fd;
 

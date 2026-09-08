@@ -6,6 +6,11 @@
 #   tests/spokematch.c — освобождение транспортных ключей при неудачном рукопожатии;
 #                        собирается под AddressSanitizer, потому что утекает именно
 #                        контекст шифра в куче (I-067).
+#   tests/vlessmatch.c — ветви отказа vless_connect: код возврата, дескрипторы и куча на
+#                        каждом «нет». Собирается под AddressSanitizer по той же причине,
+#                        что spokematch: утекают контексты AES/GCM в куче (R-114). Сюда же
+#                        входит серверная половина TLS 1.3 — та, которой в проекте не было
+#                        вовсе, и без которой до серверного Finished не доходил ни один стенд.
 #   tests/hubmatch.c   — арифметика записи в хабе: правило набора кадров в пачку против
 #                        объявленной строки воркера (I-070). Включает src/ext/xshub.c, отсюда
 #                        и mbedtls: цикл хаба тянет за собой reality.c и TLS 1.3.
@@ -179,6 +184,23 @@ $CC -O1 -g -w -Isrc $ASAN $MBED_INC "$PRIV" -o "$BUILD/spokematch" \
 	src/ext/reality.c src/ext/tls13.c src/ext/certverify.c src/ext/h2.c src/ext/tun.c src/obfs.c \
 	src/spec.c $MBED_LIB -lpthread
 "$BUILD/spokematch"
+
+# vlessmatch — ветви отказа vless_connect, под тем же AddressSanitizer.
+#
+# ASAN здесь уже определён пробой выше: второй экземпляр этой пробы разошёлся бы с первым,
+# ровно как разошлись бы два определения mbedtls. Если санитайзера нет, стенд об этом
+# ГОВОРИТ САМ (последние строки его вывода) — проверки кодов возврата и дескрипторов
+# прогонятся, куча нет.
+#
+# Список исходников повторяет devupmatch без client.c: сам client.c стенд ВКЛЮЧАЕТ (шов
+# установления TCP статический, см. заголовок стенда), и вторая его копия при компоновке
+# дала бы дубли символов.
+echo "ext-test: собираю и прогоняю vlessmatch (ASan: ${ASAN:-нет})..."
+$CC -O1 -g -w -Isrc $ASAN $MBED_INC "$PRIV" -o "$BUILD/vlessmatch" tests/vlessmatch.c \
+	src/ext/vless_proto.c src/ext/vision.c src/ext/tls13.c src/ext/certverify.c \
+	src/ext/reality.c src/ext/h2.c src/ext/tun.c src/ext/rtx.c src/ext/sub.c \
+	src/spec.c $MBED_LIB -lpthread
+"$BUILD/vlessmatch"
 
 # hubmatch — согласие правила набора пачки с размером строки воркера.
 echo "ext-test: собираю и прогоняю hubmatch..."
