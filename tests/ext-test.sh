@@ -156,22 +156,36 @@ $CC -O2 -w -Isrc $MBED_INC "$PRIV" -o "$BUILD/xsloop" tests/xsloop.c \
 # МОЛЧА значило бы получить зелёный стенд, который больше не проверяет то, ради чего написан,
 # — поэтому пропуск громкий, как и пропуск по ненайденной библиотеке.
 #
-# Проба выделяет и ОСВОБОЖДАЕТ память: программа с утечкой была бы отвергнута самим ASan там,
-# где он работает, и проба выключала бы его на ровном месте.
+# ПРОБ ДВЕ, И ВТОРАЯ ПОЯВИЛАСЬ ПОТОМУ, ЧТО ПЕРВОЙ НЕ ХВАТАЛО (I-232). Первая ничего не теряет
+# и обязана пройти: так видно, что рантайм есть и программа с ним ЗАПУСКАЕТСЯ. Вторая теряет
+# 64 байта нарочно и обязана ПРОВАЛИТЬСЯ: так видно, что утечки ищутся. Без второй проба
+# отвечала на вопрос «есть ли рантайм», а комментарий над ней обещал ответ и про отсутствие
+# LeakSanitizer — обещание, которого код не исполнял: программа без утечки проходит и там, где
+# утечек не ищут вовсе. Проверено: `ASAN_OPTIONS=detect_leaks=0 ./build/spokematch` печатал
+# «все проверки прошли», то есть барьер под I-067 снимался переменной окружения молча.
 ASAN="-fsanitize=address"
 probe="$BUILD/asan-probe"
 mkdir -p "$BUILD"
 printf '#include <stdlib.h>\nint main(void){char*p=malloc(16);p[0]=1;free(p);return 0;}\n' \
 	> "$probe.c"
-if $CC -O0 $ASAN -o "$probe" "$probe.c" >/dev/null 2>&1 && "$probe" >/dev/null 2>&1; then
-	:
-else
-	echo "ext-test: ВНИМАНИЕ — AddressSanitizer здесь не работает (нет рантайма либо нет"
-	echo "ext-test:            LeakSanitizer, как на musl). spokematch собирается БЕЗ него:"
-	echo "ext-test:            проверки в нём прогонятся, утечка (I-067) — НЕТ."
+printf '#include <stdlib.h>\nint main(void){char*p=malloc(64);p[0]=1;return 0;}\n' \
+	> "$probe-leak.c"
+asan_why=""
+if ! $CC -O0 $ASAN -o "$probe" "$probe.c" >/dev/null 2>&1 || ! "$probe" >/dev/null 2>&1; then
+	asan_why="рантайма нет либо программа с ним не запускается"
+elif ! $CC -O0 $ASAN -o "$probe-leak" "$probe-leak.c" >/dev/null 2>&1; then
+	asan_why="проба на утечку не собралась"
+elif "$probe-leak" >/dev/null 2>&1; then
+	# Вышла с нулём, потеряв 64 байта: рантайм есть, а утечек он не ищет.
+	asan_why="утечки не ищутся (нет LeakSanitizer, как на musl, либо detect_leaks=0)"
+fi
+if [ -n "$asan_why" ]; then
+	echo "ext-test: ВНИМАНИЕ — AddressSanitizer здесь не годится: $asan_why."
+	echo "ext-test:            spokematch и vlessmatch собираются БЕЗ него: проверки в них"
+	echo "ext-test:            прогонятся, утечки (I-067, R-114) — НЕТ."
 	ASAN=""
 fi
-rm -f "$probe" "$probe.c"
+rm -f "$probe" "$probe.c" "$probe-leak" "$probe-leak.c"
 
 echo "ext-test: собираю и прогоняю spokematch (ASan: ${ASAN:-нет})..."
 # xslink.c в списке ОБЯЗАТЕЛЕН: командная строка клиента принимает и ссылку xs://, и файл
