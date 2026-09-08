@@ -1042,7 +1042,23 @@ struct fakeip_entry {
     char *domain; /* lowercased, matches the ruleset's own lowercasing */
     uint32_t addr;      /* host byte order */
     uint32_t real_host; /* last-seen real backend, host order; 0 if unknown */
-    /* Which domain channel's nft set this fake IP currently sits in (-1 = none).
+    /* В КАКИХ наборах доменных каналов сейчас лежит этот поддельный адрес — по биту
+     * на канал (0 = ни в одном). Набор битов, а не один номер, и это разница по
+     * существу: имя, названное в ДВУХ правилах сразу, обязано попасть в оба набора.
+     *
+     * Пока здесь стоял номер одного канала, поддельный адрес ложился в набор ПЕРВОГО
+     * совпавшего правила и только туда. Для клиентов второго правила его в наборе не
+     * было, значит ни одно правило их пакет не забирало, а адрес у них на руках был
+     * поддельный — то есть домен переставал открываться совсем. Ровно это и пришло
+     * обраткой: два правила на YouTube (одно на телевизор, другое на всю сеть), и
+     * общее имя не работает ни там, ни там.
+     *
+     * Кто победит, когда наборов несколько, решает ПОРЯДОК ЦЕПОЧКИ — то есть порядок
+     * правил, который человек видит и меняет стрелками. Это и есть «победитель —
+     * который выше» (решение владельца), а не «нижнее правило отбрасываем».
+     *
+     * Бит на канал влезает точно: доменных каналов не больше MAX_CHANNELS = 64.
+     *
      * NOT persisted to the state file: it is re-derived on (re)query and on the
      * rehydrate pass, so the 2-field/3-field formats on disk stay unchanged. The
      * whole reason this field exists is the fake-IP route fix: a fake IP used to
@@ -1051,7 +1067,7 @@ struct fakeip_entry {
      * main route — i.e. the WAN — silently bypassing the tunnel. Now the fake IP
      * is a PERMANENT element of its channel set, exactly like it is permanent in
      * the DNAT map, so the path stays stable for the whole lifetime of the flow. */
-    int set_idx;
+    uint64_t sets;
     /* Дроссели горячего пути, оба — время последнего действия (0 = никогда).
      * Не сохраняются: после рестарта первый запрос всё сделает заново, это
      * и есть желаемое поведение.
@@ -1119,7 +1135,7 @@ static int fakeip_table_add(struct fakeip_table *t, const char *domain, uint32_t
     if (!t->entries[t->n].domain) return -1;
     t->entries[t->n].addr = addr;
     t->entries[t->n].real_host = 0;
-    t->entries[t->n].set_idx = -1;        /* unknown until the resolver routes it */
+    t->entries[t->n].sets = 0;            /* unknown until the resolver routes it */
     t->entries[t->n].route_asserted = 0;
     t->entries[t->n].refreshed = 0;
     t->n++;
@@ -1306,7 +1322,7 @@ static void fakeip_entry_set_real(const char *domain, uint32_t real_host) {
  * different channel, the fake IP must move to that channel's set — leaving it in
  * the old one would keep steering it the old way. Best-effort on the delete: a
  * missing element is exactly the post-restart state and is harmless. */
-static void fakeip_route_set(const char *domain, int new_set_idx);
+static void fakeip_route_set(const char *domain, uint64_t want);
 
 /* ---------------------------------------------------------------------- */
 /* proxy state                                                           */
@@ -1345,6 +1361,10 @@ struct pending {
      * снимает с ответа и parse_response, и проход по всем каналам.
      * Действителен, только пока rules_gen == g_rules_gen. */
     int hit;
+    /* Полный набор совпавших каналов — тот же, что посчитал приём запроса (см.
+     * dch_match_mask). Хранится рядом с `hit` по той же причине, по какой хранится
+     * `hit`: ответ несёт то же имя, и второй проход по каналам ничего не узнаёт. */
+    uint64_t sets;
     unsigned rules_gen;
     struct sockaddr_storage client;
     socklen_t client_len;
@@ -1377,16 +1397,17 @@ static struct dchan g_dch[MAX_CHANNELS];
 static size_t g_dch_n;
 static const char *g_fakeip_map = "fakeip";
 
-static void fakeip_route_set(const char *domain, int new_set_idx) {
+static void fakeip_route_set(const char *domain, uint64_t want) {
     long at = fakeip_find(domain);
     if (at < 0) return;
-    if (new_set_idx < 0 || (size_t)new_set_idx >= g_dch_n) return;
+    if (g_dch_n < 64) want &= (1ULL << g_dch_n) - 1ULL;
+    if (!want) return;
 
-    int old = g_fakeip.entries[at].set_idx;
-    if (old == new_set_idx) {
-        /* Same channel: the permanent element is already there (or survived from a
-         * previous run). Re-assert idempotently so a kernel that lost it (an fw4
-         * reload flushed the sets) gets it back without waiting for a re-resolve.
+    uint64_t old = g_fakeip.entries[at].sets;
+    if (old == want) {
+        /* Те же наборы: постоянные элементы уже стоят (или пережили прошлый запуск).
+         * Переутверждаем идемпотентно — ядро, потерявшее их (fw4 reload смывает
+         * наборы), получает их обратно, не дожидаясь повторного разрешения имени.
          *
          * Но не чаще TTL ответа: без дросселя КАЖДЫЙ повторный запрос платил
          * блокирующей nf_tables-транзакцией за ответ EEXIST — и второй раз тем
@@ -1397,26 +1418,63 @@ static void fakeip_route_set(const char *domain, int new_set_idx) {
         if (now - g_fakeip.entries[at].route_asserted < FAKEIP_ANSWER_TTL)
             return;
         g_fakeip.entries[at].route_asserted = now;
-        nft_add_element(g_dch[new_set_idx].set, g_fakeip.entries[at].addr, 0);
+        for (size_t i = 0; i < g_dch_n; i++)
+            if (want & (1ULL << i))
+                nft_add_element(g_dch[i].set, g_fakeip.entries[at].addr, 0);
         return;
     }
 
-    /* Remove from the OLD channel's set so the old mark rule no longer claims it.
-     * ENOENT is fine: nothing to delete (restart, or it never landed). */
-    if (old >= 0 && (size_t)old < g_dch_n) {
+    /* Убираем из наборов, которым имя больше не принадлежит: правило выключили,
+     * удалили или переписали его списки. ENOENT законен — удалять нечего
+     * (перезапуск, или элемент туда и не лёг). */
+    for (size_t i = 0; i < g_dch_n; i++) {
+        if (!(old & (1ULL << i)) || (want & (1ULL << i))) continue;
         uint32_t k_net = htonl(g_fakeip.entries[at].addr);
-        int drc = nftlk_elem_msg(NFT_MSG_DELSETELEM, g_nft_table, g_dch[old].set,
+        int drc = nftlk_elem_msg(NFT_MSG_DELSETELEM, g_nft_table, g_dch[i].set,
                                  &k_net, 1, NULL, 0);
         if (drc != 0 && drc != -ENOENT && dbg())
             fprintf(stderr, "nftlk: channel-move delete from %s rc=%d\n",
-                    g_dch[old].set, drc);
+                    g_dch[i].set, drc);
     }
 
-    /* Insert into the NEW channel's set as a permanent element. EEXIST is already
-     * the desired state. */
-    nft_add_element(g_dch[new_set_idx].set, g_fakeip.entries[at].addr, 0);
-    g_fakeip.entries[at].set_idx = new_set_idx;
+    /* И кладём во все, где его ещё нет, постоянным элементом. EEXIST — уже
+     * желаемое состояние. */
+    for (size_t i = 0; i < g_dch_n; i++)
+        if ((want & (1ULL << i)) && !(old & (1ULL << i)))
+            nft_add_element(g_dch[i].set, g_fakeip.entries[at].addr, 0);
+    g_fakeip.entries[at].sets = want;
     g_fakeip.entries[at].route_asserted = time(NULL);
+}
+
+/* Все доменные каналы, которым принадлежит имя, — по биту на канал.
+ *
+ * ВСЕ, а не первый: одно имя законно названо в нескольких правилах (правило на
+ * телевизор и правило на всю сеть), и каждому из них нужен свой набор, иначе клиенты
+ * второго остаются с поддельным адресом, которого нет ни в одном правиле. Кто из
+ * правил заберёт пакет, решает порядок цепочки — тот же порядок, в котором правила
+ * стоят у человека на экране. */
+static uint64_t dch_match_mask(const char *host) {
+    uint64_t m = 0;
+    for (size_t i = 0; i < g_dch_n && i < 64; i++)
+        if (ruleset_match(&g_dch[i].rules, host)) m |= 1ULL << i;
+    return m;
+}
+
+/* Первый (то есть старший по порядку правил) канал из набора; -1 — набор пуст.
+ * Он и решает, каким будет ОТВЕТ клиенту: ответ один, а режимов у каналов два. */
+static int dch_first(uint64_t mask) {
+    for (size_t i = 0; i < g_dch_n && i < 64; i++)
+        if (mask & (1ULL << i)) return (int)i;
+    return -1;
+}
+
+/* Только каналы поддельного адреса из набора. Канал реального адреса поддельный к
+ * себе не берёт: в его наборе лежат настоящие адреса из ответа, а поддельного клиент
+ * в этом режиме и не получает. */
+static uint64_t dch_fakeip_only(uint64_t mask) {
+    for (size_t i = 0; i < g_dch_n && i < 64; i++)
+        if ((mask & (1ULL << i)) && g_dch[i].realip) mask &= ~(1ULL << i);
+    return mask;
 }
 
 static volatile int g_reload_pending = 0;
@@ -1495,10 +1553,12 @@ static int handle_client_query(void) {
     size_t qend = 0;
     int quiet = 0;
     int hit = -2; /* -2 = вопрос не разобрался; см. struct pending */
+    uint64_t sets = 0;
     if (parse_query(buf, (size_t)n, qname, sizeof(qname), &qtype, &qend) == 0) {
-        hit = -1;
-        for (size_t i = 0; i < g_dch_n && hit < 0; i++)
-            if (ruleset_match(&g_dch[i].rules, qname)) hit = (int)i;
+        /* Совпавшие каналы — ВСЕ, а решает ответ первый из них: он старший по
+         * порядку правил, а ответ клиенту всё равно один. */
+        sets = dch_match_mask(qname);
+        hit = dch_first(sets);
         if (hit >= 0 && !g_dch[hit].realip) {
             if (qtype == DNS_TYPE_AAAA || qtype == DNS_TYPE_HTTPS ||
                 qtype == DNS_TYPE_SVCB) {
@@ -1535,7 +1595,7 @@ static int handle_client_query(void) {
                                (struct sockaddr *)&from, fromlen);
                         /* Маршрут переутверждается идемпотентно (fw4 reload
                          * смывает элементы наборов); дроссель внутри. */
-                        fakeip_route_set(lname, hit);
+                        fakeip_route_set(lname, dch_fakeip_only(sets));
                         /* Поход наверх — только ради свежести DNAT-карты, и
                          * чаще TTL ответа он ничего нового не узнаёт: клиент
                          * до истечения TTL и не переспросит. Без дросселя
@@ -1572,6 +1632,7 @@ static int handle_client_query(void) {
     p->in_use = 1;
     p->quiet = quiet;
     p->hit = hit;
+    p->sets = sets;
     p->rules_gen = g_rules_gen;
     p->client = from;
     p->client_len = fromlen;
@@ -1662,16 +1723,22 @@ static int handle_upstream_response(void) {
 
     /* Unparseable (malformed, or the rare qdcount != 1) or no rule match:
      * relay the real answer unchanged, exactly as before this feature. */
-    /* First match wins, exactly like the generated chain: a domain listed twice
-     * belongs to the channel written first, and the fake IP goes into THAT set
-     * only. Putting it in several sets would leave the winner to chain order. */
+    /* Имя, названное в нескольких правилах, принадлежит ВСЕМ ним, а ответ клиенту
+     * строит первое — старшее по порядку правил. Кто из правил заберёт пакет, решает
+     * порядок цепочки, то есть тот же порядок, который человек видит в списке правил
+     * и меняет стрелками (решение владельца: «победитель выше», а не «нижнее правило
+     * отбрасываем»). Прежде поддельный адрес ложился в набор ОДНОГО канала, и для
+     * клиентов остальных имя переставало открываться вовсе. */
     int hit = -1;
+    uint64_t sets = 0;
     if (nips >= 0) {
-        if (p->hit >= 0 && p->rules_gen == g_rules_gen)
+        if (p->hit >= 0 && p->rules_gen == g_rules_gen) {
             hit = p->hit; /* матчинг уже сделан на приёме запроса */
-        else
-            for (size_t i = 0; i < g_dch_n && hit < 0; i++)
-                if (ruleset_match(&g_dch[i].rules, qname)) hit = (int)i;
+            sets = p->sets;
+        } else {
+            sets = dch_match_mask(qname);
+            hit = dch_first(sets);
+        }
     }
     if (nips < 0 || hit < 0) {
         if (!quiet)
@@ -1705,9 +1772,17 @@ static int handle_upstream_response(void) {
      * become one entry, and if they belong to different channels the first one to be
      * resolved decides for both. */
     if (g_dch[hit].realip) {
+        /* Адреса кладутся в наборы ВСЕХ совпавших каналов реального адреса, а не
+         * только первого: правило на устройство и правило на всю сеть спорят за одно
+         * имя законно, и решать спор должен порядок цепочки. Каналы поддельного
+         * адреса среди совпавших пропускаются — им поддельного адреса никто не
+         * выдавал, класть в их набор нечего. */
         if (qtype == DNS_TYPE_A)
-            for (int k = 0; k < nips; k++)
-                nft_add_element(g_dch[hit].set, ntohl(ips[k].addr), ips[k].ttl);
+            for (size_t c = 0; c < g_dch_n; c++) {
+                if (!(sets & (1ULL << c)) || !g_dch[c].realip) continue;
+                for (int k = 0; k < nips; k++)
+                    nft_add_element(g_dch[c].set, ntohl(ips[k].addr), ips[k].ttl);
+            }
         if (!quiet)
             sendto(g_listen_fd, buf, (size_t)n, 0,
                    (struct sockaddr *)&p->client, p->client_len);
@@ -1753,11 +1828,11 @@ static int handle_upstream_response(void) {
                  * This replaces the old `nft_add_element(..., ips[0].ttl)`: a TTL
                  * equal to the real answer's expired mid-session and the packet
                  * then bypassed the tunnel (see fakeip_route_set). Best-effort:
-                 * a missing entry means default policy, which is fine. A domain
-                 * in the geo list goes ONLY into the geo set: it names a specific
-                 * interface, and adding the same fake IP to the VPN set as well
-                 * would leave which mark wins to chain order. */
-                fakeip_route_set(qname, hit);
+                 * a missing entry means default policy, which is fine. Наборов
+                 * может быть несколько — по одному на каждое правило, назвавшее это
+                 * имя; какая метка победит, решает порядок цепочки, и это ровно тот
+                 * порядок, в котором правила стоят у человека. */
+                fakeip_route_set(qname, dch_fakeip_only(sets));
 
                 /* Клиенту из быстрого пути уже ушёл fake-IP; этот ответ был нужен
                  * только ради строк выше — обновить карту и реальный адрес. */
@@ -1939,15 +2014,11 @@ static int run_proxy(int listen_port, int upstream_port) {
                 nft_map_set_element(g_fakeip_map, g_fakeip.entries[i].addr,
                                      g_fakeip.entries[i].real_host, 0) == 0)
                 restored++;
-            /* Re-derive the channel for the stored domain and re-assert the
-             * permanent route element. fakeip_route_set sets set_idx, so a later
-             * re-resolve that lands in the same channel is a no-op. */
-            int hit = -1;
-            for (size_t c = 0; c < g_dch_n && hit < 0; c++)
-                if (!g_dch[c].realip &&
-                    ruleset_match(&g_dch[c].rules, g_fakeip.entries[i].domain))
-                    hit = (int)c;
-            if (hit >= 0) { fakeip_route_set(g_fakeip.entries[i].domain, hit); routed++; }
+            /* Re-derive the channels for the stored domain and re-assert the
+             * permanent route elements. fakeip_route_set запоминает набор, поэтому
+             * повторное разрешение имени в те же каналы ничего не стоит. */
+            uint64_t m = dch_fakeip_only(dch_match_mask(g_fakeip.entries[i].domain));
+            if (m) { fakeip_route_set(g_fakeip.entries[i].domain, m); routed++; }
         }
     }
     fprintf(stderr, "steer dnsd: listening on :%d -> upstream 127.0.0.1:%d "
@@ -2141,6 +2212,81 @@ void dnsd_usage_flags(FILE *out) {
           "  --fakeip СОСТОЯНИЕ ДОМЕН какой поддельный адрес выдан домену\n", out);
 }
 
+/* Таблица доменных каналов резолвера из уже прочитанной спеки.
+ *
+ * Отдельной функцией, а не куском cmd_dnsd, ради стенда: пропуск выключенного правила
+ * и слияние каналов в один набор — решения о смысле, и проверять их надо прямо, а не
+ * через запуск резолвера с сетью и netlink. */
+static void dch_build(void) {
+    g_dch_n = 0;
+    /* Same coalescing the compiler does, and it must agree with it exactly: the set
+     * names here ARE the sets it generated. Domain channels that share an output, the
+     * same clients and the same mode are one set — which is why this groups by
+     * (out, realip) rather than walking channels one by one. */
+    /* ГИБРИДНЫЕ СПИСКИ: канал попадает сюда и по адресным файлам тоже.
+     *
+     * Прежде здесь стоял пропуск канала без `domains_files`, и это был не гейт по цене, а
+     * решение о смысле: доменность канала определялась ИМЕНЕМ КЛЮЧА в спеке. Из этого
+     * следовало, что человек выбирает не сервис, а вид списка — тот самый довод, по
+     * которому в spec.c уже снят запрет на адреса и домены в одном правиле.
+     *
+     * Теперь оба массива читаются одинаково, а кому какая СТРОКА принадлежит, решает
+     * spec_line_is_addr на месте чтения: адресные строки берёт компилятор набора, доменные
+     * — резолвер. Один файл может содержать и то и другое, и «движок сам разберётся»
+     * означает буквально это.
+     *
+     * Разбирается он, впрочем, не в один механизм, а в два: `8.8.8.0/24` ляжет в набор
+     * настоящим префиксом, а `youtube.com` — поддельным адресом плюс правилом DNAT. Набор
+     * с `flags interval,timeout` держит и то и то (проверено опытом, см. spec.c). */
+    for (size_t i = 0; i < g_ch_n; i++) {
+        /* ВЫКЛЮЧЕННОЕ ПРАВИЛО РЕЗОЛВЕР НЕ БЕРЁТ. Компилятор набора его уже не берёт
+         * (steer.c), а здесь брал — и это худший из возможных исходов, потому что «не
+         * действует» превращалось в «ломает».
+         *
+         * Как ломало. Резолвер выдаёт клиенту поддельный адрес и кладёт его в набор своего
+         * канала; набора выключенного канала в ядре нет вовсе. То есть имя разрешалось в
+         * адрес, которого нет ни в одном правиле: ни маршрута, ни метки, ни возврата к
+         * настоящему адресу. Домен переставал открываться СОВСЕМ — и у тех клиентов, кого
+         * выключенное правило касалось, и у тех, кого касалось соседнее включённое: первым
+         * совпадением здесь забирает имя себе первый канал, а он выключен.
+         *
+         * Снаружи это выглядело так, что выключатель не действует: «отключить правило —
+         * ничего не меняется, надо именно удалить» (обратка, два роутера с одинаковым
+         * набором правил). Ровно та же строка, что в steer.c, и по той же причине. */
+        if (g_ch[i].disabled) continue;
+        if (!g_ch[i].domains_n && !g_ch[i].prefixes_n) continue;
+        char set[64];
+        /* Имя считает ОБЩАЯ функция, та же, что у компилятора: своя формула здесь была
+         * `%.24s_dom` и не знала ни про список клиентов, ни про режим, поэтому доменные
+         * каналы одного выхода с разными from сливались в один набор, а fakeip и realip
+         * попадали туда же вместе. Разойтись двум формулам теперь негде — она одна. */
+        size_t fn = g_ch[i].from_n ? g_ch[i].from_n : g_from_default_n;
+        const char (*fr)[64] = g_ch[i].from_n ? g_ch[i].from : g_from_default;
+        /* Сужение канала (протокол и порты) уходит в имя набора наравне с `from` и
+         * режимом: компилятор по нему РАЗДЕЛЯЕТ наборы, и резолвер, не передавший его,
+         * наполнял бы набор, которого нет. Ровно та беда, от которой эта функция общая. */
+        group_set_name(set, sizeof(set), g_ch[i].out, "dom", fr, fn, g_ch[i].realip,
+                       &g_ch[i].l4);
+        size_t k = 0;
+        for (; k < g_dch_n; k++)
+            if (!strcmp(g_dch[k].set, set) && g_dch[k].realip == g_ch[i].realip) break;
+        if (k == g_dch_n) {
+            if (g_dch_n >= MAX_CHANNELS) break;
+            memset(&g_dch[g_dch_n], 0, sizeof(g_dch[g_dch_n]));
+            snprintf(g_dch[g_dch_n].set, sizeof(g_dch[g_dch_n].set), "%s", set);
+            g_dch[g_dch_n].realip = g_ch[i].realip;
+            k = g_dch_n++;
+        }
+        for (size_t f = 0; f < g_ch[i].domains_n && g_dch[k].rules_n < MAX_FILES; f++)
+            g_dch[k].rules_path[g_dch[k].rules_n++] = g_ch[i].domains_files[f];
+        /* Адресные файлы того же канала — сюда же: доменные строки в них есть у половины
+         * категорий издателя (список «Хостинги и CDN» лежит в адресных и целиком состоит
+         * из имён), и раньше они пропадали с предупреждением. */
+        for (size_t f = 0; f < g_ch[i].prefixes_n && g_dch[k].rules_n < MAX_FILES; f++)
+            g_dch[k].rules_path[g_dch[k].rules_n++] = g_ch[i].prefixes_files[f];
+    }
+}
+
 static void dnsd_usage(void) {
     fputs("steer: dnsd: непонятный флаг\n"
           "использование: steer dnsd [флаги]\n"
@@ -2185,57 +2331,7 @@ int dnsd_main(int argc, char **argv) {
      * parser the compiler used, so the sets named here are exactly the sets it
      * generated. */
     load_spec(spec);
-    /* Same coalescing the compiler does, and it must agree with it exactly: the set
-     * names here ARE the sets it generated. Domain channels that share an output, the
-     * same clients and the same mode are one set — which is why this groups by
-     * (out, realip) rather than walking channels one by one. */
-    /* ГИБРИДНЫЕ СПИСКИ: канал попадает сюда и по адресным файлам тоже.
-     *
-     * Прежде здесь стоял пропуск канала без `domains_files`, и это был не гейт по цене, а
-     * решение о смысле: доменность канала определялась ИМЕНЕМ КЛЮЧА в спеке. Из этого
-     * следовало, что человек выбирает не сервис, а вид списка — тот самый довод, по
-     * которому в spec.c уже снят запрет на адреса и домены в одном правиле.
-     *
-     * Теперь оба массива читаются одинаково, а кому какая СТРОКА принадлежит, решает
-     * spec_line_is_addr на месте чтения: адресные строки берёт компилятор набора, доменные
-     * — резолвер. Один файл может содержать и то и другое, и «движок сам разберётся»
-     * означает буквально это.
-     *
-     * Разбирается он, впрочем, не в один механизм, а в два: `8.8.8.0/24` ляжет в набор
-     * настоящим префиксом, а `youtube.com` — поддельным адресом плюс правилом DNAT. Набор
-     * с `flags interval,timeout` держит и то и то (проверено опытом, см. spec.c). */
-    for (size_t i = 0; i < g_ch_n; i++) {
-        if (!g_ch[i].domains_n && !g_ch[i].prefixes_n) continue;
-        char set[64];
-        /* Имя считает ОБЩАЯ функция, та же, что у компилятора: своя формула здесь была
-         * `%.24s_dom` и не знала ни про список клиентов, ни про режим, поэтому доменные
-         * каналы одного выхода с разными from сливались в один набор, а fakeip и realip
-         * попадали туда же вместе. Разойтись двум формулам теперь негде — она одна. */
-        size_t fn = g_ch[i].from_n ? g_ch[i].from_n : g_from_default_n;
-        const char (*fr)[64] = g_ch[i].from_n ? g_ch[i].from : g_from_default;
-        /* Сужение канала (протокол и порты) уходит в имя набора наравне с `from` и
-         * режимом: компилятор по нему РАЗДЕЛЯЕТ наборы, и резолвер, не передавший его,
-         * наполнял бы набор, которого нет. Ровно та беда, от которой эта функция общая. */
-        group_set_name(set, sizeof(set), g_ch[i].out, "dom", fr, fn, g_ch[i].realip,
-                       &g_ch[i].l4);
-        size_t k = 0;
-        for (; k < g_dch_n; k++)
-            if (!strcmp(g_dch[k].set, set) && g_dch[k].realip == g_ch[i].realip) break;
-        if (k == g_dch_n) {
-            if (g_dch_n >= MAX_CHANNELS) break;
-            memset(&g_dch[g_dch_n], 0, sizeof(g_dch[g_dch_n]));
-            snprintf(g_dch[g_dch_n].set, sizeof(g_dch[g_dch_n].set), "%s", set);
-            g_dch[g_dch_n].realip = g_ch[i].realip;
-            k = g_dch_n++;
-        }
-        for (size_t f = 0; f < g_ch[i].domains_n && g_dch[k].rules_n < MAX_FILES; f++)
-            g_dch[k].rules_path[g_dch[k].rules_n++] = g_ch[i].domains_files[f];
-        /* Адресные файлы того же канала — сюда же: доменные строки в них есть у половины
-         * категорий издателя (список «Хостинги и CDN» лежит в адресных и целиком состоит
-         * из имён), и раньше они пропадали с предупреждением. */
-        for (size_t f = 0; f < g_ch[i].prefixes_n && g_dch[k].rules_n < MAX_FILES; f++)
-            g_dch[k].rules_path[g_dch[k].rules_n++] = g_ch[i].prefixes_files[f];
-    }
+    dch_build();
     if (!g_dch_n) {
         fprintf(stderr, "steer dnsd: no channel in %s matches domains — nothing to do\n", spec);
         return 0;

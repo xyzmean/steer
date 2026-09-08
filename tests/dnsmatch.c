@@ -317,6 +317,78 @@ int main(void) {
         }
     }
 
+    /* ---- ОДНО ИМЯ В НЕСКОЛЬКИХ ПРАВИЛАХ ------------------------------------------
+     *
+     * Правило на телевизор и правило на всю сеть законно называют один и тот же YouTube.
+     * Пока резолвер клал поддельный адрес в набор ПЕРВОГО совпавшего канала, у клиентов
+     * второго на руках оказывался адрес, которого нет ни в одном правиле, — и домен
+     * переставал открываться у всех сразу. Проверяется поэтому не «нашёлся ли канал», а
+     * СКОЛЬКО их нашлось и кто из них строит ответ. */
+    {
+        static const char *const yt[] = { "youtube.com", NULL };
+        g_dch_n = 2;
+        memset(g_dch, 0, sizeof(g_dch[0]) * 2);
+        snprintf(g_dch[0].set, sizeof(g_dch[0].set), "%s", "tv_dom");
+        snprintf(g_dch[1].set, sizeof(g_dch[1].set), "%s", "all_dom");
+        build(&g_dch[0].rules, yt);
+        build(&g_dch[1].rules, yt);
+
+        check("пересечение: совпали ОБА канала", 3, (int)dch_match_mask("youtube.com"));
+        check("пересечение: поддомен — тоже оба", 3, (int)dch_match_mask("www.youtube.com"));
+        check("пересечение: ответ строит верхний", 0, dch_first(dch_match_mask("youtube.com")));
+        check("пересечение: чужое имя — ни один", 0, (int)dch_match_mask("example.org"));
+        check("пересечение: пустой набор — канала нет", -1, dch_first(0));
+
+        /* Канал реального адреса поддельного к себе не берёт: в его наборе лежат
+         * настоящие адреса из ответа, а поддельного клиент в этом режиме не получает. */
+        g_dch[1].realip = 1;
+        check("пересечение: realip не берёт поддельный адрес", 1,
+              (int)dch_fakeip_only(dch_match_mask("youtube.com")));
+
+        ruleset_free(&g_dch[0].rules);
+        ruleset_free(&g_dch[1].rules);
+        g_dch_n = 0;
+    }
+
+    /* ---- ВЫКЛЮЧЕННОЕ ПРАВИЛО РЕЗОЛВЕР НЕ БЕРЁТ -----------------------------------
+     *
+     * «Выключено» обязано значить «не действует». Компилятор набора выключенный канал
+     * пропускал, а резолвер — нет, и получалось хуже, чем «действует»: имя разрешалось в
+     * поддельный адрес, набора для которого в ядре нет вовсе. Снаружи это выглядело как
+     * сломанный выключатель — «отключить правило не помогает, надо удалить».
+     *
+     * Проверяется через dch_build на настоящей спеке: пропуск живёт именно там. */
+    {
+        char lst[] = "/tmp/dnsmatch-off-list.XXXXXX";
+        int lf = mkstemp(lst);
+        check("выключенное: список создан", 1, lf >= 0);
+        if (lf >= 0) {
+            FILE *w = fdopen(lf, "w");
+            fputs("youtube.com\n", w);
+            fclose(w);
+
+            char sp[] = "/tmp/dnsmatch-off-spec.XXXXXX";
+            int sf = mkstemp(sp);
+            if (sf >= 0) {
+                FILE *ws = fdopen(sf, "w");
+                fprintf(ws,
+                        "{\"schema\":1,"
+                        "\"outputs\":{\"vl\":{\"kind\":\"interface\",\"device\":\"lo\"}},"
+                        "\"channels\":["
+                        "{\"name\":\"off\",\"enabled\":false,"
+                        "\"match\":{\"domains_files\":[\"%s\"]},\"out\":\"vl\"}"
+                        "]}\n", lst);
+                fclose(ws);
+
+                load_spec(sp);
+                dch_build();
+                check("выключенное: канала у резолвера нет", 0, (int)g_dch_n);
+                unlink(sp);
+            }
+            unlink(lst);
+        }
+    }
+
     printf("\n%s\n", fails ? "ЕСТЬ ПРОВАЛЫ" : "все проверки прошли");
     return fails ? 1 : 0;
 }
