@@ -431,10 +431,30 @@ static int hs_build(unsigned char hs[HS_LEN], unsigned char tag, short dc, short
 static int g_tls_rc;
 
 struct upstream {
+    /* «Дескриптора нет» — это -1, а НЕ ноль. Ноль — совершенно годный дескриптор: он
+     * достаётся первому же socket(), если стандартный ввод закрыт, а служба, поднятая
+     * через procd с перенаправлением, именно такой и бывает. Пока отсутствие обозначалось
+     * нулём, ветка отката в serve (`if (u.fd > 0)`) на таком соединении не срабатывала:
+     * контекст AEAD в 18 КБ не освобождался, сокет к чужому домену оставался открытым, а
+     * клиент уходил на relay_direct и жил дальше — I-204. Слоты запаса писали -1 уже с
+     * захода 73 (H-163), то есть в одном файле на один вопрос было два разных ответа. */
     int fd;
     struct tls13 tls;
     int tls_on;
 };
+
+/* Соединение наверх больше не нужно: снять ключи и закрыть дескриптор.
+ *
+ * Одной функцией, а не пятью одинаковыми парами строк, потому что смысл здесь один и
+ * ошибиться в нём можно ровно одним способом — забыть, чем обозначено отсутствие. После
+ * вызова структура снова означает «дескриптора нет», поэтому повторный вызов безопасен и
+ * ничего не закрывает вторично. */
+static void up_drop(struct upstream *u) {
+    if (u->tls_on) tls13_free(&u->tls);
+    if (u->fd >= 0) close(u->fd);
+    u->fd = -1;
+    u->tls_on = 0;
+}
 
 static int up_write(struct upstream *u, const unsigned char *p, size_t n) {
     if (u->tls_on) return tls13_write(&u->tls, p, n) == 0 ? (int)n : -1;
@@ -1268,12 +1288,11 @@ static int dial_upstream(short dc, short media, struct upstream *u_out,
             if (u.fd < 0) continue;
             if (!getenv("STEER_TGWS_PLAIN") && tls_start(&u, sni) != 0) {
                 fprintf(stderr, LOG_W "%s: TLS не поднялся (код %d)\n", sni, g_tls_rc);
-                close(u.fd);
+                up_drop(&u);
                 continue;
             }
             if (ws_upgrade(&u, sni) != 0) {
-                if (u.tls_on) tls13_free(&u.tls);
-                close(u.fd);
+                up_drop(&u);
                 continue;
             }
             ok = 1;
@@ -1400,8 +1419,7 @@ static int warm_pass(warm_dial_fn dial) {
         g_warm[i].u.fd = -1;            /* закрывать и освобождать будет эта ветка, не слот */
         g_warm[i].u.tls_on = 0;
         pthread_mutex_unlock(&g_warm_mx);
-        if (dead.tls_on) tls13_free(&dead.tls);
-        close(dead.fd);
+        up_drop(&dead);
         pthread_mutex_lock(&g_warm_mx);
     }
 
@@ -1436,6 +1454,7 @@ static int warm_pass(warm_dial_fn dial) {
         struct upstream u;
         char sni[160] = "";
         memset(&u, 0, sizeof(u));
+        u.fd = -1;
         if (!dial(want[i].dc, want[i].media, &u, sni, sizeof(sni), NULL)) continue;
         dialed++;
 
@@ -1455,8 +1474,7 @@ static int warm_pass(warm_dial_fn dial) {
         }
         pthread_mutex_unlock(&g_warm_mx);
         if (!placed) {                       /* мест нет — соединение не бросаем открытым */
-            if (u.tls_on) tls13_free(&u.tls);
-            close(u.fd);
+            up_drop(&u);
         }
     }
 
@@ -1583,24 +1601,24 @@ static void *serve(void *arg) {
     int from_warm = 0;
 
     memset(&u, 0, sizeof(u));
+    u.fd = -1;
     if (warm_take(dc, media, &u, sni_buf, sizeof(sni_buf))) {
         from_warm = 1;
         if (ws_send(&u, hs, HS_LEN) < 0) {
-            if (u.tls_on) tls13_free(&u.tls);
-            close(u.fd);
+            up_drop(&u);
             from_warm = 0;
-            memset(&u, 0, sizeof(u));
         }
     }
     if (!from_warm) {
         if (!dial_upstream(dc, media, &u, sni_buf, sizeof(sni_buf), &tries) ||
             ws_send(&u, hs, HS_LEN) < 0) {
             /* Пропустить насквозь — единственный честный ответ: точки нет, а отправить
-             * соединение в чужую значит сломать его наверняка. */
-            if (u.fd > 0) {
-                if (u.tls_on) tls13_free(&u.tls);
-                close(u.fd);
-            }
+             * соединение в чужую значит сломать его наверняка.
+             *
+             * up_drop сам разбирает оба случая: дозвон не состоялся (fd так и остался -1 —
+             * закрывать нечего) и дозвон состоялся, а ws_send отказал. Раньше их различало
+             * условие `u.fd > 0`, и на дескрипторе ноль второй случай проходил как первый. */
+            up_drop(&u);
             relay_direct(cfd, &dst, hs, got);
             goto done;
         }
@@ -1648,8 +1666,7 @@ static void *serve(void *arg) {
             st.up, ms.pkts, st.down, st.why);
     obf_free(&ms.o);
     if (dbg_on) obf_free(&dbg);
-    if (u.tls_on) tls13_free(&u.tls);
-    close(u.fd);
+    up_drop(&u);
 
 done:
     close(cfd);
