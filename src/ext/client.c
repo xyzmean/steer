@@ -341,6 +341,19 @@ static int dial(const char *host, uint16_t port, int timeout_s) {
     return tcp_connect(host, port, timeout_s);
 }
 
+/* Второй шов той же природы: ОТКУДА БРАТЬ КОРНИ при проверке сертификата (security=tls).
+ *
+ * В бою указатель NULL, и certverify.c берёт умолчание — файл пакета ca-bundle. Стенду
+ * умолчание не годится по построению: цепочку он выпускает сам, на месте, и доверять ей
+ * системное хранилище не может и не должно. Поле auth.roots для этого и существует с самого
+ * появления security=tls, но не заполнялось никем — то есть путь «свои корни» в движке был
+ * объявлен и мёртв.
+ *
+ * Почему шов, а не настройка узла. Путь к хранилищу, вынесенный в подписку, означал бы, что
+ * узел вправе назвать, чем его проверять, — то есть проверку, которой распоряжается
+ * проверяемый. Стенду же нужна ровно подмена на время процесса, и она здесь (R-118). */
+static const char *g_cert_roots;
+
 /* Поднять вторую связь — под выгрузку. Тот же путь установления, что и у первой: TCP, и
  * дальше либо ничего (security=none), либо Reality, либо обычный TLS с проверкой. */
 static int up_connect(struct vless_conn *c, const struct vless_node *n, int timeout_s) {
@@ -380,7 +393,7 @@ static int up_connect(struct vless_conn *c, const struct vless_node *n, int time
     }
 
     struct tls13_auth auth = { 0 };
-    if (is_tls) auth.host = verify_host;
+    if (is_tls) { auth.host = verify_host; auth.roots = g_cert_roots; }
     else        auth.reality_key = rst.authkey;
 
     rc = tls13_handshake_auth(&u->tls, fd, hello, hello_n, rst.priv, &auth);
@@ -785,7 +798,7 @@ int vless_connect(const struct vless_node *node, struct vless_conn *conn, int ti
      * У обычного TLS это цепочка и имя, у Reality — HMAC в поле подписи временного
      * сертификата на ключе, который есть только у владельца постоянной пары. */
     struct tls13_auth auth = { 0 };
-    if (is_tls) auth.host = verify_host;
+    if (is_tls) { auth.host = verify_host; auth.roots = g_cert_roots; }
     else        auth.reality_key = conn->rst.authkey;
 
     rc = tls13_handshake_auth(&conn->tls, fd, hello, hello_n, conn->rst.priv, &auth);

@@ -38,6 +38,33 @@
  *
  * Нужен настоящий mbedtls (в куче лежит контекст AES — это и есть то, что может утечь),
  * поэтому в `make test` стенд не входит, как xsloop и spokematch.
+ *
+ * ВТОРАЯ ПОЛОВИНА: security=tls СО СВОИМИ КОРНЯМИ (R-118). Ветвей Reality мало для того,
+ * чтобы охватить установление соединения целиком: у Reality доказательством служит HMAC в
+ * поле подписи временного сертификата, и для ОТКАЗА проверки не нужно ни цепочки X.509, ни
+ * хранилища корней — то есть все шесть случаев выше проходят мимо certverify.c, у которого
+ * не было ни одного стенда. Главное же в том, что при отказе проверки соединение не
+ * доходит до конца никогда, а ровно та ветвь, ради которой в клиенте появился vless_close
+ * (VLESS_CONN_ENOH2, ключи уже развёрнуты и контексты AES/GCM лежат в куче), достижима
+ * ТОЛЬКО через УДАВШУЮСЯ проверку сервера.
+ *
+ * Поэтому стенд выпускает цепочку сам: корень и лист на имя SNI, ключи ECDSA P-256, сроки
+ * от текущего времени (замороженный в репозитории сертификат однажды истёк бы и покрасил
+ * стенд не по своей вине). Корень уезжает файлом PEM, путь к нему отдаётся движку швом
+ * g_cert_roots в client.c — вторым такой же природы, что g_tcp_dial. Серверная половина
+ * подписывает CertificateVerify настоящей подписью над транскриптом по Certificate
+ * включительно (RFC 8446 §4.4.3, приставка из 64 пробелов и метки), и клиент проверяет её
+ * своим кодом, а не нашим: расхождение здесь означает ошибку в движке.
+ *
+ * Что этим накрыто: успех целиком (рукопожатие, проверка цепочки, имя против sni), ветвь
+ * ENOH2 с её vless_close, имя не то, «не прислал подпись», подпись не сходится, алгоритм
+ * подписи не из предложенных и лист, подписанный сам собой. Без второго стенда все семь
+ * ветвей были недостижимы.
+ *
+ * Выпуск сертификатов требует MBEDTLS_X509_CRT_WRITE_C. Есть он не везде, и если его нет,
+ * случаи security=tls ПРОПУСКАЮТСЯ ГРОМКО (проба в tests/ext-test.sh задаёт
+ * STEER_HAVE_X509WRITE, стенд говорит о пропуске сам) — молчаливый пропуск читался бы как
+ * «прошло», ровно как в I-232.
  */
 /* До любого include: client.c просит расширения GNU, а первый подключённый заголовок
  * фиксирует набор. */
@@ -58,6 +85,13 @@
 #include "mbedtls/md.h"
 #include "mbedtls/gcm.h"
 #include "mbedtls/sha256.h"
+#include "mbedtls/version.h"
+#if defined(STEER_HAVE_X509WRITE)
+# include "mbedtls/x509_crt.h"
+# include "mbedtls/pk.h"
+# include "mbedtls/ecp.h"
+# include "mbedtls/bignum.h"
+#endif
 
 /* Общий секрет с эфемерным ключом собеседника: та же функция, которой пользуется tls13.c,
  * а не копия — копия крипто-кода это два места, где может разойтись прижатие скаляра. */
@@ -126,6 +160,12 @@ struct plan {
     int cert;             /* 0 — не присылать, 1 — мусорный Certificate, 2 — сжатый (0x19) */
     const char *alpn;     /* строка ALPN в EncryptedExtensions, или NULL */
     int hangup;           /* закрыть соединение сразу после ClientHello */
+    /* Ниже — путь security=tls: настоящая цепочка, выпущенная стендом (R-118). Поле cert у
+     * этих случаев не читается: чем именно отвечать, решает leaf. */
+    int chain;            /* 0 — не путь tls; иначе номер листа из g_leaf[] */
+    int no_cv;            /* прислать Certificate и НЕ прислать CertificateVerify */
+    int cv_bad_sig;       /* испортить байт подписи */
+    int cv_bad_alg;       /* подписать кодом, которого мы не предлагали (rsa_pkcs1_sha256) */
 };
 
 struct srv {
@@ -202,6 +242,234 @@ static int rd_rec(int fd, unsigned char *type, unsigned char *body, size_t cap, 
     return 0;
 }
 
+/* ---- своя цепочка X.509 для security=tls (R-118) ------------------------------------
+ *
+ * Три листа, и каждый нужен ровно одной проверке:
+ *   LEAF_OK   — на имя SNI, подписан корнем: единственный путь к УДАВШЕЙСЯ проверке, а
+ *               значит и к ветви ENOH2, ради которой в клиенте появился vless_close;
+ *   LEAF_NAME — тем же корнем, но на другое имя: проверка обязана отказать по имени, а не
+ *               пропустить «цепочка же сошлась»;
+ *   LEAF_SELF — подписан сам собой: корень не при чём, отказ по цепочке.
+ *
+ * Ключи ECDSA P-256, а не RSA: генерация RSA-2048 занимает секунды и делала бы стенд
+ * заметно медленнее без всякой пользы для проверяемого — certverify.c принимает и то, и
+ * другое, а подпись CertificateVerify проверяется одной и той же mbedtls_pk_verify.
+ *
+ * СРОКИ СЧИТАЮТСЯ ОТ ТЕКУЩЕГО ВРЕМЕНИ, а не зашиты строкой: замороженный сертификат
+ * однажды истекает и красит стенд не по своей вине — это named risk у самого R-118, и
+ * закрывается он тем, что срок выпускается заново на каждый прогон.
+ */
+#if defined(STEER_HAVE_X509WRITE)
+
+#define LEAF_OK   1
+#define LEAF_NAME 2
+#define LEAF_SELF 3
+
+/* Имя, на которое выпущен годный лист, и оно же уезжает в SNI узла: сертификат проверяется
+ * против sni, а не против host (client.c, verify_host). */
+#define TLS_SNI "tls.node.invalid"
+
+struct leaf {
+    unsigned char der[2048];
+    size_t der_n;
+    mbedtls_pk_context key;      /* ключ листа — им подписывается CertificateVerify */
+};
+
+static struct leaf g_leaf[4];        /* [0] не используется: номера совпадают с LEAF_* */
+static char g_roots_file[64];
+static int g_chain_ready;
+
+/* RNG для mbedtls в форме обратного вызова. Своего DRBG стенд не поднимает: xc_random —
+ * тот же источник, которым пользуется движок, и второй в одном процессе означал бы два
+ * разных ответа на вопрос «откуда случайность». */
+static int rng_cb(void *ctx, unsigned char *out, size_t n) {
+    (void)ctx;
+    return xc_random(out, n) == 0 ? 0 : -1;
+}
+
+static int gen_key(mbedtls_pk_context *k) {
+    mbedtls_pk_init(k);
+    const mbedtls_pk_info_t *info = mbedtls_pk_info_from_type(MBEDTLS_PK_ECKEY);
+    if (!info || mbedtls_pk_setup(k, info) != 0) return -1;
+    return mbedtls_ecp_gen_key(MBEDTLS_ECP_DP_SECP256R1, mbedtls_pk_ec(*k), rng_cb, NULL);
+}
+
+/* «YYYYMMDDHHMMSS» от текущего времени со сдвигом в сутках. */
+static void when(int days, char out[16]) {
+    time_t t = time(NULL) + (time_t)days * 24 * 3600;
+    struct tm g;
+    gmtime_r(&t, &g);
+    snprintf(out, 16, "%04d%02d%02d%02d%02d%02d", g.tm_year + 1900, g.tm_mon + 1, g.tm_mday,
+             g.tm_hour, g.tm_min, g.tm_sec);
+}
+
+/* Выписать сертификат. pem != NULL — вернуть заодно PEM (нужен только корню: хранилище
+ * корней читается как PEM, см. roots_load в certverify.c). */
+static int issue(const char *subject, mbedtls_pk_context *skey,
+                 const char *issuer, mbedtls_pk_context *ikey, int is_ca,
+                 unsigned char *der, size_t *der_n, char *pem, size_t pem_n) {
+    mbedtls_x509write_cert c;
+    mbedtls_x509write_crt_init(&c);
+    mbedtls_x509write_crt_set_version(&c, MBEDTLS_X509_CRT_VERSION_3);
+    mbedtls_x509write_crt_set_md_alg(&c, MBEDTLS_MD_SHA256);
+    mbedtls_x509write_crt_set_subject_key(&c, skey);
+    mbedtls_x509write_crt_set_issuer_key(&c, ikey);
+    int rc = mbedtls_x509write_crt_set_subject_name(&c, subject);
+    if (rc == 0) rc = mbedtls_x509write_crt_set_issuer_name(&c, issuer);
+    if (rc == 0) rc = mbedtls_x509write_crt_set_basic_constraints(&c, is_ca, is_ca ? 1 : -1);
+
+    /* Серийный номер. В 3.x старая форма через mbedtls_mpi объявлена устаревшей и в сборке
+     * с MBEDTLS_DEPRECATED_REMOVED её нет вовсе, поэтому ветка по мажорной версии — та же
+     * дисциплина, что у флага доступа к приватным полям в ext-test.sh. */
+    if (rc == 0) {
+#if MBEDTLS_VERSION_MAJOR >= 3
+        unsigned char serial[] = { 0x01, 0x02, 0x03 };
+        serial[2] = (unsigned char)is_ca + 1;
+        rc = mbedtls_x509write_crt_set_serial_raw(&c, serial, sizeof(serial));
+#else
+        mbedtls_mpi sn;
+        mbedtls_mpi_init(&sn);
+        rc = mbedtls_mpi_lset(&sn, is_ca ? 1 : 2);
+        if (rc == 0) rc = mbedtls_x509write_crt_set_serial(&c, &sn);
+        mbedtls_mpi_free(&sn);
+#endif
+    }
+    char nb[16], na[16];
+    when(-1, nb);
+    when(365 * 5, na);
+    if (rc == 0) rc = mbedtls_x509write_crt_set_validity(&c, nb, na);
+
+    if (rc == 0) {
+        /* der пишется В КОНЕЦ буфера — так устроен mbedtls_x509write_crt_der, — поэтому
+         * готовое сдвигается к началу: дальше оно уезжает в сообщение как есть. */
+        int n = mbedtls_x509write_crt_der(&c, der, 2048, rng_cb, NULL);
+        if (n < 0) rc = n;
+        else {
+            memmove(der, der + 2048 - n, (size_t)n);
+            *der_n = (size_t)n;
+        }
+    }
+    if (rc == 0 && pem)
+        rc = mbedtls_x509write_crt_pem(&c, (unsigned char *)pem, pem_n, rng_cb, NULL);
+    mbedtls_x509write_crt_free(&c);
+    return rc;
+}
+
+/* Корень, три листа и файл хранилища. Один раз на процесс: certverify.c разбирает корни
+ * под pthread_once, и второе хранилище в том же процессе не подействовало бы (I-217) —
+ * значит все случаи обязаны проверяться ОДНИМ набором корней. */
+static int chain_build(void) {
+    mbedtls_pk_context root_key;
+    if (gen_key(&root_key) != 0) return -1;
+
+    static char pem[4096];
+    unsigned char root_der[2048];
+    size_t root_n = 0;
+    if (issue("CN=steer test root", &root_key, "CN=steer test root", &root_key, 1,
+              root_der, &root_n, pem, sizeof(pem)) != 0) return -1;
+
+    struct { int idx; const char *cn; int self; } want[] = {
+        { LEAF_OK,   "CN=" TLS_SNI,          0 },
+        { LEAF_NAME, "CN=other.invalid",     0 },
+        { LEAF_SELF, "CN=" TLS_SNI,          1 },
+    };
+    for (size_t i = 0; i < sizeof(want) / sizeof(*want); i++) {
+        struct leaf *l = &g_leaf[want[i].idx];
+        if (gen_key(&l->key) != 0) return -1;
+        const char *issuer = want[i].self ? want[i].cn : "CN=steer test root";
+        mbedtls_pk_context *ikey = want[i].self ? &l->key : &root_key;
+        if (issue(want[i].cn, &l->key, issuer, ikey, 0, l->der, &l->der_n, NULL, 0) != 0)
+            return -1;
+    }
+
+    snprintf(g_roots_file, sizeof(g_roots_file), "%s", "/tmp/vlessmatch-roots-XXXXXX");
+    int fd = mkstemp(g_roots_file);
+    if (fd < 0) return -1;
+    size_t pn = strlen(pem);
+    int ok = wr_all(fd, (const unsigned char *)pem, pn) == 0;
+    close(fd);
+    mbedtls_pk_free(&root_key);
+    if (!ok) return -1;
+    g_chain_ready = 1;
+    return 0;
+}
+
+static void chain_free(void) {
+    for (int i = 1; i <= LEAF_SELF; i++) mbedtls_pk_free(&g_leaf[i].key);
+    if (g_roots_file[0]) unlink(g_roots_file);
+}
+
+/* Сообщение Certificate из одного листа (RFC 8446 §4.4.2): байт контекста, список из трёх
+ * байт длины, в нём запись «три байта длины + DER + два байта расширений». Корень в
+ * список не кладётся намеренно: он уже в хранилище, и цепочка обязана сойтись без него —
+ * иначе стенд проверял бы не проверку, а щедрость сервера. */
+static size_t cert_msg(const struct leaf *l, unsigned char *out, size_t cap) {
+    size_t body = 1 + 3 + 3 + l->der_n + 2;
+    if (4 + body > cap) return 0;
+    size_t n = 0;
+    out[n++] = 0x0B;
+    out[n++] = (unsigned char)(body >> 16);
+    out[n++] = (unsigned char)(body >> 8);
+    out[n++] = (unsigned char)body;
+    out[n++] = 0x00;                                     /* certificate_request_context */
+    size_t list = 3 + l->der_n + 2;
+    out[n++] = (unsigned char)(list >> 16);
+    out[n++] = (unsigned char)(list >> 8);
+    out[n++] = (unsigned char)list;
+    out[n++] = (unsigned char)(l->der_n >> 16);
+    out[n++] = (unsigned char)(l->der_n >> 8);
+    out[n++] = (unsigned char)l->der_n;
+    memcpy(out + n, l->der, l->der_n); n += l->der_n;
+    out[n++] = 0x00; out[n++] = 0x00;                    /* extensions: пусто */
+    return n;
+}
+
+/* CertificateVerify: подпись над 64 пробелами, меткой, нулём и хешем транскрипта по
+ * Certificate включительно. Приставка собирается ЗДЕСЬ, а не берётся из certverify.c: две
+ * половины обязаны прийти к одному ответу независимо, иначе ошибка в приставке сошлась бы
+ * сама с собой. */
+static size_t cv_msg(const struct leaf *l, const unsigned char thash[HLEN],
+                     const struct plan *pl, unsigned char *out, size_t cap) {
+    unsigned char content[64 + 33 + 1 + HLEN];
+    size_t cn = 0;
+    memset(content, 0x20, 64); cn = 64;
+    memcpy(content + cn, "TLS 1.3, server CertificateVerify", 33); cn += 33;
+    content[cn++] = 0x00;
+    memcpy(content + cn, thash, HLEN); cn += HLEN;
+
+    /* Без проверки кода возврата намеренно: в 2.x mbedtls_sha256 объявлена void (значение
+     * возвращает mbedtls_sha256_ret), в 3.x — int, и ветка по версии здесь ничего бы не
+     * дала. Так же зовёт её и расписание ключей выше. */
+    unsigned char digest[HLEN];
+    mbedtls_sha256(content, cn, digest, 0);
+
+    unsigned char sig[MBEDTLS_PK_SIGNATURE_MAX_SIZE];
+    size_t sig_n = 0;
+#if MBEDTLS_VERSION_MAJOR >= 3
+    if (mbedtls_pk_sign(&((struct leaf *)l)->key, MBEDTLS_MD_SHA256, digest, HLEN,
+                        sig, sizeof(sig), &sig_n, rng_cb, NULL) != 0) return 0;
+#else
+    if (mbedtls_pk_sign(&((struct leaf *)l)->key, MBEDTLS_MD_SHA256, digest, HLEN,
+                        sig, &sig_n, rng_cb, NULL) != 0) return 0;
+#endif
+    if (pl->cv_bad_sig) sig[sig_n / 2] ^= 0xFF;
+
+    if (4 + 4 + sig_n > cap) return 0;
+    size_t n = 0;
+    out[n++] = 0x0F;
+    out[n++] = 0; out[n++] = 0; out[n++] = (unsigned char)(4 + sig_n);
+    /* 0x0403 — ecdsa_secp256r1_sha256, он в нашем signature_algorithms есть. 0x0401 —
+     * rsa_pkcs1_sha256, которым в TLS 1.3 подписывать CertificateVerify запрещено, и мы
+     * его не предлагаем: сервер, выбравший его, обязан получить отдельную причину, а не
+     * «подпись не сошлась». */
+    out[n++] = 0x04; out[n++] = pl->cv_bad_alg ? 0x01 : 0x03;
+    out[n++] = (unsigned char)(sig_n >> 8);
+    out[n++] = (unsigned char)sig_n;
+    memcpy(out + n, sig, sig_n); n += sig_n;
+    return n;
+}
+#endif /* STEER_HAVE_X509WRITE */
+
 /* ClientHello: нужны серверная сторона обмена (key_share клиента) и session_id, который
  * сервер обязан вернуть как есть. Разбор по типам расширений, а не по смещениям: состав
  * Hello у reality.c меняется вместе с обликом браузера. */
@@ -253,7 +521,7 @@ static int ch_pick(const unsigned char *b, size_t n, unsigned char pub[32],
 /* Зашифрованная запись рукопожатия: одно сообщение на запись — клиент собирает их через
  * границы записей, и так проверяется в том числе это. */
 static int send_enc(struct srv *s, const unsigned char *msg, size_t n) {
-    unsigned char out[512 + 32];
+    unsigned char out[4096];
     if (n + 1 + 16 + 5 > sizeof(out)) return -1;
     size_t total = n + 1 + 16;
     out[0] = 0x17; out[1] = 0x03; out[2] = 0x03;
@@ -366,6 +634,32 @@ static void *server_half(void *arg) {
     if (send_enc(s, ee, en)) return NULL;
     mbedtls_sha256_update(&s->tr, ee, en);
 
+#if defined(STEER_HAVE_X509WRITE)
+    /* ---- Certificate и CertificateVerify настоящей цепочкой (путь security=tls) ---- */
+    if (pl->chain) {
+        const struct leaf *l = &g_leaf[pl->chain];
+        unsigned char msg[3072];
+        size_t mn = cert_msg(l, msg, sizeof(msg));
+        if (!mn) return NULL;
+        if (send_enc(s, msg, mn)) return NULL;
+        mbedtls_sha256_update(&s->tr, msg, mn);
+
+        if (!pl->no_cv) {
+            /* Хеш снимается ПОСЛЕ Certificate и ДО CertificateVerify — ровно то, что
+             * подписывает сервер по RFC 8446 §4.4.3, и ровно то место, где клиент снимает
+             * свой (tls13.c, разбор сообщения 0x0F). Ошибка на один шаг здесь дала бы
+             * «подпись не сошлась» и выглядела бы находкой в движке. */
+            unsigned char th_cv[HLEN];
+            tr_snapshot(&s->tr, th_cv);
+            size_t cn = cv_msg(l, th_cv, pl, msg, sizeof(msg));
+            if (!cn) return NULL;
+            if (send_enc(s, msg, cn)) return NULL;
+            mbedtls_sha256_update(&s->tr, msg, cn);
+        }
+        goto finished;
+    }
+#endif
+
     /* ---- Certificate или его сжатый вид ---- */
     if (pl->cert == 2) {
         /* CompressedCertificate: клиент отвечает на него отказом сразу, не дожидаясь
@@ -386,6 +680,9 @@ static void *server_half(void *arg) {
     }
 
     /* ---- Finished ---- */
+#if defined(STEER_HAVE_X509WRITE)
+finished:;
+#endif
     unsigned char fkey[HLEN], hash[HLEN], vd[HLEN];
     tr_snapshot(&s->tr, hash);
     if (xlabel(s->s_hs, "finished", NULL, 0, fkey, HLEN) != 0) return NULL;
@@ -433,6 +730,24 @@ static void node_reality(struct vless_node *n, const char *type) {
     snprintf(n->pbk, sizeof(n->pbk), "%s", "AQIDBAUGBwgJCgsMDQ4PEBESExQVFhcYGRobHB0eHyA");
     snprintf(n->sid, sizeof(n->sid), "%s", "0123456789abcdef");
 }
+
+#if defined(STEER_HAVE_X509WRITE)
+/* Узел security=tls: доказательство подлинности — цепочка до корня и имя, больше ничего.
+ * pbk/sid не заполняются вовсе, и это не небрежность: у обычного TLS их не бывает, а
+ * reality_build_hello при .plain = 1 их и не читает (client.c). Имя обязано быть — и
+ * проверяется оно против sni, а не против host, поэтому sni здесь то, на которое выпущен
+ * годный лист. */
+static void node_tls(struct vless_node *n, const char *type) {
+    memset(n, 0, sizeof(*n));
+    snprintf(n->host, sizeof(n->host), "%s", "node.invalid");
+    n->port = 443;
+    snprintf(n->uuid, sizeof(n->uuid), "%s", "00000000-0000-0000-0000-000000000001");
+    snprintf(n->type, sizeof(n->type), "%s", type);
+    snprintf(n->security, sizeof(n->security), "%s", "tls");
+    snprintf(n->sni, sizeof(n->sni), "%s", TLS_SNI);
+    snprintf(n->fp, sizeof(n->fp), "%s", "chrome");
+}
+#endif
 
 /* Один прогон: поднять пару, отдать один конец клиенту, второй — серверной половине.
  *
@@ -525,7 +840,7 @@ int main(void) {
      * измеряемом случае ниже. */
     {
         struct plan warm = { .name = "прогрев", .cert = 0 };
-        char why[96];
+        char why[256];
         int rc = run_case(&warm, &node, why, sizeof(why), NULL);
         check("прогрев: рукопожатие дошло до проверки сертификата", TLS13_ECERT, rc);
     }
@@ -557,7 +872,10 @@ int main(void) {
     };
 
     for (size_t i = 0; i < sizeof(plans) / sizeof(*plans); i++) {
-        char what[160], why[96] = "";
+        /* Буфер стенда ВДВОЕ больше движкового (g_verify_reason[96]): стенд обязан
+         * мерить движок, а не себя. Совпадающие размеры показали бы обрезку
+         * собственным буфером как свойство движка — и наоборот. */
+        char what[160], why[256] = "";
         int fd0 = fd_count(), ctx_left = -1;
         int rc = run_case(&plans[i], &node, why, sizeof(why), &ctx_left);
 
@@ -588,6 +906,116 @@ int main(void) {
         snprintf(what, sizeof(what), "%s: в куче ничего не осталось", plans[i].name);
         check(what, 0, LEAK_CHECK());
     }
+
+    /* ---- security=tls со своими корнями (R-118) ---------------------------------
+     *
+     * Здесь и только здесь проверка сервера может ПРОЙТИ, а значит только здесь достижимы
+     * успешное установление целиком и ветвь ENOH2 — та, ради которой в клиенте появился
+     * vless_close вместо close(fd). Корни отдаются движку швом g_cert_roots; хранилище
+     * одно на весь процесс, потому что certverify.c разбирает его под pthread_once
+     * (I-217), и второе тут не подействовало бы. */
+#if defined(STEER_HAVE_X509WRITE)
+    if (chain_build() != 0) {
+        printf("%-64s %s\n", "выпуск своей цепочки X.509", "ПРОВАЛ");
+        fails++;
+    } else {
+        g_cert_roots = g_roots_file;
+
+        /* Прогрев второй половины: первое рукопожатие с проверкой цепочки тянет за собой
+         * разбор хранилища корней под pthread_once — 
+         * он остаётся в куче навсегда по замыслу (см. roots_load), и без прогрева первая
+         * же проверка кучи показала бы его утечкой. */
+        {
+            struct plan warm = { .name = "прогрев tls", .chain = LEAF_OK };
+            struct vless_node w;
+            node_tls(&w, "tcp");
+            int rc = run_case(&warm, &w, NULL, 0, NULL);
+            check("прогрев tls: цепочка сошлась, соединение установлено", 0, rc);
+        }
+
+        static const struct plan tls_plans[] = {
+            { .name = "tls: цепочка сошлась",            .chain = LEAF_OK },
+            { .name = "tls: сервер выбрал не h2",        .chain = LEAF_OK, .alpn = "http/1.1" },
+            { .name = "tls: лист выдан на другое имя",   .chain = LEAF_NAME },
+            { .name = "tls: лист подписан сам собой",    .chain = LEAF_SELF },
+            { .name = "tls: сертификат без подписи",     .chain = LEAF_OK, .no_cv = 1 },
+            { .name = "tls: подпись не сходится",        .chain = LEAF_OK, .cv_bad_sig = 1 },
+            { .name = "tls: алгоритм не из предложенных",.chain = LEAF_OK, .cv_bad_alg = 1 },
+        };
+        /* Транспорт: у случая с ALPN он ОБЯЗАН быть не raw. Для tcp ALPN не просят вовсе
+         * (client.c: cfg.alpn = NULL при VT_RAW), и проверка «сервер назвал не h2» там не
+         * стоит — то есть на tcp этот случай молча прошёл бы успехом. */
+        static const char *tls_type[] = { "tcp", "grpc", "tcp", "tcp", "tcp", "tcp", "tcp" };
+        static const int tls_want[] = {
+            0, VLESS_CONN_ENOH2, TLS13_ECERT, TLS13_ECERT,
+            TLS13_ECERT, TLS13_ECERT, TLS13_ECERT,
+        };
+        /* ОЖИДАЕТСЯ ТО, ЧТО ДОХОДИТ СЕГОДНЯ, а не то, что написано в certverify.c, и разница
+         * здесь — находка I-236, а не небрежность стенда. Два самых длинных текста причин не
+         * влезают в g_verify_reason[96]: «сертификат не сошёлся с корнями или выдан не на это
+         * имя» это 100 байт, «сервер подписал алгоритмом, которого мы не предлагали» — 99.
+         * Обрезка у первого приходится НА СЕРЕДИНУ БУКВЫ. Поправить нельзя автономно: буфер
+         * живёт в tls13.c, а это защищённый путь (п.5.0) — заведён proposal. Проверка ниже
+         * («причина обрезана») меряет это числом, и когда буфер вырастет, она покраснеет —
+         * это и будет напоминанием заменить ожидания здесь на полные тексты. */
+        static const char *tls_why[] = {
+            "", "",
+            "выдан не на это",          /* CERTV_ECHAIN: имя проверяется третьим доводом verify */
+            "не сошёлся с корнями",     /* тот же код, другая половина его текста */
+            "не прислал подпись",       /* tls13.c различает «нет сертификата» и «нет подписи» */
+            "подпись сервера неверна",  /* CERTV_ESIG */
+            "которого мы не предлага",  /* CERTV_EALG — отдельная причина, а не «подпись плохая» */
+        };
+        /* Сколько байт причины дошло. -1 — «не проверяем»; 95 — обрезано движковым буфером. */
+        static const int tls_why_len[] = { -1, -1, 95, -1, -1, -1, 95 };
+
+        for (size_t i = 0; i < sizeof(tls_plans) / sizeof(*tls_plans); i++) {
+            struct vless_node tn;
+            node_tls(&tn, tls_type[i]);
+            char what[160], why[256] = "";
+            int fd0 = fd_count(), ctx_left = -1;
+            int rc = run_case(&tls_plans[i], &tn, why, sizeof(why), &ctx_left);
+
+            snprintf(what, sizeof(what), "%s: код возврата", tls_plans[i].name);
+            check(what, tls_want[i], rc);
+
+            if (tls_why[i][0]) {
+                snprintf(what, sizeof(what), "%s: причина названа", tls_plans[i].name);
+                check_str(what, tls_why[i], why);
+            }
+            if (tls_why_len[i] >= 0) {
+                /* КРАСНОЕ ЗДЕСЬ — ХОРОШАЯ НОВОСТЬ: значит g_verify_reason вырос и текст
+                 * доходит целиком (I-236). Тогда это число убирается, а ожидание причины
+                 * выше заменяется полным текстом из certverify.c. */
+                snprintf(what, sizeof(what), "%s: причина обрезана буфером движка (I-236)",
+                         tls_plans[i].name);
+                check(what, tls_why_len[i], (long)strlen(why));
+            }
+
+            for (int k = 0; k < 20; k++) {
+                int again = run_case(&tls_plans[i], &tn, NULL, 0, NULL);
+                if (again != tls_want[i]) { rc = again; break; }
+            }
+            snprintf(what, sizeof(what), "%s: двадцать попыток дают тот же код", tls_plans[i].name);
+            check(what, tls_want[i], rc);
+
+            snprintf(what, sizeof(what), "%s: контекстов шифра не осталось развёрнутыми", tls_plans[i].name);
+            check(what, 0, ctx_left);
+
+            snprintf(what, sizeof(what), "%s: дескрипторы вернулись к исходному числу", tls_plans[i].name);
+            check(what, fd0, fd_count());
+
+            snprintf(what, sizeof(what), "%s: в куче ничего не осталось", tls_plans[i].name);
+            check(what, 0, LEAK_CHECK());
+        }
+        g_cert_roots = NULL;
+        chain_free();
+    }
+#else
+    printf("\nВНИМАНИЕ: собрано БЕЗ выпуска сертификатов (нет MBEDTLS_X509_CRT_WRITE_C) —\n");
+    printf("          семь случаев security=tls ПРОПУЩЕНЫ: ни удавшаяся проверка сервера,\n");
+    printf("          ни ветвь ENOH2 с её vless_close здесь не проверены (R-118).\n\n");
+#endif
 
     /* security=none: TLS нет вовсе, и путь выхода тут единственный успешный. Нужен не ради
      * него самого, а как поверка стенда: если бы шов отдавал негодный сокет, «успех» тоже

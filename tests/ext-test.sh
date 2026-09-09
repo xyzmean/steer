@@ -209,8 +209,32 @@ $CC -O1 -g -w -Isrc $ASAN $MBED_INC "$PRIV" -o "$BUILD/spokematch" \
 # Список исходников повторяет devupmatch без client.c: сам client.c стенд ВКЛЮЧАЕТ (шов
 # установления TCP статический, см. заголовок стенда), и вторая его копия при компоновке
 # дала бы дубли символов.
+# ---- выпуск X.509: нужен vlessmatch для случаев security=tls -------------------
+# Стенд выпускает свою пару «корень + лист» на месте (R-118): иначе проверка сервера не
+# может ПРОЙТИ, а через удавшуюся проверку достижима ветвь VLESS_CONN_ENOH2 — та, ради
+# которой в клиенте появился vless_close. Для выпуска нужен MBEDTLS_X509_CRT_WRITE_C, и
+# он есть не в каждой сборке: в урезанной конфигурации роутера его нет вовсе.
+#
+# Проба, а не догадка — тот же приём, что у разбора X.509 выше и у AddressSanitizer ниже.
+# Не нашлось — стенд собирается БЕЗ этих случаев и ГОВОРИТ об этом сам последними строками
+# вывода: молчаливый пропуск читался бы как «прошло» (I-232).
+X509W=""
+x509wp="$BUILD/x509write-probe"
+printf '%s\n' '#include "mbedtls/x509_crt.h"' \
+	'int main(void){mbedtls_x509write_cert c;mbedtls_x509write_crt_init(&c);' \
+	'mbedtls_x509write_crt_free(&c);return 0;}' > "$x509wp.c"
+# shellcheck disable=SC2086
+if $CC -O0 -w $MBED_INC "$PRIV" -o "$x509wp" "$x509wp.c" $MBED_LIB >/dev/null 2>&1; then
+	X509W="-DSTEER_HAVE_X509WRITE"
+	echo "ext-test: выпуск X.509 есть — случаи security=tls в vlessmatch включены"
+else
+	echo "ext-test: ВНИМАНИЕ — в этой mbedtls нет выпуска X.509 (MBEDTLS_X509_CRT_WRITE_C):"
+	echo "ext-test:            случаи security=tls в vlessmatch будут ПРОПУЩЕНЫ (R-118)."
+fi
+rm -f "$x509wp" "$x509wp.c"
+
 echo "ext-test: собираю и прогоняю vlessmatch (ASan: ${ASAN:-нет})..."
-$CC -O1 -g -w -Isrc $ASAN $MBED_INC "$PRIV" -o "$BUILD/vlessmatch" tests/vlessmatch.c \
+$CC -O1 -g -w -Isrc $ASAN $MBED_INC "$PRIV" $X509W -o "$BUILD/vlessmatch" tests/vlessmatch.c \
 	src/ext/vless_proto.c src/ext/vision.c src/ext/tls13.c src/ext/certverify.c \
 	src/ext/reality.c src/ext/h2.c src/ext/tun.c src/ext/rtx.c src/ext/sub.c \
 	src/spec.c $MBED_LIB -lpthread
