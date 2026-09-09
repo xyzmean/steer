@@ -17,6 +17,14 @@ build/res-*
 build/tmo-*
 build/tun-gso-*
 build/gcm-size
+# Собранные стенды `make test`, которым Makefile велит лежать в build/. Один из них
+# (build/dcmatch) однажды уехал в репозиторий вместе с правкой моста и с тех пор
+# менялся в каждом коммите, который трогал tgws.c: собранный файл в истории — это
+# бинарный дифф на ровном месте и лишний повод для конфликта (I-237).
+build/dcmatch
+build/msgsplitmatch
+build/warmmatch
+build/upmatch
 build/bench
 build/dnsmatch
 build/specmatch
