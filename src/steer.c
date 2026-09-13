@@ -1592,6 +1592,9 @@ static void registry_snapshot(void) {
     int table;
     while (g_oldreg_n < MAX_OUTPUTS &&
            fscanf(f, "%31s %x %d\n", name, &mark, &table) == 3) {
+        /* Чужой диапазон — чужие правила и чужая таблица (см. registry_assign): снимать их
+         * по такой записи значило бы опустошить таблицу другого экземпляра движка. */
+        if (!mark || (mark & ~STEER_MARK_MASK)) continue;
         g_oldreg[g_oldreg_n].mark = mark;
         g_oldreg[g_oldreg_n].table = table;
         g_oldreg_n++;

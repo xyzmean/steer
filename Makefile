@@ -27,9 +27,10 @@ $(BUILD)/steer: src/steer.c src/spec.c src/dnsd.c src/failover.c src/aggregate.c
 	$(CC) $(CFLAGS) $(DEFS) -o $@ src/steer.c src/spec.c src/dnsd.c src/failover.c \
 	      src/aggregate.c src/obfs.c src/cli.c src/srs.c src/puff.c src/hwid.c
 
-test: all ext-syntax $(BUILD)/dnsmatch $(BUILD)/specmatch $(BUILD)/specmatch-ext $(BUILD)/xswirematch $(BUILD)/xsconnmatch $(BUILD)/xsstreammatch $(BUILD)/tungromatch $(BUILD)/tunnamematch $(BUILD)/xsconfmatch $(BUILD)/xslinkmatch $(BUILD)/xsroutematch $(BUILD)/chellomatch $(BUILD)/failovermatch $(BUILD)/dcmatch $(BUILD)/msgsplitmatch $(BUILD)/warmmatch $(BUILD)/upmatch $(BUILD)/h2match $(BUILD)/submatch $(BUILD)/subfetchmatch $(BUILD)/fwmatch $(BUILD)/obfsmatch $(BUILD)/visionmatch $(BUILD)/diagsim $(BUILD)/hwidsum
+test: all ext-syntax $(BUILD)/tgwssim $(BUILD)/dnsmatch $(BUILD)/specmatch $(BUILD)/specmatch-ext $(BUILD)/xswirematch $(BUILD)/xsconnmatch $(BUILD)/xsstreammatch $(BUILD)/tungromatch $(BUILD)/tunnamematch $(BUILD)/xsconfmatch $(BUILD)/xslinkmatch $(BUILD)/xsroutematch $(BUILD)/chellomatch $(BUILD)/failovermatch $(BUILD)/dcmatch $(BUILD)/msgsplitmatch $(BUILD)/warmmatch $(BUILD)/upmatch $(BUILD)/h2match $(BUILD)/submatch $(BUILD)/subfetchmatch $(BUILD)/fwmatch $(BUILD)/obfsmatch $(BUILD)/visionmatch $(BUILD)/diagsim $(BUILD)/hwidsum
 	@sh tests/run.sh
 	@sh tests/gen.sh
+	@sh tests/tgwsmark.sh
 	@sh tests/climatch.sh
 	@sh tests/dnsproxy.sh
 	@sh tests/diagmatch.sh
@@ -61,6 +62,18 @@ test: all ext-syntax $(BUILD)/dnsmatch $(BUILD)/specmatch $(BUILD)/specmatch-ext
 	@$(BUILD)/xsroutematch
 	@$(BUILD)/chellomatch
 	@sh tests/hwidmatch.sh
+
+# Мини-сборка микропакета tgws на хосте — для стенда tgwsmark: ядро движка с -DSTEER_TGWS,
+# мост заменён заглушкой (tests/tgws-stub.c), потому что настоящий тянет TLS и docker.
+# Проверяется не мост, а ruleset рядом с полным движком: свой бит метки, свой порт, свой ряд
+# таблиц, чужой реестр.
+$(BUILD)/tgwssim: src/steer.c src/spec.c src/dnsd.c src/failover.c src/aggregate.c \
+                  src/obfs.c src/cli.c src/srs.c src/puff.c src/hwid.c src/spec.h src/cli.h \
+                  tests/tgws-stub.c VERSION
+	@mkdir -p $(BUILD)
+	$(CC) $(CFLAGS) $(DEFS) -DSTEER_TGWS -o $@ src/steer.c src/spec.c src/dnsd.c \
+	      src/failover.c src/aggregate.c src/obfs.c src/cli.c src/srs.c src/puff.c src/hwid.c \
+	      tests/tgws-stub.c
 
 # Движок, собранный как расширенный, но без самой расширенной части: нужен стенду
 # diagmatch, потому что спеку с `kind: vless` базовая сборка отвергает парсером, а

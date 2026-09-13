@@ -57,6 +57,7 @@ build/ipkg-build
 # Дерево архива серверной половины: собирается из build/steer-<арх> и server/.
 build/obfs-*
 build/diagsim
+build/tgwssim
 build/crypto-vec
 build/bx-*
 # Объекты mbedtls, собранные под хост для прогона стендов src/ext в образе

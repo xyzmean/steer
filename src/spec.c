@@ -16,7 +16,16 @@
 /* База метки и число бит — в spec.h: их знает не только распорядитель, но и тот, кто
  * ставит правило и генерирует ruleset, а маска выводится из них же. */
 #define MARK_BASE   STEER_MARK_BASE
+/* У мини-сборки (STEER_TGWS) свой ряд номеров таблиц. Выходу kind=tgws таблица не нужна, но
+ * номер ему выдаётся вместе с меткой и живёт в реестре, а уборка мёртвых правил (steer.c,
+ * cleanup_stale_routing) делает по реестру `ip route flush table N`. С общей базой N совпадал
+ * бы с таблицей выхода полного движка — и удаление или переименование выхода микропакета
+ * молча опустошало бы чужую таблицу маршрутизации. Полный движок берёт 300..315 (MAX_OUTPUTS). */
+#ifdef STEER_TGWS
+#define TABLE_BASE  316
+#else
 #define TABLE_BASE  300
+#endif
 
 
 
@@ -1297,12 +1306,19 @@ void registry_assign(void) {
         char name[32];
         unsigned mark;
         int table;
-        while (fscanf(f, "%31s %x %d\n", name, &mark, &table) == 3)
+        while (fscanf(f, "%31s %x %d\n", name, &mark, &table) == 3) {
+            /* Метка вне НАШЕЙ маски — не наша: реестр остался от сборки с другим диапазоном
+             * (мини-сборка до своего бита писала 08000000). Взять её значило бы ставить
+             * `and ~маска or метка` с битом за пределами маски, который сравнение
+             * `mark and маска == метка` не увидит никогда, — то есть правило стоит, а не
+             * срабатывает. Такой выход получает метку заново, как новый. */
+            if (!mark || (mark & ~STEER_MARK_MASK)) continue;
             for (size_t i = 0; i < g_out_n; i++)
                 if (!strcmp(g_out[i].name, name) && g_out[i].kind != OUT_DIRECT) {
                     g_out[i].mark = mark;
                     g_out[i].table = table;
                 }
+        }
         fclose(f);
     }
     /* СВЕРХУ ИЛИ СНИЗУ. Обычно биты раздаются снизу: первый выход получает нулевой, второй
@@ -1402,7 +1418,13 @@ void registry_assign(void) {
  * на что. */
 static void rt_tables_write(void) {
     char path[512];
+    /* Файл — свой у каждой сборки: мини-сборка с тем же именем перезаписывала бы имена таблиц
+     * полного движка своими. */
+#ifdef STEER_TGWS
+    snprintf(path, sizeof(path), "%s/stgws.conf", g_rt_tables_d);
+#else
     snprintf(path, sizeof(path), "%s/steer.conf", g_rt_tables_d);
+#endif
 
     char want[1024];
     size_t wn = 0;
