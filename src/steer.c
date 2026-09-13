@@ -1101,10 +1101,20 @@ static void generate(FILE *f) {
          * любой стратегии, со снятым битом 33 из 37. Снимать здесь безопасно: цепочка
          * общего обхода (srcnat + 1) уже позади, дальше бит никому не нужен, а свои восемь
          * бит метки (маршрут) целы. */
+        /* ВЫХОД УЗНАЁТСЯ ПО МЕТКЕ СОЕДИНЕНИЯ (ct mark), А НЕ ПАКЕТА. Обе ставятся одним
+         * правилом в prerouting и до маршрутизации совпадают, но между маршрутизацией и этой
+         * цепочкой лежит хук forward — и там метку пакета переписывают чужие. Tailscale на
+         * каждом пакете с tailscale0 делает `meta mark set mark and 0xff00ffff xor 0x40000`:
+         * биты 16-23 стираются, а наши восемь бит начинаются с двадцатого, то есть у первых
+         * четырёх выходов метка до очереди не доезжала вовсе. Снаружи это выглядело как
+         * «добавил tailscale0 в клиенты — с телефона обход не работает, из LAN работает»:
+         * правило стоит, счётчик нулевой, обработчик жив. Метку соединения никто из соседей
+         * не трогает — она наша по назначению, тот же довод, что у conntrack_evict. Цепочка
+         * ответов (zapret_queue_in) по ct mark работала и прежде. */
         for (size_t i = 0; i < g_out_n; i++) {
             struct output *o = &g_out[i];
             if (o->kind != OUT_ZAPRET) continue;
-            fprintf(f, "        meta mark and 0x%08x == 0x%08x ct original packets 1-%d "
+            fprintf(f, "        ct mark and 0x%08x == 0x%08x ct original packets 1-%d "
                        "meta mark set mark and 0x%08x counter queue num %d%s "
                        "comment \"steer:zapret:%s\"\n",
                     STEER_MARK_MASK, o->mark, ZAPRET_FIRST_PACKETS, ~ZAPRET_SKIP_MARK,
