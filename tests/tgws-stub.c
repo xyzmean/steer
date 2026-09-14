@@ -8,7 +8,7 @@
 #include <stdio.h>
 
 int cmd_tgws(const char *spec_path, const char *out_name);
-int cmd_tgws_probe(int dc, int media);
+int cmd_tgws_probe(int dc, int media, int direct, int timeout_s);
 int cmd_tls_probe(const char *host, const char *addr, int port, int local_port, int quiet);
 
 int cmd_tgws(const char *spec_path, const char *out_name) {
@@ -16,7 +16,9 @@ int cmd_tgws(const char *spec_path, const char *out_name) {
     fprintf(stderr, "tgwsmark: мост в стенде не реализован\n");
     return 2;
 }
-int cmd_tgws_probe(int dc, int media) { (void)dc; (void)media; return 2; }
+int cmd_tgws_probe(int dc, int media, int direct, int timeout_s) {
+    (void)dc; (void)media; (void)direct; (void)timeout_s; return 2;
+}
 int cmd_tls_probe(const char *host, const char *addr, int port, int local_port, int quiet) {
     (void)host; (void)addr; (void)port; (void)local_port; (void)quiet;
     return 2;

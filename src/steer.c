@@ -92,7 +92,7 @@ void aggregate_usage_flags(FILE *out);
 #if defined(STEER_EXTENDED) || defined(STEER_TGWS)
 /* Мост Telegram → веб-сокет; объяснение целиком — в src/ext/tgws.c. */
 int cmd_tgws(const char *spec_path, const char *out_name);
-int cmd_tgws_probe(int dc, int media);
+int cmd_tgws_probe(int dc, int media, int direct, int timeout_s);
 int cmd_tls_probe(const char *host, const char *addr, int port, int local_port, int quiet);
 #endif
 #ifdef STEER_EXTENDED
@@ -144,7 +144,9 @@ static int cmd_tgws(const char *spec_path, const char *out_name) {
     (void)spec_path; (void)out_name;
     return no_vless();
 }
-static int cmd_tgws_probe(int dc, int media) { (void)dc; (void)media; return no_vless(); }
+static int cmd_tgws_probe(int dc, int media, int direct, int timeout_s) {
+    (void)dc; (void)media; (void)direct; (void)timeout_s; return no_vless();
+}
 static int cmd_tls_probe(const char *host, const char *addr, int port, int local_port, int quiet) {
     (void)host; (void)addr; (void)port; (void)local_port; (void)quiet; return no_vless();
 }
@@ -981,9 +983,13 @@ static void generate(FILE *f) {
              *
              * Ставится ЗДЕСЬ, в prerouting, потому что цепочки zapret висят на
              * postrouting: позже было бы поздно. */
-            fprintf(f, "meta mark set mark and 0x%08x or 0x%08x ct mark set mark ",
+            /* Метка СОЕДИНЕНИЯ ставится не всем: она живёт в conntrack и переживает
+             * снятие правил, поэтому у выходов, которым она не нужна, её нет вовсе — см.
+             * out_needs_ctmark в spec.h и что из-за неё случалось после удаления tgws. */
+            fprintf(f, "meta mark set mark and 0x%08x or 0x%08x %s",
                     ~STEER_MARK_MASK,
-                    out_skips_zapret(o) ? (o->mark | ZAPRET_SKIP_MARK) : o->mark);
+                    out_skips_zapret(o) ? (o->mark | ZAPRET_SKIP_MARK) : o->mark,
+                    out_needs_ctmark(o) ? "ct mark set mark " : "");
         /* `return` and not `accept`: it ends OUR chain, letting the rest of the
          * firewall proceed, while making the first matching group the winner. */
         emit_counter(f, g->name, 0);
@@ -3167,7 +3173,8 @@ int main(int argc, char **argv) {
         return cmd_tls_probe(hb, a.out_file, pt, a.node > 0 ? a.node : 0, 0);
     }
     if (!strcmp(cmd, "tgws-probe"))
-        return cmd_tgws_probe(a.node > 0 ? a.node : 2, arg && !strcmp(arg, "media"));
+        return cmd_tgws_probe(a.node > 0 ? a.node : 2, arg && !strcmp(arg, "media"),
+                              a.direct, a.timeout);
     if (!strcmp(cmd, "vless")) return cmd_vless(spec, arg);
     if (!strcmp(cmd, "vless-nodes")) return cmd_vless_nodes(spec, arg);
     if (!strcmp(cmd, "vless-probe")) return cmd_vless_probe(spec, arg, a.node, a.timeout);

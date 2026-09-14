@@ -75,6 +75,36 @@
 #define LOG_I "steer[info] tgws: "
 #define LOG_W "steer[warn] tgws: "
 
+/* КОНТЕКСТ AES ОБЯЗАН ЛЕЖАТЬ ПО АДРЕСУ, КРАТНОМУ ШЕСТНАДЦАТИ, и ни один заголовок mbedtls об
+ * этом не предупреждает. Стоило это разбора с ядерным SIGSEGV по нулевому адресу, поэтому
+ * объяснение целиком:
+ *
+ * mbedtls умеет AES тремя способами — таблицами, ассемблерной вставкой и интринсиками AES-NI.
+ * Интринсики требуют, чтобы массив раундовых ключей был выровнен на шестнадцать байт (они
+ * читают его как `__m128i`, то есть выровненной командой SSE), и mbedtls это учитывает: в
+ * aes.c есть mbedtls_aes_rk_offset, который сдвигает ключи внутри контекста. НО включается он
+ * по условию `MBEDTLS_AESNI_HAVE_CODE == 2`, а это значение выводится из макроса __AES__,
+ * который ставит компилятор по ключу -maes.
+ *
+ * А ключ этот наша сборка даёт РОВНО ОДНОМУ файлу — aesni.c (см. AESNI_FLAGS в
+ * build/build-ext.sh: иначе компилятор вставил бы команды AES-NI во весь остальной код и
+ * бинарник перестал бы работать на процессорах без них). Получается расхождение ВНУТРИ
+ * mbedtls: aesni.c собран на интринсиках и ждёт выровненный массив, а aes.c собран без -maes,
+ * считает, что работает ассемблерная вставка, которой выравнивание не нужно, и не сдвигает
+ * ничего. Контекст, оказавшийся на стеке по адресу, кратному четырём, а не шестнадцати, роняет
+ * setkey на первой же выровненной загрузке — общей защитой памяти, то есть без осмысленного
+ * адреса в отчёте.
+ *
+ * Ловушка молчаливая и старая: она есть у каждого нашего контекста AES с самого начала, просто
+ * до сих пор все они случайно ложились куда надо. Поймана на прямой пробе дата-центра, где
+ * кадр стека сложился иначе. Поэтому выравнивание объявляется ЗДЕСЬ, у типа, а не в том месте,
+ * где повезло упасть: мест, где контекст живёт на стеке, три, и выбирать между ними по факту
+ * падения — значит чинить по одному до конца времён.
+ *
+ * Контексты самого mbedtls (внутри GCM у TLS) от этого не страдают: их выделяет malloc, а он
+ * на всех наших платформах возвращает адреса, кратные шестнадцати. */
+#define STEER_AES_ALIGN16 __attribute__((aligned(16)))
+
 #define HS_LEN        64        /* длина рукопожатия обфускации */
 #define TAG_POS       56        /* метка транспорта */
 #define DC_POS        60        /* номер ДЦ, signed LE */
@@ -238,7 +268,7 @@ static void dc_table_init(void) {
  *
  * Список — файлом, а не в спеке: домены живут и умирают чаще, чем настройка роутера, и
  * обновляет его тот же набор данных, что и списки (у brb это data/tgws-domains.lst). */
-#define MAX_ALT 8
+#define MAX_ALT 16
 static char g_alt[MAX_ALT][128];
 static size_t g_alt_n;
 
@@ -249,11 +279,39 @@ static size_t g_alt_n;
  * перед тем, как уйти на запасной. Отсюда редкие, но заметные подвисания.
  *
  * Помечается домен, а не точка: 503 отдаёт край Cloudflare, и если он отказывает по kws2,
- * то с большой вероятностью откажет и по kws4 того же домена. */
+ * то с большой вероятностью откажет и по kws4 того же домена.
+ *
+ * ОТСТАВКА ХРАНИТСЯ ПО ИМЕНИ, А НЕ ПО НОМЕРУ В СПИСКЕ. Пока домен был один на все
+ * дата-центры, номер годился: очередь строилась из «своего» домена и пула, и место в ней
+ * было постоянным. С картой «дата-центр → домен» очередь у каждого ДЦ своя, домен из карты
+ * может вовсе не лежать в пуле, и номер перестал что-либо значить — два разных домена
+ * делили бы одну отставку, а это ровно та ошибка, которую невозможно увидеть в журнале. */
 #define ALT_COOLDOWN_S 60
-static time_t g_bad[1 + MAX_ALT];
+#define COOL_N (2 + MAX_ALT + 12)
+static struct { char d[128]; time_t until; } g_cool[COOL_N];
+static size_t g_cool_n;
 
-static int dom_ok_now(size_t i, time_t now) { return g_bad[i] <= now; }
+static time_t *cool_slot(const char *d, int make) {
+    for (size_t i = 0; i < g_cool_n; i++)
+        if (!strcmp(g_cool[i].d, d)) return &g_cool[i].until;
+    if (!make || g_cool_n >= COOL_N) return NULL;
+    snprintf(g_cool[g_cool_n].d, sizeof(g_cool[0].d), "%s", d);
+    g_cool[g_cool_n].until = 0;
+    return &g_cool[g_cool_n++].until;
+}
+
+static int dom_ok_now(const char *d, time_t now) {
+    const time_t *t = cool_slot(d, 0);
+    return !t || *t <= now;
+}
+
+/* Мест под отставки может не хватить (доменов в карте и пуле вместе больше, чем слотов) —
+ * тогда домен просто не отставляется. Это хуже, чем отставить, но лучше, чем отставить
+ * ЧУЖОЙ: очередь останется честной, а лишнее рукопожатие стоит полсекунды. */
+static void dom_cool(const char *d, time_t until) {
+    time_t *t = cool_slot(d, 1);
+    if (t) *t = until;
+}
 
 static void alt_init(void) {
     const char *path = getenv("STEER_TGWS_DOMAINS");
@@ -303,6 +361,104 @@ static void tgws_hosts(int dc, int media, char out[2][160]) {
     tgws_hosts_at(g_domain, dc, media, out);
 }
 
+/* ---- карта «дата-центр → путь» -------------------------------------------------------
+ *
+ * ЗАЧЕМ ОНА ВООБЩЕ. До неё домен был ОДИН НА ВСЕ дата-центры: подбор выбирал лучший в
+ * среднем и отдавал его всем. Но точки `kwsN` у чужого домена отказывают ПОРОЗНЬ — за ними
+ * стоят разные записи DNS и разные настройки проксирования, и домен с пятью живыми точками
+ * из шести не работает ровно у того ДЦ, где лежит ключ авторизации конкретного человека.
+ * Складывать из разных доменов солянку — то, чего одному домену не дано в принципе: у ДЦ2
+ * один домен, у ДЦ4 другой, у медийного третий.
+ *
+ * ВТОРОЕ, ЧЕГО НЕ БЫЛО ВОВСЕ, — ПРЯМОЙ ПУТЬ. Режут не все дата-центры сразу: медийные
+ * (загрузка файлов и картинок) у многих провайдеров доступны как есть. Гнать их в веб-сокет
+ * значит платить рукопожатием TLS к чужому домену, отказами 503 и лишним переливанием за то,
+ * что и так работало, — а у медийных ДЦ это ещё и самый объёмный трафик. Способ `direct`
+ * говорит мосту не перехватывать такой ДЦ.
+ *
+ * ФАЙЛОМ, А НЕ В СПЕКЕ, по той же причине, что и пул запасных: карта — это РЕЗУЛЬТАТ ЗАМЕРА,
+ * он живёт минутами и переписывается подбором, а спека — настройка человека. Смешать их
+ * значило бы переписывать настройку замером.
+ *
+ * Формат — строка на дата-центр:
+ *
+ *     2   ws      kartoshka.co.uk     точки kws2.<домен>
+ *     2m  direct                      медийный ДЦ2 — напрямую, не перехватывая
+ *     4   direct
+ *
+ * Дата-центр без строки в карте ведёт себя как раньше: общий домен, за ним пул. */
+#define ROUTE_N 20              /* индекс dc*2+media, ДЦ 1..9 */
+enum { RT_AUTO = 0, RT_WS, RT_DIRECT };
+struct dc_route { char domain[128]; unsigned char how; };
+static struct dc_route g_route[ROUTE_N];
+
+static int route_idx(int dc, int media) {
+    if (dc < 1 || dc > 9) return -1;
+    return dc * 2 + (media ? 1 : 0);
+}
+
+static void route_init(void) {
+    memset(g_route, 0, sizeof(g_route));
+    const char *path = getenv("STEER_TGWS_ROUTE");
+    if (!path) path = "/etc/steer/tgws-route.conf";
+    FILE *f = fopen(path, "r");
+    if (!f) return;
+    char line[224];
+    size_t n = 0;
+    while (fgets(line, sizeof(line), f)) {
+        char who[16], how[16], dom[128];
+        if (line[0] == '#') continue;
+        dom[0] = '\0';
+        int k = sscanf(line, "%15s %15s %127s", who, how, dom);
+        if (k < 2) continue;
+        /* Медийный ДЦ пишется буквой m у номера — «2m». Отдельным столбцом это было бы
+         * поле, которое почти всегда пусто, а у медийного ДЦ и путь, и домен свои. */
+        size_t wl = strlen(who);
+        int media = 0;
+        if (wl && (who[wl - 1] == 'm' || who[wl - 1] == 'M')) { media = 1; who[wl - 1] = '\0'; }
+        int i = route_idx(atoi(who), media);
+        if (i < 0) continue;
+        if (!strcmp(how, "direct")) {
+            g_route[i].how = RT_DIRECT;
+            g_route[i].domain[0] = '\0';
+        } else if (!strcmp(how, "ws") && dom[0]) {
+            g_route[i].how = RT_WS;
+            snprintf(g_route[i].domain, sizeof(g_route[0].domain), "%s", dom);
+        } else continue;
+        n++;
+    }
+    fclose(f);
+    if (n) fprintf(stderr, LOG_I "карта дата-центров из %s: %zu строк\n", path, n);
+}
+
+/* Домен этого ДЦ по карте; NULL — карта про него молчит, значит общий порядок. */
+static const char *route_domain(int dc, int media) {
+    int i = route_idx(dc, media);
+    if (i < 0 || g_route[i].how != RT_WS || !g_route[i].domain[0]) return NULL;
+    return g_route[i].domain;
+}
+
+/* ПРЯМОЙ ПУТЬ ОТМЕНЯЕТСЯ САМ, если он перестал работать.
+ *
+ * Карту пишет подбор, а он снимается раз в установку — то есть его ответ СТАРЕЕТ. Провайдер
+ * может закрыть дата-центр на следующий день, и до следующего подбора Telegram был бы
+ * сломан ровно там, где мы решили ему не мешать. Поэтому проверка идёт боем на каждом
+ * соединении (см. direct_prove), а неудача записывается сюда: следующие несколько минут этот
+ * ДЦ идёт в мост без попытки, чтобы не платить ожиданием на каждом соединении. */
+#define DIRECT_BAD_S 300
+static time_t g_direct_bad[ROUTE_N];
+
+static int route_direct_now(int dc, int media, time_t now) {
+    int i = route_idx(dc, media);
+    if (i < 0 || g_route[i].how != RT_DIRECT) return 0;
+    return g_direct_bad[i] <= now;
+}
+
+static void route_direct_failed(int dc, int media, time_t now) {
+    int i = route_idx(dc, media);
+    if (i >= 0) g_direct_bad[i] = now + DIRECT_BAD_S;
+}
+
 /* Номер ДЦ по адресу назначения. 0 — адрес неизвестен, перехватывать нельзя. */
 /* Самая длинная подходящая маска. Порядок записей в таблице при этом не важен — важно
  * только, насколько запись точна. */
@@ -327,7 +483,7 @@ static short dc_of(uint32_t ip, short *media) {
  * Сырые, без SHA-256 и без секрета, — так делает клиент, идущий в дата-центр напрямую, и
  * так же ждёт точка apiws. */
 static int hs_keystream(const unsigned char hs[HS_LEN], unsigned char out[HS_LEN]) {
-    mbedtls_aes_context aes;
+    mbedtls_aes_context aes STEER_AES_ALIGN16;
     unsigned char nonce[16], sb[16], zeros[HS_LEN];
     size_t nc = 0;
     int rc;
@@ -762,7 +918,7 @@ static int tls_start(struct upstream *u, const char *sni) {
  * Обе стороны в одном цикле poll: отдельный поток на направление стоил бы второго стека и
  * согласования закрытия ради ровно той же работы. */
 struct obf {
-    mbedtls_aes_context enc, dec;
+    mbedtls_aes_context enc STEER_AES_ALIGN16, dec STEER_AES_ALIGN16;
     unsigned char nce[16], ncd[16], sbe[16], sbd[16];
     size_t oe, od;
 };
@@ -1158,44 +1314,192 @@ static void pump(int cfd, struct upstream *u, struct pump_stat *st, struct msgsp
  * мост не понял, — неизвестный адрес ДЦ, не-MTProto, недоступная точка apiws. Молча рвать
  * такое нельзя: под правило попадает трафик человека, и «Telegram не работает» из-за нашей
  * осторожности ничем не лучше блокировки. */
+static int send_all(int fd, const unsigned char *p, size_t n) {
+    size_t off = 0;
+    while (off < n) {
+        ssize_t w = send(fd, p + off, n - off, MSG_NOSIGNAL);
+        if (w <= 0) { if (w < 0 && errno == EINTR) continue; return -1; }
+        off += (size_t)w;
+    }
+    return 0;
+}
+
+/* ---- переливание двух сокетов без разбора --------------------------------------------
+ *
+ * БЕЗ КОПИРОВАНИЯ В ПОЛЬЗОВАТЕЛЬСКОЕ ПРОСТРАНСТВО, когда ядро это умеет. Прежний цикл читал
+ * в буфер на 16 КБ и писал из него: на каждый мегабайт это два перехода границы ядра и два
+ * копирования. Здесь ходит не мелочь, а самый объёмный трафик Telegram — картинки, видео и
+ * файлы медийного дата-центра, который теперь чаще всего идёт именно этим путём, — а
+ * считается это на роутере с частотой под гигагерц, где копирование видно в загрузке.
+ *
+ * splice гоняет байты через трубу ВНУТРИ ядра: страницы не копируются, а переставляются.
+ * Труба одна на соединение и заводится один раз; если завести её не удалось (кончились
+ * дескрипторы) или ядро splice на этой паре не умеет, работает прежний путь через буфер —
+ * поэтому отказ здесь ничего не ломает, а только возвращает старую цену. */
+#define RELAY_CHUNK 65536
+
+/* 1 — что-то перелито, 0 — пока нечего, -1 — конец или отказ. */
+static int relay_splice_once(int from, int to, int pp[2], unsigned long *acct) {
+    ssize_t n = splice(from, NULL, pp[1], NULL, RELAY_CHUNK,
+                       SPLICE_F_MOVE | SPLICE_F_NONBLOCK);
+    if (n == 0) return -1;
+    if (n < 0) return (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR) ? 0 : -1;
+    size_t left = (size_t)n;
+    while (left) {
+        /* Вторая половина БЕЗ SPLICE_F_NONBLOCK: труба уже держит байты, и «приходи потом»
+         * означало бы их потерять — вынуть их оттуда больше нечем. Срок на запись стоит на
+         * самом сокете (SO_SNDTIMEO). */
+        ssize_t w = splice(pp[0], NULL, to, NULL, left, SPLICE_F_MOVE);
+        if (w <= 0) { if (w < 0 && errno == EINTR) continue; return -1; }
+        left -= (size_t)w;
+    }
+    if (acct) *acct += (unsigned long)n;
+    return 1;
+}
+
+static int relay_copy_once(int from, int to, unsigned long *acct) {
+    unsigned char buf[BUF_N];
+    ssize_t r = recv(from, buf, sizeof(buf), 0);
+    if (r == 0) return -1;
+    if (r < 0) return (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR) ? 0 : -1;
+    if (send_all(to, buf, (size_t)r) < 0) return -1;
+    if (acct) *acct += (unsigned long)r;
+    return 1;
+}
+
+/* Перелить два сокета, пока жив хоть один. up/down — счётчики объёма, можно NULL. */
+static void relay_fd(int cfd, int fd, unsigned long *up, unsigned long *down) {
+    int pp[2] = { -1, -1 };
+    int use_splice = (pipe(pp) == 0);
+    if (use_splice) fcntl(pp[0], F_SETPIPE_SZ, RELAY_CHUNK);
+
+    for (;;) {
+        struct pollfd p[2];
+        p[0].fd = cfd; p[0].events = POLLIN; p[0].revents = 0;
+        p[1].fd = fd;  p[1].events = POLLIN; p[1].revents = 0;
+        int rc = poll(p, 2, IDLE_TIMEOUT_S * 1000);
+        if (rc < 0) { if (errno == EINTR) continue; break; }
+        if (rc == 0) break;
+        int done = 0;
+        for (int i = 0; i < 2 && !done; i++) {
+            if (!(p[i].revents & POLLIN)) continue;
+            int from = i ? fd : cfd, to = i ? cfd : fd;
+            unsigned long *acct = i ? down : up;
+            int r = use_splice ? relay_splice_once(from, to, pp, acct)
+                               : relay_copy_once(from, to, acct);
+            /* Отказ splice на этой паре (ядро без поддержки на сокете) — не конец
+             * соединения: повторяем прежним путём и дальше живём без трубы. */
+            if (r < 0 && use_splice && (errno == EINVAL || errno == ENOSYS)) {
+                use_splice = 0;
+                r = relay_copy_once(from, to, acct);
+            }
+            if (r < 0) done = 1;
+        }
+        if (done) break;
+        if ((p[0].revents | p[1].revents) & (POLLERR | POLLHUP)) break;
+    }
+    if (pp[0] >= 0) { close(pp[0]); close(pp[1]); }
+}
+
+/* pre — то, что мы уже сняли с клиента и обязаны отдать первым (рукопожатие); pre2 — то,
+ * что он сказал следом, пока проверялся прямой путь. Два куска, а не один буфер, потому что
+ * второй бывает в шестнадцать килобайт, и склеивать их значило бы держать третью копию. */
 static void relay_direct(int cfd, const struct sockaddr_in *dst,
-                         const unsigned char *pre, size_t pre_n) {
+                         const unsigned char *pre, size_t pre_n,
+                         const unsigned char *pre2, size_t pre2_n) {
     int fd = socket(AF_INET, SOCK_STREAM, 0);
     if (fd < 0) return;
     struct timeval tv = { .tv_sec = UP_TIMEOUT_S, .tv_usec = 0 };
     setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
     setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
     if (connect(fd, (const struct sockaddr *)dst, sizeof(*dst)) != 0) { close(fd); return; }
-    if (pre_n) {
-        size_t off = 0;
-        while (off < pre_n) {
-            ssize_t w = send(fd, pre + off, pre_n - off, MSG_NOSIGNAL);
-            if (w <= 0) { close(fd); return; }
-            off += (size_t)w;
-        }
-    }
-    unsigned char buf[BUF_N];
+    { int one = 1; setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one)); }
+    if (pre_n && send_all(fd, pre, pre_n) < 0) { close(fd); return; }
+    if (pre2_n && send_all(fd, pre2, pre2_n) < 0) { close(fd); return; }
+    relay_fd(cfd, fd, NULL, NULL);
+    close(fd);
+}
+
+/* ---- прямой путь к дата-центру с проверкой боем ---------------------------------------
+ *
+ * ЗАЧЕМ. Режут не все дата-центры сразу — медийные у многих провайдеров доступны как есть, и
+ * гнать их в веб-сокет значит платить рукопожатием TLS к чужому домену и отказами 503 за то,
+ * что и так работало. Подбор это замечает и пишет в карту `direct` (см. route_init).
+ *
+ * ПОЧЕМУ КАРТЫ МАЛО. Ответ подбора стареет: провайдер закрывает дата-центр когда хочет, а
+ * подбор снимается раз в установку. Довериться карте на слово значило бы сломать Telegram
+ * ровно там, где мы решили ему не мешать, и до следующего подбора.
+ *
+ * ПОЧЕМУ НЕЛЬЗЯ ПРОСТО ПОСМОТРЕТЬ, СОЕДИНИЛОСЬ ЛИ. Блокировка по адресу обычно НЕ отказывает
+ * в соединении: рукопожатие TCP проходит (его завершает либо сам узел, либо оборудование
+ * провайдера), а дальше тишина или обрыв. То есть connect() говорит «готово» и там, где
+ * ничего не работает. Признак живого пути один: ДАТА-ЦЕНТР ЗАГОВОРИЛ. Клиент MTProto шлёт
+ * req_pq сразу за рукопожатием обфускации, ответ приходит за десятки миллисекунд — значит
+ * несколько секунд молчания и есть ответ «нет».
+ *
+ * ЧТО ДЕЛАТЬ С ТЕМ, ЧТО КЛИЕНТ УСПЕЛ НАГОВОРИТЬ. Отправлять его в ДЦ надо сразу — иначе тому
+ * нечего отвечать и проверка не сработает никогда, — но и КОПИЮ надо держать: если путь не
+ * ожил, эти байты придётся отдать мосту, иначе поток MTProto начнётся с середины и ключ
+ * шифра разъедется. Копия ограничена сверху: клиент, успевший наговорить больше, отката уже
+ * не переживёт, и честнее оставить его на прямом пути, чем отдать мосту обрезок. */
+#define DIRECT_PROVE_S   4
+#define DIRECT_EARLY_MAX 16384
+
+struct earlybuf { unsigned char b[DIRECT_EARLY_MAX]; size_t n; int over; };
+
+static void eb_put(struct earlybuf *e, const unsigned char *p, size_t n) {
+    if (e->over) return;
+    if (e->n + n > sizeof(e->b)) { e->over = 1; return; }
+    memcpy(e->b + e->n, p, n);
+    e->n += n;
+}
+
+/* Соединиться туда, куда шёл клиент. -1 — не вышло. */
+static int direct_open(const struct sockaddr_in *dst) {
+    int fd = socket(AF_INET, SOCK_STREAM, 0);
+    if (fd < 0) return -1;
+    struct timeval tv = { .tv_sec = UP_TIMEOUT_S, .tv_usec = 0 };
+    setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+    setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+    if (connect(fd, (const struct sockaddr *)dst, sizeof(*dst)) != 0) { close(fd); return -1; }
+    int one = 1;
+    setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
+    return fd;
+}
+
+/* 1 — дата-центр заговорил, путь живой (читать его ответ будет переливание).
+ * 0 — не заговорил; всё, что за это время сказал клиент, лежит в eb. */
+static int direct_prove(int cfd, int dfd, struct earlybuf *eb) {
+    time_t deadline = time(NULL) + DIRECT_PROVE_S;
     for (;;) {
+        long left = (long)(deadline - time(NULL));
+        if (left <= 0) return 0;
         struct pollfd p[2];
         p[0].fd = cfd; p[0].events = POLLIN; p[0].revents = 0;
-        p[1].fd = fd;  p[1].events = POLLIN; p[1].revents = 0;
-        if (poll(p, 2, 60000) <= 0) break;
-        for (int i = 0; i < 2; i++) {
-            if (!(p[i].revents & POLLIN)) continue;
-            int from = i ? fd : cfd, to = i ? cfd : fd;
-            ssize_t r = recv(from, buf, sizeof(buf), 0);
-            if (r <= 0) goto out;
-            size_t off = 0;
-            while (off < (size_t)r) {
-                ssize_t w = send(to, buf + off, (size_t)r - off, MSG_NOSIGNAL);
-                if (w <= 0) goto out;
-                off += (size_t)w;
-            }
+        p[1].fd = dfd; p[1].events = POLLIN; p[1].revents = 0;
+        int rc = poll(p, 2, (int)(left * 1000));
+        if (rc < 0) { if (errno == EINTR) continue; return 0; }
+        if (rc == 0) return 0;
+        /* POLLIN проверяется ПЕРЕД POLLHUP: узел, приславший ответ и сразу закрывший
+         * соединение, поднимает оба, и ответ при обратном порядке потерялся бы. */
+        if (p[1].revents & POLLIN) return 1;
+        if (p[1].revents & (POLLERR | POLLHUP)) return 0;
+        if (p[0].revents & POLLIN) {
+            unsigned char b[BUF_N];
+            ssize_t r = recv(cfd, b, sizeof(b), 0);
+            if (r <= 0) return 0;
+            /* КОПИЯ СНИМАЕТСЯ ПЕРВОЙ, а отправка идёт после. Порядок наоборот терял бы
+             * порцию, на которой запись в дата-центр оборвалась: сокет туда всё равно
+             * брошен, а вот поток, который мы повторим мосту, оказался бы с дырой — и
+             * шифр MTProto разъехался бы у обеих сторон навсегда. */
+            eb_put(eb, b, (size_t)r);
+            if (send_all(dfd, b, (size_t)r) < 0) return 0;
+            /* Клиент наговорил больше, чем мы можем повторить мосту. Откат отсюда всё равно
+             * невозможен, а прямой путь пока не отказал — остаёмся на нём. */
+            if (eb->over) return 1;
         }
-        if ((p[0].revents | p[1].revents) & (POLLERR | POLLHUP)) break;
+        if (p[0].revents & (POLLERR | POLLHUP)) return 0;
     }
-out:
-    close(fd);
 }
 
 /* Дозвон до точки: выбор домена, TCP, TLS, апгрейд веб-сокета.
@@ -1219,22 +1523,10 @@ static int dial_upstream(short dc, short media, struct upstream *u_out,
     char epbuf[160];
     /* Домены по порядку: свой, потом запасные. Больше трёх не пробуем — человек ждёт
      * соединения, а не полного обхода списка. */
-    const char *doms[1 + MAX_ALT];
-    size_t didx[1 + MAX_ALT];
+    const char *doms[2 + MAX_ALT];
     size_t dom_n = 0;
     time_t now = time(NULL);
 
-    /* НАГРУЗКА РАСКЛАДЫВАЕТСЯ ПО ВСЕМУ ПУЛУ, а не сваливается на первый домен.
-     *
-     * Домены чужие и общественные, и 503 у них приходит не от неисправности, а от наплыва.
-     * Пока каждое соединение начинало с одного и того же домена, наплыв создавали мы сами: на
-     * живом роутере из двадцати двух попыток за минуту десять получали 503, и каждая стоила
-     * лишнего рукопожатия TLS перед уходом на запасной.
-     *
-     * Поэтому начальный домен сдвигается по кругу на каждое соединение: при двадцати доменах
-     * каждый получает двадцатую часть нагрузки. Домен со свежим отказом уходит в конец
-     * очереди, но из неё не выпадает — «все в отказе» это состояние сети, а не повод не
-     * пробовать. */
     /* ПОРЯДОК: САМЫЙ БЫСТРЫЙ ИЗ ТЕХ, КТО НЕ В ОТКАЗЕ.
      *
      * Список приходит упорядоченным — сначала домены, у которых отвечает больше точек и
@@ -1249,27 +1541,34 @@ static int dial_upstream(short dc, short media, struct upstream *u_out,
      *
      * Отставленные домены всё равно остаются в очереди последними: «все в отказе» — это
      * состояние сети, а не повод не пробовать вовсе. */
-    const char *all[1 + MAX_ALT];
-    size_t all_i[1 + MAX_ALT];
+    /* ПЕРВЫМ ИДЁТ ДОМЕН ЭТОГО ДАТА-ЦЕНТРА, а не общий. Карта — результат замера именно по
+     * этому ДЦ (см. route_init), и общий домен, выбранный как лучший в среднем, у него может
+     * не отвечать вовсе. Общий остаётся вторым: он проверен хотя бы где-то. */
+    const char *all[2 + MAX_ALT];
     size_t all_n = 0;
-    all[all_n] = g_domain; all_i[all_n++] = 0;
-    for (size_t i = 0; i < g_alt_n && all_n < 1 + MAX_ALT; i++) {
-        if (!strcmp(g_alt[i], g_domain)) continue;
-        all[all_n] = g_alt[i]; all_i[all_n++] = i + 1;
+    const char *pref = route_domain(dc, media);
+    if (pref) all[all_n++] = pref;
+    if (!pref || strcmp(pref, g_domain)) all[all_n++] = g_domain;
+    for (size_t i = 0; i < g_alt_n && all_n < 2 + MAX_ALT; i++) {
+        int dup = 0;
+        for (size_t k = 0; k < all_n; k++) if (!strcmp(all[k], g_alt[i])) dup = 1;
+        if (!dup) all[all_n++] = g_alt[i];
     }
 
-    for (int pass = 0; pass < 2 && dom_n < 3; pass++) {
+    for (int pass = 0; pass < 2 && dom_n < 3; pass++)
         for (size_t i = 0; i < all_n && dom_n < 3; i++) {
-            if ((pass == 0) != (dom_ok_now(all_i[i], now) != 0)) continue;
-            doms[dom_n] = all[i]; didx[dom_n++] = all_i[i];
+            if ((pass == 0) != (dom_ok_now(all[i], now) != 0)) continue;
+            doms[dom_n++] = all[i];
         }
-    }
-    tgws_hosts(dc, media, cand);
     if (ep) {
         snprintf(epbuf, sizeof(epbuf), "%s", ep);
         char *c = strchr(epbuf, ':');
         if (c) { *c = '\0'; port = c + 1; }
     }
+
+    /* Имена точек ПЕРВОГО домена очереди — до цикла: на них ссылается и стартовое значение
+     * sni, и сообщение об отказе, когда ни один домен не поднялся. */
+    tgws_hosts_at(dom_n ? doms[0] : g_domain, dc, media, cand);
 
     struct upstream u;
     int ok = 0;
@@ -1279,7 +1578,7 @@ static int dial_upstream(short dc, short media, struct upstream *u_out,
      * чужому домену или в повторах после отказов. */
     int tries = 0;
     for (size_t d = 0; d < dom_n && !ok; d++) {
-        if (d || doms[0] != g_domain) tgws_hosts_at(doms[d], dc, media, cand);
+        tgws_hosts_at(doms[d], dc, media, cand);
         for (int i = 0; i < 2 && !ok; i++) {
             sni = cand[i];
             tries++;
@@ -1297,7 +1596,7 @@ static int dial_upstream(short dc, short media, struct upstream *u_out,
             }
             ok = 1;
         }
-        if (!ok) g_bad[didx[d]] = time(NULL) + ALT_COOLDOWN_S;
+        if (!ok) dom_cool(doms[d], time(NULL) + ALT_COOLDOWN_S);
     }
     if (!ok) {
         fprintf(stderr, LOG_W "%s: точка ДЦ%d%s недоступна\n", cand[0], dc, media ? "m" : "");
@@ -1565,7 +1864,7 @@ static void *serve(void *arg) {
     dc = dc_of(dst.sin_addr.s_addr, &media);
     if (!dc) {
         fprintf(stderr, LOG_I "%s: не наш дата-центр — пропускаю как есть\n", dsts);
-        relay_direct(cfd, &dst, hs, got);
+        relay_direct(cfd, &dst, hs, got, NULL, 0);
         goto done;
     }
     /* Копия рукопожатия ДО возможной правки: из неё выводятся ключи обфускации, и по ним
@@ -1579,13 +1878,49 @@ static void *serve(void *arg) {
         short want_dc = dc, want_media = media;
         if (!hs_read_dc(hs, dc, media, &tag, &want_dc, &want_media)) {
             fprintf(stderr, LOG_I "%s: это не MTProto — пропускаю как есть\n", dsts);
-            relay_direct(cfd, &dst, hs, got);
+            relay_direct(cfd, &dst, hs, got, NULL, 0);
             goto done;
         }
         /* Точку выбираем по слову клиента, а не по своей догадке: он знает, где лежит его
          * ключ авторизации, а мы нет. */
         dc = want_dc;
         media = want_media;
+    }
+
+    /* ПРЯМОЙ ПУТЬ, если карта говорит, что этот дата-центр открыт. Отдаём ему рукопожатие
+     * КЛИЕНТА КАК ЕСТЬ (hs0, а не поправленное hs): номер ДЦ вписывается только для точки
+     * apiws, а настоящий дата-центр ждёт ровно те байты, которые собрал клиент.
+     *
+     * Проверка боем, потому что карта стареет, — см. direct_prove. */
+    struct earlybuf eb;
+    eb.n = 0;
+    eb.over = 0;
+    if (route_direct_now(dc, media, time(NULL))) {
+        int dfd = direct_open(&dst);
+        if (dfd >= 0 && send_all(dfd, hs0, HS_LEN) == 0 && direct_prove(cfd, dfd, &eb)) {
+            struct timeval idle = { .tv_sec = IDLE_TIMEOUT_S, .tv_usec = 0 };
+            setsockopt(cfd, SOL_SOCKET, SO_RCVTIMEO, &idle, sizeof(idle));
+            setsockopt(cfd, SOL_SOCKET, SO_SNDTIMEO, &idle, sizeof(idle));
+            setsockopt(dfd, SOL_SOCKET, SO_RCVTIMEO, &idle, sizeof(idle));
+            setsockopt(dfd, SOL_SOCKET, SO_SNDTIMEO, &idle, sizeof(idle));
+            keepalive_on(cfd);
+            unsigned long dup_ = 0, ddown = 0;
+            time_t t0 = time(NULL);
+            fprintf(stderr, LOG_I "%s -> ДЦ%d%s напрямую (транспорт 0x%02x)\n",
+                    dsts, dc, media ? "m" : "", tag);
+            relay_fd(cfd, dfd, &dup_, &ddown);
+            close(dfd);
+            fprintf(stderr, LOG_I "%s -> %s ДЦ%d%s напрямую: сессия %ld с, вверх %lu Б, "
+                            "вниз %lu Б\n",
+                    srcs, dsts, dc, media ? "m" : "", (long)(time(NULL) - t0), dup_, ddown);
+            goto done;
+        }
+        if (dfd >= 0) close(dfd);
+        /* Молчание — это блокировка. Записываем отказ, чтобы следующие соединения к этому
+         * ДЦ не платили ожиданием, и уходим в мост вместе с копией сказанного клиентом. */
+        route_direct_failed(dc, media, time(NULL));
+        fprintf(stderr, LOG_W "%s: ДЦ%d%s напрямую не отвечает — ухожу в мост\n",
+                dsts, dc, media ? "m" : "");
     }
 
     /* Соединение наверх: сначала из запаса — оно уже поднято, и клиент не платит ни
@@ -1619,7 +1954,10 @@ static void *serve(void *arg) {
              * закрывать нечего) и дозвон состоялся, а ws_send отказал. Раньше их различало
              * условие `u.fd > 0`, и на дескрипторе ноль второй случай проходил как первый. */
             up_drop(&u);
-            relay_direct(cfd, &dst, hs, got);
+            /* Последний честный ответ: ни моста, ни прямого пути. Отдаём дата-центру
+             * ИСХОДНОЕ рукопожатие клиента и всё, что он сказал за ним, — иначе поток
+             * начался бы с середины. */
+            relay_direct(cfd, &dst, hs0, got, eb.n ? eb.b : NULL, eb.n);
             goto done;
         }
     }
@@ -1657,6 +1995,18 @@ static void *serve(void *arg) {
         fprintf(stderr, LOG_W "%s: теневой шифр не поднялся, нарезки на пакеты не будет\n", dsts);
         memset(&ms, 0, sizeof(ms));
         ms.on = 0;
+    }
+
+    /* ПОВТОР ТОГО, ЧТО КЛИЕНТ СКАЗАЛ ПРЯМОМУ ПУТИ. Байты уже ушли в дата-центр, который на
+     * них не ответил, — для моста это по-прежнему НАЧАЛО потока, и отдать их надо до всего
+     * остального: теневой шифр нарезки считает позицию в потоке, и пропуск сдвинул бы её
+     * навсегда. */
+    if (eb.n && ms_feed(&ms, &u, eb.b, eb.n) < 0) {
+        fprintf(stderr, LOG_W "%s: накопленное не ушло в мост\n", dsts);
+        obf_free(&ms.o);
+        if (dbg_on) obf_free(&dbg);
+        up_drop(&u);
+        goto done;
     }
 
     time_t t_start = time(NULL);
@@ -1714,8 +2064,122 @@ static int probe_send(struct upstream *u, struct obf *o,
     return ws_send(u, enc, n + 4);
 }
 
-int cmd_tgws_probe(int dc, int media) {
+/* Представитель дата-центра: адрес, по которому идёт ПРЯМАЯ проба.
+ *
+ * Берутся только точные записи таблицы (маска /32): подсеть адресом не является, и стучаться
+ * в её нулевой адрес значило бы проверять не то. Точная запись есть у каждого ДЦ, а
+ * дополнить их можно тем же файлом, что и остальную таблицу (STEER_TGWS_DCMAP) — списка,
+ * который нельзя поправить на месте, здесь нет. */
+static uint32_t dc_repr(int dc) {
+    for (size_t i = 0; i < g_dc_n; i++)
+        if (g_dc[i].mask == 0xffffffffu && g_dc[i].dc == dc) return g_dc[i].ip;
+    return 0;
+}
+
+/* Проба ПРЯМОГО пути: тот же обмен MTProto, но без веб-сокета и без TLS — прямо в
+ * дата-центр, как ходит сам клиент Telegram.
+ *
+ * ПОЧЕМУ НЕ ХВАТАЕТ ПРОСТО СОЕДИНИТЬСЯ. Блокировка по адресу обычно не отказывает в
+ * рукопожатии TCP: его завершает либо сам узел, либо оборудование провайдера, а режется то,
+ * что после. Проверкой поэтому считается ответ resPQ — его не подделает никто, кроме
+ * дата-центра.
+ *
+ * 0 — дата-центр отвечает напрямую (значит его можно не перехватывать вовсе). */
+static int probe_direct(int dc, int media, int timeout_s) {
+    dc_table_init();
+    uint32_t ip = dc_repr(dc);
+    if (!ip) { printf("итог:       точного адреса ДЦ%d в таблице нет\n", dc); return 2; }
+
+    struct sockaddr_in a;
+    char ips[INET_ADDRSTRLEN] = "?";
+    memset(&a, 0, sizeof(a));
+    a.sin_family = AF_INET;
+    a.sin_addr.s_addr = ip;
+    a.sin_port = htons(443);
+    inet_ntop(AF_INET, &a.sin_addr, ips, sizeof(ips));
+    printf("адрес:      %s:443 (ДЦ%d%s, напрямую)\n", ips, dc, media ? ", медийный" : "");
+
+    int fd = socket(AF_INET, SOCK_STREAM, 0);
+    if (fd < 0) { printf("итог:       сокет не завести (%s)\n", strerror(errno)); return 1; }
+    struct timeval tv = { .tv_sec = timeout_s, .tv_usec = 0 };
+    setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+    setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+    if (connect(fd, (const struct sockaddr *)&a, sizeof(a)) != 0) {
+        printf("итог:       не соединиться (%s)\n", strerror(errno));
+        close(fd);
+        return 1;
+    }
+    { int one = 1; setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one)); }
+    printf("соединение: есть\n");
+
+    unsigned char hs[HS_LEN];
+    struct obf o;
+    if (hs_build(hs, 0xee, (short)dc, (short)media) != 0 || obf_init(&o, hs) != 0) {
+        printf("итог:       не собрать рукопожатие\n");
+        close(fd);
+        return 1;
+    }
+
+    int rc = 1;
+    unsigned char pkt[64], enc[64], body[40], nonce[16];
+    if (send_all(fd, hs, HS_LEN) < 0) { printf("итог:       init не ушёл\n"); goto out; }
+    if (xc_random(nonce, sizeof(nonce)) != 0) goto out;
+    memset(body, 0, 8);                                  /* auth_key_id = 0 */
+    {
+        uint64_t mid = ((uint64_t)time(NULL) << 32) & ~3ull;
+        for (int i = 0; i < 8; i++) body[8 + i] = (unsigned char)(mid >> (8 * i));
+    }
+    body[16] = 20; body[17] = 0; body[18] = 0; body[19] = 0;
+    body[20] = 0xf1; body[21] = 0x8e; body[22] = 0x7e; body[23] = 0xbe;  /* req_pq_multi */
+    memcpy(body + 24, nonce, 16);
+    /* Транспорт intermediate: четыре байта длины, дальше тело — как и у пробы через мост. */
+    pkt[0] = 40; pkt[1] = 0; pkt[2] = 0; pkt[3] = 0;
+    memcpy(pkt + 4, body, 40);
+    if (mbedtls_aes_crypt_ctr(&o.enc, 44, &o.oe, o.nce, o.sbe, pkt, enc) != 0) goto out;
+    if (send_all(fd, enc, 44) < 0) { printf("итог:       запрос не ушёл\n"); goto out; }
+    printf("req_pq_multi: отправлен\n");
+
+    {
+        unsigned char in[256], dec[256];
+        size_t got = 0;
+        time_t deadline = time(NULL) + timeout_s;
+        while (got < 28) {
+            long left = (long)(deadline - time(NULL));
+            if (left <= 0) break;
+            struct pollfd pp = { .fd = fd, .events = POLLIN, .revents = 0 };
+            if (poll(&pp, 1, (int)(left * 1000)) <= 0) break;
+            ssize_t r = recv(fd, in, sizeof(dec) - got, 0);
+            if (r <= 0) break;
+            /* Поток CTR расшифровывается ПО ПОРЯДКУ И ЦЕЛИКОМ: пропуск байтов сдвинул бы
+             * гамму, и остаток ответа превратился бы в шум. */
+            if (mbedtls_aes_crypt_ctr(&o.dec, (size_t)r, &o.od, o.ncd, o.sbd, in,
+                                      dec + got) != 0)
+                break;
+            got += (size_t)r;
+        }
+        if (got >= 28 && dec[24] == 0x63 && dec[25] == 0x24 && dec[26] == 0x16 &&
+            dec[27] == 0x05) {
+            printf("ответ:      resPQ, %zu байт\n", got);
+            printf("итог:       дата-центр %d%s отвечает НАПРЯМУЮ\n",
+                   dc, media ? " (медийный)" : "");
+            rc = 0;
+        } else if (got) {
+            printf("ответ:      %zu байт, но это не resPQ\n", got);
+            printf("итог:       прямой путь отвечает не тем — считаю закрытым\n");
+        } else {
+            printf("итог:       прямой путь молчит — закрыт\n");
+        }
+    }
+out:
+    obf_free(&o);
+    close(fd);
+    return rc;
+}
+
+int cmd_tgws_probe(int dc, int media, int direct, int timeout_s) {
     if (dc < 1 || dc > 9) { fprintf(stderr, LOG_W "номер ДЦ: 1..5\n"); return 2; }
+    if (timeout_s <= 0) timeout_s = UP_TIMEOUT_S;
+    if (direct) return probe_direct(dc, media, timeout_s);
     domain_init(NULL);
 
     char cand[2][160], host[160];
@@ -1737,7 +2201,7 @@ int cmd_tgws_probe(int dc, int media) {
             snprintf(host, sizeof(host), "%s", sni);
         }
         printf("точка:      %s:%s\n", host, port);
-        u.fd = tcp_connect(host, port, UP_TIMEOUT_S);
+        u.fd = tcp_connect(host, port, timeout_s);
         if (u.fd < 0) printf("            не соединиться (%s)\n", strerror(errno));
         if (ep) break;
     }
@@ -1802,7 +2266,10 @@ int cmd_tgws_probe(int dc, int media) {
 
     struct ws_rx rx;
     rx.n = 0;
-    for (int round = 0; round < 40; round++) {
+    /* Ждём ровно столько, сколько велено флагом: подбор доменов гоняет пробу десятками раз
+     * подряд, и зашитые двадцать секунд на каждую молчащую точку — это его время целиком. */
+    time_t pdead = time(NULL) + timeout_s;
+    for (int round = 0; time(NULL) < pdead; round++) {
         struct pollfd p = { .fd = u.fd, .events = POLLIN, .revents = 0 };
         int wait = (u.tls_on && tls13_has_record(&u.tls)) ? 0 : 500;
         if (wait && poll(&p, 1, wait) <= 0) continue;
@@ -1872,6 +2339,7 @@ int cmd_tgws(const char *spec, const char *name) {
     dc_table_init();
     domain_init(o->tg_domain);
     alt_init();
+    route_init();
     int port = out_tgws_port(o);
 
     int srv = socket(AF_INET, SOCK_STREAM, 0);
@@ -1890,8 +2358,19 @@ int cmd_tgws(const char *spec, const char *name) {
     }
     if (listen(srv, 32) != 0) { perror("listen"); close(srv); return 1; }
 
-    fprintf(stderr, LOG_I "%s: жду перехваченные соединения на :%d, домен %s, адресов ДЦ %zu\n",
-            name, port, g_domain, g_dc_n);
+    {
+        /* Что именно поднялось: домен по умолчанию, сколько дата-центров идёт своим доменом
+         * и сколько — напрямую. Без этой строки карта работает молча, и «почему медиа не
+         * через мост» пришлось бы выяснять на роутере. */
+        size_t ws_n = 0, dir_n = 0;
+        for (int i = 0; i < ROUTE_N; i++) {
+            if (g_route[i].how == RT_WS) ws_n++;
+            else if (g_route[i].how == RT_DIRECT) dir_n++;
+        }
+        fprintf(stderr, LOG_I "%s: жду перехваченные соединения на :%d, домен %s, адресов ДЦ %zu, "
+                        "по карте своим доменом %zu, напрямую %zu\n",
+                name, port, g_domain, g_dc_n, ws_n, dir_n);
+    }
 
     signal(SIGPIPE, SIG_IGN);
     /* Наполнитель запаса — один поток на процесс. Он поднимает соединения заранее, чтобы
@@ -1940,7 +2419,9 @@ int cmd_tgws(const char *spec, const char *name) {
          * перезапускался по кругу, а в журнале это выглядело как «всё не MTProto».
          * Память здесь виртуальная и выделяется страницами по мере обращения, так что запас
          * ничего не стоит, а его отсутствие стоит дорого. */
-        pthread_attr_setstacksize(&at, 320 * 1024);
+        /* 384, а не 320: в потоке соединения появилась копия начала клиентского потока
+         * (struct earlybuf, 16 КБ) — та, которой откатывают прямой путь в мост. */
+        pthread_attr_setstacksize(&at, 384 * 1024);
         if (pthread_create(&t, &at, serve, j) != 0) {
             pthread_mutex_lock(&g_mu);
             g_live--;
