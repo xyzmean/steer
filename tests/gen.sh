@@ -832,6 +832,43 @@ EOF
 "$BIN" apply --dry-run --spec "$tmp/tgws-alien.json" --state-dir "$tmp/state-ta" >/dev/null 2>&1
 check "domain у чужого вида выхода отвергается" "2" "$?"
 
+# ---- `any` без списков: согласие требуется независимо от вида выхода -----------------------
+#
+# Канал `any` без списков уводит В ВЫХОД ВЕСЬ трафик клиентов, и движок этого не разрешает без
+# явного `allow_all`. Но проверка стояла ЗА `continue` по «у выхода нет устройства» — и потому
+# не срабатывала там, где последствие самое тяжёлое: у kind=zapret устройства нет по
+# определению, значит весь трафик локальной сети уходил в nfqws, а при on_fail=drop умирал
+# целиком. Воспроизведено на стенде в QEMU: спека принималась, правило выходило без
+# `ip daddr @набор`, счётчик рос на любом трафике клиента.
+#
+# Проверяются все три случая: запрет там, где его не было, и оба законных обхода запрета.
+cat > "$tmp/any-zap.json" <<EOF
+{ "schema": 1, "outputs": { "direct": {"kind":"direct"}, "zt": {"kind":"zapret"} },
+  "channels": [ { "name": "c", "out": "zt", "match": { "any": true } } ] }
+EOF
+"$BIN" apply --dry-run --spec "$tmp/any-zap.json" --state-dir "$tmp/state-any" >/dev/null 2>&1
+check "any без списков на выход БЕЗ устройства отвергается" "2" "$?"
+check "и сказано, что делать" "1" \
+    "$("$BIN" apply --dry-run --spec "$tmp/any-zap.json" --state-dir "$tmp/state-any" 2>&1 |
+       grep -c 'allow_all')"
+# Осознанное «весь трафик» — законно и проходит.
+cat > "$tmp/any-ok.json" <<EOF
+{ "schema": 1, "outputs": { "direct": {"kind":"direct"}, "zt": {"kind":"zapret"} },
+  "channels": [ { "name": "c", "out": "zt", "match": { "any": true, "allow_all": true } } ] }
+EOF
+"$BIN" apply --dry-run --spec "$tmp/any-ok.json" --state-dir "$tmp/state-any" >/dev/null 2>&1
+check "any с allow_all проходит" "0" "$?"
+# Правило на ОДНО устройство согласия не требует: цена ошибки — один хозяин, и он её заметит.
+# Это и есть «весь трафик телефона в туннель» и «этот ноутбук не маршрутизируем».
+cat > "$tmp/any-dev.json" <<EOF
+{ "schema": 2, "lan_devices": ["br-lan"],
+  "outputs": { "direct": {"kind":"direct"}, "zt": {"kind":"zapret"} },
+  "channels": [ { "name": "d", "out": "zt", "scope": "device", "from": ["192.168.1.50"],
+                  "match": { "any": true } } ] }
+EOF
+"$BIN" apply --dry-run --spec "$tmp/any-dev.json" --state-dir "$tmp/state-any" >/dev/null 2>&1
+check "any на одно устройство проходит без allow_all" "0" "$?"
+
 # ---- подпись таблицы каналов: хватит ли резолверу SIGHUP -----------------------------------
 #
 # ЗАЧЕМ ЭТО ВООБЩЕ ЕСТЬ. reload_dnsd всегда посылал резолверу TERM, а procd поднимает его
