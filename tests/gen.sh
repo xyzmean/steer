@@ -833,11 +833,45 @@ EOF
 check "domain у чужого вида выхода отвергается" "2" "$?"
 
 # Что поднимать — спрашивают у движка, вместе с номером очереди и файлом ключей.
-zi="$("$BIN" zapret-instances --spec "$tmp/zap.json" --state-dir "$tmp/state-z" 2>&1)"
+#
+# ВЫХОД БЕЗ ФАЙЛА СТРАТЕГИИ НЕ НАЗЫВАЕТСЯ ВОВСЕ. Так выглядит только что заведённый выход:
+# интерфейс создаёт его пустым, стратегию выбирают следующим действием. Пока движок называл
+# и такой выход, обёртка steer-nfqws выходила с кодом 2 сразу, а procd поднимал её снова
+# через свои пять секунд — бесконечно. Замерено на живом роутере: три записи в daemon.err за
+# пятнадцать секунд, то есть около семнадцати тысяч строк в сутки на недокрученный выход.
+#
+# Спека здесь своя, с `opts_file` В ПЕСОЧНИЦЕ: у zap.json путь выводится из имени и указывает
+# в /etc/steer/zapret, а стенд не вправе ни читать, ни создавать файлы настоящей системы.
+cat > "$tmp/zap-opts.json" <<EOF
+{ "schema": 1, "lan_devices": ["br-lan"],
+  "outputs": { "direct": { "kind": "direct" },
+               "yt":  { "kind": "zapret", "opts_file": "$tmp/yt.opts" },
+               "dis": { "kind": "zapret", "opts_file": "$tmp/dis.opts", "on_fail": "direct" } },
+  "channels": [ { "name": "ю", "match": { "prefixes_file": "$tmp/a.lst" }, "out": "yt" },
+                { "name": "д", "match": { "prefixes_file": "$tmp/b.lst" }, "out": "dis" } ] }
+EOF
+rm -f "$tmp/yt.opts" "$tmp/dis.opts"
+zi="$("$BIN" zapret-instances --spec "$tmp/zap-opts.json" --state-dir "$tmp/state-z" 2>/dev/null)"
+check "без файла стратегии поднимать нечего — код 1" "1" "$?"
+check "и ни одной строки" "0" "$(printf '%s' "$zi" | grep -c .)"
+# ПРИЧИНА ГОВОРИТСЯ, но в stderr: init-скрипт читает stdout, значит строка попадёт в журнал
+# один раз за запуск, а не раз в пять секунд, как это делал перезапуск обёртки.
+check "причина названа в stderr, а не в stdout" "2" \
+    "$("$BIN" zapret-instances --spec "$tmp/zap-opts.json" --state-dir "$tmp/state-z" 2>&1 >/dev/null |
+       grep -c 'файла стратегии')"
+# Файл появился у одного из двух — называется ровно он. Это и есть состояние «стратегию
+# выбрали одному выходу, второй ещё пустой».
+printf -- '--dpi-desync=fake\n' > "$tmp/yt.opts"
+zi="$("$BIN" zapret-instances --spec "$tmp/zap-opts.json" --state-dir "$tmp/state-z" 2>/dev/null)"
+check "со стратегией у одного — код 0" "0" "$?"
+check "и ровно одна строка" "1" "$(printf '%s\n' "$zi" | grep -c .)"
+check "номер очереди печатает движок" "1" \
+    "$(printf '%s\n' "$zi" | grep -c "^yt	8300	$tmp/yt.opts$")"
+# Оба с файлами — обе строки.
+printf -- '--dpi-desync=fake\n' > "$tmp/dis.opts"
+zi="$("$BIN" zapret-instances --spec "$tmp/zap-opts.json" --state-dir "$tmp/state-z" 2>/dev/null)"
 check "zapret-instances: код 0, когда поднимать есть что" "0" "$?"
 check "по строке на выход" "2" "$(printf '%s\n' "$zi" | grep -c .)"
-check "номер очереди печатает движок" "1" \
-    "$(printf '%s\n' "$zi" | grep -c "^yt	8300	/etc/steer/zapret/yt.opts$")"
 "$BIN" zapret-instances --spec "$tmp/spec.json" --state-dir "$tmp/state-z" >/dev/null 2>&1
 check "zapret-instances: код 1, когда таких выходов нет" "1" "$?"
 
