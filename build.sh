@@ -74,8 +74,24 @@ mips_24kc:mips-linux-musl:mips32r2+soft_float
 aarch64_cortex-a53:aarch64-linux-musl:cortex_a53
 aarch64_generic:aarch64-linux-musl:baseline
 arm_cortex-a7_neon-vfpv4:arm-linux-musleabihf:cortex_a7
+arm_cortex-a9:arm-linux-musleabi:cortex_a9
+arm_cortex-a9_neon:arm-linux-musleabihf:cortex_a9+neon
+arm_cortex-a9_vfpv3-d16:arm-linux-musleabihf:cortex_a9+vfp3d16
 x86_64:x86_64-linux-musl:baseline
 "
+
+# ТРИ РАЗНОВИДНОСТИ CORTEX-A9, А НЕ ОДНА, и выбирать из них нельзя: OpenWrt публикует именно
+# три, и пакет под чужую роутер не поставит — apk и opkg сверяют архитектуру по имени.
+#
+#   arm_cortex-a9            без блока с плавающей точкой, отсюда musleabi (мягкая ABI);
+#                            так собран bcm53xx — Netgear R7000, Asus RT-AC68U и родня;
+#   arm_cortex-a9_neon       NEON и жёсткая ABI: imx6, oxnas, zynq;
+#   arm_cortex-a9_vfpv3-d16  VFPv3-D16 и жёсткая ABI: mvebu — Linksys WRT1200/1900,
+#                            Turris Omnia.
+#
+# Мягкость ABI задаёт ТРИПЛЕТ (musleabi против musleabihf), а не ключ -mcpu: `cortex_a9+soft_float`
+# zig не принимает вовсе (проверено сборкой), и пытаться выразить её признаком процессора
+# значило бы получить пакет с чужой ABI, который встанет и упадёт на первом же вызове.
 
 # Во время отладки собирать все шесть архитектур незачем: это три бинарника на каждую и около
 # десяти минут ожидания. STEER_ARCH сужает список до нужной — полная сборка нужна только перед
