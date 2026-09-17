@@ -916,17 +916,65 @@ int vless_recv(struct vless_conn *c, unsigned char *d, size_t cap, size_t *got) 
  * признали и мы разговариваем с настоящим сайтом: соединение при этом рабочее, страница
  * откроется, и без этой проверки узел выглядел бы полностью здоровым.
  *
- * Обращаемся к 1.1.1.1:80 и ждём хоть какой-то ответ: цель не проверить интернет, а
+ * Обращаемся к чужому адресу и ждём хоть какой-то ответ: цель не проверить интернет, а
  * получить от СЕРВЕРА подтверждение, что он понял запрос VLESS. Побочно это и есть
  * измерение задержки — тот же путь, по которому пойдёт настоящий трафик. */
+
+/* КУДА ПРОСИТЬСЯ — ДВА АДРЕСА, А НЕ ОДИН, И ЭТО НЕ ПЕРЕСТРАХОВКА.
+ *
+ * Здесь была единственная зашитая цель 1.1.1.1:80. Узел, который её не пропускает —
+ * провайдер сервера её блокирует, у хостера свой DNS на этом адресе, у самого сервера
+ * правило на 1.1.1.1, — не отвечал ничем, проба возвращала «сервер не прислал данных»,
+ * и узел браковался ЦЕЛИКОМ. Дальше по цепочке это стоило дорого: автоматический режим
+ * вызывает пробу для каждого узла и негодный пропускает, cmd_vless возвращает 1, при
+ * on_fail=drop (умолчание) канал просто стоит. Тот же самый узел, выбранный номером
+ * вручную, берётся без пробы и работает — отсюда дословное «с автоматическим режимом
+ * ничего не загружается, приходится выбирать вручную».
+ *
+ * У сторожа выходов рядом (failover.c) две цели с того самого дня, и причина там записана
+ * теми же словами: один адрес может быть недоступен именно в этом туннеле, и тогда
+ * здоровый путь выглядит мёртвым. Здесь ровно тот же случай, только цена выше — сторож
+ * переключает выход, а проба вычёркивает узел из подбора.
+ *
+ * Вторая цель пробуется ТОЛЬКО тогда, когда виновата может быть цель: соединение с
+ * сервером состоялось, а данных в ответ не пришло. Отказ рукопожатия и отказ Reality
+ * (маскировочный сайт вместо туннеля) — свойства узла, повторять их со второй целью
+ * значило бы удваивать время подбора на всех мёртвых узлах подписки. */
+struct probe_target { unsigned char ip[4]; const char *host; };
+static const struct probe_target PROBE_TARGETS[] = {
+    { { 1, 1, 1, 1 }, "1.1.1.1" },
+    { { 8, 8, 8, 8 }, "8.8.8.8" },
+};
+
+static int probe_once(const struct vless_node *node, int timeout_s, char *why, size_t why_n,
+                      int *handshake_ms, int *ttfb_ms,
+                      const struct probe_target *tg, int *connected);
+
 int vless_probe(const struct vless_node *node, int timeout_s, char *why, size_t why_n) {
     return vless_probe_timed(node, timeout_s, why, why_n, NULL, NULL);
 }
 
 int vless_probe_timed(const struct vless_node *node, int timeout_s, char *why, size_t why_n,
                       int *handshake_ms, int *ttfb_ms) {
+    int rc = VLESS_CONN_EIO;
+    for (size_t i = 0; i < sizeof(PROBE_TARGETS) / sizeof(PROBE_TARGETS[0]); i++) {
+        int connected = 0;
+        rc = probe_once(node, timeout_s, why, why_n, handshake_ms, ttfb_ms,
+                        &PROBE_TARGETS[i], &connected);
+        if (rc == 0) return 0;
+        /* До сервера не дошли, либо он нас не признал — цель ни при чём. */
+        if (!connected || rc == VLESS_CONN_EREJECTED || rc == VLESS_CONN_EBADUUID)
+            return rc;
+    }
+    return rc;
+}
+
+static int probe_once(const struct vless_node *node, int timeout_s, char *why, size_t why_n,
+                      int *handshake_ms, int *ttfb_ms,
+                      const struct probe_target *tg, int *connected) {
     if (handshake_ms) *handshake_ms = -1;
     if (ttfb_ms) *ttfb_ms = -1;
+    *connected = 0;
 
     struct vless_conn c;
     int64_t t0 = now_ms();
@@ -936,6 +984,7 @@ int vless_probe_timed(const struct vless_node *node, int timeout_s, char *why, s
         return rc;
     }
     if (handshake_ms) *handshake_ms = (int)(now_ms() - t0);
+    *connected = 1;
 
     unsigned char uuid[16];
     if (vless_uuid_parse(node->uuid, uuid) != 0) {
@@ -945,17 +994,23 @@ int vless_probe_timed(const struct vless_node *node, int timeout_s, char *why, s
     }
 
     unsigned char req[512];
-    unsigned char probe_ip[4] = { 1, 1, 1, 1 };
-    size_t req_n = vless_build_request(uuid, VLESS_CMD_TCP, NULL, probe_ip, 80,
+    size_t req_n = vless_build_request(uuid, VLESS_CMD_TCP, NULL, tg->ip, 80,
                                        node->flow, req, sizeof(req));
     if (!req_n) { vless_close(&c); snprintf(why, why_n, "заголовок не собрался"); return VLESS_CONN_EIO; }
 
     /* Минимальный HTTP-запрос вместе с заголовком: сервер не отвечает, пока не получит
      * данные для пересылки, и без них проверка ждала бы до таймаута. */
-    static const char http[] = "GET / HTTP/1.1\r\nHost: 1.1.1.1\r\nConnection: close\r\n\r\n";
-    if (req_n + sizeof(http) - 1 <= sizeof(req)) {
-        memcpy(req + req_n, http, sizeof(http) - 1);
-        req_n += sizeof(http) - 1;
+    char http[128];
+    int http_n = snprintf(http, sizeof(http),
+                          "GET / HTTP/1.1\r\nHost: %s\r\nConnection: close\r\n\r\n", tg->host);
+    /* Сколько данных реально уехало за заголовком. Отдельной переменной, а не sizeof:
+     * ниже Vision вычитает ровно это число, чтобы отделить заголовок VLESS от данных, и
+     * при не влезшем запросе прежняя формула вычла бы длину того, чего в буфере нет. */
+    size_t http_used = 0;
+    if (http_n > 0 && req_n + (size_t)http_n <= sizeof(req)) {
+        memcpy(req + req_n, http, (size_t)http_n);
+        req_n += (size_t)http_n;
+        http_used = (size_t)http_n;
     }
 
     /* Заголовок VLESS и данные с Vision — РАЗНЫЕ вещи, и порядок здесь не произволен.
@@ -975,7 +1030,7 @@ int vless_probe_timed(const struct vless_node *node, int timeout_s, char *why, s
         vision_init(&vis, uuid);
         static __thread unsigned char framed[8192];
         /* Заголовок VLESS занимает первые header_n байт req — остальное это HTTP-данные. */
-        size_t header_n = req_n - (sizeof(http) - 1);
+        size_t header_n = req_n - http_used;
         size_t fn = vision_wrap(&vis, req + header_n, req_n - header_n,
                                 framed, sizeof(framed));
         if (!fn) { vless_close(&c); snprintf(why, why_n, "кадр Vision не собрался"); return VLESS_CONN_EIO; }
