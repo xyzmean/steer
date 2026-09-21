@@ -3245,7 +3245,18 @@ int main(int argc, char **argv) {
         int pt = 443;
         snprintf(hb, sizeof(hb), "%s", h);
         char *c = strrchr(hb, ':');
-        if (c) { *c = '\0'; pt = atoi(c + 1); }
+        if (c) {
+            *c = '\0';
+            /* Порт — число 1..65535, иначе отказ: atoi на «host:abc» давал 0, и проба шла на
+             * порт 0 с приговором «не отвечает» про узел, который никто не спрашивал. */
+            char *pe = NULL;
+            long v = strtol(c + 1, &pe, 10);
+            if (pe == c + 1 || *pe || v < 1 || v > 65535) {
+                fprintf(stderr, "неверный порт: %s\n", c + 1);
+                return 2;
+            }
+            pt = (int)v;
+        }
         if (!hb[0]) { fprintf(stderr, "нужно имя узла\n"); return 2; }
         return cmd_tls_probe(hb, a.out_file, pt, a.node > 0 ? a.node : 0, 0);
     }
