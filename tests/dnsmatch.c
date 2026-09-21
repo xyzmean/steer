@@ -389,6 +389,70 @@ int main(void) {
         }
     }
 
+    /* ---- fake-IP: пул, регистр, восстановление, флаги, срок элемента ------------- */
+    {
+        char dir[] = "/tmp/dnsmatch-fk.XXXXXX";
+        if (!mkdtemp(dir)) { perror("mkdtemp"); return 2; }
+        char path[768];
+        snprintf(path, sizeof(path), "%s/state", dir);
+
+        /* Срок элемента набора канала: TTL 0 — не «навечно». */
+        check("срок элемента: TTL 0 даёт 1 с, не постоянный элемент", 1, (int)set_ttl_clamp(0));
+        check("срок элемента: сутки — потолок", 86400, (int)set_ttl_clamp(86401));
+        check("срок элемента: обычный TTL как есть", 300, (int)set_ttl_clamp(300));
+
+        /* Адрес вне пула в файле состояния — брак строки, а не исчерпанный пул. */
+        FILE *f = fopen(path, "w");
+        fputs("bad.test\t203.0.113.5\n", f);
+        fclose(f);
+        memset(&g_fakeip, 0, sizeof(g_fakeip));
+        memset(&g_fakeip_idx, 0, sizeof(g_fakeip_idx));
+        g_fakeip_next = 0;
+        g_fakeip_state_path = NULL;
+        fakeip_state_load(path);
+        check("адрес вне пула в состоянии не загружен", 0, (int)g_fakeip.n);
+        uint32_t addr = 0;
+        check("после такой строки пул не исчерпан", 0, fakeip_lookup_or_alloc("new.test", &addr));
+        check("и адрес выдан из пула", 1, addr >= FAKEIP_POOL_BASE && addr < FAKEIP_POOL_BASE + FAKEIP_POOL_SIZE);
+
+        /* Регистр: ключ таблицы строчный независимо от вызывающего. */
+        uint32_t a1 = 0, a2 = 0;
+        fakeip_lookup_or_alloc("X.TEST", &a1);
+        fakeip_lookup_or_alloc("x.test", &a2);
+        check("X.TEST и x.test — один адрес", 1, a1 != 0 && a1 == a2);
+
+        /* Восстановление без ядра: третье поле НЕ становится real_host. */
+        f = fopen(path, "w");
+        fputs("known.test\t198.18.0.7\t93.184.216.34\n", f);
+        fclose(f);
+        memset(&g_fakeip, 0, sizeof(g_fakeip));
+        memset(&g_fakeip_idx, 0, sizeof(g_fakeip_idx));
+        g_fakeip_next = 0;
+        fakeip_state_load(path);
+        check("трёхполевая строка загружена", 1, (int)g_fakeip.n);
+        size_t routed = 99;
+        size_t restored = fakeip_rehydrate(-1, &routed);
+        check("без netlink ничего не восстановлено", 0, (int)restored);
+        check("и real_host сброшен — быстрый путь закрыт", 0, g_fakeip.n ? (int)(g_fakeip.entries[0].real_host != 0) : -1);
+        check("маршруты без ядра не утверждались", 0, (int)routed);
+        memset(&g_fakeip, 0, sizeof(g_fakeip));
+        memset(&g_fakeip_idx, 0, sizeof(g_fakeip_idx));
+        g_fakeip_next = 0;
+        unlink(path);
+        rmdir(dir);
+
+        /* Флаги синтетического ответа из ответа upstream: TC и AD не наследуются. */
+        uint8_t up[64] = { 0x12, 0x34, 0x83, 0xA0, 0, 1, 0, 0, 0, 0, 0, 0,
+                           1, 'a', 0, 0, 1, 0, 1 };
+        size_t qend = 12 + 3 + 4;
+        uint8_t out[512];
+        size_t len = build_rewritten_response(up, qend, out, sizeof(out), 1, 0xC6120005u);
+        check("ответ из upstream собран", 1, len > 0);
+        check("TC снят", 0, out[2] & 0x02);
+        check("AD снят", 0, out[3] & 0x20);
+        check("QR стоит", 0x80, out[2] & 0x80);
+    }
+
     printf("\n%s\n", fails ? "ЕСТЬ ПРОВАЛЫ" : "все проверки прошли");
     return fails ? 1 : 0;
 }

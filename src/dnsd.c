@@ -958,6 +958,16 @@ static int nftlk_elem_msg(uint16_t nft_msg_type, const char *table,
  * an entry for longer than a day. ttl == 0 is a PERMANENT element (no timeout
  * attribute at all): used for fake-IP, which must outlive the client's cached
  * answer — see fakeip_route_set. */
+/* Срок элемента набора канала из TTL ответа: 1..86400 с. Ноль здесь НЕ «навечно»: TTL 0 у
+ * A-записи законен (балансировщики), а нулевой аргумент у nft_add_element означает постоянный
+ * элемент — так реальный, часто общий CDN-адрес навечно оставался в наборе канала, и весь
+ * чужой трафик на него шёл в канал до пересборки набора. */
+static uint32_t set_ttl_clamp(uint32_t ttl) {
+    if (ttl < 1) return 1;
+    if (ttl > 86400) return 86400;
+    return ttl;
+}
+
 static int nft_add_element(const char *set_name, uint32_t key_host, uint32_t ttl) {
     uint64_t timeout_ms;
     if (ttl == 0) {
@@ -1149,7 +1159,7 @@ static int fakeip_table_add(struct fakeip_table *t, const char *domain, uint32_t
         t->n--;
         return -1;
     }
-    if (addr >= FAKEIP_POOL_BASE) {
+    if (addr >= FAKEIP_POOL_BASE && addr < FAKEIP_POOL_BASE + FAKEIP_POOL_SIZE) {
         size_t idx = (size_t)(addr - FAKEIP_POOL_BASE);
         if (idx + 1 > g_fakeip_next) g_fakeip_next = idx + 1;
     }
@@ -1193,6 +1203,11 @@ static void fakeip_state_load(const char *path) {
         if (tab2) *tab2 = '\0';
         struct in_addr a;
         if (inet_aton(fake_s, &a) == 0) continue;
+        /* Адрес вне пула — брак строки, а не запись: одна такая строка (203.0.113.5) ставила
+         * верхнюю отметку пула за его край, и каждый новый домен получал «пул исчерпан»
+         * навсегда, а сам чужой адрес выдавался клиентам как поддельный. */
+        if (ntohl(a.s_addr) < FAKEIP_POOL_BASE ||
+            ntohl(a.s_addr) >= FAKEIP_POOL_BASE + FAKEIP_POOL_SIZE) continue;
         /* Keep the FIRST allocation for a domain: a duplicate line is expected
          * (the --fakeip CLI appends what it looked up), and adding it twice would
          * both bloat the table and, before the high-water mark above, corrupt the
@@ -1266,7 +1281,12 @@ static void fakeip_state_rewrite(void) {
  * persists it. Returns 0 and fills *out_addr (host order) on success; -1 if
  * the pool is exhausted (caller falls back to relaying the real answer
  * unchanged — fail open, never block DNS over an exhausted pool). */
-static int fakeip_lookup_or_alloc(const char *domain, uint32_t *out_addr) {
+static int fakeip_lookup_or_alloc(const char *domain_in, uint32_t *out_addr) {
+    /* Ключ таблицы — строчные буквы, и приводит к ним сама таблица, а не каждый вызывающий:
+     * демон приводил, команда `--fakeip` нет, и X.TEST получала второй адрес рядом с x.test. */
+    char domain[MAX_HOSTNAME];
+    snprintf(domain, sizeof(domain), "%s", domain_in);
+    str_lower(domain);
     long at = fakeip_find(domain);
     if (at >= 0) {
         *out_addr = g_fakeip.entries[at].addr;
@@ -1654,6 +1674,10 @@ static size_t build_rewritten_response(const uint8_t *orig, size_t qend,
                                         int with_answer, uint32_t fake_addr_host) {
     if (qend > out_cap) return 0;
     memcpy(out, orig, qend);
+    /* Флаги — здесь, в единственном сборщике: путь из ответа upstream копировал их как есть,
+     * и клиент видел TC (переспрашивал по TCP:53 мимо заворота — реальный адрес мимо туннеля)
+     * и AD на неподписанном синтетическом ответе. */
+    make_response_flags(out);
     out[6] = 0; out[7] = with_answer ? 1 : 0;               /* ancount */
     out[8] = 0; out[9] = 0; out[10] = 0; out[11] = 0;       /* nscount, arcount */
 
@@ -1781,7 +1805,7 @@ static int handle_upstream_response(void) {
             for (size_t c = 0; c < g_dch_n; c++) {
                 if (!(sets & (1ULL << c)) || !g_dch[c].realip) continue;
                 for (int k = 0; k < nips; k++)
-                    nft_add_element(g_dch[c].set, ntohl(ips[k].addr), ips[k].ttl);
+                    nft_add_element(g_dch[c].set, ntohl(ips[k].addr), set_ttl_clamp(ips[k].ttl));
             }
         if (!quiet)
             sendto(g_listen_fd, buf, (size_t)n, 0,
@@ -1889,6 +1913,40 @@ static int handle_upstream_response(void) {
     if (!quiet)
         sendto(g_listen_fd, buf, (size_t)n, 0, (struct sockaddr *)&p->client, p->client_len);
     return 1;
+}
+
+/* Восстановить DNAT-карту и наборы каналов после (пере)запуска. Возвращает число
+ * восстановленных отображений fake→real, в *routed_out — число вновь утверждённых маршрутов.
+ *
+ * ГЛАВНОЕ ЗДЕСЬ — real_host остаётся у записи ТОЛЬКО если ядро подтвердило отображение.
+ * Быстрый путь handle_client_query отвечает клиенту поддельным адресом без похода наверх,
+ * когда real_host ненулевой, и считает это безопасным потому, что «real_host запоминается
+ * только после ack ядра либо восстановлен rehydrate». Загрузка файла состояния писала третье
+ * поле в real_host безусловно, а неудача восстановления его не обнуляла — и при пустой
+ * таблице ядра (netlink не открылся, таблица снесена) клиент получал fake-IP в чёрную дыру,
+ * пока свежие домены честно шли наверх. Теперь несостоявшееся отображение обнуляет поле, и
+ * такой домен идёт долгим путём — как обещает шапка файла про fail-open. */
+static size_t fakeip_rehydrate(int nk_open, size_t *routed_out) {
+    size_t restored = 0, routed = 0;
+    for (size_t i = 0; i < g_fakeip.n; i++) {
+        struct fakeip_entry *e = &g_fakeip.entries[i];
+        if (e->real_host) {
+            /* known_real = 0: after a restart the kernel map is empty as far as we know, so
+             * this is a plain add (and an EEXIST just means the map survived). */
+            if (nk_open == 0 && nft_map_set_element(g_fakeip_map, e->addr, e->real_host, 0) == 0)
+                restored++;
+            else
+                e->real_host = 0;
+        }
+        if (nk_open != 0) continue;
+        /* Re-derive the channels for the stored domain and re-assert the permanent route
+         * elements. fakeip_route_set запоминает набор, поэтому повторное разрешение имени в те
+         * же каналы ничего не стоит. */
+        uint64_t m = dch_fakeip_only(dch_match_mask(e->domain));
+        if (m) { fakeip_route_set(e->domain, m); routed++; }
+    }
+    if (routed_out) *routed_out = routed;
+    return restored;
 }
 
 static int run_proxy(int listen_port, int upstream_port) {
@@ -2004,23 +2062,8 @@ static int run_proxy(int listen_port, int upstream_port) {
      * re-derived here by matching the stored domain against the freshly loaded
      * rules — reload_rules() above already built them. Best-effort throughout: a
      * failed insert just leaves that domain to be re-resolved on demand. */
-    size_t restored = 0, routed = 0;
-    if (nk_open == 0) {
-        for (size_t i = 0; i < g_fakeip.n; i++) {
-            /* known_real = 0: after a restart the kernel map is empty as far as we
-             * know, so this is a plain add (and an EEXIST just means the map
-             * survived, which is equally fine). */
-            if (g_fakeip.entries[i].real_host &&
-                nft_map_set_element(g_fakeip_map, g_fakeip.entries[i].addr,
-                                     g_fakeip.entries[i].real_host, 0) == 0)
-                restored++;
-            /* Re-derive the channels for the stored domain and re-assert the
-             * permanent route elements. fakeip_route_set запоминает набор, поэтому
-             * повторное разрешение имени в те же каналы ничего не стоит. */
-            uint64_t m = dch_fakeip_only(dch_match_mask(g_fakeip.entries[i].domain));
-            if (m) { fakeip_route_set(g_fakeip.entries[i].domain, m); routed++; }
-        }
-    }
+    size_t routed = 0;
+    size_t restored = fakeip_rehydrate(nk_open, &routed);
     fprintf(stderr, "steer dnsd: listening on :%d -> upstream 127.0.0.1:%d "
             "(netlink:%s fakeip:%zu loaded, %zu map rehydrated, %zu routes restored)\n",
             listen_port, upstream_port, nk_open == 0 ? "ok" : "FAILED",
