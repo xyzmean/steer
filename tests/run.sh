@@ -41,6 +41,14 @@ out="$(printf 'nonsense\n10.0.0.1\n999.1.1.1\n10.0.0.2/33\n' | $BIN 2>"$tmp/r")"
 check "skips malformed lines" "10.0.0.1" "$out"
 check "counts malformed lines" "3" "$(field malformed < "$tmp/r")"
 
+# Косая без длины — это обрезанная строка, а не /0. strtol на пустом хвосте молча даёт 0,
+# и «10.0.2.0/» превращался в 0.0.0.0/0 — весь IPv4 одной строкой, причём законной по форме:
+# проверка списка в splify2-update-lists идёт ПОСЛЕ подгонки и такую строку пропускает.
+# Хвост после длины — тоже брак: «/24x» это не /24.
+out="$(printf '10.0.0.1\n10.0.2.0/\n10.0.3.0/24x\n' | $BIN 2>"$tmp/r")"
+check "a bare slash is malformed, not the whole internet" "10.0.0.1" "$out"
+check "and so is trailing garbage after the length" "2" "$(field malformed < "$tmp/r")"
+
 # ---- lossless merge --------------------------------------------------------
 out="$(printf '10.0.0.0/25\n10.0.0.128/25\n' | $BIN 2>/dev/null)"
 check "merges touching prefixes into one" "10.0.0.0/24" "$out"
