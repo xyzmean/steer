@@ -255,7 +255,11 @@ static int js_str(struct js *j, char *buf, size_t n) {
     size_t i = 0;
     while (*j->p && *j->p != '"') {
         if (*j->p == '\\' && j->p[1]) j->p++;
-        if (i + 1 < n) buf[i++] = *j->p;
+        /* Длиннее буфера — отказ, а не молчаливая обрезка: имя выхода из 36 знаков
+         * принималось как 31-значное, а имя устройства длиннее IFNAMSIZ ядро всё равно не
+         * возьмёт — и узнать об этом было нечем. */
+        if (i + 1 >= n) die("spec: строка длиннее допустимого (имя, путь или ключ)", NULL);
+        buf[i++] = *j->p;
         j->p++;
     }
     if (*j->p != '"') return -1;
@@ -267,6 +271,10 @@ static long js_num(struct js *j) {
     js_ws(j);
     char *e = NULL;
     long v = strtol(j->p, &e, 10);
+    /* Не число (например, число в кавычках) — отказ. strtol молча давал 0 и не двигал
+     * указатель: `"node":"3"` выбирал узел 0 вместо третьего, `"stream_port":"443"` — порт 0,
+     * а строка «3» затем читалась как следующий ключ. */
+    if (e == j->p) die("spec: здесь ожидалось число без кавычек", NULL);
     j->p = e;
     return v;
 }
@@ -866,12 +874,20 @@ static void parse_outputs(struct js *j) {
                 if (o.nodes[a] == o.nodes[b])
                     die("outputs.%s: узел подписки указан в nodes дважды", o.name);
         if (g_out_n >= MAX_OUTPUTS) die("too many outputs", NULL);
+        /* Два выхода с одним именем: реестр раздаст две метки, init поднимет два процесса
+         * на одно имя, а out_by_name всегда возьмёт первый — как у devices и nodes, это
+         * отказ, не молчаливая победа одного из двух. */
+        for (size_t a = 0; a < g_out_n; a++)
+            if (!strcmp(g_out[a].name, o.name))
+                die("outputs.%s: имя выхода повторяется", o.name);
         g_out[g_out_n++] = o;
         js_ws(j);
         if (*j->p == ',') { j->p++; continue; }
         break;
     }
-    js_lit(j, '}');
+    /* Закрывающая скобка обязательна: без неё это оборванный файл (питание пропало посреди
+     * записи), и половина спеки применялась бы без единой жалобы. */
+    if (js_lit(j, '}') != 0) die("outputs: нет закрывающей скобки — спека оборвана?", NULL);
 }
 
 static void parse_channels(struct js *j) {
@@ -880,6 +896,9 @@ static void parse_channels(struct js *j) {
     if (*j->p == ']') { j->p++; return; }
     for (;;) {
         struct channel c = {0};
+        /* Какой из двух форм записаны списки совпадения — как у device/devices: заданы обе
+         * значит половина написанного человеком молча не действует. */
+        int pf_one = 0, pf_many = 0, df_one = 0, df_many = 0;
         if (js_lit(j, '{') != 0) die("channels: expected an object", NULL);
         js_ws(j);
         while (*j->p != '}') {
@@ -923,20 +942,28 @@ static void parse_channels(struct js *j) {
                     /* Singular is shorthand for a one-element list, so a spec written
                      * before this stayed valid. */
                     if (!strcmp(mk, "prefixes_file")) {
+                        if (pf_many) die("channels.%s: prefixes_file рядом с prefixes_files", c.name);
+                        pf_one = 1;
                         char one[256];
                         if (js_str(j, one, sizeof(one)) == 0) {
                             c.prefixes_files[0] = keep(one);
                             c.prefixes_n = 1;
                         }
                     } else if (!strcmp(mk, "domains_file")) {
+                        if (df_many) die("channels.%s: domains_file рядом с domains_files", c.name);
+                        df_one = 1;
                         char one[256];
                         if (js_str(j, one, sizeof(one)) == 0) {
                             c.domains_files[0] = keep(one);
                             c.domains_n = 1;
                         }
                     } else if (!strcmp(mk, "prefixes_files")) {
+                        if (pf_one) die("channels.%s: prefixes_files рядом с prefixes_file", c.name);
+                        pf_many = 1;
                         c.prefixes_n = str_list(j, c.prefixes_files, MAX_FILES);
                     } else if (!strcmp(mk, "domains_files")) {
+                        if (df_one) die("channels.%s: domains_files рядом с domains_file", c.name);
+                        df_many = 1;
                         c.domains_n = str_list(j, c.domains_files, MAX_FILES);
                     }
                     else if (!strcmp(mk, "mode")) {
@@ -1036,7 +1063,7 @@ static void parse_channels(struct js *j) {
         if (*j->p == ',') { j->p++; continue; }
         break;
     }
-    js_lit(j, ']');
+    if (js_lit(j, ']') != 0) die("channels: нет закрывающей скобки — спека оборвана?", NULL);
 }
 
 void load_spec(const char *path) {
@@ -1084,6 +1111,12 @@ void load_spec(const char *path) {
         js_ws(&j);
         if (*j.p == ',') { j.p++; js_ws(&j); }
     }
+    /* Закрывающая скобка обязательна: без неё это файл, оборванный посреди записи (питание
+     * пропало), и половина спеки применялась без единой жалобы. Комментарий выше обещает
+     * громкий отказ на битой спеке; до этой правки он был только при обрыве внутри строки.
+     * Текст ПОСЛЕ скобки по-прежнему не читается и не мешает: так было всегда, и на это
+     * опираются стенды. */
+    if (js_lit(&j, '}') != 0) die("spec: нет закрывающей скобки — файл оборван?", NULL);
     if (lan_one && lan_many)
         die("задано и lan_device, и lan_devices — оставьте одно", NULL);
     /* Пустой список — это «клиентов нет», а правило без условия «кто» забирает ВЕСЬ транзит
