@@ -95,14 +95,21 @@ static int host_is_name(const char *h) {
     return 0;
 }
 
+static int pct_hex(int c) {
+    if (c >= '0' && c <= '9') return c - '0';
+    c |= 32;
+    if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+    return -1;
+}
+
 static void pct_decode(char *s) {
     char *w = s;
     for (char *r = s; *r; r++) {
         if (*r == '%' && r[1] && r[2]) {
-            int hi = r[1], lo = r[2];
-            hi = hi <= '9' ? hi - '0' : (hi | 32) - 'a' + 10;
-            lo = lo <= '9' ? lo - '0' : (lo | 32) - 'a' + 10;
-            if (hi >= 0 && hi < 16 && lo >= 0 && lo < 16) {
+            /* Только шестнадцатеричные цифры: прежняя арифметика считала «@» и «`» девяткой
+             * (0x40|32 = 0x60 → 9), и «%@@» в имени узла давал байт 0x99 — битый UTF-8. */
+            int hi = pct_hex(r[1]), lo = pct_hex(r[2]);
+            if (hi >= 0 && lo >= 0) {
                 *w++ = (char)((hi << 4) | lo);
                 r += 2;
                 continue;
