@@ -161,6 +161,32 @@ int main(void) {
     check("в строке назван размер очереди, о котором просили", 1,
           strstr(log, "4096") != NULL);
 
+    /* ---- пул запасных: указатели после переезда структуры -----------------------
+     *
+     * spare_checkout копирует сессию из слота пула в таблицу соединений (memcpy) и чинит один
+     * самоуказатель — h2.io.ctx. Второй такой же живёт у выгрузки xhttp: up_request ставит
+     * up.h2.io.ctx = &c->up, и для stream-up это происходит ЕЩЁ В СЛОТЕ (up_open внутри
+     * vless_connect). После переезда он указывал в брошенный слот, который тут же
+     * переиспользовала следующая запасная — выгрузка одного соединения уезжала в сокет чужого. */
+    printf("\n== пул запасных: оба самоуказателя чинятся после переезда ==\n");
+    {
+        memset(&g_spares[0], 0, sizeof(g_spares[0]));
+        g_spares[0].state = SPARE_READY;
+        g_spares[0].born_ns = now_ns();
+        g_spares[0].v.fd = -1;
+        g_spares[0].v.tr = VT_XHTTP;
+        g_spares[0].v.h2.io.ctx = &g_spares[0].v;
+        g_spares[0].v.up.started = 1;
+        g_spares[0].v.up.h2.io.ctx = &g_spares[0].v.up;
+        struct vless_conn out;
+        memset(&out, 0, sizeof(out));
+        check("запасная взята", 0, spare_checkout(&out));
+        check("h2.io.ctx указывает на новую структуру", 1, out.h2.io.ctx == &out);
+        check("up.h2.io.ctx указывает на новую структуру, а не в слот", 1,
+              out.up.h2.io.ctx == &out.up);
+        check("слот освобождён", SPARE_EMPTY, g_spares[0].state);
+    }
+
     printf(fails ? "\nПРОВАЛОВ: %d\n" : "\nвсе проверки прошли\n", fails);
     return fails ? 1 : 0;
 }
