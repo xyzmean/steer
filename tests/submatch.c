@@ -17,6 +17,8 @@
  * которых у make test нет (см. R-014). */
 #include <stdio.h>
 #include <string.h>
+#include <signal.h>
+#include <unistd.h>
 
 #include "../src/ext/sub.c"
 /* Вывод UUID живёт в vless_proto.c, а проверка пригодности — в sub.c, и стенду нужны
@@ -74,6 +76,14 @@ static int utf8_ok(const char *s) {
         }
     }
     return 1;
+}
+
+/* Кривой JSON конфига Xray приходит из интернета, и разбор обязан ВЕРНУТЬСЯ, а не зависнуть:
+ * висел и процесс туннеля, и интерфейс. Будильник превращает зависание в провал стенда. */
+static void on_alarm(int sig) {
+    (void)sig;
+    printf("ЗАВИС: разбор не вернулся за 2 с\n");
+    _exit(1);
 }
 
 int main(void) {
@@ -738,6 +748,26 @@ int main(void) {
         check_n("extra: нижняя граница", 50, (int)n.pad_from);
         check_n("extra: верхняя граница", 150, (int)n.pad_to);
 
+        /* Длинный extra: продавец кладёт перед xPaddingBytes заголовки на сотни знаков, и в
+         * процентной форме это втрое длиннее. Буфер в 256 байт обрезал JSON до раскодирования,
+         * и диапазон терялся молча. */
+        {
+            char big[2048] = "%7B%22headers%22%3A%7B";
+            for (int i = 0; i < 12; i++) {
+                char kv[96];
+                snprintf(kv, sizeof(kv), "%s%%22h%d%%22%%3A%%22" "vvvvvvvvvvvvvvvv" "%%22",
+                         i ? "%2C" : "", i);
+                strncat(big, kv, sizeof(big) - strlen(big) - 1);
+            }
+            strncat(big, "%7D%2C%22xPaddingBytes%22%3A%2250-150%22%7D", sizeof(big) - strlen(big) - 1);
+            char url2[4096];
+            snprintf(url2, sizeof(url2), "%s&extra=%s#x", base, big);
+            memset(&n, 0, sizeof(n));
+            vless_parse_url(url2, &n);
+            check_n("длинный extra: нижняя граница доехала", 50, (int)n.pad_from);
+            check_n("длинный extra: верхняя граница доехала", 150, (int)n.pad_to);
+        }
+
         /* Одно число — тоже законная форма: диапазон из самого себя. */
         snprintf(url, sizeof(url), "%s&extra=%%7B%%22xPaddingBytes%%22%%3A512%%7D#x", base);
         vless_parse_url(url, &n);
@@ -956,6 +986,65 @@ int main(void) {
         printf(", %d ПРОВАЛЕНО\n", g_fail);
         return 1;
     }
+    /* ---- кривой JSON: разбор возвращается ------------------------------------- */
+    {
+        static const char *const bad[] = {
+            "[null]", "[1,{\"outbounds\":[]}]", "{\"outbounds\":[null]}", "{\"outbounds\":[}",
+            "{\"outbounds\":[{\"protocol\":\"vless\"} x]}",
+            "{\"outbounds\":[{\"protocol\":\"vless\",\"settings\":{\"vnext\":[}]}",
+            "{\"outbounds\":[{\"protocol\":\"vless\",\"settings\":{\"vnext\":[{\"address\":\"h\",\"port\":\"443\","
+            "\"users\":[{\"id\":\"u\"}]}]},\"streamSettings\":{\"network\":\"tcp\"}}]}",
+        };
+        signal(SIGALRM, on_alarm);
+        for (size_t i = 0; i < sizeof(bad) / sizeof(*bad); i++) {
+            struct vless_node nodes[4];
+            struct vless_sub_stats st;
+            alarm(2);
+            size_t n = vless_parse_sub(bad[i], nodes, 4, &st);
+            alarm(0);
+            char what[96];
+            snprintf(what, sizeof(what), "кривой JSON %zu: разбор вернулся", i);
+            check_n(what, 1, 1);
+            if (i == 6) check_n("порт строкой в конфиге читается", 443, (long)(n ? nodes[0].port : 0));
+        }
+    }
+    /* ---- конфиг Xray: умолчание транспорта и имя raw -------------------------- */
+    {
+        struct vless_node nodes[4];
+        struct vless_sub_stats st;
+        size_t n = vless_parse_sub(
+            "{\"outbounds\":[{\"protocol\":\"vless\",\"settings\":{\"vnext\":[{\"address\":\"h\",\"port\":443,"
+            "\"users\":[{\"id\":\"u\"}]}]}}]}", nodes, 4, &st);
+        check_n("конфиг без streamSettings: узел пригоден", 1, (long)n);
+        check("конфиг без streamSettings: транспорт tcp", "tcp", n ? nodes[0].type : "");
+        n = vless_parse_sub(
+            "{\"outbounds\":[{\"protocol\":\"vless\",\"settings\":{\"vnext\":[{\"address\":\"h\",\"port\":443,"
+            "\"users\":[{\"id\":\"u\"}]}]},\"streamSettings\":{\"network\":\"raw\"}}]}", nodes, 4, &st);
+        check_n("network raw: узел пригоден", 1, (long)n);
+        check("network raw читается как tcp", "tcp", n ? nodes[0].type : "");
+    }
+    /* ---- ссылка: порт и границы имени --------------------------------------- */
+    {
+        struct vless_node n;
+        check_n("порт 70000 — ссылка не разобрана", -1, vless_parse_url("vless://u@h:70000#x", &n));
+        check_n("порт -1 — ссылка не разобрана", -1, vless_parse_url("vless://u@h:-1#x", &n));
+        check_n("порт 443abc — ссылка не разобрана", -1, vless_parse_url("vless://u@h:443abc#x", &n));
+        check_n("имя с '?' без параметров — узел взят", 0, vless_parse_url("vless://u@h:443#Fast?type=ws", &n));
+        check("имя с '?' без параметров — транспорт tcp", "tcp", n.type);
+        check_n("хост с '?' до '#': порт из параметров не берётся", -1,
+                vless_parse_url("vless://u@host.example?type=tcp#name:1", &n));
+    }
+    /* ---- список: мест меньше, чем ссылок — остаток считается ------------------ */
+    {
+        struct vless_node nodes[1];
+        struct vless_sub_stats st;
+        size_t n = vless_parse_sub("vless://a@h1:443#one\nvless://b@h2:443#two\nss://c@h3:443#x\n",
+                                   nodes, 1, &st);
+        check_n("мест одно: взят один", 1, (long)n);
+        check_n("второй vless посчитан пропущенным", 1, (long)st.skipped);
+        check_n("чужая ссылка за пределом мест посчитана", 1, (long)st.foreign);
+    }
+
     printf("\nвсе проверки прошли\n");
     return 0;
 }

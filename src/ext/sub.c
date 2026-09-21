@@ -212,6 +212,18 @@ static int node_usable(struct vless_node *n);
  * Возвращает 0, если ссылка разобрана и узел ПРИГОДЕН. Непригодный узел — это не ошибка
  * подписки: сервер может предлагать транспорт, которого клиент не умеет, и правильное
  * поведение — пропустить его, а не отказаться от всей подписки. */
+/* Порт из строки цифр: 1..65535, иначе 0. Одно место на ссылку и на конфиг Xray. */
+static uint16_t port_of(const char *s) {
+    if (!*s) return 0;
+    unsigned long v = 0;
+    for (; *s; s++) {
+        if (*s < '0' || *s > '9') return 0;
+        v = v * 10 + (unsigned long)(*s - '0');
+        if (v > 65535) return 0;
+    }
+    return (uint16_t)v;
+}
+
 int vless_parse_url(const char *url, struct vless_node *n) {
     memset(n, 0, sizeof(*n));
     if (strncmp(url, "vless://", 8) != 0) return -1;
@@ -222,12 +234,26 @@ int vless_parse_url(const char *url, struct vless_node *n) {
     set_field(n->uuid, sizeof(n->uuid), p, (size_t)(at - p));
 
     p = at + 1;
-    const char *colon = strchr(p, ':');
-    const char *qmark = strchr(p, '?');
+    /* Границы: хост и порт лежат ДО '?' и '#', параметры — до '#'. Иначе имя узла «Fast?type=ws»
+     * без параметров читалось как параметры, а «host?type=tcp#name:1» — как хост с портом 1. */
     const char *hash = strchr(p, '#');
+    const char *hp_end = hash ? hash : p + strlen(p);
+    const char *qmark = memchr(p, '?', (size_t)(hp_end - p));
+    const char *colon = memchr(p, ':', (size_t)((qmark ? qmark : hp_end) - p));
     if (!colon) return -1;
     set_field(n->host, sizeof(n->host), p, (size_t)(colon - p));
-    n->port = (uint16_t)atoi(colon + 1);
+    {
+        /* Порт — только цифры до конца хоста и в диапазоне 1..65535: atoi давал 4464 на
+         * «:70000», 65535 на «:-1» и 443 на «:443abc», и узел шёл не туда. */
+        char pnum[8];
+        const char *pe = colon + 1;
+        size_t pl = 0;
+        while (pe < (qmark ? qmark : hp_end) && *pe >= '0' && *pe <= '9' && pl + 1 < sizeof(pnum))
+            pnum[pl++] = *pe++;
+        pnum[pl] = '\0';
+        if (!pl || pe != (qmark ? qmark : hp_end)) return -1;
+        n->port = port_of(pnum);
+    }
     if (!n->port) return -1;
 
     /* Имя узла: за '#', и оно единственное, что может содержать что угодно. */
@@ -261,7 +287,11 @@ int vless_parse_url(const char *url, struct vless_node *n) {
                 /* extra — настройки транспорта в JSON. Читается ради длины набивки: сервер
                  * её ПРОВЕРЯЕТ и на чужую отвечает 400 (см. pad_range). */
                 else if (klen == 5 && !strncmp(k, "extra", 5)) {
-                    char ex[256];
+                    /* Буфер под ПРОЦЕНТНУЮ форму: она втрое длиннее текста, и 256 байт
+                     * обрезали JSON до раскодирования — xPaddingBytes дальше ~85 знаков
+                     * пропадал молча, набивка оставалась 100…1000, и сервер отвечал 400 —
+                     * ровно тот симптом, ради которого поле и заведено. */
+                    char ex[2048];
                     set_field(ex, sizeof(ex), v, vlen);
                     pct_decode(ex);
                     parse_extra(n, ex);
@@ -539,6 +569,13 @@ static int sj_arr_next(struct sj *j, int *first) {
     } else {
         sj_ws(j);
         if (*j->p == ',') j->p++;
+        /* После элемента бывает только запятая или конец массива. Всё прочее — брак, и на
+         * нём разбор обязан ОСТАНОВИТЬСЯ: прежде он отвечал «есть следующий элемент», не
+         * сдвигая указатель, а читатель элемента на не-объекте тоже не сдвигался — и цикл
+         * крутился вечно на `[null]`, `[}`, порте строкой и ещё четырёх формах кривого JSON,
+         * который приходит из интернета (подписка с панели). Висел и процесс туннеля, и
+         * интерфейс. */
+        else if (*j->p != ']') return -1;
     }
     sj_ws(j);
     if (*j->p == ']') { j->p++; return 1; }
@@ -550,7 +587,11 @@ static void xray_stream(struct sj *j, struct vless_node *n) {
     int first = 1;
     char k[64];
     while (sj_obj_key(j, &first, k, sizeof(k)) == 0) {
-        if (!strcmp(k, "network")) sj_str(j, n->type, sizeof(n->type));
+        if (!strcmp(k, "network")) {
+            sj_str(j, n->type, sizeof(n->type));
+            /* raw — каноническое имя tcp у Xray с 24.9.30; панели пишут его всё чаще. */
+            if (!strcmp(n->type, "raw")) snprintf(n->type, sizeof(n->type), "tcp");
+        }
         else if (!strcmp(k, "security")) sj_str(j, n->security, sizeof(n->security));
         else if (!strcmp(k, "realitySettings") || !strcmp(k, "tlsSettings")) {
             /* Оба объекта несут serverName и fingerprint; publicKey и shortId бывают только
@@ -613,11 +654,17 @@ static void xray_settings(struct sj *j, struct vless_node *n) {
                 else if (!strcmp(k2, "port")) {
                     sj_ws(j);
                     char num[16];
-                    size_t i = 0;
-                    while (*j->p >= '0' && *j->p <= '9' && i + 1 < sizeof(num))
-                        num[i++] = *j->p++;
-                    num[i] = '\0';
-                    n->port = (uint16_t)atoi(num);
+                    /* Число или число строкой: панели пишут и так, и так. Прочее — брак,
+                     * пропускается как значение, чтобы разбор не разъехался по объекту. */
+                    if (*j->p == '"') sj_str(j, num, sizeof(num));
+                    else {
+                        size_t i = 0;
+                        while (*j->p >= '0' && *j->p <= '9' && i + 1 < sizeof(num))
+                            num[i++] = *j->p++;
+                        num[i] = '\0';
+                        if (!i) sj_skip(j);
+                    }
+                    n->port = port_of(num);
                 } else if (!strcmp(k2, "users")) {
                     int fu = 1, u_taken = 0;
                     while (sj_arr_next(j, &fu) == 0) {
@@ -640,6 +687,9 @@ static void xray_settings(struct sj *j, struct vless_node *n) {
 /* Один outbound. 1 — это узел vless и он записан в n, 0 — не наш. */
 static int xray_outbound(struct sj *j, struct vless_node *n) {
     memset(n, 0, sizeof(*n));
+    /* Умолчание транспорта — tcp, как у ссылки: конфиг без streamSettings или без network
+     * законен (так и подразумевает Xray), а пустое слово давало «транспорт  не поддержан». */
+    snprintf(n->type, sizeof(n->type), "tcp");
     int first = 1, is_vless = 0;
     char k[64], proto[32] = "";
     /* Порядок ключей в JSON не задан, поэтому protocol может оказаться ПОСЛЕ settings.
@@ -720,6 +770,7 @@ static size_t parse_xray(const char *text, struct vless_node *out, size_t max,
             int r = sj_arr_next(&j, &fa);
             if (r != 0) break;
         }
+        const char *cfg_before = j.p;
         /* Тело одного конфига: узлы — из outbounds, имя им — из remarks (xray_remarks). */
         char remarks[sizeof(((struct vless_node *)0)->name)];
         xray_remarks(&j, remarks, sizeof(remarks));
@@ -734,8 +785,9 @@ static size_t parse_xray(const char *text, struct vless_node *out, size_t max,
             while (sj_arr_next(&j, &fo) == 0) {
                 struct vless_node node;
                 const char *before = j.p;
-                if (!xray_outbound(&j, &node)) continue;
+                int ours = xray_outbound(&j, &node);
                 if (j.p == before) break;               /* разбор не двинулся — уходим */
+                if (!ours) continue;
                 /* До проверки пригодности: имя уходит и в список узлов, и в объяснение
                  * пропуска (skip_note берёт его как пример), а человеку в обоих местах
                  * нужно одно и то же слово — то, которое он видит в панели. */
@@ -753,6 +805,7 @@ static size_t parse_xray(const char *text, struct vless_node *out, size_t max,
         }
         (void)seen_ob;
         if (wrapped) break;
+        if (j.p == cfg_before) break;                   /* конфиг не разобрался — не крутимся */
     }
     return n;
 }
@@ -864,7 +917,7 @@ size_t vless_parse_sub(const char *text, struct vless_node *out, size_t max,
      * появится ровно тогда, когда панель уберёт одну строчку из своего конфига. */
     while (*p == ' ' || *p == '\t' || *p == '\n' || *p == '\r') p++;
     if (*p == '[' || *p == '{') return parse_xray(p, out, max, st);
-    while (*p && n < max) {
+    while (*p) {
         while (*p == '\n' || *p == '\r' || *p == ' ' || *p == '\t') p++;
         if (!*p) break;
         /* Конец ссылки — перевод строки ИЛИ начало следующей схемы. Подписки часто
@@ -965,7 +1018,11 @@ size_t vless_parse_sub(const char *text, struct vless_node *out, size_t max,
                  * двоеточие оказывается внутри скобок, порт читается как 0, разбор
                  * возвращает -1. Заголовок этого файла обещает обратное: «в ней 26
                  * узлов, а steer видит 17» должно объясняться цифрой. */
-                if (rc == 0) out[n++] = node;
+                /* Мест больше нет — считаем как пропущенный, а не бросаем остаток текста
+                 * непрочитанным: то же обещание, что у конфига Xray, — арифметика
+                 * usable + skipped + foreign обязана сходиться с числом ссылок. */
+                if (rc == 0 && n < max) out[n++] = node;
+                else if (rc == 0) skip_note(st, &node, "узлов больше, чем помещается");
                 else skip_note(st, &node, rc > 0 ? node.skip_reason
                                                  : "ссылка не разобрана");
             } else if (strstr(line, "://") && st) {
