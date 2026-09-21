@@ -325,10 +325,19 @@ static void seg_take(struct tun_dev *d, size_t frame_n) {
     size_t hdr_n = vh->hdr_len, gso = vh->gso_size;
     if (!gso || hdr_n < 40 || hdr_n > pkt_n) { d->rx_dropped++; return; }
     if (pkt[0] != 0x45 || pkt[9] != 6) { d->rx_dropped++; return; }
+    /* Длина заголовков считается ПО ПАКЕТУ, а не берётся из hdr_len. Ядро пишет в hdr_len
+     * skb_headlen — «сколько линейной части», и это подсказка, а не длина заголовков: у
+     * пакета собственного сокета линейная часть — ровно заголовки, а у ФОРВАРДИМОГО
+     * склеенного (клиент локальной сети → роутер → TUN) линейной может быть весь первый
+     * пакет. Прежнее требование `20 + doff == hdr_len` выбрасывало такой супер-кадр целиком
+     * в rx_dropped, клиент повторял, ядро склеивало снова — и так до конца потока. hdr_len
+     * остаётся нижней границей проверки: короче заголовков он быть не может. Половина на Go
+     * (tun/offload_linux.go) поступает так же. */
     size_t doff = (size_t)(pkt[32] >> 4) * 4;
-    if (doff < 20 || 20 + doff != hdr_n) { d->rx_dropped++; return; }
-    d->seg_hdr = hdr_n;
-    d->seg_body = pkt_n - hdr_n;
+    size_t seg_hdr = 20 + doff;
+    if (doff < 20 || seg_hdr > hdr_n) { d->rx_dropped++; return; }
+    d->seg_hdr = seg_hdr;
+    d->seg_body = pkt_n - seg_hdr;
     d->seg_gso = gso;
     d->seg_n = (int)((d->seg_body + gso - 1) / gso);
     if (d->seg_n <= 0) { d->rx_dropped++; d->seg_n = 0; return; }

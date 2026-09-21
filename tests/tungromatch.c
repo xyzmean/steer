@@ -129,6 +129,85 @@ static void vh_of(const unsigned char *d, struct vh_read *v) {
     v->cs_start = h.csum_start; v->cs_off = h.csum_offset;
 }
 
+/* Разбор склеенного, приехавшего ОТ ядра. hint_full_first = 1 — в hdr_len лежит длина
+ * ВСЕГО первого пакета (так бывает у форвардимого склеенного: skb_headlen — линейная
+ * часть, а не заголовки), 0 — ровно длина заголовков, как у пакета своего сокета. */
+static void superframe_case(int hint_full_first) {
+    setup(1);
+    g_dev.rx_gso = 1;
+    const size_t gso = 1400;
+    size_t sizes[5] = { gso, gso, gso, gso, 617 };
+    static unsigned char want[5][2048];
+    size_t want_n[5];
+    uint32_t seq = 0x1000;
+    for (int i = 0; i < 5; i++) {
+        unsigned char fl = (i == 4) ? 0x18 : 0x10;
+        want_n[i] = mk(want[i], 40000, seq, 0x9000, 64000, sizes[i], fl, OPT_TS, 0xA0 + i, 7);
+        /* Идентификатор IP: у нарезки он растёт на сегмент. */
+        want[i][4] = (unsigned char)(100 >> 8);
+        want[i][5] = (unsigned char)(100 + i);
+        /* Суммы — настоящие: разбор считает их заново, и сверять надо с верными. */
+        want[i][10] = want[i][11] = 0;
+        uint16_t ick = csum_fin(csum_add(want[i], 20, 0));
+        want[i][10] = (unsigned char)(ick >> 8);
+        want[i][11] = (unsigned char)(ick & 0xFF);
+        want[i][20 + 16] = want[i][20 + 17] = 0;
+        uint16_t tck = seg_tcp_csum(want[i], want[i] + 20, want_n[i] - 20);
+        want[i][20 + 16] = (unsigned char)(tck >> 8);
+        want[i][20 + 17] = (unsigned char)(tck & 0xFF);
+        seq += (uint32_t)sizes[i];
+    }
+    /* Супер-кадр, как его отдаёт ядро: заголовок первого сегмента, вся нагрузка подряд,
+     * флаги последнего, длина IP по всему кадру и неполная сумма TCP в поле. */
+    static unsigned char frame[VNET_HDR_LEN + 16384];
+    size_t hdr_n = 20 + 20 + OPT_TS;
+    memset(frame, 0, sizeof(frame));
+    memcpy(frame + VNET_HDR_LEN, want[0], hdr_n);
+    size_t off = hdr_n;
+    size_t body = 0;
+    for (int i = 0; i < 5; i++) {
+        memcpy(frame + VNET_HDR_LEN + off, want[i] + hdr_n, sizes[i]);
+        off += sizes[i];
+        body += sizes[i];
+    }
+    unsigned char *pkt = frame + VNET_HDR_LEN;
+    pkt[33] = 0x18;                          /* PSH накоплен, как у ядра */
+    size_t tot = hdr_n + body;
+    pkt[2] = (unsigned char)(tot >> 8);
+    pkt[3] = (unsigned char)(tot & 0xFF);
+    pkt[10] = pkt[11] = 0;
+    uint16_t ick = csum_fin(csum_add(pkt, 20, 0));
+    pkt[10] = (unsigned char)(ick >> 8);
+    pkt[11] = (unsigned char)(ick & 0xFF);
+    struct vnet_hdr vh;
+    memset(&vh, 0, sizeof(vh));
+    vh.flags = VNET_F_NEEDS_CSUM;
+    vh.gso_type = VNET_GSO_TCPV4;
+    vh.hdr_len = (uint16_t)(hint_full_first ? hdr_n + sizes[0] : hdr_n);
+    vh.gso_size = (uint16_t)gso;
+    vh.csum_start = 20;
+    vh.csum_offset = 16;
+    memcpy(frame, &vh, sizeof(vh));
+    if (send(g_pair[1], frame, VNET_HDR_LEN + tot, 0) < 0) { perror("send"); exit(2); }
+
+    int same = 1, count = 0;
+    for (int i = 0; i < 5; i++) {
+        unsigned char got[2048];
+        ssize_t r = tun_read_packet(&g_dev, got, sizeof(got));
+        if (r <= 0) break;
+        count++;
+        if ((size_t)r != want_n[i] || memcmp(got, want[i], (size_t)r) != 0) {
+            same = 0;
+            printf("     сегмент %d разошёлся: %zd байт против %zu\n", i, r, want_n[i]);
+            for (size_t k = 0; k < (size_t)r && k < want_n[i]; k++)
+                if (got[k] != want[i][k]) { printf("     первое расхождение в байте %zu\n", k); break; }
+        }
+    }
+    check("разбор склеенного: отдано пакетов", 5, count);
+    check("разбор склеенного: пакеты те же, что без склейки", 1, same);
+    check("разбор склеенного: ничего не отброшено", 0, (long)g_dev.rx_dropped);
+}
+
 int main(void) {
     unsigned char a[2048], b[2048], c[2048];
     unsigned char got[65536];
@@ -332,81 +411,9 @@ int main(void) {
      * Набор тот же, что у склейки выше: четыре полноразмерных сегмента и короткий хвост, PSH на
      * последнем, идентификатор IP растёт на сегмент, метка времени у всех одна (ядро при нарезке
      * копирует заголовок целиком). */
-    {
-        setup(1);
-        g_dev.rx_gso = 1;
-        const size_t gso = 1400;
-        size_t sizes[5] = { gso, gso, gso, gso, 617 };
-        static unsigned char want[5][2048];
-        size_t want_n[5];
-        uint32_t seq = 0x1000;
-        for (int i = 0; i < 5; i++) {
-            unsigned char fl = (i == 4) ? 0x18 : 0x10;
-            want_n[i] = mk(want[i], 40000, seq, 0x9000, 64000, sizes[i], fl, OPT_TS, 0xA0 + i, 7);
-            /* Идентификатор IP: у нарезки он растёт на сегмент. */
-            want[i][4] = (unsigned char)(100 >> 8);
-            want[i][5] = (unsigned char)(100 + i);
-            /* Суммы — настоящие: разбор считает их заново, и сверять надо с верными. */
-            want[i][10] = want[i][11] = 0;
-            uint16_t ick = csum_fin(csum_add(want[i], 20, 0));
-            want[i][10] = (unsigned char)(ick >> 8);
-            want[i][11] = (unsigned char)(ick & 0xFF);
-            want[i][20 + 16] = want[i][20 + 17] = 0;
-            uint16_t tck = seg_tcp_csum(want[i], want[i] + 20, want_n[i] - 20);
-            want[i][20 + 16] = (unsigned char)(tck >> 8);
-            want[i][20 + 17] = (unsigned char)(tck & 0xFF);
-            seq += (uint32_t)sizes[i];
-        }
-        /* Супер-кадр, как его отдаёт ядро: заголовок первого сегмента, вся нагрузка подряд,
-         * флаги последнего, длина IP по всему кадру и неполная сумма TCP в поле. */
-        static unsigned char frame[VNET_HDR_LEN + 16384];
-        size_t hdr_n = 20 + 20 + OPT_TS;
-        memset(frame, 0, sizeof(frame));
-        memcpy(frame + VNET_HDR_LEN, want[0], hdr_n);
-        size_t off = hdr_n;
-        size_t body = 0;
-        for (int i = 0; i < 5; i++) {
-            memcpy(frame + VNET_HDR_LEN + off, want[i] + hdr_n, sizes[i]);
-            off += sizes[i];
-            body += sizes[i];
-        }
-        unsigned char *pkt = frame + VNET_HDR_LEN;
-        pkt[33] = 0x18;                          /* PSH накоплен, как у ядра */
-        size_t tot = hdr_n + body;
-        pkt[2] = (unsigned char)(tot >> 8);
-        pkt[3] = (unsigned char)(tot & 0xFF);
-        pkt[10] = pkt[11] = 0;
-        uint16_t ick = csum_fin(csum_add(pkt, 20, 0));
-        pkt[10] = (unsigned char)(ick >> 8);
-        pkt[11] = (unsigned char)(ick & 0xFF);
-        struct vnet_hdr vh;
-        memset(&vh, 0, sizeof(vh));
-        vh.flags = VNET_F_NEEDS_CSUM;
-        vh.gso_type = VNET_GSO_TCPV4;
-        vh.hdr_len = (uint16_t)hdr_n;
-        vh.gso_size = (uint16_t)gso;
-        vh.csum_start = 20;
-        vh.csum_offset = 16;
-        memcpy(frame, &vh, sizeof(vh));
-        if (send(g_pair[1], frame, VNET_HDR_LEN + tot, 0) < 0) { perror("send"); exit(2); }
-
-        int same = 1, count = 0;
-        for (int i = 0; i < 5; i++) {
-            unsigned char got[2048];
-            ssize_t r = tun_read_packet(&g_dev, got, sizeof(got));
-            if (r <= 0) break;
-            count++;
-            if ((size_t)r != want_n[i] || memcmp(got, want[i], (size_t)r) != 0) {
-                same = 0;
-                printf("     сегмент %d разошёлся: %zd байт против %zu\n", i, r, want_n[i]);
-                for (size_t k = 0; k < (size_t)r && k < want_n[i]; k++)
-                    if (got[k] != want[i][k]) { printf("     первое расхождение в байте %zu\n", k); break; }
-            }
-        }
-        check("разбор склеенного: отдано пакетов", 5, count);
-        check("разбор склеенного: пакеты те же, что без склейки", 1, same);
-        check("разбор склеенного: ничего не отброшено", 0, (long)g_dev.rx_dropped);
-    }
+    superframe_case(0);
+    /* Та же склейка с hdr_len = длина первого пакета: прежде выбрасывалась целиком. */
+    superframe_case(1);
 
     /* Круг: склейка и разбор обратны друг другу. Проверяет обе половины разом и на том же наборе —
      * пакеты уходят в устройство по одному, уезжают одним кадром, разбираются обратно и обязаны
