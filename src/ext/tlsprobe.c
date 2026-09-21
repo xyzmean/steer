@@ -32,7 +32,13 @@
 
 #include "reality.h"
 
+/* Срок ВСЕЙ пробы, а не отдельного вызова: ниже он и считается от начала отправки.
+ * Стенд tests/tlsprobematch.c подменяет его на секунду (-DPROBE_TIMEOUT_S=1) — иначе прогон
+ * стоял бы полминуты на ожиданиях, а проверяется в нём не длительность срока, а то, чем он
+ * кончается. */
+#ifndef PROBE_TIMEOUT_S
 #define PROBE_TIMEOUT_S 6
+#endif
 
 static void pb64(const unsigned char *in, size_t n, char *out) {
     static const char A[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
@@ -151,19 +157,38 @@ int cmd_tls_probe(const char *host, const char *addr, int port, int local_port, 
     }
 
     struct timeval tv = { .tv_sec = PROBE_TIMEOUT_S, .tv_usec = 0 };
+    /* Причина запоминается там, где случилась. Одного errno на весь цикл не хватает: он
+     * переписывается следующим адресом из getaddrinfo и даже close(), а исходы это разные —
+     * «порт занят у нас» и «узел не ответил» человек лечит в разных местах. */
+    int sock_err = 0, bind_err = 0, conn_err = 0;
     for (it = res; it; it = it->ai_next) {
         fd = socket(it->ai_family, it->ai_socktype, 0);
-        if (fd < 0) continue;
+        if (fd < 0) { sock_err = errno; continue; }
         setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
         setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
-        if (bind_local(fd, local_port) != 0) { close(fd); fd = -1; continue; }
+        if (bind_local(fd, local_port) != 0) { bind_err = errno; close(fd); fd = -1; continue; }
         if (connect(fd, it->ai_addr, it->ai_addrlen) == 0) break;
+        conn_err = errno;
         close(fd);
         fd = -1;
     }
     freeaddrinfo(res);
     if (fd < 0) {
-        if (!quiet) printf("итог:       соединение не установилось (%s)\n", strerror(errno));
+        if (!quiet) {
+            /* SO_SNDTIMEO обрывает и блокирующий connect(), и обрыв этот приходит как
+             * EINPROGRESS. Печатать его дословно значит сказать «операция ещё идёт» ровно в
+             * тот момент, когда она кончилась ничем, — а это единственный исход, ради
+             * которого пробу и зовут: узел, до которого SYN не доходит. */
+            if (conn_err == EINPROGRESS || conn_err == EAGAIN || conn_err == EWOULDBLOCK)
+                printf("итог:       соединение не установилось (нет ответа за %d с)\n",
+                       PROBE_TIMEOUT_S);
+            else if (conn_err)
+                printf("итог:       соединение не установилось (%s)\n", strerror(conn_err));
+            else if (bind_err)
+                printf("итог:       свой порт %d занят (%s)\n", local_port, strerror(bind_err));
+            else
+                printf("итог:       сокет не создался (%s)\n", strerror(sock_err));
+        }
         return 1;
     }
     { int one = 1; setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one)); }
@@ -216,12 +241,30 @@ int cmd_tls_probe(const char *host, const char *addr, int port, int local_port, 
     unsigned char head[5];
     size_t got = 0;
     while (got < sizeof(head)) {
-        ssize_t r = recv(fd, head + got, sizeof(head) - got, 0);
+        /* Остаток срока пробы, а не полный срок заново. Пока каждый recv заводил свой
+         * отсчёт, узел, отдающий по байту, держал пробу впятеро дольше объявленного — и
+         * приговор всё равно выходил «отвечает браузерным рукопожатием». */
+        struct timespec now;
+        clock_gettime(CLOCK_MONOTONIC, &now);
+        long left = PROBE_TIMEOUT_S * 1000L - ((now.tv_sec - t0.tv_sec) * 1000L +
+                                               (now.tv_nsec - t0.tv_nsec) / 1000000L);
+        int expired = left <= 0;
+        if (!expired) {
+            struct timeval rest = { .tv_sec = left / 1000, .tv_usec = (left % 1000) * 1000 };
+            setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &rest, sizeof(rest));
+        }
+        ssize_t r = expired ? -1 : recv(fd, head + got, sizeof(head) - got, 0);
+        if (expired) errno = EWOULDBLOCK;
         if (r <= 0) {
             close(fd);
-            if (!quiet)
-                printf("итог:       ответа нет (%s) — рукопожатие не дошло\n",
-                       r == 0 ? "соединение закрыто" : strerror(errno));
+            if (!quiet) {
+                if (r < 0 && (errno == EAGAIN || errno == EWOULDBLOCK))
+                    printf("итог:       ответа нет (срок %d с истёк) — рукопожатие не дошло\n",
+                           PROBE_TIMEOUT_S);
+                else
+                    printf("итог:       ответа нет (%s) — рукопожатие не дошло\n",
+                           r == 0 ? "соединение закрыто" : strerror(errno));
+            }
             return 1;
         }
         got += (size_t)r;

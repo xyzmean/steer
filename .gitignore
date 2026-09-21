@@ -35,6 +35,7 @@ build/subfetchmatch
 build/fwmatch
 build/obfsmatch
 build/visionmatch
+build/tlsprobematch
 build/specmatch-ext
 build/xswirematch
 build/xsstreammatch

@@ -27,7 +27,7 @@ $(BUILD)/steer: src/steer.c src/spec.c src/dnsd.c src/failover.c src/aggregate.c
 	$(CC) $(CFLAGS) $(DEFS) -o $@ src/steer.c src/spec.c src/dnsd.c src/failover.c \
 	      src/aggregate.c src/obfs.c src/cli.c src/srs.c src/puff.c src/hwid.c
 
-test: all ext-syntax $(BUILD)/tgwssim $(BUILD)/dnsmatch $(BUILD)/specmatch $(BUILD)/specmatch-ext $(BUILD)/xswirematch $(BUILD)/xsconnmatch $(BUILD)/xsstreammatch $(BUILD)/tungromatch $(BUILD)/tunnamematch $(BUILD)/xsconfmatch $(BUILD)/xslinkmatch $(BUILD)/xsroutematch $(BUILD)/chellomatch $(BUILD)/failovermatch $(BUILD)/dcmatch $(BUILD)/msgsplitmatch $(BUILD)/warmmatch $(BUILD)/upmatch $(BUILD)/h2match $(BUILD)/submatch $(BUILD)/subfetchmatch $(BUILD)/fwmatch $(BUILD)/obfsmatch $(BUILD)/visionmatch $(BUILD)/diagsim $(BUILD)/hwidsum
+test: all ext-syntax $(BUILD)/tgwssim $(BUILD)/dnsmatch $(BUILD)/specmatch $(BUILD)/specmatch-ext $(BUILD)/xswirematch $(BUILD)/xsconnmatch $(BUILD)/xsstreammatch $(BUILD)/tungromatch $(BUILD)/tunnamematch $(BUILD)/xsconfmatch $(BUILD)/xslinkmatch $(BUILD)/xsroutematch $(BUILD)/chellomatch $(BUILD)/failovermatch $(BUILD)/dcmatch $(BUILD)/msgsplitmatch $(BUILD)/warmmatch $(BUILD)/upmatch $(BUILD)/h2match $(BUILD)/submatch $(BUILD)/subfetchmatch $(BUILD)/fwmatch $(BUILD)/obfsmatch $(BUILD)/visionmatch $(BUILD)/tlsprobematch $(BUILD)/diagsim $(BUILD)/hwidsum
 	@sh tests/run.sh
 	@sh tests/gen.sh
 	@sh tests/tgwsmark.sh
@@ -52,6 +52,7 @@ test: all ext-syntax $(BUILD)/tgwssim $(BUILD)/dnsmatch $(BUILD)/specmatch $(BUI
 	@$(BUILD)/fwmatch
 	@$(BUILD)/obfsmatch
 	@$(BUILD)/visionmatch
+	@$(BUILD)/tlsprobematch
 	@$(BUILD)/xswirematch
 	@$(BUILD)/xsconnmatch
 	@$(BUILD)/xsstreammatch
@@ -142,6 +143,14 @@ $(BUILD)/msgsplitmatch: tests/msgsplitmatch.c src/ext/tgws.c
 $(BUILD)/warmmatch: tests/warmmatch.c src/ext/tgws.c
 	@mkdir -p $(BUILD)
 	$(CC) $(CFLAGS) -Itests/stub -Isrc -o $@ tests/warmmatch.c
+
+# Исходы пробы браузерным рукопожатием и то, как она их называет (I-272). Там же и по той же
+# причине: bind_local и hello12_build статические. Срок пробы подменён секундой — с шестью
+# настоящими прогон стоял бы полминуты на ожиданиях, а стенд смотрит не на длительность
+# срока, а на то, чем он кончается.
+$(BUILD)/tlsprobematch: tests/tlsprobematch.c src/ext/tlsprobe.c src/ext/reality.h
+	@mkdir -p $(BUILD)
+	$(CC) $(CFLAGS) -Itests/stub -Isrc -DPROBE_TIMEOUT_S=1 -o $@ tests/tlsprobematch.c
 
 # Освобождение соединения наверх: чем обозначено «дескриптора нет» (I-204). Там же и по той
 # же причине: up_drop статическая.
