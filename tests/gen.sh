@@ -301,6 +301,14 @@ check "domain set is declared empty, with timeouts" "1" \
     "$(printf '%s\n' "$dout" | grep -A3 'set geo_dom' | grep -c 'flags interval,timeout')"
 check "fake-IP DNAT appears with a domain channel" "1" \
     "$(printf '%s\n' "$dout" | grep -c 'dnat ip to ip daddr map @fakeip')"
+# У разворота fake-IP счётчик обязателен, и это не единообразие ради единообразия.
+# Правило отвечает на единственный вопрос, который встаёт, когда «домены не работают»:
+# доехал ли поддельный адрес до роутера вообще. Без счётчика «клиент не прислал» и
+# «прислал, а мы не развернули» различаются только tcpdump'ом, а у клиента из mesh-VPN
+# (Tailscale, ZeroTier) первое — обычное дело: 198.18.0.0/15 идёт в туннель, только если
+# роутер объявил этот диапазон маршрутом.
+check "у разворота fake-IP есть счётчик" "1" \
+    "$(printf '%s\n' "$dout" | grep -c 'counter dnat ip to ip daddr map @fakeip')"
 check "DNS redirect covers IPv6 too" "1" \
     "$(printf '%s\n' "$dout" | grep -c 'nfproto ipv6 iifname "br-lan" udp dport 53')"
 # No domain channel means none of that plumbing should exist at all.

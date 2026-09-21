@@ -1308,9 +1308,17 @@ static void generate(FILE *f) {
             fprintf(f, "\n    map fakeip {\n        type ipv4_addr : ipv4_addr;\n");
             emit_fakeip_elements(f);
             fprintf(f, "    }\n");
+            /* Счётчик здесь обязателен, и это не единообразие с соседями. Правило
+             * отвечает на единственный вопрос, который встаёт, когда «домены не
+             * работают»: доехал ли поддельный адрес до роутера вообще. Без счётчика
+             * «клиент не прислал» и «прислал, а мы не развернули» различаются только
+             * tcpdump'ом на роутере, а первое — обычное дело у клиента из mesh-VPN
+             * (Tailscale, ZeroTier): 198.18.0.0/15 уходит в туннель, только если роутер
+             * объявил этот диапазон маршрутом, и по умолчанию он его не объявляет. Из
+             * локальной сети вопрос не встаёт вовсе — там роутер и есть шлюз. */
             fprintf(f, "    chain prerouting_dnat {\n"
                        "        type nat hook prerouting priority dstnat; policy accept;\n"
-                       "        ip daddr 198.18.0.0/15 dnat ip to ip daddr map @fakeip\n"
+                       "        ip daddr 198.18.0.0/15 counter dnat ip to ip daddr map @fakeip\n"
                        "    }\n");
         }
         /* Make traceroute show the REAL intermediate routers while the destination
