@@ -585,6 +585,11 @@ for f in src/ext/xsclient.c src/ext/xshub.c; do
         "$(grep -nE '(\.|->)mtu = ' "$f" | grep -E 'g_cf|g_conf|conf->' | grep -v xs_mtu_clamp; true)"
 done
 
+# Оба SYN обфускатора — первый и повтор — уходят с одним набором опций (OBFS_SYN_OPTS): повтор
+# шёл с одним MSS, и потеря первого SYN оставляла сессию без масштаба окна (I-292).
+check "src/obfs.c: оба SYN с OBFS_SYN_OPTS" "2" "$(grep -c 'TH_SYN, NULL, 0, OBFS_SYN_OPTS)' src/obfs.c)"
+check "src/obfs.c: SYN с голым MSS не осталось" "0" "$(grep -c 'TH_SYN, NULL, 0, 1)' src/obfs.c)"
+
 printf '\n%d проверок пройдено' "$pass"
 if [ "$fail" -gt 0 ]; then printf ', %d ПРОВАЛЕНО\n' "$fail"; exit 1; fi
 printf '\nвсе проверки прошли\n'

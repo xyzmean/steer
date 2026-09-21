@@ -338,6 +338,41 @@ int main(void) {
         check_str("цепочка: тот же выход у обфускатора — другое имя", "o_vpn", c);
     }
 
+    /* ---- SYN: первый и повтор — одни опции ------------------------------------
+     * Повтор шёл с одним MSS: потеря первого SYN оставляла сессию без масштаба окна. */
+    {
+        uint8_t seg[128];
+        size_t n = obfs_build(seg, A, B, 40000, 4567, 7, 0, TH_SYN, OBFS_SYN_OPTS, NULL, 0);
+        check("SYN нашего повтора: длина с MSS, масштабом и SACK", 32, (long)n);
+        int ws = 0;
+        for (size_t o = 20; o + 1 < n; ) {
+            if (seg[o] == 1) { o++; continue; }          /* NOP */
+            if (seg[o] == 3) ws = 1;
+            if (seg[o + 1] < 2) break;
+            o += seg[o + 1];
+        }
+        check("SYN нашего повтора: масштаб окна среди опций", 1, ws);
+    }
+
+    /* ---- мёртвый путь: по нагрузке этой сессии, не по счётчику процесса ------- */
+    {
+        struct fconn c;
+        memset(&c, 0, sizeof(c));
+        c.state = ST_EST;
+        long long t = 1000000;
+        c.last_rx = t - 70000; c.last_data_tx = t - 120000;
+        check("покой: ничего не отправляли после приёма — жив", 0, conn_dead(&c, t));
+        c.last_rx = t - 70000; c.last_tx = t - 69000; c.last_data_tx = t - 120000;
+        check("покой с голым ACK после приёма — жив", 0, conn_dead(&c, t));
+        c.last_rx = t - 70000; c.last_data_tx = t - 65000;
+        check("нагрузка после приёма и минута тишины — мёртв", 1, conn_dead(&c, t));
+        c.last_rx = t - 30000; c.last_data_tx = t - 20000;
+        check("нагрузка после приёма, тишина короче срока — жив", 0, conn_dead(&c, t));
+        c.state = ST_SYN_SENT;
+        c.last_rx = t - 70000; c.last_data_tx = t - 65000;
+        check("не установлено — не судим", 0, conn_dead(&c, t));
+    }
+
     printf("\n%s\n", fails ? "ЕСТЬ ПРОВАЛЫ" : "все проверки прошли");
     return fails ? 1 : 0;
 }

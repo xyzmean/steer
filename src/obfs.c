@@ -124,6 +124,7 @@ struct fconn {
     int state;
     int syn_tries;
     long long last_rx, last_tx, last_ack;   /* монотонные миллисекунды */
+    long long last_data_tx;     /* когда последний раз ушла НАГРУЗКА (не SYN и не голый ACK) */
     int unacked;                /* принято сегментов с прошлого нашего ACK */
 };
 
@@ -570,6 +571,7 @@ static uint8_t *build_ahead(struct fconn *c, uint8_t *base, size_t plen, size_t 
      * Ровно это решение уже принято в туннеле, по той же причине и с тем же объяснением:
      * см. g_now_ns в src/ext/tunnel.c. */
     c->last_tx = now;
+    c->last_data_tx = now;
     c->last_ack = now;
     c->unacked = 0;
     return seg;
@@ -585,6 +587,7 @@ static int conn_send(int fd, struct fconn *c, uint8_t flags,
     c->seq += (uint32_t)plen;
     if (flags & TH_SYN) c->seq += 1;            /* SYN занимает один номер */
     c->last_tx = now_ms();
+    if (plen) c->last_data_tx = c->last_tx;
     if (flags & TH_ACK) { c->unacked = 0; c->last_ack = c->last_tx; }
     return 0;
 }
@@ -713,6 +716,17 @@ int obfs_guard_up(char kind, const char *label, const char *peer_addr, int port,
 #define DEAD_MS      60000      /* тишина при активной отправке — путь считается мёртвым */
 
 /* ---- клиент ---------------------------------------------------------------- */
+/* Путь мёртв, если после ПОСЛЕДНЕГО принятого мы отправляли нагрузку и с тех пор DEAD_MS
+ * тишины. Именно нагрузку: голый ACK — не разговор, и путь, где мы только подтверждали и
+ * замолчали, живой. И именно ЭТОЙ сессии: прежнее условие смотрело на счётчик пакетов за
+ * всю жизнь процесса, и любая следующая сессия, простоявшая минуту без отправки (WireGuard
+ * без keepalive), пересоздавалась каждые шестьдесят секунд — новый порт, новое
+ * рукопожатие, строка в журнале; первая сессия при этом вела себя иначе. Та же форма, что у
+ * xs_conn_tick в xsconn.c и у tick в клиенте на Go. */
+static int conn_dead(const struct fconn *c, long long t) {
+    return c->state == ST_EST && c->last_data_tx > c->last_rx && t - c->last_rx > DEAD_MS;
+}
+
 static void client_reset(struct fconn *c, uint32_t daddr, int dport) {
     memset(c, 0, sizeof(*c));
     c->daddr = daddr;
@@ -746,7 +760,7 @@ static int client_connect(struct fconn *c, int *raw_fd, uint32_t daddr, int dpor
     /* Фильтр ставится ДО первого SYN: между socket() и настройкой очередь успевает
      * набрать чужого, и на нагруженном роутере это тысячи пакетов. */
     obfs_filter_quad(*raw_fd, daddr, c->dport, c->sport);
-    if (conn_send(*raw_fd, c, TH_SYN, NULL, 0, OBFS_OPT_SCALE) != 0) return -1;
+    if (conn_send(*raw_fd, c, TH_SYN, NULL, 0, OBFS_SYN_OPTS) != 0) return -1;
     c->state = ST_SYN_SENT;
     c->syn_tries = 1;
     c->last_rx = now_ms();
@@ -939,7 +953,7 @@ int obfs_client(const char *out_name, const char *server, int server_port,
                 c.state = ST_CLOSED;
             } else {
                 c.seq -= 1;                     /* повтор SYN — тот же сегмент, тот же номер */
-                conn_send(raw, &c, TH_SYN, NULL, 0, 1);
+                conn_send(raw, &c, TH_SYN, NULL, 0, OBFS_SYN_OPTS);
                 c.syn_tries++;
             }
         }
@@ -953,7 +967,7 @@ int obfs_client(const char *out_name, const char *server, int server_port,
 
         /* Мёртвый путь: мы шлём, ответа нет. Смена адреса WAN попадает сюда же —
          * пересоздание сокета заново спрашивает маршрут, а с ним и адрес источника. */
-        if (c.state == ST_EST && up_pkts && t - c.last_rx > DEAD_MS) {
+        if (conn_dead(&c, t)) {
             fprintf(stderr, LOG_W "%s: %d с тишины при активной отправке — пересоздаю сессию\n",
                     out_name, DEAD_MS / 1000);
             c.state = ST_CLOSED;
