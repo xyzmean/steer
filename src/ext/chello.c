@@ -94,8 +94,14 @@ int chello_parse(const uint8_t *rec, size_t n, struct chello_ref *out) {
         if (type == 0x0000 && len >= 5) {          /* server_name */
             struct cur e = { rec, body + len, body };
             unsigned list_len, nt, nlen;
-            if (u16(&e, &list_len) == 0 && u8(&e, &nt) == 0 && nt == 0 &&
-                u16(&e, &nlen) == 0 && nlen < sizeof(out->sni) && need(&e, nlen)) {
+            /* Длина списка имён обязана сходиться с тем, что в нём лежит (RFC 6066: один
+             * элемент — тип, длина, имя): стек TLS отвергает Hello, у которого она врёт, и
+             * разбор на границе доверия не может быть мягче стека. Раньше list_len читался и
+             * ни с чем не сверялся. */
+            if (u16(&e, &list_len) != 0 || u8(&e, &nt) != 0 || u16(&e, &nlen) != 0 ||
+                2 + (size_t)list_len != len || list_len != 3 + nlen)
+                return -1;
+            if (nt == 0 && nlen < sizeof(out->sni) && need(&e, nlen)) {
                 memcpy(out->sni, rec + e.i, nlen);
                 out->sni[nlen] = '\0';
             }
@@ -108,7 +114,10 @@ int chello_parse(const uint8_t *rec, size_t n, struct chello_ref *out) {
             while (e.i < shares_end) {
                 unsigned grp, klen;
                 if (u16(&e, &grp) != 0 || u16(&e, &klen) != 0) return -1;
-                if (!need(&e, klen)) return -1;
+                /* Ключ не может вылезать за длину СПИСКА ключей, а не только за расширение:
+                 * прежняя проверка сверяла только со второй границей, и ключ, объявленный
+                 * длиннее списка, принимался. */
+                if (!need(&e, klen) || e.i + klen > shares_end) return -1;
                 /* GREASE-группа лежит в key_share первой и несёт один случайный байт —
                  * взять её за ключ значило бы не найти настоящий вовсе. */
                 if (grp == CHELLO_GROUP_X25519 && klen == 32 && !out->ks_off)

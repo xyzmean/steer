@@ -184,6 +184,49 @@ int main(void) {
         check("перебор искажений: разбор ни разу не упал", 0, crashes);
     }
 
+    /* ---- вложенные длины, которые не сходятся с внешними ---------------------
+     *
+     * Длина СПИСКА у server_name и длина СПИСКА КЛЮЧЕЙ у key_share — поля, которые разбор
+     * читал, но ни с чем не сверял: сходились внешние границы расширения, и этого считалось
+     * достаточно. Стек TLS такой Hello отвергает (decode_error); наш разбор на границе
+     * доверия обязан быть не мягче. Расширения ищутся по типу, потому что порядок в
+     * замороженных байтах перемешан. */
+    {
+        uint8_t buf[FROZEN_N];
+        memcpy(buf, aes, FROZEN_N);
+        struct chello_ref a;
+        check("вложенные длины: исходный разобран", 0, chello_parse(buf, FROZEN_N, &a));
+        size_t i = a.hs_off + 4 + 2 + 32;
+        i += 1 + 32;
+        i += 2 + (((size_t)buf[i] << 8) | buf[i + 1]);
+        i += 1 + buf[i];
+        size_t ext_end = i + 2 + (((size_t)buf[i] << 8) | buf[i + 1]);
+        size_t sni_body = 0, ks_body = 0;
+        for (i += 2; i + 4 <= ext_end; ) {
+            unsigned type = ((unsigned)buf[i] << 8) | buf[i + 1];
+            size_t l = ((size_t)buf[i + 2] << 8) | buf[i + 3];
+            if (type == 0x0000) sni_body = i + 4;
+            if (type == 0x0033) ks_body = i + 4;
+            i += 4 + l;
+        }
+        check("вложенные длины: server_name найден", 1, sni_body != 0);
+        check("вложенные длины: key_share найден", 1, ks_body != 0);
+        if (sni_body) {
+            memcpy(buf, aes, FROZEN_N);
+            buf[sni_body + 1] += 1;                 /* длина списка имён на байт больше */
+            check("брак: длина списка server_name не сходится с именем", -1,
+                  chello_parse(buf, FROZEN_N, &r));
+        }
+        if (ks_body) {
+            memcpy(buf, aes, FROZEN_N);
+            /* Список ключей объявлен короче первого же ключа: ключ вылезает за список, но не за
+             * расширение — ровно тот случай, который внешняя граница не ловит. */
+            buf[ks_body] = 0; buf[ks_body + 1] = 8;
+            check("брак: ключ key_share длиннее объявленного списка ключей", -1,
+                  chello_parse(buf, FROZEN_N, &r));
+        }
+    }
+
     /* ---- GREASE ------------------------------------------------------------- */
     check("GREASE: 0x0A0A распознан", 1, chello_is_grease(0x0A0A));
     check("GREASE: 0xFAFA распознан", 1, chello_is_grease(0xFAFA));
