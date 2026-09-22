@@ -503,12 +503,14 @@ int main(void) {
         p += sprintf(p, "%s\"outputs\":{\"direct\":{\"kind\":\"direct\"}},"
                         "\"channels\":[{\"name\":\"many\",\"out\":\"direct\","
                         "\"from\":[", SPEC_OPEN);
-        for (int i = 0; i < 17; i++) {
+        /* Предел берётся из MAX_FROM, а не числом: он уже менялся (16 -> 32), и
+         * записанное руками число превращает проверку предела в проверку прошлого. */
+        for (int i = 0; i < MAX_FROM + 1; i++) {
             p += sprintf(p, "\"10.0.0.%d\"", i);
-            if (i < 16) p += sprintf(p, ",");
+            if (i < MAX_FROM) p += sprintf(p, ",");
         }
         p += sprintf(p, "],\"match\":{\"any\":true,\"allow_all\":true}}]}");
-        check("больше 16 from: отказ (I-001)", 2, load_from_str(big));
+        check("больше MAX_FROM from: отказ (I-001)", 2, load_from_str(big));
     }
     {
         /* I-002: Спека больше 256 КБ вызывает отказ */
@@ -885,11 +887,16 @@ int main(void) {
         check("узел в nodes дважды — отказ", 2, load_from_str(s));
     }
     {
-        const char *s = SPEC(
-            "\"outputs\":{\"vpn\":{\"kind\":\"vless\",\"sub_file\":\"/tmp/sub.txt\","
-            "\"nodes\":[0,1,2,3,4,5,6,7,8]}},"
-            "\"channels\":[]}");
-        check("nodes длиннее предела — отказ", 2, load_from_str(s));
+        /* Список строится из MAX_NODE_SEL: предел уже менялся (8 -> 16), и перечисление
+         * номеров руками проверяло бы прежний предел, а не нынешний. */
+        char many[512];
+        int mn = snprintf(many, sizeof(many),
+                          "%s\"outputs\":{\"vpn\":{\"kind\":\"vless\","
+                          "\"sub_file\":\"/tmp/sub.txt\",\"nodes\":[", SPEC_OPEN);
+        for (int i = 0; i < MAX_NODE_SEL + 1; i++)
+            mn += snprintf(many + mn, sizeof(many) - (size_t)mn, "%s%d", i ? "," : "", i);
+        snprintf(many + mn, sizeof(many) - (size_t)mn, "]}},\"channels\":[]}");
+        check("nodes длиннее предела — отказ", 2, load_from_str(many));
     }
     {
         /* Отрицательный номер здесь не «первый рабочий»: в списке кандидатов он не значит
@@ -1038,6 +1045,94 @@ int main(void) {
         rmdir(rdir);
         snprintf(path, sizeof(path), "%s/registry", sdir);
         unlink(path);
+        rmdir(sdir);
+        g_state_dir = saved_state;
+        g_rt_tables_d = saved_rt;
+    }
+
+    /* ---- мест под метку столько же, сколько выходов ----------------------------
+     *
+     * Выход получал БИТ (метка `база << номер`), и восемь бит поля значили восемь
+     * помеченных выходов — при том что объявить их разрешено шестнадцать. Девятый падал с
+     * «out of mark bits», и обойти это расширением поля нельзя: слева от нашего диапазона
+     * бит 28 у мини-сборки, 29 и 30 у zapret, 16-23 у Tailscale и pbr. Поэтому выходу
+     * выдаётся ЗНАЧЕНИЕ в том же поле, и проверяется здесь именно это: все шестнадцать
+     * получают метку, и ни метка, ни таблица, ни очередь ни у кого не повторяются. */
+    {
+        char sdir[] = "/tmp/specmatch-slots-XXXXXX";
+        char rdir[] = "/tmp/specmatch-slotsrt-XXXXXX";
+        if (!mkdtemp(sdir) || !mkdtemp(rdir)) { perror("mkdtemp"); return 1; }
+        const char *saved_state = g_state_dir, *saved_rt = g_rt_tables_d;
+        g_state_dir = sdir;
+        g_rt_tables_d = rdir;
+
+        reset_globals();
+        char many[4096];
+        int mn = snprintf(many, sizeof(many), "%s\"outputs\":{", SPEC_OPEN);
+        for (int i = 0; i < MAX_OUTPUTS; i++)
+            mn += snprintf(many + mn, sizeof(many) - (size_t)mn,
+                           "%s\"o%d\":{\"kind\":\"interface\",\"device\":\"wg%d\"}",
+                           i ? "," : "", i, i);
+        snprintf(many + mn, sizeof(many) - (size_t)mn, "},\"channels\":[]}");
+        check("спека на все MAX_OUTPUTS туннелей загрузилась", 0, load_from_str(many));
+        registry_assign();
+
+        int no_mark = 0, off_mask = 0, dup_mark = 0, dup_table = 0, dup_queue = 0;
+        int bad_table = 0;
+        for (size_t i = 0; i < g_out_n; i++) {
+            if (!g_out[i].mark) { no_mark++; continue; }
+            if (g_out[i].mark & ~STEER_MARK_MASK) off_mask++;
+            if (g_out[i].table < 300 || g_out[i].table > 300 + MAX_OUTPUTS - 1) bad_table++;
+            for (size_t j = 0; j < i; j++) {
+                if (g_out[j].mark == g_out[i].mark) dup_mark++;
+                if (g_out[j].table == g_out[i].table) dup_table++;
+                if (out_zapret_queue(&g_out[j]) == out_zapret_queue(&g_out[i])) dup_queue++;
+            }
+        }
+        check("метку получили все MAX_OUTPUTS выходов", 0, no_mark);
+        check("метка каждого внутри маски контракта", 0, off_mask);
+        check("метки не повторяются", 0, dup_mark);
+        check("номера таблиц не повторяются", 0, dup_table);
+        check("номера таблиц в своём ряду (300..315)", 0, bad_table);
+        check("номера очередей обхода не повторяются", 0, dup_queue);
+
+        /* РЕЕСТР С ПРЕЖНЕЙ СБОРКИ. Там метки одинокими битами, и старший из них — база,
+         * умноженная на 128, — новой раздачей не выдаётся никому. Выход обязан сохранить
+         * и метку, и таблицу: метка уже стоит в пакетах и в правиле маршрутизации, а
+         * перетасовка на обновлении означала бы трафик, ушедший по чужому пути. */
+        char rpath[512];
+        snprintf(rpath, sizeof(rpath), "%s/registry", sdir);
+        FILE *rf = fopen(rpath, "w");
+        if (rf) {
+            fprintf(rf, "old %08x %d\n", STEER_MARK_BASE << 7, 300 + 7);
+            fclose(rf);
+        }
+        reset_globals();
+        const char *s4 = SPEC(
+            "\"outputs\":{\"old\":{\"kind\":\"interface\",\"device\":\"wg0\"},"
+            "\"fresh\":{\"kind\":\"interface\",\"device\":\"wg1\"}},"
+            "\"channels\":[]}");
+        check("спека со старым и новым выходом загрузилась", 0, load_from_str(s4));
+        registry_assign();
+        unsigned old_mark = 0, fresh_mark = 0;
+        int old_table = 0, fresh_table = 0;
+        for (size_t i = 0; i < g_out_n; i++) {
+            if (!strcmp(g_out[i].name, "old")) {
+                old_mark = g_out[i].mark; old_table = g_out[i].table;
+            } else if (!strcmp(g_out[i].name, "fresh")) {
+                fresh_mark = g_out[i].mark; fresh_table = g_out[i].table;
+            }
+        }
+        check("старая метка из реестра сохранена как есть", STEER_MARK_BASE << 7, old_mark);
+        check("старая таблица из реестра сохранена", 307, old_table);
+        check("новый выход метку получил", 1, fresh_mark != 0);
+        check("новый выход не занял чужую метку", 1, fresh_mark != old_mark);
+        check("новый выход не занял чужую таблицу", 1, fresh_table != old_table);
+
+        unlink(rpath);
+        snprintf(rpath, sizeof(rpath), "%s/steer.conf", rdir);
+        unlink(rpath);
+        rmdir(rdir);
         rmdir(sdir);
         g_state_dir = saved_state;
         g_rt_tables_d = saved_rt;

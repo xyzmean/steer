@@ -13,11 +13,11 @@
 
 #define MAX_CHANNELS 64
 #define MAX_OUTPUTS  16
-#define MAX_FROM     16
+#define MAX_FROM     32
 /* Локальных устройств в спеке. Столько же, сколько адресных записей в `from_default`, и по
  * той же причине: это две формы одного ответа на «кто наши клиенты», и разные пределы у них
  * означали бы, что один способ описать сеть богаче другого без всякого основания. */
-#define MAX_LAN_DEV  16
+#define MAX_LAN_DEV  32
 /* Several lists can feed ONE channel. Enabling "youtube" and "google" must not force
  * two channels with two rules and two sets — they are one destination as far as
  * routing is concerned. Read as several files rather than concatenated into one by
@@ -138,7 +138,7 @@ enum on_fail { FAIL_DROP, FAIL_DIRECT, FAIL_ZAPRET };
 
 /* Устройства выхода в порядке предпочтения: первое здоровое побеждает. Список — это
  * приоритет, ровно как порядок каналов. */
-#define MAX_DEVICES 8
+#define MAX_DEVICES 16
 
 /* Узлов подписки, выбранных в один выход kind=vless.
  *
@@ -152,7 +152,7 @@ enum on_fail { FAIL_DROP, FAIL_DIRECT, FAIL_ZAPRET };
  * секунд таймаута, и подписка из двадцати шести узлов целиком превратила бы «выход не
  * поднялся» в три с половиной минуты тишины. Кто хочет перебирать всю подписку, тот не
  * перечисляет узлы вовсе — пустой список и есть «первый рабочий среди всех пригодных». */
-#define MAX_NODE_SEL 8
+#define MAX_NODE_SEL 16
 
 /* Обфускация транспорта выхода: WireGuard поверх поддельного TCP (см. obfs.c).
  *
@@ -596,6 +596,24 @@ int out_node_named(const struct output *o);
 #endif
 #define STEER_MARK_MASK (((1u << STEER_MARK_BITS) - 1u) * STEER_MARK_BASE)
 
+/* СКОЛЬКО ВЫХОДОВ ВЛЕЗАЕТ В ПОЛЕ МЕТКИ.
+ *
+ * Раньше выход получал БИТ: метка была `база << номер`, и восемь бит поля значили ровно
+ * восемь помеченных выходов. Поле расширить нельзя — слева от нашего диапазона бит 28 у
+ * мини-сборки, 29 и 30 у zapret, а 16-23 занимают Tailscale и pbr, — поэтому выходу
+ * выдаётся ЗНАЧЕНИЕ: `база * (место + 1)`. Правило разметки пишет `mark and ~МАСКА or
+ * метка`, а правило маршрутизации сравнивает `mark and МАСКА == метка`, и обоим
+ * безразлично, одинокий там бит или число: в поле помещается столько выходов, сколько в
+ * нём умещается ненулевых значений, то есть 255 вместо 8.
+ *
+ * Упирается это не в метку, а в номера таблиц маршрутизации: полный движок занимает
+ * 300..315, дальше стоит мини-сборка (TABLE_BASE в spec.c). Поэтому мест ровно столько,
+ * сколько выходов вообще разрешено объявить, — MAX_OUTPUTS. */
+#define STEER_MARK_FIELD_MAX ((1u << STEER_MARK_BITS) - 1u)
+#define STEER_MARK_SLOTS \
+    (STEER_MARK_FIELD_MAX < (unsigned)MAX_OUTPUTS ? STEER_MARK_FIELD_MAX \
+                                                  : (unsigned)MAX_OUTPUTS)
+
 /* ---- биты, которыми объясняются с zapret ------------------------------------
  *
  * Все три принадлежат НЕ НАМ: значения задал zapret, и мы их только соблюдаем. Взяты они не
@@ -662,11 +680,19 @@ int out_node_named(const struct output *o);
  * ядро отдаст пакет одному из них, и какому именно, зависит от порядка запуска. */
 #define ZAPRET_QUEUE_BASE 8300
 
-/* Номер очереди выхода. Из метки: бит метки — это и есть номер выхода в реестре. */
+/* МЕСТО ВЫХОДА В РЕЕСТРЕ, выведенное из его метки. Метка — это `база * (место + 1)`,
+ * поэтому место читается делением. Прежняя раздача давала биты (`база << номер`), и метка
+ * из старого реестра даёт здесь не номер бита, а его степень двойки: 0, 1, 3, 7, 15 и
+ * дальше. Это НЕ ошибка — от места требуется только быть своим у каждого выхода, а
+ * распорядитель (registry_assign) держит занятые места и новому выходу их не выдаёт. */
+static inline int out_mark_slot(const struct output *o) {
+    uint32_t m = o->mark / STEER_MARK_BASE;
+    return m ? (int)(m - 1) : 0;
+}
+
+/* Номер очереди выхода. Из метки: место выхода в реестре — это и есть его номер. */
 static inline int out_zapret_queue(const struct output *o) {
-    int bit = 0;
-    for (uint32_t m = o->mark / STEER_MARK_BASE; m > 1; m >>= 1) bit++;
-    return ZAPRET_QUEUE_BASE + bit;
+    return ZAPRET_QUEUE_BASE + out_mark_slot(o);
 }
 
 /* ---- выход kind=tgws: Telegram через веб-сокет --------------------------------------
@@ -711,9 +737,7 @@ static inline int out_zapret_queue(const struct output *o) {
 /* Порт, на котором ждёт мост этого выхода. Выводится из метки по той же причине, что номер
  * очереди у zapret: второе поле в спеке — это второй источник правды. */
 static inline int out_tgws_port(const struct output *o) {
-    int bit = 0;
-    for (uint32_t m = o->mark / STEER_MARK_BASE; m > 1; m >>= 1) bit++;
-    return TGWS_PORT_BASE + bit;
+    return TGWS_PORT_BASE + out_mark_slot(o);
 }
 
 /* Где лежит nfqws. Путь пакета zapret на OpenWrt (remittor/zapret-openwrt) — тот же, что у
