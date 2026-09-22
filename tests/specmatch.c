@@ -1374,6 +1374,42 @@ int main(void) {
             "\"match\":{\"domains_file\":\"/tmp/x.lst\"}}]")));
     }
 
+    /* ---- пустая строка в «кому» (I-315) --------------------------------------------
+     *
+     * from:[""] принимался, а в правило уходил как «ip saddr {  }», и nft отвергал всё
+     * применение синтаксической ошибкой. Такой from пишет сам интерфейс splify2 («только эти
+     * устройства» без единого устройства), поэтому у канала это предупреждение, а не отказ:
+     * пустые строки выбрасываются, а канал, у которого не осталось никого, не применяется —
+     * и НЕ превращается в правило на всю сеть. from_default:[""] не пишет никто, там отказ. */
+    {
+        check("from:[\"\"] у канала — грузится", 0, load_from_str(SPEC(
+            "\"outputs\":{\"direct\":{\"kind\":\"direct\"}},"
+            "\"channels\":[{\"name\":\"c\",\"out\":\"direct\",\"from\":[\"\"],"
+            "\"match\":{\"domains_file\":\"/tmp/x.lst\"}},"
+            "{\"name\":\"d\",\"out\":\"direct\","
+            "\"match\":{\"domains_file\":\"/tmp/y.lst\"}}]")));
+        check("и этот канал не применяется", 1, g_ch_n ? g_ch[0].disabled : -1);
+        check("а соседний канал — применяется", 0, g_ch_n > 1 ? g_ch[1].disabled : -1);
+        check("пустая строка рядом с адресом — грузится", 0, load_from_str(SPEC(
+            "\"outputs\":{\"direct\":{\"kind\":\"direct\"}},"
+            "\"channels\":[{\"name\":\"c\",\"out\":\"direct\","
+            "\"from\":[\"192.168.1.5\",\"\"],"
+            "\"match\":{\"domains_file\":\"/tmp/x.lst\"}}]")));
+        check("и пустая выброшена, адрес остался", 1, g_ch_n ? (int)g_ch[0].from_n : -1);
+        check_str("и это тот адрес", "192.168.1.5", g_ch_n ? g_ch[0].from[0] : "");
+        check("и канал применяется", 0, g_ch_n ? g_ch[0].disabled : -1);
+        check("from:[\"\"] у выключенного канала — грузится", 0, load_from_str(SPEC(
+            "\"outputs\":{\"direct\":{\"kind\":\"direct\"}},"
+            "\"channels\":[{\"name\":\"c\",\"out\":\"direct\",\"from\":[\"\"],"
+            "\"enabled\":false,\"match\":{\"domains_file\":\"/tmp/x.lst\"}}]")));
+        check("from_default:[\"\"] у канала без from — отказ", 2, load_from_str(
+            "{\"schema\":1,\"from_default\":[\"\"],"
+            "\"outputs\":{\"direct\":{\"kind\":\"direct\"}},"
+            "\"channels\":[{\"name\":\"c\",\"out\":\"direct\","
+            "\"match\":{\"domains_file\":\"/tmp/x.lst\"}}]}"));
+    }
+
+
     printf("\n%s\n", fails ? "ЕСТЬ ПРОВАЛЫ" : "все проверки прошли");
     return fails ? 1 : 0;
 }
