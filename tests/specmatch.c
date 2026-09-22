@@ -1325,6 +1325,29 @@ int main(void) {
         check_str("\\\" и \\\\ — как прежде", "a\"b\\c", b);
     }
 
+    /* ---- enabled: 0 и 1 наравне с false и true (I-315) ------------------------------
+     *
+     * enabled проверялся по первой букве 'f', а any рядом — по 't' и '1'. jshn у OpenWrt
+     * пишет логическое значение то словом, то единицей (см. any в spec.c), и «enabled»:0 —
+     * канал, выключенный человеком, — включался. Непонятное значение по-прежнему оставляет
+     * канал включённым, с предупреждением. */
+    {
+        static const struct { const char *v; int disabled; } ev[] = {
+            { "false", 1 }, { "true", 0 }, { "0", 1 }, { "1", 0 }, { "null", 0 },
+        };
+        for (size_t k = 0; k < sizeof ev / sizeof *ev; k++) {
+            char s[512], what[96];
+            snprintf(s, sizeof s, SPEC(
+                "\"outputs\":{\"direct\":{\"kind\":\"direct\"}},"
+                "\"channels\":[{\"name\":\"c\",\"out\":\"direct\",\"enabled\":%s,"
+                "\"match\":{\"domains_file\":\"/tmp/x.lst\"}}]"), ev[k].v);
+            snprintf(what, sizeof what, "enabled:%s — грузится", ev[k].v);
+            check(what, 0, load_from_str(s));
+            snprintf(what, sizeof what, "enabled:%s — disabled=%d", ev[k].v, ev[k].disabled);
+            check(what, ev[k].disabled, g_ch_n ? g_ch[0].disabled : -1);
+        }
+    }
+
     printf("\n%s\n", fails ? "ЕСТЬ ПРОВАЛЫ" : "все проверки прошли");
     return fails ? 1 : 0;
 }

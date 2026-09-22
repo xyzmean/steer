@@ -979,9 +979,25 @@ static void parse_channels(struct js *j) {
                 else if (strcmp(sc, "global") != 0)
                     die("channels.%s: unknown scope (want device or global)", c.name);
             }
-            /* Отсутствие поля и `true` значат одно: правило работает. Проверяем на 'f',
-             * потому что спека без этого поля обязана вести себя как прежде. */
-            else if (!strcmp(key, "enabled")) { js_ws(j); c.disabled = (*j->p == 'f'); js_skip(j); }
+            /* Отсутствие поля и `true` значат одно: правило работает, — спека без этого
+             * поля обязана вести себя как прежде. «Нет» — и `false`, и `0`: jshn пишет
+             * логическое значение то словом, то единицей (см. any ниже), а проверка по
+             * первой букве 'f' включала канал, выключенный человеком, на `"enabled":0`
+             * (I-315). Непонятное значение канал по-прежнему не выключает, но называется. */
+            else if (!strcmp(key, "enabled")) {
+                js_ws(j);
+                const char *v = j->p;
+                js_skip(j);
+                size_t vl = (size_t)(j->p - v);
+                while (vl && (v[vl - 1] == ' ' || v[vl - 1] == '\t' ||
+                              v[vl - 1] == '\n' || v[vl - 1] == '\r')) vl--;
+                if ((vl == 5 && !strncmp(v, "false", 5)) || (vl == 1 && *v == '0'))
+                    c.disabled = 1;
+                else if (!(vl == 4 && !strncmp(v, "true", 4)) && !(vl == 1 && *v == '1'))
+                    fprintf(stderr, "steer[warn] channels.%s: enabled=%.*s не понят — канал "
+                            "остаётся включённым; запишите true или false\n",
+                            c.name[0] ? c.name : "?", (int)(vl > 16 ? 16 : vl), v);
+            }
             else if (!strcmp(key, "match")) {
                 if (js_lit(j, '{') != 0) die("channels.%s: match must be an object", c.name);
                 js_ws(j);
