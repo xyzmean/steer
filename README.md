@@ -10,7 +10,7 @@ steer решает, какой трафик уходит в туннель, а �
 [splify2](https://gitlab.com/xyzmean/splify2), он управляет этим движком.
 
 [![Telegram](https://img.shields.io/badge/Telegram-chat-2CA5E0?style=flat&logo=telegram)](https://t.me/ssplify)
-[![Поддержать проект](https://img.shields.io/badge/%D0%9F%D0%BE%D0%B4%D0%B4%D0%B5%D1%80%D0%B6%D0%B0%D1%82%D1%8C-%D0%BF%D1%80%D0%BE%D0%B5%D0%BA%D1%82-f5365c?style=flat)](https://www.donationalerts.com/r/yo1nkxxd)
+[![Поддержать проект](https://img.shields.io/badge/%D0%9F%D0%BE%D0%B4%D0%B4%D0%B5%D1%80%D0%B6%D0%B0%D1%82%D1%8C-%D0%BF%D1%80%D0%BE%D0%B5%D0%BA%D1%82-f5365c?style=flat)](https://pay.cloudtips.ru/p/fb925110)
 
 ## Что он умеет
 
