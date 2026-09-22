@@ -257,15 +257,23 @@ static int up_read(void *ctx, unsigned char *d, size_t cap, size_t *got) {
  * больших файлах». Заодно этот же вызов забирает служебные кадры HTTP/2 (SETTINGS,
  * WINDOW_UPDATE, PING) — без них окно соединения не пополнялось бы вовсе.
  *
- * Ничего не ждёт и ничего не отдаёт: прочитанное выбрасывается. */
-static void up_drain(struct vless_up *u) {
-    if (!u->started) return;
+ * Ничего не ждёт и данных не отдаёт: прочитанное выбрасывается. Отдаёт ОТКАЗ: сервер xhttp
+ * отвечает не-200 на кусок, который не принял (например, 400 на набивку не той длины), и
+ * этот кусок потерян — поток VLESS за ним цел уже не будет. Прежде код выбрасывался вместе с
+ * телом, vless_send возвращал успех, и узел выглядел живым, а трафик не шёл (I-219). Прочие
+ * коды h2_read здесь не отказ: H2_ERESET у packet-up — это законный конец ответа на кусок,
+ * а обрыв связи назовёт следующая запись. */
+static int up_drain(struct vless_up *u) {
+    if (!u->started) return 0;
     static __thread unsigned char sink[H2_MIN_READ_CAP];
     for (int i = 0; i < 4; i++) {
         size_t got = 0;
-        if (h2_read(&u->h2, sink, sizeof(sink), &got) != 0) return;
-        if (!got) return;
+        int rc = h2_read(&u->h2, sink, sizeof(sink), &got);
+        if (rc == H2_ESTATUS) return rc;
+        if (rc) return 0;
+        if (!got) return 0;
     }
+    return 0;
 }
 
 static int h2_open(struct vless_conn *c, const struct vless_node *n) {
@@ -854,7 +862,11 @@ int vless_send(struct vless_conn *c, const unsigned char *d, size_t n) {
                 case XH_STREAM_UP:
                     /* Один длинный POST на всё соединение: пишем в него и попутно
                      * забираем то, что сервер успел ответить. */
-                    { int rc = h2_write(&c->up.h2, d, n); up_drain(&c->up); return rc; }
+                    {
+                        int rc = h2_write(&c->up.h2, d, n);
+                        int dr = up_drain(&c->up);
+                        return rc ? rc : dr;
+                    }
                 case XH_PACKET_UP: {
                     /* Кусок = отдельный запрос: открыть, записать, закрыть свою половину.
                      *
@@ -871,8 +883,8 @@ int vless_send(struct vless_conn *c, const unsigned char *d, size_t n) {
                     if (rc) return rc;
                     rc = h2_end_stream(&c->up.h2);
                     c->seq++;
-                    up_drain(&c->up);
-                    return rc;
+                    int dr = up_drain(&c->up);
+                    return rc ? rc : dr;
                 }
             }
             return h2_write(&c->h2, d, n);

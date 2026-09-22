@@ -589,6 +589,17 @@ int h2_read(struct h2 *h, unsigned char *out, size_t cap, size_t *got) {
                 }
             } else if (h->frame_type == FR_HEADERS) {
                 if (h->frame_ours && h->status == 0 && real) status_peek(h, rec + p, real);
+                else if (!h->frame_ours && !h->frame_peeked && real) {
+                    /* Ответ на прежний поток (packet-up: прошлый кусок). Спрашивается только
+                     * начало кадра, как и у своего: статус в HEADERS идёт первым полем.
+                     * status_peek пишет в h->status — текущий поток его не должен видеть. */
+                    int keep = h->status;
+                    h->status = 0;
+                    status_peek(h, rec + p, real);
+                    if (h->status > 0 && h->status != 200) h->old_status = h->status;
+                    h->status = keep;
+                }
+                if (real) h->frame_peeked = 1;
             } else {
                 /* Служебный кадр: собираем тело, пока влезает. Не влезло — значит это
                  * SETTINGS с десятком настроек, из которых нас интересуют первые. */
@@ -630,6 +641,7 @@ int h2_read(struct h2 *h, unsigned char *out, size_t cap, size_t *got) {
          * делает общий разбор ниже) и отбрасываются: их содержимое — пустой ответ 200 на
          * выгрузку, читать в нём нечего. */
         h->frame_ours = (sid == h->sid);
+        h->frame_peeked = 0;
         h->frame_left = len;
         h->ctl_n = 0;
         p += 9;
@@ -655,6 +667,7 @@ int h2_read(struct h2 *h, unsigned char *out, size_t cap, size_t *got) {
     }
 
     if (h->status > 0 && h->status != 200) { g_last_status = h->status; return H2_ESTATUS; }
+    if (h->old_status) { g_last_status = h->old_status; return H2_ESTATUS; }
     rc = window_refill(h);
     if (rc) return rc;
     /* Ноль байт — это законный результат: в записи мог приехать только PING или SETTINGS.

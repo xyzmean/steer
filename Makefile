@@ -27,7 +27,7 @@ $(BUILD)/steer: src/steer.c src/spec.c src/dnsd.c src/failover.c src/aggregate.c
 	$(CC) $(CFLAGS) $(DEFS) -o $@ src/steer.c src/spec.c src/dnsd.c src/failover.c \
 	      src/aggregate.c src/obfs.c src/cli.c src/srs.c src/puff.c src/hwid.c
 
-test: all ext-syntax $(BUILD)/tgwssim $(BUILD)/dnsmatch $(BUILD)/specmatch $(BUILD)/specmatch-ext $(BUILD)/xswirematch $(BUILD)/xsconnmatch $(BUILD)/xsstreammatch $(BUILD)/tungromatch $(BUILD)/tunnelmatch $(BUILD)/tunnamematch $(BUILD)/xsconfmatch $(BUILD)/xslinkmatch $(BUILD)/xsroutematch $(BUILD)/chellomatch $(BUILD)/failovermatch $(BUILD)/dcmatch $(BUILD)/msgsplitmatch $(BUILD)/warmmatch $(BUILD)/upmatch $(BUILD)/tgwsfailmatch $(BUILD)/h2match $(BUILD)/submatch $(BUILD)/subfetchmatch $(BUILD)/fwmatch $(BUILD)/obfsmatch $(BUILD)/visionmatch $(BUILD)/tlsprobematch $(BUILD)/diagsim $(BUILD)/hwidsum
+test: all ext-syntax $(BUILD)/tgwssim $(BUILD)/dnsmatch $(BUILD)/specmatch $(BUILD)/specmatch-ext $(BUILD)/xswirematch $(BUILD)/xsconnmatch $(BUILD)/xsstreammatch $(BUILD)/tungromatch $(BUILD)/tunnelmatch $(BUILD)/tunnamematch $(BUILD)/xsconfmatch $(BUILD)/xslinkmatch $(BUILD)/xsroutematch $(BUILD)/chellomatch $(BUILD)/failovermatch $(BUILD)/dcmatch $(BUILD)/msgsplitmatch $(BUILD)/warmmatch $(BUILD)/upmatch $(BUILD)/tgwsfailmatch $(BUILD)/h2match $(BUILD)/xhupmatch $(BUILD)/submatch $(BUILD)/subfetchmatch $(BUILD)/fwmatch $(BUILD)/obfsmatch $(BUILD)/visionmatch $(BUILD)/tlsprobematch $(BUILD)/diagsim $(BUILD)/hwidsum
 	@sh tests/run.sh
 	@sh tests/gen.sh
 	@sh tests/tgwsmark.sh
@@ -49,6 +49,7 @@ test: all ext-syntax $(BUILD)/tgwssim $(BUILD)/dnsmatch $(BUILD)/specmatch $(BUI
 	@$(BUILD)/upmatch
 	@$(BUILD)/tgwsfailmatch
 	@$(BUILD)/h2match
+	@$(BUILD)/xhupmatch
 	@$(BUILD)/submatch
 	@$(BUILD)/subfetchmatch
 	@$(BUILD)/fwmatch
@@ -211,6 +212,15 @@ $(BUILD)/h2match: tests/h2match.c src/ext/h2.c src/ext/h2.h src/ext/tls13.h
 	@mkdir -p $(BUILD)
 	$(CC) $(CFLAGS) -Itests/stub -o $@ tests/h2match.c
 
+# Отказ сервера на выгрузку xhttp (stream-up, packet-up) обязан дойти до vless_send (I-219):
+# client.c включается целиком (up_drain статическая), h2.c настоящий, TLS и Reality
+# подменены — связь выгрузки голая, на сокетной паре. Подробности — в шапке стенда.
+XHUPMATCH_SRC = src/ext/h2.c src/ext/vless_proto.c src/ext/vision.c
+$(BUILD)/xhupmatch: tests/xhupmatch.c src/ext/client.c src/ext/client.h src/ext/h2.h $(XHUPMATCH_SRC)
+	@mkdir -p $(BUILD)
+	$(CC) $(CFLAGS) -Itests/stub -Isrc -Isrc/ext -DSTEER_EXTENDED -o $@ tests/xhupmatch.c \
+		$(XHUPMATCH_SRC) -lpthread
+
 # Разбор подписки — единственное место, куда в движок попадает чужой текст из интернета.
 # Ни сети, ни mbedtls он не требует, поэтому стенд включает исходник напрямую и входит
 # в обычный make test, в отличие от остального src/ext (см. ext-syntax).
@@ -336,7 +346,7 @@ $(BUILD)/chellomatch: tests/chellomatch.c tests/chello-frozen.h src/ext/chello.c
 # только артефакты: то, что здесь же и собирается, плюс упаковка из build.sh.
 clean:
 	rm -rf $(BUILD)/steer $(BUILD)/steer-* $(BUILD)/dnsmatch $(BUILD)/specmatch $(BUILD)/specmatch-ext \
-	       $(BUILD)/failovermatch $(BUILD)/dcmatch $(BUILD)/msgsplitmatch $(BUILD)/warmmatch $(BUILD)/upmatch $(BUILD)/tgwsfailmatch $(BUILD)/h2match $(BUILD)/submatch $(BUILD)/subfetchmatch $(BUILD)/fwmatch $(BUILD)/obfsmatch \
+	       $(BUILD)/failovermatch $(BUILD)/dcmatch $(BUILD)/msgsplitmatch $(BUILD)/warmmatch $(BUILD)/upmatch $(BUILD)/tgwsfailmatch $(BUILD)/h2match $(BUILD)/xhupmatch $(BUILD)/submatch $(BUILD)/subfetchmatch $(BUILD)/fwmatch $(BUILD)/obfsmatch \
 	       $(BUILD)/visionmatch $(BUILD)/xswirematch $(BUILD)/xsconnmatch $(BUILD)/xsstreammatch $(BUILD)/xsepochmatch $(BUILD)/tungromatch $(BUILD)/tunnamematch $(BUILD)/xsconfmatch $(BUILD)/xslinkmatch $(BUILD)/xsroutematch $(BUILD)/chellomatch $(BUILD)/hellofreeze $(BUILD)/xsloop $(BUILD)/xsbench \
 	       $(BUILD)/steer-hub $(BUILD)/steer-ext \
 	       $(BUILD)/diagsim $(BUILD)/libmbed-*.a \

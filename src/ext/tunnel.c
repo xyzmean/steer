@@ -1252,6 +1252,17 @@ static int upstream_send(struct conn *c, const struct vless_node *node,
         s->vis = vis_before;                /* кадр не ушёл — обёртка как бы не делалась */
         return SEND_AGAIN;
     }
+    if (rc == H2_ESTATUS) {
+        /* Сервер xhttp ответил отказом на выгрузку (stream-up, packet-up): кусок не принят, и
+         * поток за ним цел не будет. Закрываем, как любую неудачу отправки, но причину
+         * называем — иначе узел, отказывающий каждому куску, выглядит живым (I-219). */
+        static __thread time_t said;
+        if (g_now_s - said >= 5) {
+            said = g_now_s;
+            fprintf(stderr, LOG_W "узел %s не принял данные: %s — соединение закрыто; "
+                            "проверьте настройки xhttp узла\n", node->name, vless_strerror(rc));
+        }
+    }
     if (rc) return SEND_FATAL;
     /* Заголовок отмечаем отправленным только теперь: пометить раньше значило бы, что
      * повторная попытка уйдёт без него, и сервер не поймёт, куда соединять. */

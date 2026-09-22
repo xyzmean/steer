@@ -440,6 +440,29 @@ static void t_bad_uuid(void) {
     check(said && g_run_rc == 1, "I-097: tunnel_run называет негодный UUID до подъёма устройства");
 }
 
+static void send_refused(void *arg) {
+    (void)arg;
+    const unsigned char d[] = "GET / HTTP/1.1\r\n";
+    g_send_rc = H2_ESTATUS;
+    cli_send(1001, 2, TCP_ACK | TCP_PSH, 65535, d, sizeof(d) - 1);
+    g_send_rc = 0;
+}
+
+/* I-219: сервер xhttp не принял кусок выгрузки (vless_send вернул H2_ESTATUS). Соединение
+ * закрывается, как при любой неудаче отправки, но причину обязан услышать человек: прежде
+ * RST уходил молча, и узел выглядел живым. */
+static void t_send_refused(void) {
+    struct conn *c = open_conn(65535);
+    if (!c) { check(0, "I-219: соединение не открылось"); return; }
+    g_now_s += 10;
+    int said = stderr_has(send_refused, NULL, "не принял данные");
+    struct flow_key k = cli_key();
+    c = conn_find(&k);
+    check(said && !c, "I-219: отказ сервера на отправку назван в журнале, соединение закрыто");
+    if (c) conn_drop(c);
+    dev_drain(NULL);
+}
+
 int main(void) {
     int sp[2];
     if (socketpair(AF_UNIX, SOCK_DGRAM, 0, sp) != 0 || pipe(g_sess_pipe) != 0) return 2;
@@ -462,6 +485,7 @@ int main(void) {
     t_out_of_order_dupack();
     t_release_last_sleep();
     t_bad_uuid();
+    t_send_refused();
 
     printf(g_fail ? "\ntunnelmatch: ПРОВАЛ\n" : "\nвсе проверки прошли\n");
     return g_fail;
