@@ -797,9 +797,9 @@ static int nftlk_open(void) {
     return 0;
 }
 
-/* Build & send one set-element message inside a transaction, then synchronously
- * drain the kernel's NLM_F_ACK reply. Returns 0 on a successful ack, -1 on any
- * failure (send error, timeout, error ack).
+/* Build one set-element message (NFT_MSG_NEWSETELEM / DELSETELEM) into `buf`
+ * with sequence number `seq`; returns its length. Sending is nftlk_txn's job, so
+ * several of these can go into ONE transaction (see nft_map_set_element).
  *
  * A re-insert of an element that already exists returns -EEXIST — NOT 0, despite
  * what an earlier version of this comment claimed. Measured on the test router:
@@ -816,18 +816,17 @@ static int nftlk_open(void) {
  *   data_host  : element DATA as 4 bytes, or NULL for a plain set (no mapping)
  *   timeout_ms : element timeout in ms (nft 'timeout'), or 0 for none
  */
-static int nftlk_elem_msg(uint16_t nft_msg_type, const char *table,
-                          const char *obj_name, const void *key_net,
-                          int interval, const void *data_net,
-                          uint64_t timeout_ms) {
-    if (g_nlk_fd < 0) return -1;
+static size_t nftlk_elem_build(uint8_t *buf, size_t cap, uint32_t seq,
+                               uint16_t nft_msg_type, const char *table,
+                               const char *obj_name, const void *key_net,
+                               int interval, const void *data_net,
+                               uint64_t timeout_ms) {
     const char *fam_str, *tbl_str;
     nftlk_split_table(table, &fam_str, &tbl_str);
 
-    /* Build the whole message in a stack buffer (no malloc in the hot path). */
-    uint8_t buf[NFTLK_MSG_CAP];
+    /* The caller's stack buffer (no malloc in the hot path). */
     struct nlbuf b;
-    nlbuf_init(&b, buf, sizeof(buf));
+    nlbuf_init(&b, buf, cap);
 
     /* Reserve the fixed headers up front, then fill attrs, then patch nlmsg_len. */
     struct nlmsghdr *nh = (struct nlmsghdr *)b.p;
@@ -908,15 +907,14 @@ static int nftlk_elem_msg(uint16_t nft_msg_type, const char *table,
      * NLM_F_CREATE matters: without it the kernel rejects an element that is not
      * already present, which is every element we ever add.
      *
-     * The sequence number must be unique per request, not a timestamp: two
-     * inserts within the same second would share a seq, and the ack matcher
-     * below could then credit one transaction with the other's result. */
+     * The sequence number comes from nftlk_seq_reserve: it is how nftlk_txn tells
+     * this message's ack from its neighbours' and from stale ones. */
     nh->nlmsg_len   = (uint32_t)(b.p - buf);
     nh->nlmsg_type  = (uint16_t)((NFNL_SUBSYS_NFTABLES << 8) | nft_msg_type);
     /* NLM_F_CREATE only makes sense for an add; a delete must not carry it. */
     nh->nlmsg_flags = NLM_F_REQUEST | NLM_F_ACK
                     | (nft_msg_type == NFT_MSG_NEWSETELEM ? NLM_F_CREATE : 0);
-    nh->nlmsg_seq   = (g_nlk_seq += 2);   /* leaves room for the batch-begin seq below */
+    nh->nlmsg_seq   = seq;
     nh->nlmsg_pid   = 0;
     nfg->nfgen_family = nftlk_family(fam_str);
     nfg->version      = NFNETLINK_V0;
@@ -932,57 +930,110 @@ static int nftlk_elem_msg(uint16_t nft_msg_type, const char *table,
         fprintf(stderr, "\n");
     }
 
-    /* One transaction: BATCH_BEGIN + the element + BATCH_END, in a single
-     * sendmsg so the kernel can never see a half-open transaction if we are
-     * interrupted between writes. The begin/end messages carry no NLM_F_ACK, so
-     * the only ack that comes back is the element's own. */
+    return nh->nlmsg_len;
+}
+
+/* One nf_tables TRANSACTION of `n` element messages: BATCH_BEGIN, the messages,
+ * BATCH_END — in a single sendmsg, so the kernel can never see a half-open
+ * transaction if we are interrupted between writes. The kernel applies the batch
+ * all-or-nothing: if ANY message fails, every message in it is rolled back.
+ *
+ * Every element message carries NLM_F_ACK (begin/end do not), and the kernel
+ * reports ALL of them once the whole batch has been processed — including a 0 for
+ * a message that was fine but rolled back because a neighbour failed. So errs[i]
+ * alone does not say "applied": the batch committed only if every errs[i] is 0.
+ *
+ * msgs[i] must have been built with seq = first_seq + i (see nftlk_seq_reserve).
+ * Returns 0 once every message's ack has been read (errs[] filled with the
+ * kernel's negative errno or 0), -1 if the batch could not be sent or an ack did
+ * not arrive in ACK_TIMEOUT_MS — the outcome is then unknown. */
+static int nftlk_txn(uint8_t *const msgs[], const size_t lens[], int n,
+                     uint32_t first_seq, int errs[]) {
+    if (g_nlk_fd < 0 || n < 1 || n > 4) return -1;
     uint8_t bbuf[64], ebuf[64];
-    size_t blen = nftlk_build_batch(bbuf, nh->nlmsg_seq - 1, 1);
-    size_t elen = nftlk_build_batch(ebuf, nh->nlmsg_seq + 1, 0);
-    g_nlk_seq = nh->nlmsg_seq + 1;   /* keep the counter past the end message */
+    size_t blen = nftlk_build_batch(bbuf, first_seq - 1, 1);
+    size_t elen = nftlk_build_batch(ebuf, first_seq + (uint32_t)n, 0);
 
     struct sockaddr_nl dst = { .nl_family = AF_NETLINK };
-    struct iovec iov[3] = { { bbuf, blen },
-                            { buf, nh->nlmsg_len },
-                            { ebuf, elen } };
+    struct iovec iov[6];
+    int k = 0;
+    iov[k++] = (struct iovec){ bbuf, blen };
+    for (int i = 0; i < n; i++) iov[k++] = (struct iovec){ msgs[i], lens[i] };
+    iov[k++] = (struct iovec){ ebuf, elen };
     struct msghdr msg = { .msg_name = &dst, .msg_namelen = sizeof(dst),
-                          .msg_iov = iov, .msg_iovlen = 3 };
-    uint32_t want_seq = nh->nlmsg_seq;
+                          .msg_iov = iov, .msg_iovlen = (size_t)k };
     if (sendmsg(g_nlk_fd, &msg, 0) < 0) {
         if (dbg()) fprintf(stderr, "nftlk: sendmsg fail errno=%d\n", errno);
         return -1;
     }
 
-    /* Drain until we see the ack for OUR request. The kernel replies with an
-     * NLMSG_ERROR whose nlmsgerr::error is 0 on success or a negative errno on
-     * failure; acks for other sequence numbers are leftovers from a transaction
-     * that timed out earlier and must not be mistaken for this one's result. */
-    uint8_t rbuf[256];
-    for (;;) {
+    /* Drain until every message of THIS batch has its ack. The kernel replies with
+     * an NLMSG_ERROR whose nlmsgerr::error is 0 on success or a negative errno;
+     * acks for other sequence numbers are leftovers from a transaction that timed
+     * out earlier and must not be mistaken for this one's result. An error acked
+     * against BATCH_BEGIN's own seq is a batch-level refusal (e.g. ENOMEM): none
+     * of the messages then get an ack of their own. */
+    int got = 0, seen[4] = {0};
+    uint8_t rbuf[1024];
+    while (got < n) {
         ssize_t r = recv(g_nlk_fd, rbuf, sizeof(rbuf), 0);
         if (r < (ssize_t)NLMSG_HDRLEN) {
             if (dbg()) fprintf(stderr, "nftlk: ack recv short/timeout r=%zd errno=%d\n", r, errno);
             return -1; /* timeout / truncated */
         }
-        struct nlmsghdr *rh = (struct nlmsghdr *)rbuf;
-        if (rh->nlmsg_type == NLMSG_ERROR) {
+        size_t left = (size_t)r;
+        for (struct nlmsghdr *rh = (struct nlmsghdr *)rbuf; NLMSG_OK(rh, left);
+             rh = NLMSG_NEXT(rh, left)) {
+            if (rh->nlmsg_type != NLMSG_ERROR) continue; /* multipart / unrelated */
             struct nlmsgerr *e = NLMSG_DATA(rh);
-            if (rh->nlmsg_seq != want_seq) {
+            if (rh->nlmsg_seq == first_seq - 1 && e->error != 0) {
+                if (dbg()) fprintf(stderr, "nftlk: batch refused error=%d\n", e->error);
+                return -1;
+            }
+            uint32_t i = rh->nlmsg_seq - first_seq;
+            if (i >= (uint32_t)n || seen[i]) {
                 if (dbg())
-                    fprintf(stderr, "nftlk: stale ack seq=%u (want %u), ignoring\n",
-                            rh->nlmsg_seq, want_seq);
+                    fprintf(stderr, "nftlk: stale ack seq=%u (want %u..%u), ignoring\n",
+                            rh->nlmsg_seq, first_seq, first_seq + (uint32_t)n - 1);
                 continue;
             }
-            if (e->error != 0 && dbg())
-                fprintf(stderr, "nftlk: kernel ack error=%d (%s) for %s/%s\n",
-                        e->error, strerror(-e->error), tbl_str, obj_name);
-            /* The kernel's errno is returned as-is (negative): EEXIST and ENOENT
-             * are meaningful outcomes for the callers below, not plain failures. */
-            return e->error;
+            seen[i] = 1;
+            errs[i] = e->error;
+            got++;
         }
-        if (rh->nlmsg_type == NLMSG_DONE) return 0;
-        /* multipart / unrelated: keep draining until we see the ack */
     }
+    return 0;
+}
+
+/* Sequence numbers for one transaction of `n` messages: begin, n messages, end.
+ * Returns the first MESSAGE seq. Unique per request, not a timestamp: two inserts
+ * within the same second would share a seq, and the ack matcher could then credit
+ * one transaction with the other's result. */
+static uint32_t nftlk_seq_reserve(int n) {
+    uint32_t first = g_nlk_seq + 2;           /* g_nlk_seq + 1 is BATCH_BEGIN */
+    g_nlk_seq = first + (uint32_t)n;          /* ... and this one is BATCH_END */
+    return first;
+}
+
+/* One element message in its own transaction. Returns the kernel's errno as-is
+ * (0 or negative): EEXIST and ENOENT are meaningful outcomes for the callers
+ * below, not plain failures. -1 for send failure / timeout. */
+static int nftlk_elem_msg(uint16_t nft_msg_type, const char *table,
+                          const char *obj_name, const void *key_net,
+                          int interval, const void *data_net,
+                          uint64_t timeout_ms) {
+    if (g_nlk_fd < 0) return -1;
+    uint8_t buf[NFTLK_MSG_CAP];
+    uint32_t seq = nftlk_seq_reserve(1);
+    size_t len = nftlk_elem_build(buf, sizeof(buf), seq, nft_msg_type, table, obj_name,
+                                  key_net, interval, data_net, timeout_ms);
+    uint8_t *msgs[1] = { buf };
+    int err = 0;
+    if (nftlk_txn(msgs, &len, 1, seq, &err) != 0) return -1;
+    if (err != 0 && dbg())
+        fprintf(stderr, "nftlk: kernel ack error=%d (%s) for %s/%s\n",
+                err, strerror(-err), table, obj_name);
+    return err;
 }
 
 /* ---- typed wrappers (the call sites below use these) ------------------ */
@@ -1038,6 +1089,21 @@ static int nft_add_element(const char *set_name, uint32_t key_host, uint32_t ttl
  * whose value must change is deleted and re-added inside ONE transaction (the
  * pair is atomic: no packet can observe the fake IP without a mapping).
  *
+ * ONE transaction, not two back to back — which is what this used to be, despite
+ * the paragraph above: delete in its own batch, add in the next. Between them was
+ * a kernel generation with no mapping at all, and if the add then failed (100 ms
+ * ack timeout, the table mid-rebuild) the delete stayed committed: the map lost
+ * the element while the fast path kept handing out the fake IP from our own
+ * bookkeeping — clients went to 198.18.x.x with no DNAT behind it. Now a refused
+ * add rolls the delete back with it, the OLD mapping stays in the kernel, we
+ * return -1 and the caller keeps `known_real` as the installed value (it only
+ * records the new backend on 0). Covered by tests/dnsnft.sh.
+ *
+ * The one catch of all-or-nothing: a delete of an element that is not there
+ * answers -ENOENT, and that alone rolls back the add in the same batch. That state
+ * is legitimate (an fw4 reload flushed the map) and is exactly what a plain add
+ * wants, so on ENOENT for the delete we retry the add on its own.
+ *
  * `known_real` is what we believe is currently installed (0 = nothing), so the
  * common case — same backend as last time — costs one add that the kernel
  * answers EEXIST to, and the uncommon case costs a delete plus an add.
@@ -1046,13 +1112,24 @@ static int nft_map_set_element(const char *map_name, uint32_t fake_host,
                                uint32_t real_host, uint32_t known_real) {
     uint32_t k = htonl(fake_host), d = htonl(real_host);
     if (known_real != 0 && known_real != real_host) {
-        /* Value must change: drop the stale mapping first. ENOENT is fine — it
-         * means the kernel already lost it (e.g. an fw4 reload flushed the map),
-         * which is exactly the state the add below wants. */
-        int drc = nftlk_elem_msg(NFT_MSG_DELSETELEM, g_nft_table, map_name,
-                                 &k, 0, NULL, 0);
-        if (drc != 0 && drc != -ENOENT && dbg())
-            fprintf(stderr, "nftlk: map delete for update failed rc=%d\n", drc);
+        if (g_nlk_fd < 0) return -1;
+        uint8_t del[NFTLK_MSG_CAP], add[NFTLK_MSG_CAP];
+        uint32_t seq = nftlk_seq_reserve(2);
+        size_t lens[2];
+        lens[0] = nftlk_elem_build(del, sizeof(del), seq, NFT_MSG_DELSETELEM, g_nft_table,
+                                   map_name, &k, 0, NULL, 0);
+        lens[1] = nftlk_elem_build(add, sizeof(add), seq + 1, NFT_MSG_NEWSETELEM,
+                                   g_nft_table, map_name, &k, 0, &d, 0);
+        uint8_t *msgs[2] = { del, add };
+        int errs[2] = { 0, 0 };
+        if (nftlk_txn(msgs, lens, 2, seq, errs) != 0) return -1;
+        if (errs[0] == 0 && errs[1] == 0) return 0;   /* committed: new value in place */
+        if (dbg())
+            fprintf(stderr, "nftlk: map update rolled back del=%d add=%d\n",
+                    errs[0], errs[1]);
+        /* Rolled back. Only a missing old element is worth a retry (see above);
+         * anything else leaves the old mapping in place and fails the update. */
+        if (errs[0] != -ENOENT) return -1;
     }
     int rc = nftlk_elem_msg(NFT_MSG_NEWSETELEM, g_nft_table, map_name,
                             &k, 0 /* plain map, not interval */, &d, 0);
