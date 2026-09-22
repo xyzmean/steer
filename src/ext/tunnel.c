@@ -784,21 +784,39 @@ static void *connector(void *arg) {
 }
 
 /* Поставить заявку в очередь; заводит потоки-установщики при первом вызове.
- * 0 — принята, -1 — очередь полна. */
+ * 0 — принята, -1 — очередь полна, -2 — установщиков нет ни одного.
+ *
+ * Запущенной очередь считается, только если создался хотя бы один установщик (I-322).
+ * Прежде started ставился до pthread_create, и при отказе всех созданий заявки копились в
+ * очереди, которую никто не разбирает: клиент получал SYN-ACK, а дальше ни данных, ни RST,
+ * и повторной попытки завести потоки не было уже никогда. Теперь отказ говорит в журнал,
+ * заявка отклоняется, а следующая заявка пробует завести установщиков снова. */
 static int connq_push(const struct connjob *j) {
     pthread_mutex_lock(&g_cq.mu);
     if (!g_cq.started) {
-        g_cq.started = 1;
         pthread_attr_t a;
         pthread_attr_init(&a);
         /* Стек скромный: рукопожатие держит крупные буферы в __thread, а не на стеке. */
         pthread_attr_setstacksize(&a, 128 * 1024);
         pthread_attr_setdetachstate(&a, PTHREAD_CREATE_DETACHED);
+        int made = 0, err = 0;
         for (int i = 0; i < CONNECTORS; i++) {
             pthread_t t;
-            if (pthread_create(&t, &a, connector, NULL) != 0) break;
+            if ((err = pthread_create(&t, &a, connector, NULL)) != 0) break;
+            made++;
         }
         pthread_attr_destroy(&a);
+        if (!made) {
+            static time_t said;
+            if (g_now_s - said >= 5) {
+                said = g_now_s;
+                fprintf(stderr, LOG_W "потоки установки соединений не создаются (%s) — "
+                                "новые соединения через туннель отклоняются\n", strerror(err));
+            }
+            pthread_mutex_unlock(&g_cq.mu);
+            return -2;
+        }
+        g_cq.started = 1;
     }
     if (g_cq.n == CONNQ) { pthread_mutex_unlock(&g_cq.mu); return -1; }
     g_cq.q[(g_cq.head + g_cq.n) % CONNQ] = *j;
@@ -1748,17 +1766,19 @@ static void udp_packet(const struct tun_dev *tun, const struct vless_node *node,
         /* Vision не заводим вовсе: в запросе UDP flow не объявлен, значит кадров не будет
          * ни в ту, ни в другую сторону. */
 
+        int qr;
         if (g_spare_want > 0 && spare_checkout(&SESS(c)->v) == 0) {
             c->fd = SESS(c)->v.fd;
             TR("UDP: взята запасная сессия\n");
-        } else if (conn_submit(c, node) == 0) {
+        } else if ((qr = conn_submit(c, node)) == 0) {
             c->pending = 1;
             TR("UDP: заявка установщику\n");
         } else {
             /* Очередь установки полна. Сказать об этом надо: снаружи это выглядит как
-             * «QUIC не работает через туннель», а причина — процессор, а не протокол. */
+             * «QUIC не работает через туннель», а причина — процессор, а не протокол.
+             * Отказ -2 (нет установщиков) connq_push назвал сам. */
             static __thread time_t said_q;
-            if (g_now_s - said_q >= 5) {
+            if (qr == -1 && g_now_s - said_q >= 5) {
                 said_q = g_now_s;
                 fprintf(stderr, LOG_W "очередь установки соединений полна (%d), "
                                 "датаграмма отброшена — процессор не успевает\n", CONNQ);
@@ -1923,13 +1943,15 @@ static void handle_packet(const struct tun_dev *tun, const struct vless_node *no
         }
 
         TR("SYN: заявка установщику\n");
-        if (conn_submit(c, node) != 0) {
+        int qr = conn_submit(c, node);
+        if (qr != 0) {
             /* Очередь полна: столько рукопожатий разом процессор не переварит. Молча
              * отбрасывать SYN нельзя — за это уже пришлось расплатиться однажды, — поэтому
-             * говорим в лог и отпускаем запись: клиент повторит SYN сам. */
+             * говорим в лог и отпускаем запись: клиент повторит SYN сам. Отказ -2 (нет
+             * установщиков) connq_push назвал сам. */
             static __thread time_t said_q;
             time_t nw = g_now_s;
-            if (nw - said_q >= 5) {
+            if (qr == -1 && nw - said_q >= 5) {
                 said_q = nw;
                 fprintf(stderr, LOG_W "очередь установки соединений полна (%d), "
                                 "SYN отклонён — процессор не успевает\n", CONNQ);
@@ -2135,7 +2157,9 @@ int run_quiet(const char *const argv[]);   /* из steer.c */
  * бы завести второе место, где номера могут разъехаться. */
 static void tun_bring_up(const char *dev, int table) {
     char addr[40];
-    snprintf(addr, sizeof(addr), "198.51.100.%d/32", 1 + (table % 200));
+    /* Без знака: таблица приходит из файла реестра, и отрицательное число оттуда давало
+     * адрес 198.51.100.-N, который ip не примет (I-322). */
+    snprintf(addr, sizeof(addr), "198.51.100.%u/32", 1u + ((unsigned)table % 200u));
     const char *a[] = { "ip", "addr", "replace", addr, "dev", dev, NULL };
     /* Отказы называются по одному, и тон у них разный, потому что разная и цена.
      *

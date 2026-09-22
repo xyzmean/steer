@@ -27,7 +27,7 @@ $(BUILD)/steer: src/steer.c src/spec.c src/dnsd.c src/failover.c src/aggregate.c
 	$(CC) $(CFLAGS) $(DEFS) -o $@ src/steer.c src/spec.c src/dnsd.c src/failover.c \
 	      src/aggregate.c src/obfs.c src/cli.c src/srs.c src/puff.c src/hwid.c
 
-test: all ext-syntax $(BUILD)/tgwssim $(BUILD)/dnsmatch $(BUILD)/specmatch $(BUILD)/specmatch-ext $(BUILD)/xswirematch $(BUILD)/xsconnmatch $(BUILD)/xsstreammatch $(BUILD)/tungromatch $(BUILD)/tunnamematch $(BUILD)/xsconfmatch $(BUILD)/xslinkmatch $(BUILD)/xsroutematch $(BUILD)/chellomatch $(BUILD)/failovermatch $(BUILD)/dcmatch $(BUILD)/msgsplitmatch $(BUILD)/warmmatch $(BUILD)/upmatch $(BUILD)/h2match $(BUILD)/submatch $(BUILD)/subfetchmatch $(BUILD)/fwmatch $(BUILD)/obfsmatch $(BUILD)/visionmatch $(BUILD)/tlsprobematch $(BUILD)/diagsim $(BUILD)/hwidsum
+test: all ext-syntax $(BUILD)/tgwssim $(BUILD)/dnsmatch $(BUILD)/specmatch $(BUILD)/specmatch-ext $(BUILD)/xswirematch $(BUILD)/xsconnmatch $(BUILD)/xsstreammatch $(BUILD)/tungromatch $(BUILD)/tunnelmatch $(BUILD)/tunnamematch $(BUILD)/xsconfmatch $(BUILD)/xslinkmatch $(BUILD)/xsroutematch $(BUILD)/chellomatch $(BUILD)/failovermatch $(BUILD)/dcmatch $(BUILD)/msgsplitmatch $(BUILD)/warmmatch $(BUILD)/upmatch $(BUILD)/h2match $(BUILD)/submatch $(BUILD)/subfetchmatch $(BUILD)/fwmatch $(BUILD)/obfsmatch $(BUILD)/visionmatch $(BUILD)/tlsprobematch $(BUILD)/diagsim $(BUILD)/hwidsum
 	@sh tests/run.sh
 	@sh tests/gen.sh
 	@sh tests/tgwsmark.sh
@@ -58,6 +58,7 @@ test: all ext-syntax $(BUILD)/tgwssim $(BUILD)/dnsmatch $(BUILD)/specmatch $(BUI
 	@$(BUILD)/xsconnmatch
 	@$(BUILD)/xsstreammatch
 	@$(BUILD)/tungromatch
+	@$(BUILD)/tunnelmatch
 	@$(BUILD)/tunnamematch
 	@$(BUILD)/xsconfmatch
 	@$(BUILD)/xslinkmatch
@@ -264,6 +265,16 @@ $(BUILD)/xsstreammatch: tests/xsstreammatch.c src/ext/xsstream.c src/ext/xsstrea
 $(BUILD)/tungromatch: tests/tungromatch.c src/ext/tun.c src/ext/tun.h
 	@mkdir -p $(BUILD)
 	$(CC) $(CFLAGS) -Isrc -o $@ tests/tungromatch.c
+
+# Разбор пакетов туннеля VLESS на подменённом клиенте (I-320, I-321, I-322): tunnel.c
+# включается целиком, client.c подменён, поэтому mbedtls не нужна — заголовки из tests/stub,
+# как у ext-syntax. Подробности — в шапке стенда.
+TUNNELMATCH_SRC = src/ext/tun.c src/ext/rtx.c src/ext/vless_proto.c src/ext/vision.c \
+                  src/ext/sub.c src/spec.c
+$(BUILD)/tunnelmatch: tests/tunnelmatch.c src/ext/tunnel.c $(TUNNELMATCH_SRC)
+	@mkdir -p $(BUILD)
+	$(CC) $(CFLAGS) -Itests/stub -Isrc -Isrc/ext -DSTEER_EXTENDED -o $@ tests/tunnelmatch.c \
+		$(TUNNELMATCH_SRC) -lpthread -ldl
 
 # Имя устройства: движок работает ровно с тем именем, о котором просил, — иначе отказ. Ядро
 # усекает имя длиннее 15 символов молча, и разошедшееся имя не видно ниоткуда: очереди
