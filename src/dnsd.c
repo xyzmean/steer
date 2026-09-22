@@ -1674,13 +1674,37 @@ static void on_sigterm(int sig) { (void)sig; g_running = 0; }
  * виден вовсе. */
 static unsigned g_rules_gen;
 
+/* Перечитать списки всех каналов.
+ *
+ * Новый набор собирается РЯДОМ и подменяет текущий только целиком. Прежде текущий
+ * освобождался первым, и HUP в тот миг, когда файла списка нет (его переписывают или
+ * качают заново), оставлял канал без правил вовсе: имена канала до следующего HUP шли
+ * настоящими адресами мимо туннеля — вопреки обещанию load_rules_into «missing file:
+ * caller keeps what it has» (I-318). Теперь нет хотя бы одного файла канала — канал
+ * остаётся с тем, что было. Исключение — пустой прежний набор (первая загрузка при
+ * запуске): держаться там не за что, и канал берёт те файлы, что есть. Исчезнуть файлу
+ * насовсем HUP не может: перечень файлов входит в подпись таблицы (dch_signature), и
+ * его смена ведёт к перезапуску, а не к HUP. */
 static void reload_rules(void) {
     g_rules_gen++;
     for (size_t i = 0; i < g_dch_n; i++) {
-        ruleset_free(&g_dch[i].rules);
-        memset(&g_dch[i].rules, 0, sizeof(g_dch[i].rules));
+        struct ruleset fresh;
+        memset(&fresh, 0, sizeof(fresh));
+        int missing = 0;
         for (size_t k = 0; k < g_dch[i].rules_n; k++)
-            load_rules_into(g_dch[i].rules_path[k], &g_dch[i].rules);
+            if (load_rules_into(g_dch[i].rules_path[k], &fresh) != 0) {
+                missing++;
+                fprintf(stderr, "steer dnsd: channel %s: %s не читается\n",
+                        g_dch[i].set, g_dch[i].rules_path[k]);
+            }
+        if (missing && g_dch[i].rules.n > 0) {
+            ruleset_free(&fresh);
+            fprintf(stderr, "steer dnsd: channel %s: оставлены прежние правила\n",
+                    g_dch[i].set);
+            continue;
+        }
+        ruleset_free(&g_dch[i].rules);
+        g_dch[i].rules = fresh;
     }
     for (size_t i = 0; i < g_dch_n; i++)
         fprintf(stderr, "steer dnsd: channel %s: %zu rule(s)\n",

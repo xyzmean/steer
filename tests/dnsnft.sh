@@ -17,6 +17,8 @@
 #     ENOENT, батч откатывается целиком — и резолвер обязан повторить одно добавление.
 #  4. Ядро отвергло добавление нового значения — прежнее отображение остаётся в карте (батч
 #     откатывается целиком), а не пропадает вместе с удалением.
+#  5. HUP при исчезнувшем файле правил не оставляет канал без правил, а вернувшийся файл
+#     следующим HUP подхватывается.
 #
 # Нужны root (сетевое пространство и nf_tables), nft и python3. Без них стенд пропускается,
 # а не проваливается: остальной набор обязан проходить на голой машине.
@@ -77,7 +79,7 @@ elif struct.unpack('>H', d[6:8])[0] == 0: print("empty")
 else: print(".".join(str(b) for b in d[-4:]))
 PY
 
-printf 'example.com\nmoved.net\nfail.io\n' > "$tmp/d.lst"
+printf 'example.com\nmoved.net\nfail.io\nstay.org\n' > "$tmp/d.lst"
 printf '{"schema":1,"from_default":["127.0.0.0/8"],'\
 '"outputs":{"direct":{"kind":"direct"},"vpn":{"kind":"interface","device":"lo"}},'\
 '"channels":[{"name":"c","match":{"domains_files":["%s/d.lst"],"mode":"fakeip"},"out":"vpn"}]}' \
@@ -155,6 +157,21 @@ check "отказ добавления не снёс прежний элемен
     "$(nft list map inet steer fakeip | grep -c "$fake : 2001:db8::21")"
 nft delete map inet steer fakeip
 nft add map inet steer fakeip '{ type ipv4_addr : ipv4_addr; }'
+
+# --- 5. HUP при исчезнувшем файле правил ----------------------------------------------------
+mv "$tmp/d.lst" "$tmp/d.lst.gone"
+kill -HUP "$DPID"
+sleep 0.5
+stay="$(ask stay.org)"
+check "HUP без файла правил: домен из прежних правил всё ещё подменяется" "198.18" \
+    "$(echo "$stay" | cut -d. -f1-2)"
+# Файл вернулся с новым именем — следующий HUP его берёт: подмена не застыла на старом.
+{ cat "$tmp/d.lst.gone"; echo new.dev; } > "$tmp/d.lst"
+rm -f "$tmp/d.lst.gone"
+kill -HUP "$DPID"
+sleep 0.5
+check "HUP с вернувшимся файлом берёт новые правила" "198.18" \
+    "$(ask new.dev | cut -d. -f1-2)"
 
 kill "$DPID" 2>/dev/null; wait "$DPID" 2>/dev/null
 if [ "$fail" -gt 0 ]; then
