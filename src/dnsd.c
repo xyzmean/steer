@@ -74,7 +74,41 @@
 #include <unistd.h>
 
 #define MAX_PKT 4096
-#define MAX_PENDING 256
+/* Сколько запросов может ждать ответа одновременно.
+ *
+ * ЧИСЛО — ЭТО ПРОПУСКНАЯ СПОСОБНОСТЬ ПРИ МЕДЛЕННОМ АПСТРИМЕ, а не «сколько бывает».
+ * Ожидание живёт PENDING_TTL_SEC, значит таблица на N мест держит N/TTL запросов в
+ * секунду: при 256 это 51 запрос/с. Пока резолвер наверху отвечает за миллисекунды,
+ * столько и не нужно; но когда он начинает отвечать за секунды (DoH через туннель, а
+ * туннель просел), таблица заполняется, и КАЖДЫЙ следующий запрос отбрасывается молча.
+ * Снаружи это выглядит как «интернет тормозит через несколько часов работы»: клиент ждёт
+ * свой таймаут и переспрашивает, а переспросы добивают ту же таблицу. 1024 места дают
+ * 204 запроса/с и стоят ~180 КБ — на роутере, где свободно мегабайты, это дёшево. */
+#define MAX_PENDING 1024
+/* Раскладка нашего номера транзакции: младшие PENDING_IDX_BITS — номер слота, старшие —
+ * поколение. Прежде было 8 и 8, и это ровно та арифметика, из-за которой защита от
+ * запоздавшего ответа переставала работать именно под нагрузкой: слот переиспользуется
+ * примерно через MAX_PENDING выдач, а поколение — байт, то есть при 256 слотах оно
+ * возвращалось к тому же значению РОВНО тогда, когда слот шёл по второму кругу. Теперь
+ * поколения мало (6 бит), и оно больше не единственная защита — главная проверка в том,
+ * что ответ обязан отвечать на наш вопрос (см. question_fp). */
+#define PENDING_IDX_BITS 10
+#define PENDING_IDX_MASK ((1u << PENDING_IDX_BITS) - 1u)
+#define PENDING_GEN_MASK (0xFFFFu >> PENDING_IDX_BITS)
+
+/* Жалоба не чаще раза в WARN_EVERY_SEC на каждое место.
+ *
+ * Все три случая ниже (таблица ожиданий полна, апстрим не принял запрос, пул fake-IP
+ * исчерпан) прежде происходили МОЛЧА, и это их главное свойство: снаружи они выглядят как
+ * «DNS тормозит» или «сайт пошёл мимо туннеля», а в журнале нет ни строки. Молчать о них
+ * нельзя, но и печатать на каждый пакет тоже — на всплеске это тысячи строк в syslog на
+ * роутере с единственным ядром. */
+#define WARN_EVERY_SEC 10
+static int warn_due(time_t *last, time_t now) {
+    if (now - *last < WARN_EVERY_SEC) return 0;
+    *last = now;
+    return 1;
+}
 #define PENDING_TTL_SEC 5
 #define MAX_RULE_LINES 65536
 #define MAX_HOSTNAME 256
@@ -1292,7 +1326,18 @@ static int fakeip_lookup_or_alloc(const char *domain_in, uint32_t *out_addr) {
         *out_addr = g_fakeip.entries[at].addr;
         return 0;
     }
-    if (g_fakeip_next >= FAKEIP_POOL_SIZE) return -1;
+    if (g_fakeip_next >= FAKEIP_POOL_SIZE) {
+        /* Пул кончился: домен уйдёт клиенту реальным адресом, то есть МИМО канала, в
+         * который его положил человек. Молчать об этом нельзя — снаружи это «правило
+         * перестало работать», и связать это с пулом нечем. */
+        static time_t said_pool;
+        time_t now = time(NULL);
+        if (warn_due(&said_pool, now))
+            fprintf(stderr, "steer dnsd: пул fake-IP исчерпан (%u адресов, занято %zu): "
+                            "новые домены идут мимо каналов\n",
+                    (unsigned)FAKEIP_POOL_SIZE, g_fakeip.n);
+        return -1;
+    }
     uint32_t addr = fakeip_index_to_addr(g_fakeip_next);
     if (fakeip_table_add(&g_fakeip, domain, addr) != 0) return -1;
     if (g_fakeip_state_path) fakeip_state_append(g_fakeip_state_path, domain, addr);
@@ -1367,6 +1412,11 @@ struct pending {
      * старший — поколение. Без него запоздавший ответ на давно закрытое ожидание
      * попал бы в чужой слот, переиспользовавший тот же индекс. */
     uint8_t gen;
+    /* Отпечаток вопроса и его длина — чем ответ сверяется с ожиданием (см. question_fp).
+     * qfp == 0 значит «вопрос не разобрался», и тогда проверки нет: такой запрос
+     * пересылается как есть и разбирается по полному пути. */
+    uint16_t qfp;
+    uint16_t qsec_end;
     int in_use;
     /* Клиенту уже ответили из быстрого пути: ответ upstream нужен только чтобы
      * обновить DNAT-карту и реальный адрес, отправлять его клиенту нельзя —
@@ -1399,12 +1449,38 @@ static int g_listen_fd = -1;
  * ничего не стоит: подделать ответ может только тот, кто уже на петле, а такой и так
  * может всё. */
 static int g_up_fd = -1;
+/* Порт резолвера наверху — только чтобы назвать его в жалобах: человеку, читающему
+ * «запрос не ушёл наверх», нужно знать, куда именно мы не достучались. */
+static int g_up_port;
 static uint8_t g_gen_next;
 
 /* Номер транзакции, под которым ожидание уходит наверх. */
 static uint16_t pending_tag(const struct pending *p) {
-    return (uint16_t)(((uint16_t)p->gen << 8) | (uint16_t)(p - g_pending));
+    return (uint16_t)(((uint16_t)(p->gen & PENDING_GEN_MASK) << PENDING_IDX_BITS) |
+                      (uint16_t)((p - g_pending) & PENDING_IDX_MASK));
 }
+
+/* Отпечаток СЕКЦИИ ВОПРОСА: имя, тип и класс, то есть всё, что делает вопрос вопросом.
+ *
+ * Зачем он есть. Ответ приходит на общий сокет, и единственное, чем он связан со своим
+ * ожиданием, — номер транзакции. Номер составной (слот плюс поколение), и поколение
+ * когда-нибудь повторится: запоздавший ответ на давно закрытый вопрос имеет шанс попасть
+ * в живой слот и уехать клиенту КАК ОТВЕТ НА ДРУГОЙ ВОПРОС — то есть чужой адрес вместо
+ * нужного, молча. Отпечаток это закрывает по существу: ответ обязан нести тот же вопрос,
+ * что мы задали, иначе он не наш, каким бы ни был номер.
+ *
+ * FNV-1a по сырым байтам, без разбора имени: ответ echo'ит секцию вопроса дословно — на
+ * этом уже держится быстрый путь (см. pending.hit), — и сравнивать байты и дешевле, и
+ * строже, чем разбирать их второй раз. */
+static uint16_t question_fp(const uint8_t *pkt, size_t qend) {
+    uint32_t h = 2166136261u;
+    for (size_t i = 12; i < qend; i++) {
+        h ^= pkt[i];
+        h *= 16777619u;
+    }
+    return (uint16_t)((h ^ (h >> 16)) | 1u);   /* ненулевой: 0 значит «отпечатка нет» */
+}
+
 /* One entry per channel that matches domains, in SPEC ORDER. */
 struct dchan {
     char set[64];               /* the nft set the compiler generated for it */
@@ -1634,7 +1710,18 @@ static int handle_client_query(void) {
     }
 
     struct pending *p = pending_alloc();
-    if (!p) return 1; /* under load: drop, client's own resolver will retry/timeout */
+    if (!p) {
+        /* Мест нет: запрос отбрасывается, клиент переспросит сам. Но сказать об этом
+         * надо — это и есть «DNS тормозит», увиденное изнутри, и без строки в журнале
+         * отличить его от беды у провайдера нечем. */
+        static time_t said_full;
+        time_t now = time(NULL);
+        if (warn_due(&said_full, now))
+            fprintf(stderr, "steer dnsd: таблица ожиданий полна (%d мест): запросы "
+                            "отбрасываются. Резолвер наверху (127.0.0.1:%d) отвечает "
+                            "слишком медленно\n", MAX_PENDING, g_up_port);
+        return 1;
+    }
 
     if (g_up_fd < 0) return 1;                 /* апстрим не открылся — отвечать нечем */
 
@@ -1647,7 +1734,24 @@ static int handle_client_query(void) {
     buf[0] = (uint8_t)(tag >> 8);
     buf[1] = (uint8_t)(tag & 0xFF);
 
-    if (send(g_up_fd, buf, (size_t)n, 0) < 0) return 1;
+    if (send(g_up_fd, buf, (size_t)n, 0) < 0) {
+        /* Чаще всего это ECONNREFUSED от петли: резолвер наверху не запущен или
+         * перезапускается. Ядро отдаёт такую ошибку отложенно, следующим системным
+         * вызовом, поэтому одна строка на десять секунд — ровно то, что нужно: увидеть
+         * факт, не залив журнал. */
+        static time_t said_send;
+        time_t now = time(NULL);
+        if (warn_due(&said_send, now))
+            fprintf(stderr, "steer dnsd: запрос не ушёл наверх (127.0.0.1:%d): %s\n",
+                    g_up_port, strerror(errno));
+        return 1;
+    }
+
+    /* Отпечаток вопроса — ПОСЛЕ удачной отправки и до того, как слот объявлен занятым:
+     * ровно те байты, что уехали наверх. Вопрос, который не разобрался (qend == 0),
+     * отпечатка не получает. */
+    p->qfp = (qend > 12 && qend <= (size_t)n) ? question_fp(buf, qend) : 0;
+    p->qsec_end = (uint16_t)((p->qfp) ? qend : 0);
 
     p->in_use = 1;
     p->quiet = quiet;
@@ -1703,15 +1807,31 @@ static size_t build_rewritten_response(const uint8_t *orig, size_t qend,
 static int handle_upstream_response(void) {
     uint8_t buf[MAX_PKT];
     ssize_t n = recv(g_up_fd, buf, sizeof(buf), 0);
-    if (n < 0) return 0;                       /* в том числе EAGAIN: очередь пуста */
+    if (n < 0) {
+        if (errno == EAGAIN || errno == EWOULDBLOCK) return 0;   /* очередь пуста */
+        /* Прочая ошибка — это ОДНА отложенная ошибка сокета (обычно ECONNREFUSED с
+         * петли), а не конец очереди: за ней в очереди могут лежать настоящие ответы, и
+         * прежний `return 0` бросал их ждать следующего витка цикла. Читаем дальше. */
+        static time_t said_recv;
+        time_t now = time(NULL);
+        if (warn_due(&said_recv, now))
+            fprintf(stderr, "steer dnsd: ошибка чтения ответа сверху (127.0.0.1:%d): %s\n",
+                    g_up_port, strerror(errno));
+        return 1;
+    }
     if (n < 12) return 1;                      /* короче заголовка DNS — не ответ */
 
     uint16_t tag = (uint16_t)((buf[0] << 8) | buf[1]);
-    struct pending *p = &g_pending[tag & 0xFF];
-    /* Три условия сразу: слот занят, поколение совпадает, и это вообще ответ на наш
-     * номер. Иначе датаграмма — запоздавший ответ на давно закрытое ожидание или
-     * чужая подделка, и применять её к живому слоту нельзя. */
-    if (!p->in_use || p->gen != (uint8_t)(tag >> 8)) return 1;
+    struct pending *p = &g_pending[tag & PENDING_IDX_MASK];
+    /* Слот занят и поколение совпадает. Иначе датаграмма — запоздавший ответ на давно
+     * закрытое ожидание или чужая подделка, и применять её к живому слоту нельзя. */
+    if (!p->in_use ||
+        p->gen != (uint8_t)((tag >> PENDING_IDX_BITS) & PENDING_GEN_MASK)) return 1;
+    /* И ГЛАВНОЕ: ответ обязан отвечать на НАШ вопрос. Поколение когда-нибудь повторится
+     * (шесть бит), и без этой проверки запоздавший ответ уехал бы клиенту как ответ на
+     * другой вопрос — чужой адрес вместо нужного, молча и без единой строки в журнале. */
+    if (p->qfp && ((size_t)n < p->qsec_end || question_fp(buf, p->qsec_end) != p->qfp))
+        return 1;
 
     /* Номер клиента возвращается на место ДО любой отправки вниз: клиент сопоставляет
      * ответ с запросом именно по нему, а дальше буфер уходит клиенту и как есть, и
@@ -2021,6 +2141,7 @@ static int run_proxy(int listen_port, int upstream_port) {
     if (g_up_fd < 0) { perror("upstream socket"); return 1; }
     struct sockaddr_in up = {0};
     up.sin_family = AF_INET;
+    g_up_port = upstream_port;
     up.sin_port = htons((uint16_t)upstream_port);
     up.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
     if (connect(g_up_fd, (struct sockaddr *)&up, sizeof(up)) != 0) {
