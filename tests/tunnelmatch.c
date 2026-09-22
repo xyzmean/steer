@@ -382,6 +382,64 @@ static void t_release_last_sleep(void) {
     *c = save;
 }
 
+/* Выполнить f с stderr в файл и вернуть, нашлась ли в написанном строка needle. */
+static int stderr_has(void (*f)(void *), void *arg, const char *needle) {
+    char path[] = "/tmp/tunnelmatch-err.XXXXXX";
+    int fd = mkstemp(path);
+    if (fd < 0) return 0;
+    fflush(stderr);
+    int save = dup(2);
+    dup2(fd, 2);
+    f(arg);
+    fflush(stderr);
+    dup2(save, 2); close(save);
+    char buf[4096];
+    ssize_t r = pread(fd, buf, sizeof(buf) - 1, 0);
+    close(fd); unlink(path);
+    buf[r > 0 ? r : 0] = 0;
+    return strstr(buf, needle) != NULL;
+}
+
+static void syn_bad(void *arg) {
+    struct vless_node *bad = arg;
+    unsigned char p[128];
+    size_t l = tcp_build(p, sizeof(p), CLI_IP, SRV_IP, CLI_PORT, SRV_PORT, 1000, 0, TCP_SYN,
+                         NULL, 0, 65535, 0, -1);
+    handle_packet(&g_tun, bad, p, l);
+}
+
+static int g_run_rc;
+static void run_bad(void *arg) {
+    struct output o;
+    memset(&o, 0, sizeof(o));
+    /* Имя длиннее 15 символов: tun_open откажет и сам, так что устройство не появится ни до
+     * правки, ни после — различается только названа ли причина. */
+    snprintf(o.device, sizeof(o.device), "tunnelmatch-no-such-dev");
+    g_run_rc = tunnel_run(&o, arg);
+}
+
+/* I-097: UUID узла не разбирается. Прежде соединение закрывалось молча — ни строки, ни
+ * причины, — а tunnel_run поднимал устройство, которое закрывало бы всё подряд. */
+static void t_bad_uuid(void) {
+    struct vless_node bad = g_node;
+    /* Короче 31 знака — законный «производный» UUID (sha1 строки, как у Xray); длиннее 36
+     * не разбирается никак. */
+    memset(bad.uuid, 0, sizeof(bad.uuid));
+    memset(bad.uuid, 'x', 40);
+    snprintf(bad.name, sizeof(bad.name), "узел-стенда");
+    struct flow_key k = cli_key();
+    struct conn *c = conn_find(&k);
+    if (c) conn_drop(c);
+    g_now_s += 10;                                   /* ограничитель строки не мешает */
+    int said = stderr_has(syn_bad, &bad, "не разбирается UUID");
+    c = conn_find(&k);
+    check(said && !c, "I-097: SYN к узлу с негодным UUID — отказ назван в журнале");
+    if (c) conn_drop(c);
+    dev_drain(NULL);
+    said = stderr_has(run_bad, &bad, "не разбирается UUID");
+    check(said && g_run_rc == 1, "I-097: tunnel_run называет негодный UUID до подъёма устройства");
+}
+
 int main(void) {
     int sp[2];
     if (socketpair(AF_UNIX, SOCK_DGRAM, 0, sp) != 0 || pipe(g_sess_pipe) != 0) return 2;
@@ -403,6 +461,7 @@ int main(void) {
     t_sendagain_eof();
     t_out_of_order_dupack();
     t_release_last_sleep();
+    t_bad_uuid();
 
     printf(g_fail ? "\ntunnelmatch: ПРОВАЛ\n" : "\nвсе проверки прошли\n");
     return g_fail;

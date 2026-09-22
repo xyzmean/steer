@@ -1734,6 +1734,20 @@ static size_t udp_defrag(const unsigned char *pkt, size_t n, unsigned char *out,
     return asm_total;
 }
 
+/* Идентификатор узла не разобрался, и соединение закрывается. Причина известна здесь и
+ * обязана быть сказана: молчаливый conn_drop снаружи выглядит как «трафика нет», и ровно так
+ * выглядел бы следующий похожий случай (I-097). Сегодня сюда не попасть — узел с негодным
+ * UUID отсеивается при разборе подписки, а tunnel_run проверяет его до подъёма устройства, —
+ * поэтому строка через ограничитель, а не на каждый пакет. Сам UUID не печатается: это
+ * ключ доступа к узлу. */
+static void node_id_refused(const struct vless_node *node, const char *what) {
+    static __thread time_t said;
+    if (g_now_s - said < 5) return;
+    said = g_now_s;
+    fprintf(stderr, LOG_W "у узла %s не разбирается UUID — %s отклонено; "
+                    "проверьте ссылку узла\n", node->name, what);
+}
+
 /* Датаграмма из TUN: своя сессия VLESS на каждый поток «адрес-порт → адрес-порт».
  *
  * Почему сессия на поток, а не одна на всё. Адрес назначения в VLESS едет в заголовке
@@ -1767,7 +1781,11 @@ static void udp_packet(const struct tun_dev *tun, const struct vless_node *node,
         c->fd = -1;
         conn_link(c);                               /* после ключа: хэш считается по нему */
         c->last = g_now_s;
-        if (vless_uuid_parse(node->uuid, SESS(c)->uuid) != 0) { conn_drop(c); return; }
+        if (vless_uuid_parse(node->uuid, SESS(c)->uuid) != 0) {
+            node_id_refused(node, "соединение UDP");
+            conn_drop(c);
+            return;
+        }
         /* Vision не заводим вовсе: в запросе UDP flow не объявлен, значит кадров не будет
          * ни в ту, ни в другую сторону. */
 
@@ -1930,7 +1948,11 @@ static void handle_packet(const struct tun_dev *tun, const struct vless_node *no
          * Зачем так: браузер держит десятки соединений живыми, ничего по ним не передавая
          * (HTTP/2 keep-alive), и за каждое платилось 32 КБ, которых потом не хватало на новые.
          * Теперь простаивающее соединение стоит только своей записи в таблице. */
-        if (vless_uuid_parse(node->uuid, SESS(c)->uuid) != 0) { conn_drop(c); return; }
+        if (vless_uuid_parse(node->uuid, SESS(c)->uuid) != 0) {
+            node_id_refused(node, "соединение TCP");
+            conn_drop(c);
+            return;
+        }
         vision_init(&SESS(c)->vis, SESS(c)->uuid);
 
         /* SYN-ACK — СРАЗУ, не дожидаясь рукопожатия с узлом. Рукопожатие стоит
@@ -2738,6 +2760,16 @@ int tunnel_run(struct output *o, const struct vless_node *node) {
     g_spare_want = sp ? atoi(sp) : 4;
     if (g_spare_want < 0) g_spare_want = 0;
     if (g_spare_want > SPARE_MAX) g_spare_want = SPARE_MAX;
+
+    /* Идентификатор узла — ДО устройства и потоков, пока узел ещё можно назвать. Ниже он
+     * разбирается заново на каждое соединение, и отказ там означал бы туннель, который
+     * поднят, но закрывает всё подряд (I-097). */
+    unsigned char id[16];
+    if (vless_uuid_parse(node->uuid, id) != 0) {
+        fprintf(stderr, LOG_W2 "у узла %s не разбирается UUID — туннель %s не поднят; "
+                        "проверьте ссылку узла\n", node->name, dev);
+        return 1;
+    }
 
     static struct worker workers[MAX_WORKERS];
     struct tun_dev queues[MAX_WORKERS];
