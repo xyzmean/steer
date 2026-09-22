@@ -99,6 +99,17 @@ static char *trim(char *s) {
     return s;
 }
 
+/* Целое без знака и без хвоста. Было atol, и хвост после цифр молча отбрасывался:
+ * «MTU = 1400abc» давал 1400, «Endpoint = 1.2.3.4:443x» — порт 443 (I-324). Файл строгий
+ * (xsconf.h), и опечатка в числе — отказ с номером строки, как опечатка в ключе. Пробелы
+ * вокруг значения уже сняты trim. */
+static int num_strict(const char *s, long *v) {
+    if (*s < '0' || *s > '9') return -1;
+    char *e = NULL;
+    *v = strtol(s, &e, 10);
+    return *e ? -1 : 0;
+}
+
 /* Ключи wg, поведение которых движок не реализует. Отвергаются НАЗЫВАЯ замену: человек,
  * скопировавший конфигурацию из wg-quick, обязан узнать, что его PostUp не выполнится, —
  * иначе он будет ждать от туннеля того, чего тот не делает. */
@@ -250,6 +261,14 @@ int xs_conf_parse(const char *text, size_t n, enum xs_role role,
         p = nl ? nl + 1 : end;
         line_no++;
 
+        /* Комментарий в конце строки: «#» после пробела или табуляции и всё за ним. Так
+         * пишет пояснения docs/xsteer.md («MTU = 1439  # необязательно…») и так же срезает
+         * их wg-quick. Снимается до разбора значения и у всех ключей: иначе строгий разбор
+         * чисел (I-324) отвергал бы пример из нашего же документа, а «Decoy = proxy  # …»
+         * не читался и раньше. «#» вплотную к значению — часть значения: хвост без пробела
+         * («1400#x») остаётся отказом, как и любой хвост после числа. */
+        for (char *h = raw; *h; h++)
+            if (*h == '#' && h > raw && (h[-1] == ' ' || h[-1] == '\t')) { *h = '\0'; break; }
         char *line = trim(raw);
         if (!*line || *line == '#' || *line == ';') continue;
 
@@ -313,12 +332,16 @@ int xs_conf_parse(const char *text, size_t n, enum xs_role role,
                 c->addr_plen = a.plen;
                 have_addr = 1;
             } else if (ieq(key, "MTU")) {
-                long v = atol(val);
+                long v;
+                if (num_strict(val, &v) != 0)
+                    FAIL("строка %d: MTU — нужно число, а не «%s»", line_no, val);
                 if (v < 576 || v > XS_LINK_MAX)
                     FAIL("строка %d: MTU вне разумного (576..%d)", line_no, XS_LINK_MAX);
                 c->mtu = (int)v;
             } else if (ieq(key, "ListenPort")) {
-                long v = atol(val);
+                long v;
+                if (num_strict(val, &v) != 0)
+                    FAIL("строка %d: ListenPort — нужно число, а не «%s»", line_no, val);
                 if (v < 1 || v > 65535) FAIL("строка %d: ListenPort вне 1..65535", line_no);
                 c->listen_port = (int)v;
             } else if (ieq(key, "SNI")) {
@@ -390,7 +413,10 @@ int xs_conf_parse(const char *text, size_t n, enum xs_role role,
                 char *colon = strrchr(val, ':');
                 if (!colon) FAIL("строка %d: DecoyDest должен быть вида адрес:порт", line_no);
                 *colon = '\0';
-                long port = atol(colon + 1);
+                long port;
+                if (num_strict(colon + 1, &port) != 0)
+                    FAIL("строка %d: DecoyDest: порт — нужно число, а не «%s»",
+                         line_no, colon + 1);
                 if (port < 1 || port > 65535)
                     FAIL("строка %d: DecoyDest: порт вне 1..65535", line_no);
                 struct in_addr in;
@@ -476,7 +502,9 @@ int xs_conf_parse(const char *text, size_t n, enum xs_role role,
             char *colon = strrchr(val, ':');
             if (!colon) FAIL("строка %d: Endpoint должен быть вида адрес:порт", line_no);
             *colon = '\0';
-            long port = atol(colon + 1);
+            long port;
+            if (num_strict(colon + 1, &port) != 0)
+                FAIL("строка %d: Endpoint: порт — нужно число, а не «%s»", line_no, colon + 1);
             if (port < 1 || port > 65535)
                 FAIL("строка %d: Endpoint: порт вне 1..65535", line_no);
             struct in_addr in;
@@ -488,7 +516,9 @@ int xs_conf_parse(const char *text, size_t n, enum xs_role role,
             snprintf(pe->endpoint, sizeof(pe->endpoint), "%s", val);
             pe->endpoint_port = (int)port;
         } else if (ieq(key, "PersistentKeepalive")) {
-            long v = atol(val);
+            long v;
+            if (num_strict(val, &v) != 0)
+                FAIL("строка %d: PersistentKeepalive — нужно число, а не «%s»", line_no, val);
             if (v < 0 || v > 3600)
                 FAIL("строка %d: PersistentKeepalive вне 0..3600", line_no);
             pe->keepalive = (int)v;

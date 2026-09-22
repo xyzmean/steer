@@ -542,6 +542,104 @@ int main(void) {
         refuses("отказ: файл больше предела", big, XS_ROLE_SPOKE);
     }
 
+    /* ---- пример из docs/xsteer.md целиком (I-324) -----------------------------------
+     *
+     * Документация пишет пояснения в конце строки («MTU = 1439  # необязательно…»), как
+     * это принято в wg-quick. Строгий разбор чисел не имеет права отвергнуть пример, который
+     * человек скопировал из нашего же документа: комментарий, начатый «#» после пробела или
+     * табуляции, снимается со строки до разбора значения — у всех ключей. Тексты ниже —
+     * примеры документа построчно, с тестовыми ключами вместо <...>; хабу добавлен пир. */
+    {
+        char t[2048];
+        snprintf(t, sizeof(t),
+                 "# пир (роутер)\n"
+                 "[Interface]\n"
+                 "PrivateKey = %s\n"
+                 "Address    = 10.7.0.2/24\n"
+                 "MTU        = 1439          # необязательно: считается из канала\n"
+                 "SNI        = www.example.com\n"
+                 "Device     = xs0\n"
+                 "\n"
+                 "[Peer]                     # у пира ровно одна секция — хаб\n"
+                 "PublicKey  = %s\n"
+                 "Endpoint   = 203.0.113.10:443   # адресом, не именем\n"
+                 "AllowedIPs = 10.7.0.0/24, 192.168.9.0/24\n"
+                 "PersistentKeepalive = 25\n", KEY_A, KEY_B);
+        check("docs/xsteer.md, пример пира: принят", 0, parse(t, XS_ROLE_SPOKE));
+        if (g_err[0]) printf("     объяснение: \"%s\"\n", g_err);
+        check("docs: MTU 1439", 1439, g_c.mtu);
+        check_str("docs: Endpoint", "203.0.113.10", g_c.peer[0].endpoint);
+        check("docs: порт Endpoint", 443, g_c.peer[0].endpoint_port);
+        check("docs: AllowedIPs — два префикса", 2, (long)g_c.peer[0].allowed_n);
+        check("docs: PersistentKeepalive", 25, g_c.peer[0].keepalive);
+        snprintf(t, sizeof(t),
+                 "# хаб (VPS)\n"
+                 "[Interface]\n"
+                 "PrivateKey = %s\n"
+                 "Address    = 10.7.0.1/24\n"
+                 "ListenPort = 443\n"
+                 "Decoy      = proxy               # alert (умолчание), silent, reset или proxy\n"
+                 "DecoyDest  = 93.184.216.34:443   # адресом, не именем: разрешать имя пришлось бы из цикла,\n"
+                 "                                 # где нет ни одного блокирующего вызова\n"
+                 "DecoySNI   = www.example.com, cdn.example.net   # по каким именам прибор выбирает прикрытие сам\n"
+                 "[Peer]\nPublicKey=%s\nAllowedIPs=10.7.0.2/32\n", KEY_A, KEY_B);
+        check("docs/xsteer.md, пример хаба: принят", 0, parse(t, XS_ROLE_HUB));
+        if (g_err[0]) printf("     объяснение: \"%s\"\n", g_err);
+        check("docs: Decoy proxy", (long)XS_DECOY_PROXY, (long)g_c.decoy);
+        check_str("docs: DecoyDest", "93.184.216.34", g_c.decoy_dest);
+        check("docs: порт DecoyDest", 443, g_c.decoy_port);
+        check("docs: DecoySNI — два имени", 2, (long)g_c.decoy_sni_n);
+        check_str("docs: второе имя DecoySNI", "cdn.example.net",
+                  g_c.decoy_sni_n > 1 ? g_c.decoy_sni[1] : "");
+        /* «#» без пробела перед ним — часть значения, а не комментарий (так же, как «;» и «#»
+         * в начале строки остаются единственными комментариями целой строки). Хвост без «#»
+         * — по-прежнему отказ: это и есть I-324. */
+        snprintf(t, sizeof(t), "[Interface]\nPrivateKey=%s\nAddress=10.0.0.2/24\nMTU=1400#x\n"
+                 "[Peer]\nPublicKey=%s\nAllowedIPs=0.0.0.0/0\nEndpoint=1.2.3.4:443\n", KEY_A, KEY_B);
+        refuses("отказ: «1400#x» — «#» без пробела не комментарий", t, XS_ROLE_SPOKE);
+        snprintf(t, sizeof(t), "[Interface]\nPrivateKey=%s\nAddress=10.0.0.2/24\nMTU=1400abc # x\n"
+                 "[Peer]\nPublicKey=%s\nAllowedIPs=0.0.0.0/0\nEndpoint=1.2.3.4:443\n", KEY_A, KEY_B);
+        refuses("отказ: хвост перед комментарием", t, XS_ROLE_SPOKE);
+    }
+
+    /* ---- числа с хвостом (I-324) ---------------------------------------------------
+     *
+     * Числа читались atol, и хвост после цифр молча отбрасывался: «MTU = 1400abc» давал 1400,
+     * «Endpoint = 1.2.3.4:443x» — порт 443. Файл объявлен строгим (xsconf.h), и опечатка в
+     * числе — такой же отказ с номером строки, как опечатка в ключе. По случаю на каждое из
+     * пяти мест, и прежние чистые числа принимаются по-прежнему. */
+    {
+        char t[1024];
+        snprintf(t, sizeof(t), "[Interface]\nPrivateKey=%s\nAddress=10.0.0.2/24\nMTU=1400abc\n"
+                 "[Peer]\nPublicKey=%s\nAllowedIPs=0.0.0.0/0\nEndpoint=1.2.3.4:443\n", KEY_A, KEY_B);
+        refuses("отказ: MTU с хвостом", t, XS_ROLE_SPOKE);
+        check("отказ: названа строка", 1, strstr(g_err, "строка 4") != NULL);
+        snprintf(t, sizeof(t), "[Interface]\nPrivateKey=%s\nAddress=10.0.0.2/24\n"
+                 "[Peer]\nPublicKey=%s\nAllowedIPs=0.0.0.0/0\nEndpoint=1.2.3.4:443x\n", KEY_A, KEY_B);
+        refuses("отказ: порт Endpoint с хвостом", t, XS_ROLE_SPOKE);
+        snprintf(t, sizeof(t), "[Interface]\nPrivateKey=%s\nAddress=10.0.0.2/24\n"
+                 "[Peer]\nPublicKey=%s\nAllowedIPs=0.0.0.0/0\nEndpoint=1.2.3.4:443\n"
+                 "PersistentKeepalive=15s\n", KEY_A, KEY_B);
+        refuses("отказ: PersistentKeepalive с хвостом", t, XS_ROLE_SPOKE);
+        snprintf(t, sizeof(t), "[Interface]\nPrivateKey=%s\nAddress=10.77.0.1/24\nListenPort=443x\n"
+                 "[Peer]\nPublicKey=%s\nAllowedIPs=10.77.0.2/32\n", KEY_A, KEY_B);
+        refuses("отказ: ListenPort с хвостом", t, XS_ROLE_HUB);
+        snprintf(t, sizeof(t), "[Interface]\nPrivateKey=%s\nAddress=10.77.0.1/24\nListenPort=443\n"
+                 "Decoy=proxy\nDecoyDest=93.184.216.34:443x\n"
+                 "[Peer]\nPublicKey=%s\nAllowedIPs=10.77.0.2/32\n", KEY_A, KEY_B);
+        refuses("отказ: порт DecoyDest с хвостом", t, XS_ROLE_HUB);
+        snprintf(t, sizeof(t), "[Interface]\nPrivateKey=%s\nAddress=10.0.0.2/24\nMTU=-1400\n"
+                 "[Peer]\nPublicKey=%s\nAllowedIPs=0.0.0.0/0\nEndpoint=1.2.3.4:443\n", KEY_A, KEY_B);
+        refuses("отказ: MTU со знаком", t, XS_ROLE_SPOKE);
+        snprintf(t, sizeof(t), "[Interface]\nPrivateKey=%s\nAddress=10.0.0.2/24\nMTU = 1400\n"
+                 "[Peer]\nPublicKey=%s\nAllowedIPs=0.0.0.0/0\nEndpoint = 1.2.3.4:443\n"
+                 "PersistentKeepalive = 15\n", KEY_A, KEY_B);
+        check("чистые числа с пробелами у знака равенства: принято", 0, parse(t, XS_ROLE_SPOKE));
+        check("MTU прочитан", 1400, g_c.mtu);
+        check("порт Endpoint прочитан", 443, g_c.peer[0].endpoint_port);
+        check("PersistentKeepalive прочитан", 15, g_c.peer[0].keepalive);
+    }
+
     printf("\n%s\n", fails ? "ЕСТЬ ПРОВАЛЫ" : "все проверки прошли");
     return fails ? 1 : 0;
 }
