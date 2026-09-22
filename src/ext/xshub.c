@@ -1819,8 +1819,11 @@ static void *worker_loop(void *arg) {
              * встречается ни в одном браузерном соединении и находится подсчётом пауз между мелкими
              * пакетами. Разброс ±20% не стоит ничего. */
             if (s->phase == PH_EST && !s->keep_next) s->keep_next = XSH_KEEPALIVE_MS;
-            if (s->phase == PH_EST && s->conn.last_rx > s->conn.last_tx &&
-                now - s->conn.last_tx >= s->keep_next) {
+            /* Срок считается от последней ЗАПИСИ, а не от последнего сегмента: голые
+             * подтверждения хаба сбрасывали его так же, как у пира (см.
+             * xs_conn_need_keepalive), и пустая запись не уходила, пока хаб что-то принимал. */
+            if (s->phase == PH_EST && s->conn.last_rx > s->conn.last_data_tx &&
+                xs_conn_need_keepalive(&s->conn, s->keep_next, now)) {
                 send_to(w, s, w->row, 0, now);
                 uint32_t j = 0;
                 xc_random((unsigned char *)&j, sizeof(j));

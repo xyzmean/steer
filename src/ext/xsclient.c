@@ -577,6 +577,14 @@ static void probe_done(struct spoke *s, const char *dev, long long now) {
                               "Похоже, пробы не доходят вовсе\n", XS_MTU_FLOOR);
         mtu_apply(s, dev, XS_MTU_FLOOR, "путь не подтвердил ничего выше низа");
         s->mtu_confirmed = 0;
+        /* ХАБУ ГОВОРИМ И ЭТОТ ИСХОД. Прежде кадр итога уходил только при удачном пробое, и
+         * сторона, спустившаяся на безопасный низ, оставляла хаб с прежним согласованным
+         * размером: тот продолжал подрезать MSS по 1431 и слать полноразмерные записи в путь,
+         * который мы только что признали узким. Молчание здесь означало «ничего не изменилось»,
+         * а изменилось как раз то, ради чего согласование и существует. */
+        uint8_t fin[8];
+        size_t fn3 = xs_mtu_build(fin, sizeof(fin), XS_MTU_FLOOR);
+        if (fn3) send_frame(s, fin, fn3, now);
         return;
     }
     /* Сравнение — с тем, что СТОИТ НА УСТРОЙСТВЕ, а не с прошлым подтверждённым значением.
@@ -1699,9 +1707,21 @@ static void *worker_main(void *arg) {
                         continue;
                     }
                 }
+                /* ОТКАЗ СОБСТВЕННОЙ ОТПРАВКИ — НЕ ПРИГОВОР ПУТИ. Прежде возврат send_frame
+                 * здесь отбрасывался, и кадр, который не ушёл из нашего же сокета (ENOBUFS на
+                 * всплеске, EMSGSIZE при узком канале, пропавший маршрут), считался «путь этого
+                 * размера не несёт». Человек получал строку про недошедшие пробы, а пробы никуда
+                 * и не отправлялись — самый дорогой вид неправды в журнале. */
                 static uint8_t probe[XS_ROW];
-                if (xs_probe_build(probe, sizeof(probe), s->p_cur) == s->p_cur)
-                    send_frame(s, probe, (size_t)s->p_cur, now);
+                if (xs_probe_build(probe, sizeof(probe), s->p_cur) == s->p_cur &&
+                    send_frame(s, probe, (size_t)s->p_cur, now) != 0) {
+                    fprintf(stderr, LOG_W "проба %d байт не ушла из сокета (%s) — это наш отказ, "
+                                          "а не путь; проверю ещё раз\n",
+                            s->p_cur, strerror(errno));
+                    s->probe_sent = now;
+                    s->p_tries = 0;      /* попытка не состоялась: путь о ней не спрашивали */
+                    continue;
+                }
                 s->probe_sent = now;
             }
         } else if (s->probe_next && now >= s->probe_next) {
@@ -1760,7 +1780,7 @@ static void *worker_main(void *arg) {
          * keepalive секунд не встречается ни в одном браузерном соединении и находится подсчётом
          * пауз между мелкими пакетами. Разброс ±20% не стоит ничего. */
         if (keepalive_ms && !s->keep_next) s->keep_next = keepalive_ms;
-        if (keepalive_ms && now - s->conn.last_tx >= s->keep_next) {
+        if (xs_conn_need_keepalive(&s->conn, keepalive_ms ? s->keep_next : 0, now)) {
             uint32_t rel = xs_conn_rel_next(&s->conn);
             uint8_t *rec = s->txb + XS_HDR_ROOM - XS_REC_HDR;
             if (xs_rec_build(rec, XS_TAG) == 0 &&
