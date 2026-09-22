@@ -88,6 +88,17 @@ static uint32_t wu_sum(const struct fake_io *io, uint32_t sid) {
     return sum;
 }
 
+/* Кадр любого типа с данным телом. Возвращает полную длину кадра. */
+static size_t put_frame(unsigned char *out, unsigned char type, unsigned char flags,
+                        uint32_t sid, const unsigned char *body, size_t len) {
+    out[0] = (unsigned char)(len >> 16); out[1] = (unsigned char)(len >> 8);
+    out[2] = (unsigned char)len;
+    out[3] = type; out[4] = flags;
+    put32(out + 5, sid);
+    if (len) memcpy(out + 9, body, len);
+    return 9 + len;
+}
+
 /* Кадр SETTINGS с одной настройкой. */
 static size_t settings_frame(unsigned char *out, uint16_t id, uint32_t v) {
     out[0] = 0; out[1] = 0; out[2] = 6;
@@ -329,6 +340,34 @@ int main(void) {
             if (h2_read(&h, out, sizeof(out), &got) != 0) break;
         check("после h2_next: долг перед окном соединения не потерян",
               32768, (int)wu_sum(&io, 0));
+    }
+
+    {
+        /* ---- :status значением в кодировке Huffman (I-325) -----------------------
+         *
+         * Go-сервер (Xray) пишет статус литералом с индексом имени 8 и значением в Huffman,
+         * когда так короче: «502» — два байта 0x6C 0x02 вместо трёх цифр. Такой статус
+         * обязан читаться как 502, то есть кончаться H2_ESTATUS с кодом, а не молчанием. */
+        static const unsigned char st502[] = { 0x48, 0x82, 0x6C, 0x02 };
+        static const unsigned char st200[] = { 0x48, 0x82, 0x10, 0x01 };
+        struct h2 h;
+        struct fake_io io;
+        unsigned char feed[64];
+        unsigned char out[H2_MIN_READ_CAP];
+        size_t got = 0;
+
+        h2_open(&h, &io);
+        g_last_status = 0;
+        io.feed = feed; io.feed_pos = 0;
+        io.feed_n = put_frame(feed, FR_HEADERS, FLAG_END_HEADERS, h.sid, st502, sizeof st502);
+        check(":status 502 в Huffman: H2_ESTATUS", H2_ESTATUS, h2_read(&h, out, sizeof(out), &got));
+        check(":status 502 в Huffman: код назван", 502, g_last_status);
+
+        h2_open(&h, &io);
+        io.feed = feed; io.feed_pos = 0;
+        io.feed_n = put_frame(feed, FR_HEADERS, FLAG_END_HEADERS, h.sid, st200, sizeof st200);
+        check(":status 200 в Huffman: не ошибка", 0, h2_read(&h, out, sizeof(out), &got));
+        check(":status 200 в Huffman: статус 200", 200, h.status);
     }
 
     printf("\n%s\n", fails ? "ЕСТЬ ПРОВАЛЫ" : "все проверки прошли");
