@@ -640,6 +640,30 @@ int main(void) {
         check("PersistentKeepalive прочитан", 15, g_c.peer[0].keepalive);
     }
 
+    /* ---- ключ не в своей секции (I-324) ---------------------------------------------
+     *
+     * Подсказка по опечатке искала ближайший из ВСЕХ известных ключей, и для ключа чужой
+     * секции ближайшим был он сам: «неизвестный ключ PublicKey — возможно, PublicKey».
+     * Такому ключу нужно не исправление, а перенос, и отказ обязан назвать секцию. */
+    {
+        char t[1024];
+        snprintf(t, sizeof(t), "[Interface]\nPrivateKey=%s\nAddress=10.0.0.2/24\nPublicKey=%s\n"
+                 "[Peer]\nPublicKey=%s\nAllowedIPs=0.0.0.0/0\nEndpoint=1.2.3.4:443\n",
+                 KEY_A, KEY_B, KEY_B);
+        refuses("отказ: PublicKey в [Interface]", t, XS_ROLE_SPOKE);
+        check("и названа его секция [Peer]", 1, strstr(g_err, "[Peer]") != NULL);
+        snprintf(t, sizeof(t), "[Interface]\nPrivateKey=%s\nAddress=10.0.0.2/24\n"
+                 "[Peer]\nPublicKey=%s\nAllowedIPs=0.0.0.0/0\nEndpoint=1.2.3.4:443\nMTU=1400\n",
+                 KEY_A, KEY_B);
+        refuses("отказ: MTU в [Peer]", t, XS_ROLE_SPOKE);
+        check("и названа его секция [Interface]", 1, strstr(g_err, "[Interface]") != NULL);
+        snprintf(t, sizeof(t), "[Interface]\nPrivateKey=%s\nAddress=10.0.0.2/24\nMTUU=1400\n"
+                 "[Peer]\nPublicKey=%s\nAllowedIPs=0.0.0.0/0\nEndpoint=1.2.3.4:443\n",
+                 KEY_A, KEY_B);
+        refuses("опечатка в ключе — по-прежнему подсказка", t, XS_ROLE_SPOKE);
+        check("и подсказан MTU", 1, strstr(g_err, "возможно, MTU") != NULL);
+    }
+
     printf("\n%s\n", fails ? "ЕСТЬ ПРОВАЛЫ" : "все проверки прошли");
     return fails ? 1 : 0;
 }

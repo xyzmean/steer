@@ -470,6 +470,11 @@ int xs_conf_parse(const char *text, size_t n, enum xs_role role,
             } else {
                 const char *hint = did_you_mean(key);
                 c->unknown_n++;
+                /* Ближайший известный ключ — он сам: ключ из [Peer], поставленный сюда.
+                 * Подсказка «возможно, PublicKey» к PublicKey ничего не говорит (I-324). */
+                if (hint && ieq(hint, key))
+                    FAIL("строка %d: ключ %s пишется в секции [Peer], а стоит в [Interface] — "
+                         "перенесите его", line_no, key);
                 if (hint) FAIL("строка %d: неизвестный ключ %s — возможно, %s",
                                line_no, key, hint);
                 FAIL("строка %d: неизвестный ключ %s", line_no, key);
@@ -526,6 +531,9 @@ int xs_conf_parse(const char *text, size_t n, enum xs_role role,
         } else {
             const char *hint = did_you_mean(key);
             c->unknown_n++;
+            if (hint && ieq(hint, key))
+                FAIL("строка %d: ключ %s пишется в секции [Interface], а стоит в [Peer] — "
+                     "перенесите его", line_no, key);
             if (hint) FAIL("строка %d: неизвестный ключ %s — возможно, %s",
                            line_no, key, hint);
             FAIL("строка %d: неизвестный ключ %s", line_no, key);
