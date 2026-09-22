@@ -1030,19 +1030,20 @@ static uint32_t nftlk_seq_reserve(int n) {
 
 /* One element message in its own transaction. Returns the kernel's errno as-is
  * (0 or negative): EEXIST and ENOENT are meaningful outcomes for the callers
- * below, not plain failures. -1 for send failure / timeout. */
+ * below, not plain failures. -ETIMEDOUT when the outcome is unknown (send
+ * failure / no ack in time), -ENOTCONN without a netlink socket. */
 static int nftlk_elem_msg(uint16_t nft_msg_type, const char *table,
                           const char *obj_name, const void *key_net,
                           int interval, const void *data_net,
                           uint64_t timeout_ms) {
-    if (g_nlk_fd < 0) return -1;
+    if (g_nlk_fd < 0) return -ENOTCONN;
     uint8_t buf[NFTLK_MSG_CAP];
     uint32_t seq = nftlk_seq_reserve(1);
     size_t len = nftlk_elem_build(buf, sizeof(buf), seq, nft_msg_type, table, obj_name,
                                   key_net, interval, data_net, timeout_ms);
     uint8_t *msgs[1] = { buf };
     int err = 0;
-    if (nftlk_txn(msgs, &len, 1, seq, &err) != 0) return -1;
+    if (nftlk_txn(msgs, &len, 1, seq, &err) != 0) return -ETIMEDOUT;
     if (err != 0 && dbg())
         fprintf(stderr, "nftlk: kernel ack error=%d (%s) for %s/%s\n",
                 err, strerror(-err), table, obj_name);
@@ -1117,6 +1118,10 @@ static int nft_add_element(const char *set_name, uint32_t key_host, uint32_t ttl
  * is legitimate (an fw4 reload flushed the map) and is exactly what a plain add
  * wants, so on ENOENT for the delete we retry the add on its own.
  *
+ * Returns 0 when the kernel holds the wanted mapping, otherwise the kernel's
+ * negative errno (-ETIMEDOUT: outcome unknown) — the caller decides by it whether
+ * this is the table-rebuild window or a lasting refusal (see map_refusal_is_window).
+ *
  * `known_real` is what we believe is currently installed (0 = nothing), so the
  * common case — same backend as last time — costs one add that the kernel
  * answers EEXIST to, and the uncommon case costs a delete plus an add.
@@ -1125,7 +1130,7 @@ static int nft_map_set_element(const char *map_name, uint32_t fake_host,
                                uint32_t real_host, uint32_t known_real) {
     uint32_t k = htonl(fake_host), d = htonl(real_host);
     if (known_real != 0 && known_real != real_host) {
-        if (g_nlk_fd < 0) return -1;
+        if (g_nlk_fd < 0) return -ENOTCONN;
         uint8_t del[NFTLK_MSG_CAP], add[NFTLK_MSG_CAP];
         uint32_t seq = nftlk_seq_reserve(2);
         size_t lens[2];
@@ -1135,14 +1140,14 @@ static int nft_map_set_element(const char *map_name, uint32_t fake_host,
                                    g_nft_table, map_name, &k, 0, &d, 0);
         uint8_t *msgs[2] = { del, add };
         int errs[2] = { 0, 0 };
-        if (nftlk_txn(msgs, lens, 2, seq, errs) != 0) return -1;
+        if (nftlk_txn(msgs, lens, 2, seq, errs) != 0) return -ETIMEDOUT;
         if (errs[0] == 0 && errs[1] == 0) return 0;   /* committed: new value in place */
         if (dbg())
             fprintf(stderr, "nftlk: map update rolled back del=%d add=%d\n",
                     errs[0], errs[1]);
         /* Rolled back. Only a missing old element is worth a retry (see above);
          * anything else leaves the old mapping in place and fails the update. */
-        if (errs[0] != -ENOENT) return -1;
+        if (errs[0] != -ENOENT) return errs[0] ? errs[0] : errs[1];
     }
     int rc = nftlk_elem_msg(NFT_MSG_NEWSETELEM, g_nft_table, map_name,
                             &k, 0 /* plain map, not interval */, &d, 0);
@@ -1151,7 +1156,7 @@ static int nft_map_set_element(const char *map_name, uint32_t fake_host,
          * lost our bookkeeping and the kernel kept the mapping) — desired state. */
         return 0;
     }
-    return rc == 0 ? 0 : -1;
+    return rc;
 }
 
 /* ---------------------------------------------------------------------- */
@@ -1674,6 +1679,31 @@ static uint64_t dch_fakeip_only(uint64_t mask) {
     return mask;
 }
 
+/* Сколько секунд подряд отказ ядра ещё считается окном пересборки таблицы.
+ *
+ * SERVFAIL вместо настоящего адреса (см. handle_upstream_response) оправдан ровно одним
+ * состоянием: apply удалил таблицу и грузит новую (`nft delete table`, затем `nft -f`), карты
+ * в этот миг нет, и через секунду-другую она будет. Прежде ветка срабатывала на ЛЮБОЙ отказ
+ * при открытом сокете netlink — и стойкий отказ (карта не того типа, таблицу снесли и никто
+ * не применяет набор заново) превращал «сеть идёт мимо туннеля» в «имена не разрешаются»,
+ * вопреки fail-open из шапки файла (I-207).
+ *
+ * Различаются два признака. Код ошибки: в окне пересборки ядро отвечает ENOENT (нет таблицы
+ * или карты), а если ответа не дождались — исход неизвестен (ETIMEDOUT), и занятое
+ * загрузкой набора ядро похоже именно на это. Всё прочее (EINVAL на карту не того типа,
+ * ENOMEM, EPERM) окном не бывает и сразу даёт настоящий ответ. И длительность: окно
+ * пересборки — секунды даже на наборе в сотни тысяч элементов, поэтому ENOENT, длящийся
+ * дольше MAP_WINDOW_SEC с первого отказа подряд, считается стойким. Серия обрывается первым
+ * же принятым отображением. */
+#define MAP_WINDOW_SEC 15
+static time_t g_map_fail_since;
+
+static int map_refusal_is_window(int rc, time_t now) {
+    if (rc != -ENOENT && rc != -ETIMEDOUT) return 0;
+    if (!g_map_fail_since) g_map_fail_since = now;
+    return now - g_map_fail_since < MAP_WINDOW_SEC;
+}
+
 static volatile int g_reload_pending = 0;
 static volatile int g_running = 1;
 
@@ -2089,6 +2119,7 @@ static int handle_upstream_response(void) {
             if (dbg())
                 fprintf(stderr, "nftlk-debug: nft_map_set_element -> %d\n", maprc);
             if (maprc == 0) {
+                g_map_fail_since = 0;               /* серия отказов ядра окончена */
                 /* Record the real backend so a post-restart rehydrate can rebuild
                  * the DNAT map from state without re-resolving every domain. */
                 fakeip_entry_set_real(qname, real_host);
@@ -2113,9 +2144,10 @@ static int handle_upstream_response(void) {
                     sendto(g_listen_fd, out, len, 0, (struct sockaddr *)&p->client, p->client_len);
                     return 1;
                 }
-            } else if (g_nlk_fd >= 0) {
-                /* Ядро НЕ ПРИНЯЛО подмену при живом netlink — так бывает ровно в тот миг,
-                 * когда apply пересобирает таблицу и карты ещё нет. Прежний ответ здесь был
+            } else if (g_nlk_fd >= 0 && map_refusal_is_window(maprc, time(NULL))) {
+                /* Ядро НЕ ПРИНЯЛО подмену при живом netlink в окне пересборки таблицы — apply
+                 * пересобирает таблицу, и карты ещё нет (что считается окном, решает
+                 * map_refusal_is_window; стойкий отказ идёт ниже, в fail-open). Прежний ответ здесь был
                  * fail-open: клиенту уходил настоящий адрес. Для домена, который человек велел
                  * вести в туннель, это не «открыто», а «мимо»: сайт идёт напрямую (у
                  * заблокированного — не идёт вовсе), и клиент запоминает настоящий адрес на
@@ -2147,6 +2179,15 @@ static int handle_upstream_response(void) {
                             qname, maprc);
                 }
                 return 1;
+            } else if (g_nlk_fd >= 0) {
+                /* Стойкий отказ — дальше fail-open настоящим ответом, как везде в файле. */
+                static time_t warned_open;
+                time_t now = time(NULL);
+                if (now - warned_open > 60) {
+                    warned_open = now;
+                    fprintf(stderr, "steer dnsd: подмена для %s не встала в ядро (rc=%d) — "
+                                    "клиенту отвечено настоящим адресом\n", qname, maprc);
+                }
             }
         }
     }
