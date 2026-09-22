@@ -417,6 +417,101 @@ int main(void) {
               0, h2_next(&h, "example.org", path, "application/grpc", ref, H2_POST));
     }
 
+    {
+        /* ---- PADDED и PRIORITY (I-325) -------------------------------------------
+         *
+         * DATA и HEADERS вправе нести набивку (PADDED: байт длины впереди, набивка в конце),
+         * HEADERS — ещё и пять байт приоритета (PRIORITY). Ни то ни другое не данные: байт
+         * длины и набивка не должны попасть в тело, а статус лежит после приоритета. Окну
+         * при этом зачитывается ВЕСЬ кадр, с набивкой (RFC 7540 §6.9.1), иначе объявленное
+         * серверу окно разойдётся с тем, что считает он. */
+        struct h2 h;
+        struct fake_io io;
+        unsigned char feed[128];
+        unsigned char out[H2_MIN_READ_CAP];
+        size_t got = 0;
+
+        /* HEADERS: набивка 2, приоритет, :status 404 индексом, две нулевые набивки. */
+        static const unsigned char hdrs[] = { 2, 0, 0, 0, 0, 16, 0x8D, 0, 0 };
+        h2_open(&h, &io);
+        g_last_status = 0;
+        io.feed = feed; io.feed_pos = 0;
+        io.feed_n = put_frame(feed, FR_HEADERS, FLAG_END_HEADERS | 0x08 | 0x20, h.sid,
+                              hdrs, sizeof hdrs);
+        check("HEADERS с PADDED и PRIORITY: статус 404 прочитан",
+              H2_ESTATUS, h2_read(&h, out, sizeof(out), &got));
+        check("HEADERS с PADDED и PRIORITY: код назван", 404, g_last_status);
+
+        /* HEADERS только с PRIORITY: :status 200. */
+        static const unsigned char hdrs_pri[] = { 0, 0, 0, 0, 16, 0x88 };
+        h2_open(&h, &io);
+        io.feed = feed; io.feed_pos = 0;
+        io.feed_n = put_frame(feed, FR_HEADERS, FLAG_END_HEADERS | 0x20, h.sid,
+                              hdrs_pri, sizeof hdrs_pri);
+        check("HEADERS с PRIORITY: не ошибка", 0, h2_read(&h, out, sizeof(out), &got));
+        check("HEADERS с PRIORITY: статус 200", 200, h.status);
+
+        /* DATA: набивка 3, тело «abcd». */
+        static const unsigned char data[] = { 3, 'a', 'b', 'c', 'd', 0, 0, 0 };
+        h2_open(&h, &io);
+        io.feed = feed; io.feed_pos = 0;
+        io.feed_n = put_frame(feed, FR_DATA, 0x08, h.sid, data, sizeof data);
+        int rc = h2_read(&h, out, sizeof(out), &got);
+        check("DATA с PADDED: без ошибки", 0, rc);
+        check("DATA с PADDED: отдано 4 байта тела", 4, (int)got);
+        check("DATA с PADDED: тело не искажено", 0, got == 4 ? memcmp(out, "abcd", 4) : 1);
+        check("DATA с PADDED: окну соединения зачтён весь кадр", 8, h.recv_credit_conn);
+        check("DATA с PADDED: окну потока зачтён весь кадр", 8, h.recv_credit);
+
+        /* Тот же кадр, разорванный границами записей: заголовок и байт длины, потом два
+         * байта тела, потом остаток тела с набивкой. */
+        static const unsigned char data2[] = { 3, 'a', 'b', 'c', 'd', 0, 0, 0 };
+        h2_open(&h, &io);
+        size_t fn = put_frame(feed, FR_DATA, 0x08, h.sid, data2, sizeof data2);
+        size_t cuts[] = { 10, 12, fn };
+        size_t from = 0, total = 0;
+        unsigned char body[16];
+        for (int i = 0; i < 3; i++) {
+            io.feed = feed + from; io.feed_n = cuts[i] - from; io.feed_pos = 0;
+            if (h2_read(&h, out, sizeof(out), &got) != 0) { total = 99; break; }
+            if (total + got <= sizeof body) memcpy(body + total, out, got);
+            total += got;
+            from = cuts[i];
+        }
+        check("DATA с PADDED по трём записям: отдано 4 байта", 4, (int)total);
+        check("DATA с PADDED по трём записям: тело не искажено",
+              0, total == 4 ? memcmp(body, "abcd", 4) : 1);
+
+        /* Граница записи ВНУТРИ набивки: набивка 5, тело «abcd», первая запись кончается
+         * через два байта набивки. Остаток набивки во второй записи — не данные. */
+        static const unsigned char data3[] = { 5, 'a', 'b', 'c', 'd', 0, 0, 0, 0, 0 };
+        h2_open(&h, &io);
+        fn = put_frame(feed, FR_DATA, 0x08, h.sid, data3, sizeof data3);
+        size_t cut = 9 + 1 + 4 + 2;
+        total = 0;
+        rc = 0;
+        io.feed = feed; io.feed_n = cut; io.feed_pos = 0;
+        rc = h2_read(&h, out, sizeof(out), &got);
+        if (rc == 0 && got <= sizeof body) { memcpy(body, out, got); total = got; }
+        io.feed = feed + cut; io.feed_n = fn - cut; io.feed_pos = 0;
+        if (rc == 0) rc = h2_read(&h, out, sizeof(out), &got);
+        if (rc == 0) total += got;
+        check("DATA: граница внутри набивки — без ошибки", 0, rc);
+        check("DATA: граница внутри набивки — отдано 4 байта", 4, (int)total);
+        check("DATA: граница внутри набивки — тело не искажено",
+              0, total == 4 ? memcmp(body, "abcd", 4) : 1);
+        check("DATA: граница внутри набивки — окну зачтён весь кадр",
+              (int)sizeof data3, h.recv_credit_conn);
+
+        /* Набивка длиннее кадра — ошибка протокола (RFC 7540 §6.1), а не чтение за край. */
+        static const unsigned char bad[] = { 9, 'a', 'b' };
+        h2_open(&h, &io);
+        io.feed = feed; io.feed_pos = 0;
+        io.feed_n = put_frame(feed, FR_DATA, 0x08, h.sid, bad, sizeof bad);
+        check("DATA с набивкой длиннее кадра: H2_EPROTO",
+              H2_EPROTO, h2_read(&h, out, sizeof(out), &got));
+    }
+
     printf("\n%s\n", fails ? "ЕСТЬ ПРОВАЛЫ" : "все проверки прошли");
 
     return fails ? 1 : 0;

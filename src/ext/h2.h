@@ -38,6 +38,13 @@ struct h2 {
     unsigned char frame_type;
     unsigned char frame_flags;
     int frame_ours;             /* тело этого кадра адресовано нашему потоку */
+    /* Обрамление тела DATA и HEADERS, которое данными не является (RFC 7540 §6.1, §6.2):
+     * pad_wait — впереди ещё байт длины набивки (PADDED), skip_left — сколько байт
+     * приоритета HEADERS осталось пропустить (PRIORITY), pad_left — длина набивки в конце
+     * кадра. Переносятся через вызовы: граница записи TLS может пройти где угодно. */
+    unsigned char pad_wait;
+    unsigned char pad_left;
+    unsigned char skip_left;
 
     /* Тело служебного кадра собирается здесь: WINDOW_UPDATE, SETTINGS, PING и RST надо
      * увидеть ЦЕЛИКОМ, чтобы на них ответить, а границы записи TLS и кадра HTTP/2 не

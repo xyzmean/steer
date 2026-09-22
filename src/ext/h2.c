@@ -44,6 +44,8 @@
 #define FLAG_END_STREAM  0x01
 #define FLAG_ACK         0x01
 #define FLAG_END_HEADERS 0x04
+#define FLAG_PADDED      0x08
+#define FLAG_PRIORITY    0x20
 
 
 /* Наше окно приёма. Большое намеренно: при 65535 по умолчанию каждые 64 КБ загрузки
@@ -538,21 +540,51 @@ int h2_read(struct h2 *h, unsigned char *out, size_t cap, size_t *got) {
     size_t p = 0;
     while (p < avail) {
         if (h->frame_left) {
+            if (h->pad_wait) {
+                /* Байт длины набивки. Набивка вместе с приоритетом обязана уместиться в
+                 * остаток кадра, иначе это ошибка протокола (RFC 7540 §6.1), а не повод
+                 * читать за край. */
+                h->pad_wait = 0;
+                if ((uint32_t)rec[p] + h->skip_left > h->frame_left - 1) return H2_EPROTO;
+                h->pad_left = rec[p];
+                if (h->frame_type == FR_DATA) {
+                    h->recv_credit_conn += 1;
+                    if (h->frame_ours) h->recv_credit += 1;
+                }
+                p++;
+                h->frame_left--;
+            }
+            if (h->skip_left) {
+                /* Приоритет HEADERS: пять байт, которые нам ни к чему. Не доехали целиком —
+                 * остаток пропустится в следующей записи, а take ниже выйдет нулём. */
+                size_t sk = h->skip_left < avail - p ? h->skip_left : avail - p;
+                h->skip_left = (unsigned char)(h->skip_left - sk);
+                p += sk;
+                h->frame_left -= (uint32_t)sk;
+            }
             size_t take = h->frame_left < avail - p ? h->frame_left : avail - p;
+            /* Содержимое — то, что до набивки; сама набивка только пропускается. Когда граница
+             * записи прошла внутри набивки, frame_left уже меньше pad_left: содержимого не
+             * осталось вовсе, и беззнаковая разность ушла бы через ноль — остаток набивки
+             * попал бы в тело. */
+            size_t body = h->frame_left > h->pad_left ? h->frame_left - h->pad_left : 0;
+            size_t real = take < body ? take : body;
             if (h->frame_type == FR_DATA) {
                 /* Окну СОЕДИНЕНИЯ байты зачитываются всегда, даже когда кадр пришёл от уже
                  * закрытого потока прежнего куска: из общего окна они вычтены, и вернуть их
                  * обязаны мы. Раньше такой кадр не считался нигде — он попадал в ветку
-                 * служебных, где его тело копировалось в h->ctl и выбрасывалось. */
+                 * служебных, где его тело копировалось в h->ctl и выбрасывалось.
+                 *
+                 * Зачитывается и набивка: окно тратит весь кадр (RFC 7540 §6.9.1). */
                 h->recv_credit_conn += (int32_t)take;
                 if (h->frame_ours) {
-                    if (*got + take > cap) return H2_ETOOBIG;
-                    memcpy(out + *got, rec + p, take);
-                    *got += take;
+                    if (*got + real > cap) return H2_ETOOBIG;
+                    memcpy(out + *got, rec + p, real);
+                    *got += real;
                     h->recv_credit += (int32_t)take;
                 }
             } else if (h->frame_type == FR_HEADERS) {
-                if (h->frame_ours && h->status == 0) status_peek(h, rec + p, take);
+                if (h->frame_ours && h->status == 0 && real) status_peek(h, rec + p, real);
             } else {
                 /* Служебный кадр: собираем тело, пока влезает. Не влезло — значит это
                  * SETTINGS с десятком настроек, из которых нас интересуют первые. */
@@ -597,6 +629,15 @@ int h2_read(struct h2 *h, unsigned char *out, size_t cap, size_t *got) {
         h->frame_left = len;
         h->ctl_n = 0;
         p += 9;
+        h->pad_left = 0;
+        h->pad_wait = 0;
+        h->skip_left = 0;
+        if (h->frame_type == FR_DATA || h->frame_type == FR_HEADERS) {
+            h->pad_wait = (h->frame_flags & FLAG_PADDED) != 0;
+            if (h->frame_type == FR_HEADERS && (h->frame_flags & FLAG_PRIORITY))
+                h->skip_left = 5;
+            if (h->pad_wait + h->skip_left > len) return H2_EPROTO;
+        }
 
         /* Кадр без тела обрабатывается сразу: цикл выше ждёт байт, которых не будет. */
         if (len == 0) {
