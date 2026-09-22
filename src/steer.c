@@ -3260,9 +3260,18 @@ int main(int argc, char **argv) {
         if (!hb[0]) { fprintf(stderr, "нужно имя узла\n"); return 2; }
         return cmd_tls_probe(hb, a.out_file, pt, a.node > 0 ? a.node : 0, 0);
     }
-    if (!strcmp(cmd, "tgws-probe"))
+    if (!strcmp(cmd, "tgws-probe")) {
+        /* Позиционный — не имя, а переключатель, и понимается ровно одно слово. Прежде
+         * всё, что не «media», молча значило обычную точку: «steer tgws-probe medai»
+         * проверял другую точку и отвечал «ок» (I-316). */
+        if (arg && strcmp(arg, "media") != 0) {
+            fprintf(stderr, "steer: команда tgws-probe понимает аргументом только «media», "
+                    "а получила «%s»\n", arg);
+            return 2;
+        }
         return cmd_tgws_probe(a.node > 0 ? a.node : 2, arg && !strcmp(arg, "media"),
                               a.direct, a.timeout);
+    }
     if (!strcmp(cmd, "vless")) return cmd_vless(spec, arg);
     if (!strcmp(cmd, "vless-nodes")) return cmd_vless_nodes(spec, arg);
     if (!strcmp(cmd, "vless-probe")) return cmd_vless_probe(spec, arg, a.node, a.timeout);

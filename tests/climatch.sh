@@ -234,6 +234,16 @@ ext_marker "splify2: vless '' называет пакет (по этому splif
 accepted "splify2: fit --budget --report ФАЙЛ" -- \
     "$BIN" fit --budget 100 --report "$tmp/rep.json" /dev/null
 
+# tgws-probe понимает одно слово — media. Любое другое молча проверяло ОБЫЧНУЮ точку, и
+# «steer tgws-probe medai» отвечал «ок» про другую (I-316). Опечатка — отказ разбора с
+# названием того, что есть, раньше, чем команда куда-либо пойдёт.
+ext_marker "tgws-probe media доходит до команды" -- "$BIN" tgws-probe media
+code "tgws-probe medai: отказ" 2 -- "$BIN" tgws-probe medai
+check "tgws-probe medai: отказ разбора, а не команды" "0" \
+    "$("$BIN" tgws-probe medai 2>&1 >/dev/null | grep -c 'steer-extended')"
+check "tgws-probe medai: названо, что есть" "1" \
+    "$("$BIN" tgws-probe medai 2>&1 >/dev/null | grep -c '«media»')"
+
 printf '\n%d проверок пройдено' "$pass"
 if [ "$fail" -gt 0 ]; then printf ', %d ПРОВАЛЕНО\n' "$fail"; exit 1; fi
 printf '\nвсе проверки прошли\n'
