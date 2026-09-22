@@ -348,6 +348,19 @@ static int ruleset_add(struct ruleset *rs, const char *raw) {
         str_lower(r->pattern);
     }
     if (!r->pattern && r->type != RULE_REGEX) return -1;
+    /* Запись FQDN с завершающей точкой (`foo.org.`) — законная для человека, но имя вопроса
+     * из пакета собирается без неё, и такое правило не совпадало ни с чем: канал молча не
+     * брал домен (I-318). Точка снимается. Если после этого не осталось ни буквы, ни цифры
+     * (`.`, `*.`), правила нет: такая строка и прежде не совпадала ни с чем, и снятая точка
+     * не должна превращать её в «всё». */
+    if (r->type != RULE_REGEX) {
+        size_t pl = strlen(r->pattern), was = pl;
+        while (pl > 0 && r->pattern[pl - 1] == '.') r->pattern[--pl] = '\0';
+        int named = 0;
+        for (size_t i = 0; i < pl; i++)
+            if (isalnum((unsigned char)r->pattern[i])) { named = 1; break; }
+        if (pl != was && !named) { free(r->pattern); r->pattern = NULL; return -1; }
+    }
     rs->n++;
 
     /* Место в индексе — сразу при добавлении, а не отдельным проходом после загрузки: иначе

@@ -58,6 +58,21 @@ int main(void) {
         ruleset_free(&rs);
     }
     {
+        /* Правило в записи FQDN, с завершающей точкой. Имя вопроса из пакета собирается без
+         * неё, и `foo.org.` не совпадало ни с чем — правило молча не действовало. */
+        static const char *const lines[] = { "fqdn.example.", "=exactdot.example.",
+                                             "*.wilddot.example.", ".", "*.", NULL };
+        struct ruleset rs;
+        build(&rs, lines);
+        check("завершающая точка: доменное, само имя", 1, ruleset_match(&rs, "fqdn.example"));
+        check("завершающая точка: доменное, поддомен", 1, ruleset_match(&rs, "www.fqdn.example"));
+        check("завершающая точка: точное", 1, ruleset_match(&rs, "exactdot.example"));
+        check("завершающая точка: шаблон", 1, ruleset_match(&rs, "a.wilddot.example"));
+        check("`.` и `*.` — не правило «всё»", 0, ruleset_match(&rs, "other.test"));
+        check("`.` и `*.` правилами не становятся", 3, (int)rs.n);
+        ruleset_free(&rs);
+    }
+    {
         /* Одно имя двумя правилами: в индексе это один ключ, и метки обязаны сложиться. */
         static const char *const lines[] = { "=both.test", "both.test", NULL };
         struct ruleset rs;
