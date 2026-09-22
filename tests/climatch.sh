@@ -244,6 +244,24 @@ check "tgws-probe medai: отказ разбора, а не команды" "0" 
 check "tgws-probe medai: названо, что есть" "1" \
     "$("$BIN" tgws-probe medai 2>&1 >/dev/null | grep -c '«media»')"
 
+# Режим потока xsteer: --no-stream вместе с --stream или --stream-port — противоречие.
+# Прежде побеждал порядок: «--stream-port 5 --no-stream» молча выключал поток и бросал порт,
+# «--no-stream --stream» включал (I-316). Теперь отказ разбора при любом порядке, а каждый
+# флаг поодиночке по-прежнему доходит до команды.
+for args in "--stream-port 5 --no-stream" "--no-stream --stream-port 5" \
+            "--stream --no-stream" "--no-stream --stream"; do
+    # shellcheck disable=SC2086
+    check "xsteer $args: отказ разбора" "0" \
+        "$("$BIN" xsteer x $args 2>&1 >/dev/null | grep -c 'steer-extended')"
+    # shellcheck disable=SC2086
+    check "xsteer $args: названо противоречие" "1" \
+        "$("$BIN" xsteer x $args 2>&1 >/dev/null | grep -c -- '--no-stream')"
+done
+for args in "--stream-port 5" "--stream" "--no-stream" "--stream --stream-port 5"; do
+    # shellcheck disable=SC2086
+    ext_marker "xsteer $args доходит до команды" -- "$BIN" xsteer x $args
+done
+
 printf '\n%d проверок пройдено' "$pass"
 if [ "$fail" -gt 0 ]; then printf ', %d ПРОВАЛЕНО\n' "$fail"; exit 1; fi
 printf '\nвсе проверки прошли\n'

@@ -679,6 +679,8 @@ void cli_parse(const struct cli_cmd *cmd, int argc, char **argv, int from,
      * выхода, поэтому проверка отвечает на вопрос «что будет, если применить». */
     out->node = -1;
     out->timeout = 5;
+    const char *want_stream = NULL;     /* флаг, которым режим потока запрошен */
+    int no_stream = 0;
 
     for (int i = from; i < argc; i++) {
         const char *a = argv[i];
@@ -736,15 +738,23 @@ void cli_parse(const struct cli_cmd *cmd, int argc, char **argv, int from,
         else if (!strcmp(f->name, "--node"))       out->node = cli_int(f->name, val, -1, 65535);
         else if (!strcmp(f->name, "--timeout"))    out->timeout = cli_int(f->name, val, 1, 3600);
         else if (!strcmp(f->name, "--listen"))     out->listen = cli_int(f->name, val, 1, 65535);
-        else if (!strcmp(f->name, "--stream"))     out->stream = 1;
-        else if (!strcmp(f->name, "--no-stream"))  out->stream = -1;
+        else if (!strcmp(f->name, "--stream"))     { out->stream = 1; want_stream = f->name; }
+        else if (!strcmp(f->name, "--no-stream"))  no_stream = 1;
         /* Порт подразумевает режим: назвать порт потока и остаться на поддельном TCP человек
          * не может хотеть, а молча проигнорировать ключ — это «настроил и не работает». */
         else if (!strcmp(f->name, "--stream-port")) {
             out->stream_port = cli_int(f->name, val, 1, 65535);
-            if (out->stream >= 0) out->stream = 1;
+            out->stream = 1;
+            want_stream = f->name;
         }
     }
+
+    /* --no-stream рядом с --stream или --stream-port — противоречие, и решает его не порядок
+     * флагов. Прежде решал: «--stream-port 5 --no-stream» молча выключал поток и бросал порт,
+     * «--no-stream --stream» включал (I-316). */
+    if (no_stream && want_stream)
+        cli_die("флаги --no-stream и %s противоречат друг другу — оставьте один", want_stream);
+    if (no_stream) out->stream = -1;
 
     if (out->npos < cmd->npos)
         cli_die("команде %s нужен аргумент %s (подсказка: steer %s --help)",
