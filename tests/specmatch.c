@@ -1348,6 +1348,32 @@ int main(void) {
         }
     }
 
+    /* ---- ключ без двоеточия (I-315) ------------------------------------------------
+     *
+     * В четырёх циклах объектов возврат js_lit(':') не проверялся, и {"kind" "direct"}
+     * читался как {"kind":"direct"}. Это не JSON: интерфейс такую спеку не разберёт, а
+     * движок молча принимал. Каждое из четырёх мест — отдельный случай. */
+    {
+        check("ключ верхнего уровня без ':' — отказ", 2, load_from_str(
+            "{\"schema\" 1,\"from_default\":[\"192.168.1.0/24\"],"
+            "\"outputs\":{\"direct\":{\"kind\":\"direct\"}},\"channels\":[]}"));
+        check("ключ выхода без ':' — отказ", 2, load_from_str(SPEC(
+            "\"outputs\":{\"direct\":{\"kind\" \"direct\"}},\"channels\":[]")));
+        check("ключ канала без ':' — отказ", 2, load_from_str(SPEC(
+            "\"outputs\":{\"direct\":{\"kind\":\"direct\"}},"
+            "\"channels\":[{\"name\" \"c\",\"out\":\"direct\","
+            "\"match\":{\"domains_file\":\"/tmp/x.lst\"}}]")));
+        check("ключ obfs без ':' — отказ", 2, load_from_str(SPEC(
+            "\"outputs\":{\"wg\":{\"kind\":\"interface\",\"device\":\"wg0\","
+            "\"obfs\":{\"server\" \"203.0.113.10:4567\",\"listen\":\"127.0.0.1:51820\"}}},"
+            "\"channels\":[]")));
+        check("те же спеки с ':' грузятся", 0, load_from_str(SPEC(
+            "\"outputs\":{\"wg\":{\"kind\":\"interface\",\"device\":\"wg0\","
+            "\"obfs\":{\"server\":\"203.0.113.10:4567\",\"listen\":\"127.0.0.1:51820\"}}},"
+            "\"channels\":[{\"name\":\"c\",\"out\":\"wg\","
+            "\"match\":{\"domains_file\":\"/tmp/x.lst\"}}]")));
+    }
+
     printf("\n%s\n", fails ? "ЕСТЬ ПРОВАЛЫ" : "все проверки прошли");
     return fails ? 1 : 0;
 }

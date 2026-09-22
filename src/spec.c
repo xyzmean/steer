@@ -601,7 +601,7 @@ static void parse_obfs(struct js *j, struct output *o) {
     while (*j->p != '}') {
         char key[32];
         if (js_str(j, key, sizeof(key)) != 0) die("outputs.%s: плохой ключ в obfs", o->name);
-        js_lit(j, ':');
+        if (js_lit(j, ':') != 0) die("outputs.%s: в obfs после ключа нет двоеточия", o->name);
         if (!strcmp(key, "mode")) js_str(j, mode, sizeof(mode));
         else if (!strcmp(key, "server")) js_str(j, server, sizeof(server));
         else if (!strcmp(key, "listen")) js_str(j, listen, sizeof(listen));
@@ -690,7 +690,7 @@ static void parse_outputs(struct js *j) {
         while (*j->p != '}') {
             char key[32];
             if (js_str(j, key, sizeof(key)) != 0) die("outputs.%s: bad key", o.name);
-            js_lit(j, ':');
+            if (js_lit(j, ':') != 0) die("outputs.%s: после ключа нет двоеточия", o.name);
             if (!strcmp(key, "kind")) js_str(j, kind, sizeof(kind));
             else if (!strcmp(key, "device")) {
                 js_str(j, o.device, sizeof(o.device));
@@ -964,7 +964,7 @@ static void parse_channels(struct js *j) {
         while (*j->p != '}') {
             char key[32];
             if (js_str(j, key, sizeof(key)) != 0) die("channels: bad key", NULL);
-            js_lit(j, ':');
+            if (js_lit(j, ':') != 0) die("channels: после ключа «%s» нет двоеточия", key);
             if (!strcmp(key, "name")) js_str(j, c.name, sizeof(c.name));
             else if (!strcmp(key, "out")) js_str(j, c.out, sizeof(c.out));
             else if (!strcmp(key, "from")) str_array(j, c.from, MAX_FROM, &c.from_n);
@@ -1165,7 +1165,10 @@ void load_spec(const char *path) {
     while (*j.p && *j.p != '}') {
         char key[64];
         if (js_str(&j, key, sizeof(key)) != 0) die("spec: bad key", NULL);
-        js_lit(&j, ':');
+        /* Возврат проверяется, как в цикле match: без этого {"kind" "direct"} читался как
+         * {"kind":"direct"} — не JSON, который интерфейс не разберёт, а движок молча принимал
+         * (I-315). То же в циклах выходов, каналов и obfs. */
+        if (js_lit(&j, ':') != 0) die("spec: после ключа «%s» нет двоеточия", key);
         if (!strcmp(key, "schema")) schema = js_num(&j);
         else if (!strcmp(key, "outputs")) parse_outputs(&j);
         else if (!strcmp(key, "channels")) parse_channels(&j);
