@@ -275,9 +275,12 @@ struct conn {
     unsigned char *early;
     uint32_t early_n;
     uint32_t early_off;
-    /* Клиент передумал (RST/FIN), пока установщик работал: запись трогать нельзя,
+    /* Клиент передумал (RST), пока установщик работал: запись трогать нельзя,
      * поэтому только помечаем, а закрываем по готовности установщика. */
     uint8_t client_gone;
+    /* Клиент прислал FIN и принят он по порядку: от клиента больше данных не будет, но
+     * ответ сервера ему ещё идёт (I-319). */
+    uint8_t client_fin;
 };
 
 /* Горячая запись обязана оставаться маленькой — в этом весь смысл разделения. Проверка
@@ -1945,13 +1948,18 @@ static void handle_packet(const struct tun_dev *tun, const struct vless_node *no
          * Запись трогать нельзя (в сессию пишет установщик), а вот СВОЯ половина —
          * счётчики TCP и буфер early — наша: принимаем данные сюда и подтверждаем.
          * Отказ клиента только помечаем — закрыть под установщиком нельзя. */
-        if (k.tcp_flags & (TCP_RST | TCP_FIN)) { c->client_gone = 1; return; }
+        /* FIN здесь — не отказ, а половинчатое закрытие (I-319): данные сегмента в буфер,
+         * FIN в счёт, ответ сервера клиенту всё ещё нужен. Отказ — только RST. */
+        if (k.tcp_flags & TCP_RST) { c->client_gone = 1; return; }
+        int fin = (k.tcp_flags & TCP_FIN) != 0;
+        if (c->client_fin) { if (fin) c->ack_due = 1; return; }
         if (k.tcp_flags & TCP_ACK) c->client_win = k.window;
         size_t dn = n - off;
-        if (!dn || k.seq != c->client_seq) return;
+        if ((!dn && !fin) || k.seq != c->client_seq) return;
         /* Не поместилось — не подтверждаем: клиент повторит сам, когда поток будет готов. */
-        if (early_hold(c, pkt + off, dn) != 0) return;
+        if (dn && early_hold(c, pkt + off, dn) != 0) return;
         c->client_seq += (uint32_t)dn;
+        if (fin) { c->client_seq += 1; c->client_fin = 1; }
         c->last = g_now_s;
         c->ack_due = 1;
         TR("ранние данные: %zu байт в буфер (всего %u)\n", dn, c->early_n);
@@ -2008,20 +2016,26 @@ static void handle_packet(const struct tun_dev *tun, const struct vless_node *no
         c->client_win = k.window;
     }
 
-    if (k.tcp_flags & (TCP_RST | TCP_FIN)) {
-        if (k.tcp_flags & TCP_FIN) {
-            /* Подтверждаем FIN и закрываем: половинчатое закрытие не поддержано, потому
-             * что требует хранить, какая сторона ещё пишет. */
-            unsigned char fa[64];
-            size_t fl = tcp_build(fa, sizeof(fa), k.dst, k.src, k.dport, k.sport,
-                                  c->our_seq, k.seq + 1, TCP_ACK | TCP_FIN, NULL, 0, 0, 0, -1);
-            if (fl) tun_write_ctl(tun, fa, fl);
-        }
-        conn_drop(c);
+    if (k.tcp_flags & TCP_RST) { conn_drop(c); return; }
+
+    /* FIN клиента — половинчатое закрытие, а не конец соединения (I-319).
+     *
+     * Прежде FIN закрывал всё сразу, ДО отправки данных сегмента и до проверки порядка:
+     * хвост запроса, приехавший в одном сегменте с FIN (nc -q0, HTTP/1.0, CORK), серверу
+     * не уходил, подтверждение было seq+1 вместо seq+данные+1, а ответ сервера, ради
+     * которого клиент и ждёт, уничтожался вместе с кольцом. Теперь FIN — это ещё один
+     * байт потока: данные сегмента уходят серверу, FIN учитывается в client_seq и
+     * подтверждается тем же отложенным ACK, а соединение живёт, пока сервер не закроет
+     * своё (FIN клиенту уходит из общего прохода, как при srv_closed) или пока клиент
+     * не замолчит на CLOSE_DRAIN_MS. После FIN от клиента ждём только подтверждений:
+     * повтор FIN значит, что наш ACK потерялся, — подтверждаем снова. */
+    int fin = (k.tcp_flags & TCP_FIN) != 0;
+    if (c->client_fin) {
+        if (fin) c->ack_due = 1;
         return;
     }
 
-    if (!data_n) return;                            /* чистый ACK */
+    if (!data_n && !fin) return;                    /* чистый ACK */
 
     /* Не по порядку — отбрасываем. Буфер переупорядочивания на каждое соединение это как
      * раз та память, которой на слабой коробке нет; клиент повторит. */
@@ -2036,8 +2050,8 @@ static void handle_packet(const struct tun_dev *tun, const struct vless_node *no
         if (fr > 0) return;
     }
 
-    TR("данные клиента %zu байт -> серверу\n", data_n);
-    int sr = upstream_send(c, node, pkt + off, data_n);
+    TR("данные клиента %zu байт -> серверу%s\n", data_n, fin ? " (и FIN)" : "");
+    int sr = data_n ? upstream_send(c, node, pkt + off, data_n) : SEND_OK;
     if (sr == SEND_AGAIN) {
         /* Окно закрыто. Прежде чем перекладывать задержку на клиента, разберём то, что уже
          * лежит в сокете: WINDOW_UPDATE приходит именно оттуда и обычно УЖЕ там — сервер
@@ -2074,6 +2088,7 @@ static void handle_packet(const struct tun_dev *tun, const struct vless_node *no
         return;
     }
     c->client_seq += (uint32_t)data_n;
+    if (fin) { c->client_seq += 1; c->client_fin = 1; }
 
     /* Подтверждение ОТКЛАДЫВАЕМ до конца разбора порции из TUN. Без ACK клиент повторит
      * пакет, считая его потерянным, — но подтверждать каждый пакет отдельной записью в
@@ -2563,6 +2578,14 @@ static void *worker_loop(void *arg) {
                 TR("узел закрыл поток UDP conn#%ld\n", (long)(c - g_conns));
                 conn_drop(c);
                 continue;                        /* на место этого встал другой */
+            }
+
+            /* Клиент закрыл свою половину и замолчал, а сервер своей не закрывает (узнать
+             * о FIN клиента ему неоткуда): дальше ждать нечего — закрываем тем же путём,
+             * что и после сервера. */
+            if (c->client_fin && !c->srv_closed && g_now_s - c->last > CLOSE_DRAIN_MS / 1000) {
+                c->srv_closed = 1;
+                c->closed_at = now;
             }
 
             /* Закрытые сервером: как только клиент подтвердил всё — FIN и закрываем. Если не

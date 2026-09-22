@@ -95,6 +95,29 @@ class Handler(socketserver.BaseRequestHandler):
                 pass
             return
 
+        # Порт 7 (echo) — ответ ТОЛЬКО после того, как дочитан запрос до перевода строки.
+        #
+        # Нужен стенду tests/run-tunnel-fin.sh (I-319): клиент шлёт строку и сразу FIN,
+        # часто одним сегментом, и ответ обязан прийти на уже закрытую клиентом половину.
+        # Обычный режим ниже отвечает, не глядя на запрос, и потерю хвоста не заметил бы.
+        if port == 7:
+            sock.sendall(b"\x00\x00")
+            buf = b""
+            try:
+                while not buf.endswith(b"\n"):
+                    chunk = sock.recv(65536)
+                    if not chunk:
+                        break
+                    buf += chunk
+                if buf.endswith(b"\n"):
+                    sock.sendall(b"ECHO " + buf)
+                sock.shutdown(socket.SHUT_WR)
+                while sock.recv(65536):
+                    pass
+            except OSError:
+                pass
+            return
+
         # Остаток запроса надо ВЫЧИТАТЬ, а не игнорировать, и это не аккуратность.
         # Клиент присылает за заголовком VLESS ещё и сам запрос HTTP. Закрыть соединение,
         # оставив его непрочитанным, значит заставить Linux послать RST вместо FIN — а RST
