@@ -248,12 +248,72 @@ static int js_lit(struct js *j, char c) {
     j->p++;
     return 0;
 }
+/* Четыре шестнадцатеричные цифры после \u. -1 — если их нет. */
+static long js_hex4(const char *p) {
+    long v = 0;
+    for (int k = 0; k < 4; k++) {
+        char c = p[k];
+        int d = c >= '0' && c <= '9' ? c - '0' :
+                c >= 'a' && c <= 'f' ? c - 'a' + 10 :
+                c >= 'A' && c <= 'F' ? c - 'A' + 10 : -1;
+        if (d < 0) return -1;
+        v = v * 16 + d;
+    }
+    return v;
+}
+
+/* \uXXXX в UTF-8 (I-315). Раньше экранирование читалось как «следующий знак как есть», и
+ * «a\u0022b» становилось «au0022b»: JSON вправе так записать любой знак, а сериализатор,
+ * экранирующий не-ASCII, так пишет любую кириллицу. Возвращает число записанных байт и
+ * сдвигает *pp за разобранное; 0 — не раскодировано, и тогда строка читается как прежде
+ * (буква «u» и дальше как есть), с предупреждением. Не раскодируются управляющие знаки —
+ * в имени, пути или адресе им смысла нет, а грузилась такая спека и до правки, — одинокие
+ * суррогаты и недописанное \u. */
+static size_t js_uesc(const char **pp, char out[4]) {
+    const char *p = *pp;                              /* указывает на 'u' */
+    long cp = js_hex4(p + 1);
+    size_t used = 5;
+    if (cp >= 0xD800 && cp <= 0xDBFF && p[5] == '\\' && p[6] == 'u') {
+        long lo = js_hex4(p + 7);
+        if (lo >= 0xDC00 && lo <= 0xDFFF) { cp = 0x10000 + ((cp - 0xD800) << 10) + (lo - 0xDC00); used = 11; }
+    }
+    if (cp < 0x20 || (cp >= 0xD800 && cp <= 0xDFFF)) {
+        fprintf(stderr, "steer[warn] spec: \\%.5s в строке не раскодирован и прочитан как есть — "
+                "запишите вместо него сам знак\n", p);
+        return 0;
+    }
+    size_t k;
+    if (cp < 0x80) { out[0] = (char)cp; k = 1; }
+    else if (cp < 0x800) { out[0] = (char)(0xC0 | (cp >> 6)); out[1] = (char)(0x80 | (cp & 0x3F)); k = 2; }
+    else if (cp < 0x10000) {
+        out[0] = (char)(0xE0 | (cp >> 12)); out[1] = (char)(0x80 | ((cp >> 6) & 0x3F));
+        out[2] = (char)(0x80 | (cp & 0x3F)); k = 3;
+    } else {
+        out[0] = (char)(0xF0 | (cp >> 18)); out[1] = (char)(0x80 | ((cp >> 12) & 0x3F));
+        out[2] = (char)(0x80 | ((cp >> 6) & 0x3F)); out[3] = (char)(0x80 | (cp & 0x3F)); k = 4;
+    }
+    *pp = p + used;
+    return k;
+}
+
 static int js_str(struct js *j, char *buf, size_t n) {
     js_ws(j);
     if (*j->p != '"') return -1;
     j->p++;
     size_t i = 0;
     while (*j->p && *j->p != '"') {
+        if (*j->p == '\\' && j->p[1] == 'u') {
+            char u[4];
+            const char *q = j->p + 1;
+            size_t k = js_uesc(&q, u);
+            if (k) {
+                if (i + k >= n) die("spec: строка длиннее допустимого (имя, путь или ключ)", NULL);
+                memcpy(buf + i, u, k);
+                i += k;
+                j->p = q;
+                continue;
+            }
+        }
         if (*j->p == '\\' && j->p[1]) j->p++;
         /* Длиннее буфера — отказ, а не молчаливая обрезка: имя выхода из 36 знаков
          * принималось как 31-значное, а имя устройства длиннее IFNAMSIZ ядро всё равно не
