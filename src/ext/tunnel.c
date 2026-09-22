@@ -1827,6 +1827,9 @@ static void udp_packet(const struct tun_dev *tun, const struct vless_node *node,
 }
 
 /* Один пакет из TUN. */
+static void drain_conn(struct conn *c, const struct vless_node *node,
+                       const struct tun_dev *tun);
+
 static void handle_packet(const struct tun_dev *tun, const struct vless_node *node,
                           const unsigned char *pkt, size_t n) {
     struct flow_key k;
@@ -2091,9 +2094,17 @@ static void handle_packet(const struct tun_dev *tun, const struct vless_node *no
          *
          * Больше нельзя: цикл здесь один на все соединения, и каждая миллисекунда ожидания
          * — это миллисекунда, на которую стоят остальные. */
+        /* Читаем тем же drain_conn, что и цикл (I-320): только он спрашивает окно клиента
+         * и на конце потока ставит srv_closed, а не закрывает. Прямой downstream_pump здесь
+         * отдавал клиенту записи за его окном (приёмник их выбросит — лечится повтором по
+         * таймауту), а конец потока в этот момент рвал соединение вместе с кольцом, то есть
+         * с хвостом ответа, который drain_conn в том же случае додаёт. Окна у клиента нет —
+         * не читаем вовсе: клиент повторит пакет, как ниже. */
         struct pollfd sp = { .fd = c->fd, .events = POLLIN };
-        if (poll(&sp, 1, 5) > 0 && (sp.revents & POLLIN)) {
-            if (downstream_pump(c, node, tun) != 0) { conn_drop(c); return; }
+        if (client_can_take_record(c) &&
+            poll(&sp, 1, 5) > 0 && (sp.revents & POLLIN)) {
+            drain_conn(c, node, tun);
+            if (c->srv_closed) return;          /* пакет не ушёл и уже не уйдёт */
             sr = upstream_send(c, node, pkt + off, data_n);
         }
     }

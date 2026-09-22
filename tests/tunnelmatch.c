@@ -70,6 +70,7 @@ void bind_device(struct output *o, const char *dev) { (void)o; (void)dev; }
 
 static int g_sess_pipe[2] = { -1, -1 };
 static int g_send_rc;                 /* что вернёт vless_send: 0 или H2_EWINDOW */
+static int g_send_again_n;            /* столько раз подряд вернуть H2_EWINDOW, потом 0 */
 static int g_recv_calls;
 static int g_recv_rc;                 /* что вернёт vless_recv_zc: 0 или -1 (конец потока) */
 static unsigned char g_recv_buf[4096];
@@ -84,6 +85,7 @@ int vless_connect(const struct vless_node *node, struct vless_conn *conn, int ti
 }
 int vless_send(struct vless_conn *c, const unsigned char *d, size_t n) {
     (void)c; (void)d; (void)n;
+    if (g_send_again_n > 0) { g_send_again_n--; return H2_EWINDOW; }
     return g_send_rc;
 }
 int vless_recv_zc(struct vless_conn *c, unsigned char *buf, size_t cap,
@@ -187,6 +189,8 @@ static struct conn *open_conn(uint16_t win) {
     g_recv_n = 1002;
     drain_conn(c, &g_node, &g_tun);
     dev_drain(NULL);
+    /* Стенд сам себя проверяет: без этого «провал» мог бы означать сломанную подготовку. */
+    if (!c->established || c->rtx.len != 1000 || c->srv_closed) return NULL;
     return c;
 }
 
@@ -231,6 +235,64 @@ static void t_bring_up_table(void) {
     check(host >= 1 && host <= 200, "I-322: таблица -7 даёт адрес 198.51.100.1..200");
 }
 
+/* I-320: окно HTTP/2 закрыто (SEND_AGAIN), и туннель читает у сервера, надеясь на
+ * WINDOW_UPDATE. Читать можно только то, что клиент в силах принять: прочитанное за его
+ * окно уходит в пустоту и лечится лишь повтором по таймауту. */
+static void t_sendagain_window(void) {
+    struct conn *c = open_conn(65535);
+    if (!c) { check(0, "I-320: соединение не открылось"); return; }
+    /* Клиент принял не всё и объявил окно ровно под уже отправленное: места нет. */
+    const unsigned char d[] = "GET / HTTP/1.1\r\n";
+    g_send_rc = H2_EWINDOW;
+    g_recv_rc = 0;
+    memset(g_recv_buf, 'r', 1000);
+    g_recv_n = 1000;
+    int calls = g_recv_calls;
+    cli_send(1001, 2, TCP_ACK | TCP_PSH, 1000, d, sizeof(d) - 1);
+    check(g_recv_calls == calls, "I-320: при закрытом окне клиента у сервера не читаем");
+    g_send_rc = 0;
+    g_recv_n = 0;
+    conn_drop(c);
+    dev_drain(NULL);
+}
+
+/* I-320, обратная сторона: окно клиента открыто — чтение у сервера делается (оттуда
+ * приходит WINDOW_UPDATE), повторная отправка удаётся, пакет подтверждён. */
+static void t_sendagain_retry(void) {
+    struct conn *c = open_conn(65535);
+    if (!c) { check(0, "I-320: соединение не открылось"); return; }
+    const unsigned char d[] = "GET / HTTP/1.1\r\n";
+    g_send_again_n = 1;
+    g_recv_rc = 0;
+    g_recv_n = 0;                                       /* служебный кадр: данных нет */
+    int calls = g_recv_calls;
+    cli_send(1001, 2, TCP_ACK | TCP_PSH, 65535, d, sizeof(d) - 1);
+    check(g_recv_calls > calls && c->used && c->client_seq == 1001 + sizeof(d) - 1,
+          "I-320: окно клиента открыто — читаем, повтор отправки удался");
+    g_send_again_n = 0;
+    conn_drop(c);
+    dev_drain(NULL);
+}
+
+/* I-320: на том же чтении сервер закрыл поток. Соединение обязано дожить до подтверждения
+ * уже отправленного (srv_closed, как в drain_conn), а не пропасть вместе с кольцом. */
+static void t_sendagain_eof(void) {
+    struct conn *c = open_conn(65535);
+    if (!c) { check(0, "I-320: соединение не открылось"); return; }
+    const unsigned char d[] = "GET / HTTP/1.1\r\n";
+    g_send_rc = H2_EWINDOW;
+    g_recv_rc = -1;
+    cli_send(1001, 2, TCP_ACK | TCP_PSH, 65535, d, sizeof(d) - 1);
+    struct flow_key k = cli_key();
+    c = conn_find(&k);
+    check(c && c->srv_closed && c->rtx.len == 1000,
+          "I-320: конец потока при SEND_AGAIN — соединение живо, 1000 байт ждут подтверждения");
+    g_send_rc = 0;
+    g_recv_rc = 0;
+    if (c) conn_drop(c);
+    dev_drain(NULL);
+}
+
 int main(void) {
     int sp[2];
     if (socketpair(AF_UNIX, SOCK_DGRAM, 0, sp) != 0 || pipe(g_sess_pipe) != 0) return 2;
@@ -247,7 +309,9 @@ int main(void) {
 
     t_no_connectors();
     t_bring_up_table();
-    (void)open_conn;
+    t_sendagain_window();
+    t_sendagain_retry();
+    t_sendagain_eof();
 
     printf(g_fail ? "\ntunnelmatch: ПРОВАЛ\n" : "\nвсе проверки прошли\n");
     return g_fail;
