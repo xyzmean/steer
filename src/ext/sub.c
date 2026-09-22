@@ -147,6 +147,9 @@ static void utf8_trim_tail(char *s) {
     while (at && ((unsigned char)s[at - 1] & 0xC0) == 0x80) { at--; cont++; }
     if (!at) { s[0] = '\0'; return; }              /* одни продолжения — мусор целиком */
     unsigned char lead = (unsigned char)s[at - 1];
+    /* Перед продолжениями ASCII: ведущего байта нет, и снимаются только продолжения. Иначе
+     * «ab\x80» теряло бы и «b» — букву, которая ни при чём (I-326). */
+    if (lead < 0x80) { s[at] = '\0'; return; }
     size_t need = (lead & 0xE0) == 0xC0 ? 1 :
                   (lead & 0xF0) == 0xE0 ? 2 :
                   (lead & 0xF8) == 0xF0 ? 3 : 0;
@@ -455,7 +458,6 @@ static int node_usable(struct vless_node *n) {
                  "xhttp mode=%s не поддержан", n->mode);
         return 1;
     }
-    return 0;
     return 0;
 }
 
