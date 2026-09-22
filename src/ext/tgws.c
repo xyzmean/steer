@@ -960,7 +960,12 @@ static int tls_start(struct upstream *u, const char *sni) {
     if (up_write(u, hello, hello_n) < 0) { g_tls_rc = -102; return -1; }
     memset(&u->tls, 0, sizeof(u->tls));
     g_tls_rc = tls13_handshake(&u->tls, u->fd, hello, hello_n, priv);
-    if (g_tls_rc != 0) return -1;
+    /* На отказе освобождаем здесь, а не у вызывающих: tls_on ещё ноль, и их ветки отказа
+     * ключей не трогают. Отказ рукопожатия бывает и после разворота ключа записи (tls13.c:
+     * ключ чтения не развернулся), и тогда контекст AEAD оставался бы выделенным (I-197).
+     * Вызов безвреден и там, где ничего не развёрнуто: структура обнулена выше, а
+     * tls13_keys_free выходит по ctx_ready. */
+    if (g_tls_rc != 0) { tls13_free(&u->tls); return -1; }
     u->tls_on = 1;
     return 0;
 }
