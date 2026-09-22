@@ -463,6 +463,60 @@ static void t_send_refused(void) {
     dev_drain(NULL);
 }
 
+/* Заполнить таблицу целиком свежими TCP, кроме одного потока UDP с заданными портом и
+ * возрастом, и спросить conn_new о новом месте. Возвращает, отдали ли место этого потока. */
+static int full_table_gives_udp(uint16_t dport, int idle_s) {
+    struct conn *u = NULL;
+    int n = 0;
+    while (g_free_n) {
+        struct conn *c = conn_new(&g_tun);
+        memset(c, 0, sizeof(*c));
+        c->used = 1;
+        c->fd = -1;
+        c->key = cli_key();
+        c->key.sport = (uint16_t)(20000 + n++);
+        c->last = g_now_s;
+        if (!u) {
+            u = c;
+            c->is_udp = 1;
+            c->key.proto = 17;
+            c->key.dport = dport;
+            c->last = g_now_s - idle_s;
+        }
+        conn_link(c);
+    }
+    int save = dup(2), nul = open("/dev/null", O_WRONLY);
+    dup2(nul, 2);
+    struct conn *got = conn_new(&g_tun);
+    fflush(stderr);
+    dup2(save, 2); close(save); close(nul);
+    int gave = got && got == u;
+    if (got) {                          /* выданное место — в таблицу, чтобы уборка его вернула */
+        memset(got, 0, sizeof(*got));
+        got->used = 1;
+        got->fd = -1;
+        got->key = cli_key();
+        got->key.sport = 19999;
+        conn_link(got);
+    }
+    /* Уборка: всё живое — обратно в свободные. */
+    while (g_live_n) conn_drop(&g_conns[g_live[g_live_n - 1]]);
+    dev_drain(NULL);
+    return gave;
+}
+
+/* I-055: таблица полна, свободных мест нет. Поток DNS (UDP на порт 53), молчащий 15 с, своё
+ * уже сделал — запрос и ответ, — но выглядел активным все 120 с, и conn_new отказывал новым
+ * соединениям, включая обычный TCP. Живой поток QUIC с тем же простоем не трогается, и DNS,
+ * ответ на который ещё может прийти, тоже. */
+static void t_dns_evict(void) {
+    /* Сам стенд: поток, молчащий дольше IDLE_EVICT_S, вытеснялся и прежде. */
+    check(full_table_gives_udp(443, IDLE_EVICT_S + 10), "I-055: стенд — молчащий дольше 120 с вытесняется");
+    check(full_table_gives_udp(53, 15), "I-055: таблица полна — молчащий 15 с поток DNS уступает место");
+    check(!full_table_gives_udp(443, 15), "I-055: поток UDP не на порт 53 с тем же простоем не вытесняется");
+    check(!full_table_gives_udp(53, 3), "I-055: поток DNS, молчащий 3 с, не вытесняется");
+}
+
 int main(void) {
     int sp[2];
     if (socketpair(AF_UNIX, SOCK_DGRAM, 0, sp) != 0 || pipe(g_sess_pipe) != 0) return 2;
@@ -486,6 +540,7 @@ int main(void) {
     t_release_last_sleep();
     t_bad_uuid();
     t_send_refused();
+    t_dns_evict();
 
     printf(g_fail ? "\ntunnelmatch: ПРОВАЛ\n" : "\nвсе проверки прошли\n");
     return g_fail;
