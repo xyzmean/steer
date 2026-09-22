@@ -748,6 +748,106 @@ int main(void) {
     }
     g_health_probe = NULL;
 
+    /* ---- туннель xsteer, поднятый netifd, судится по СВОЕМУ файлу состояния ----------
+     *
+     * Снято с живого роутера (10.8.1.1): интерфейс `xs0` с proto xsteer, его устройство
+     * `xs-xs0`, `ping 8.8.8.8 -I xs-xs0` идёт, а выход, в пул которого это устройство
+     * записано, стоит на запасном туннеле и не переключается.
+     *
+     * ПРИЧИНА, КОТОРУЮ ЗАКРЫВАЕТ ЭТОТ СТЕНД. Особое обращение с xsteer (не пинговать наружу,
+     * не звать ifdown/ifup) висело на `o->kind == OUT_XSTEER`, то есть на ВИДЕ ВЫХОДА. Но
+     * splify2 поднимает туннель не выходом спеки, а обычным интерфейсом netifd
+     * (splify2/files/lib/netifd/proto/xsteer.sh), и в спеке такой туннель — просто имя
+     * устройства в пуле выхода kind=interface. Вида xsteer там нет нигде, поэтому сторож
+     * судил исправный туннель пингом наружу (хаб полной звезды не обязан выпускать в
+     * интернет) и «чинил» его ifdown по имени УСТРОЙСТВА, которого netifd не знает:
+     * интерфейс зовётся xs0, устройство — xs-xs0.
+     *
+     * Признак здесь тот же, что у splify2 в методе xsteer_state: файл состояния, который
+     * пишет сам клиент. Приставка «xs-» в признак не годится — это умолчание настройки
+     * (device_name), а не правило. */
+    {
+        snprintf(g_dir, sizeof(g_dir), "/tmp/failovermatch-xs-XXXXXX");
+        if (!mkdtemp(g_dir)) { perror("mkdtemp"); return 1; }
+        const char *xd = g_dir;
+        g_state_dir = g_dir;
+        g_rules = "";
+        g_routes = "";
+        g_out_n = 0;                    /* выхода kind=xsteer в спеке НЕТ — и не должно быть */
+
+        struct output o = {0};
+        snprintf(o.name, sizeof(o.name), "wg0");
+        o.kind = OUT_INTERFACE;         /* ровно так splify2 и описывает такой туннель */
+        o.on_fail = FAIL_DROP;
+        snprintf(o.devices[0], sizeof(o.devices[0]), "lo");
+        o.devices_n = 1;
+        o.mark = 0x100000;
+        o.table = 300;
+
+        char xs[512];
+        snprintf(xs, sizeof(xs), "%s/xsteer-lo.json", xd);
+
+        /* Файла нет: устройство не наше, и приговор прежний — проба ICMP. Эта проверка
+         * стоит здесь затем, чтобы правка не отменила обычный путь заодно. */
+        g_cmd_n = 0;
+        device_healthy_for(&o, "lo");
+        check("без файла состояния — обычная проба пингом", cmd_seen("ping"), 1);
+
+        /* Файл свежий и говорит «поднят». Пинговать наружу нельзя: у хаба полной звезды
+         * маршрута в интернет может не быть вовсе, и пинг объявил бы мёртвым работающий
+         * туннель, а при on_fail=drop сторож поставил бы ему blackhole. */
+        state_write("xsteer-lo.json",
+                    "{\"schema\":1,\"out\":\"lo\",\"up\":true,\"handshake_age\":3}\n");
+        g_cmd_n = 0;
+        check("файл говорит «поднят» — устройство живо", device_healthy_for(&o, "lo"), 1);
+        check("файл говорит «поднят» — наружу не пингуем", cmd_seen("ping"), 0);
+
+        /* Файл свежий и говорит «не поднят» — приговор его, а не пинга: клиент знает про
+         * рукопожатие с хабом то, чего пинг не знает. */
+        state_write("xsteer-lo.json",
+                    "{\"schema\":1,\"out\":\"lo\",\"up\":false,\"handshake_age\":-1}\n");
+        g_cmd_n = 0;
+        check("файл говорит «не поднят» — устройство мертво", device_healthy_for(&o, "lo"), 0);
+        check("файл говорит «не поднят» — наружу тоже не пингуем", cmd_seen("ping"), 0);
+
+        /* Файл устарел: писавшего процесса нет. Врать в сторону «сломано» здесь дороже
+         * всего — при on_fail=drop это blackhole, — поэтому приговор отдаётся наличию
+         * устройства, как и у выхода kind=xsteer. */
+        {
+            struct timespec ts[2];
+            ts[0].tv_sec = ts[1].tv_sec = time(NULL) - 600;
+            ts[0].tv_nsec = ts[1].tv_nsec = 0;
+            if (utimensat(AT_FDCWD, xs, ts, 0) != 0) { perror("utimensat"); return 1; }
+        }
+        check("файл устарел — судим по наличию устройства", device_healthy_for(&o, "lo"), 1);
+
+        /* И «починка»: ifdown по имени устройства netifd отвечает «Interface not found» —
+         * интерфейс зовётся иначе. Сторожу здесь делать нечего, кроме как подождать. */
+        state_write("xsteer-lo.json",
+                    "{\"schema\":1,\"out\":\"lo\",\"up\":false,\"handshake_age\":-1}\n");
+        g_cmd_n = 0;
+        g_slept = 0;
+        {
+            char err[4096] = "";
+            int rc = revive_with_stderr(&o, "lo", err, sizeof(err));
+            check("xsteer от netifd: ifdown не зовётся", cmd_seen("ifdown"), 0);
+            check("xsteer от netifd: ifup не зовётся", cmd_seen("ifup"), 0);
+            check("xsteer от netifd: сторож ждёт", g_slept, 10);
+            check("xsteer от netifd: возврат 0", rc, 0);
+        }
+
+        {
+            char path[600];
+            snprintf(path, sizeof(path), "%s/restart-lo", xd);
+            unlink(path);
+            unlink(xs);
+            snprintf(path, sizeof(path), "%s/active", xd);
+            unlink(path);
+            rmdir(xd);
+        }
+        g_state_dir = "/tmp";
+    }
+
     if (g_fail) {
         fprintf(stderr, "failovermatch: провалено проверок: %d\n", g_fail);
         return 1;
