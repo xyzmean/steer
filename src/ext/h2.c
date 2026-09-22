@@ -323,7 +323,10 @@ int h2_next(struct h2 *h, const char *authority, const char *path,
      * обнулить его здесь значило бы не вернуть серверу уже потраченное окно. */
     h->recv_credit = 0;
 
-    static __thread unsigned char buf[2048];
+    /* Столько же, сколько у h2_start_ex: заголовки те же (облик браузера и Referer с
+     * набивкой до 1400 байт), и в 2 КБ второй кусок с длинным путём узла не влезал, хотя
+     * первый с теми же заголовками уходил. */
+    static __thread unsigned char buf[4096];
     struct wbuf b = { buf, 0, sizeof(buf) };
     if (put_headers(h, &b, authority, path, content_type, referer, method, 0) != 0)
         return H2_ETOOBIG;

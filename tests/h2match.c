@@ -395,6 +395,28 @@ int main(void) {
         check("RST_STREAM текущего потока: разрыв", H2_ERESET, h2_read(&h, out, sizeof(out), &got));
     }
 
+    {
+        /* ---- следующий запрос влезает туда же, куда первый (I-325) -----------------
+         *
+         * Кусок packet-up идёт обликом браузера с Referer до 1399 байт (предел xhttp_referer_r
+         * в client.c) — так же, как первый запрос. Первый собирается в буфер на 4 КБ,
+         * следующие собирались в 2 КБ: при длинном пути узла (здесь 240 байт) первый кусок
+         * уходил, а второй с теми же заголовками получал H2_ETOOBIG. */
+        static char ref[1400], path[241];
+        memset(ref, 'X', 1399); ref[1399] = '\0';
+        path[0] = '/'; memset(path + 1, 'p', 239); path[240] = '\0';
+        struct h2 h;
+        struct fake_io io;
+        memset(&io, 0, sizeof io);
+        struct h2_io ops = { &io, fake_write, fake_read };
+        check("первый запрос: путь 240, Referer 1399 — без ошибки",
+              0, h2_start_ex(&h, &ops, "example.org", path, "application/grpc", ref,
+                             H2_POST, 0, 1));
+        h2_end_stream(&h);
+        check("следующий запрос с теми же заголовками: без ошибки",
+              0, h2_next(&h, "example.org", path, "application/grpc", ref, H2_POST));
+    }
+
     printf("\n%s\n", fails ? "ЕСТЬ ПРОВАЛЫ" : "все проверки прошли");
 
     return fails ? 1 : 0;
