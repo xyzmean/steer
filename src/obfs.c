@@ -715,6 +715,15 @@ int obfs_guard_up(char kind, const char *label, const char *peer_addr, int port,
 #define ACK_MS       40         /* и не реже, чем раз во столько миллисекунд */
 #define DEAD_MS      60000      /* тишина при активной отправке — путь считается мёртвым */
 
+/* Пауза перед новым подключением: четверть секунды, дальше вдвое, до пяти секунд; сброс —
+ * когда сессия прожила REDIAL_RESET_MS (значит подключаться получается). Те же числа, что у
+ * worker в клиенте на Go. Без паузы сервер, у которого не встало правило против RST, получал
+ * новый SYN на каждый RST ядра: на стенде 69 тысяч SYN и 138 тысяч строк журнала за три
+ * секунды. Шесть безответных SYN — та же серия сразу заново, без передышки. */
+#define REDIAL_MIN_MS   250
+#define REDIAL_MAX_MS   5000
+#define REDIAL_RESET_MS 10000
+
 /* ---- клиент ---------------------------------------------------------------- */
 /* Путь мёртв, если после ПОСЛЕДНЕГО принятого мы отправляли нагрузку и с тех пор DEAD_MS
  * тишины. Именно нагрузку: голый ACK — не разговор, и путь, где мы только подтверждали и
@@ -801,6 +810,8 @@ int obfs_client(const char *out_name, const char *server, int server_port,
     /* Уходим с ошибкой, а не крутимся в цикле: подъём заново — дело procd, и его пауза
      * respawn заодно не даёт молотить сеть, которой ещё нет. */
     if (client_connect(&c, &raw, sa.s_addr, server_port) != 0) return 1;
+    long long began = now_ms(), redial_at = 0;
+    int redial_wait = REDIAL_MIN_MS;
     fprintf(stderr, LOG_I "%s: %s:%d ← udp %s:%d, порт %u\n",
             out_name, server, server_port, listen_addr, listen_port, c.sport);
 
@@ -972,10 +983,21 @@ int obfs_client(const char *out_name, const char *server, int server_port,
                     out_name, DEAD_MS / 1000);
             c.state = ST_CLOSED;
         }
-        if (c.state == ST_CLOSED) {
+        /* Закрытая сессия с открытым сокетом — только что оборвалась: сокет закрываем сразу
+         * (иначе в паузе он копил бы тот же поток RST), и назначаем время новой попытки.
+         * Датаграммы WireGuard в паузе считаются потерянными до сессии, как и раньше. */
+        if (c.state == ST_CLOSED && raw >= 0) {
             fprintf(stderr, LOG_I "%s: наружу %llu, обратно %llu, потеряно до сессии %llu\n",
                     out_name, up_pkts, down_pkts, dropped);
+            if (t - began >= REDIAL_RESET_MS) redial_wait = REDIAL_MIN_MS;
+            redial_at = t + redial_wait;
+            redial_wait = redial_wait * 2 > REDIAL_MAX_MS ? REDIAL_MAX_MS : redial_wait * 2;
+            close(raw);
+            raw = -1;
+        }
+        if (c.state == ST_CLOSED && raw < 0 && t >= redial_at) {
             if (client_connect(&c, &raw, sa.s_addr, server_port) != 0) return 1;
+            began = now_ms();
         }
     }
     obfs_guard_down();
