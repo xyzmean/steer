@@ -370,6 +370,31 @@ int main(void) {
         check(":status 200 в Huffman: статус 200", 200, h.status);
     }
 
+    {
+        /* ---- RST_STREAM закрытого потока не рвёт текущий (I-325) -------------------
+         *
+         * Go-сервер отвечает RST_STREAM(NO_ERROR) на поток, чей обработчик уже закончил, и у
+         * packet-up такой кадр приходит по ПРЕЖНЕМУ куску, когда открыт следующий. Это конец
+         * чужого потока, а не нашего: соединение обязано жить. RST по ТЕКУЩЕМУ потоку —
+         * по-прежнему разрыв. */
+        static const unsigned char no_error[4] = { 0, 0, 0, 0 };
+        struct h2 h;
+        struct fake_io io;
+        unsigned char feed[64];
+        unsigned char out[H2_MIN_READ_CAP];
+        size_t got = 0;
+
+        h2_open(&h, &io);
+        h2_end_stream(&h);
+        h2_next(&h, "example.org", "/x/sid/1", "application/grpc", NULL, H2_POST);
+        io.feed = feed; io.feed_pos = 0;
+        io.feed_n = put_frame(feed, FR_RST_STREAM, 0, 1, no_error, 4);
+        check("RST_STREAM прежнего потока: не ошибка", 0, h2_read(&h, out, sizeof(out), &got));
+        io.feed_pos = 0;
+        io.feed_n = put_frame(feed, FR_RST_STREAM, 0, h.sid, no_error, 4);
+        check("RST_STREAM текущего потока: разрыв", H2_ERESET, h2_read(&h, out, sizeof(out), &got));
+    }
+
     printf("\n%s\n", fails ? "ЕСТЬ ПРОВАЛЫ" : "все проверки прошли");
 
     return fails ? 1 : 0;
