@@ -1014,8 +1014,13 @@ static void sess_free(struct sess *s) {
     s->used = 0;
 }
 
-static struct sess *sess_alloc(uint32_t caddr, uint16_t cport, uint16_t our_port,
-                               uint32_t fwd_addr, int fwd_port) {
+/* our_addr — адрес, НА КОТОРЫЙ клиент прислал SYN: с него и отвечаем (см. obfs_raw_open_from).
+ * Раньше сокет ответа открывался через obfs_raw_open, и адрес источника выбирала таблица
+ * маршрутов — на VPS с двумя адресами это первичный, а не тот, куда писал клиент. Фильтр
+ * клиента (obfs_filter_quad) такой SYN-ACK отбрасывает в ядре, и сессия не встаёт без единой
+ * строки в журнале. Та же беда, что у хаба xsteer, и то же лекарство. */
+static struct sess *sess_alloc(uint32_t caddr, uint16_t cport, uint32_t our_addr,
+                               uint16_t our_port, uint32_t fwd_addr, int fwd_port) {
     struct sess *slot = NULL, *oldest = NULL;
     for (int i = 0; i < MAX_SESS; i++) {
         if (!g_sess[i].used) { slot = &g_sess[i]; break; }
@@ -1028,7 +1033,7 @@ static struct sess *sess_alloc(uint32_t caddr, uint16_t cport, uint16_t our_port
     memset(slot, 0, sizeof(*slot));
     slot->udp = slot->tx = -1;
 
-    slot->tx = obfs_raw_open(caddr, &slot->c.saddr);
+    slot->tx = obfs_raw_open_from(caddr, our_addr, &slot->c.saddr);
     if (slot->tx < 0) return NULL;
     obfs_filter_none(slot->tx);
 
@@ -1127,7 +1132,7 @@ int obfs_server(int listen_port, const char *forward, int forward_port) {
                     /* Повторный SYN по живой сессии — клиент, потерявший наш ответ:
                      * отвечаем заново по той же записи, а не заводим вторую. */
                     if (!ss) {
-                        ss = sess_alloc(s.saddr, s.sport, (uint16_t)listen_port,
+                        ss = sess_alloc(s.saddr, s.sport, s.daddr, (uint16_t)listen_port,
                                         fa.s_addr, forward_port);
                         if (!ss) continue;
                     } else {
@@ -1147,7 +1152,12 @@ int obfs_server(int listen_port, const char *forward, int forward_port) {
                      * сразу, и клиент переподключается за миллисекунды.
                      *
                      * Окно 65535, а не ноль: именно этим наш RST отличается от RST ядра,
-                     * который гасит наше же правило (см. guard_up). */
+                     * который гасит наше же правило (см. guard_up).
+                     *
+                     * Адрес источника назван явно (IP_PKTINFO): сумма посчитана с s.daddr, а
+                     * несвязанный tx0 без подсказки ушёл бы с адреса, который выберет маршрут.
+                     * На многоадресном сервере это другой адрес — RST с битой суммой и чужого
+                     * адреса, который клиент отбросит, так и не узнав о нашем перезапуске. */
                     if (tx0 >= 0 && !(s.flags & TH_RST)) {
                         uint8_t rst[60];
                         size_t rn = obfs_build(rst, s.daddr, s.saddr,
@@ -1158,7 +1168,29 @@ int obfs_server(int listen_port, const char *forward, int forward_port) {
                         memset(&to, 0, sizeof(to));
                         to.sin_family = AF_INET;
                         to.sin_addr.s_addr = s.saddr;
-                        sendto(tx0, rst, rn, 0, (struct sockaddr *)&to, sizeof(to));
+                        struct iovec riov = { rst, rn };
+                        union {
+                            char buf[CMSG_SPACE(sizeof(struct in_pktinfo))];
+                            struct cmsghdr align;
+                        } cb;
+                        memset(&cb, 0, sizeof(cb));
+                        struct msghdr mh;
+                        memset(&mh, 0, sizeof(mh));
+                        mh.msg_name = &to;
+                        mh.msg_namelen = sizeof(to);
+                        mh.msg_iov = &riov;
+                        mh.msg_iovlen = 1;
+                        mh.msg_control = cb.buf;
+                        mh.msg_controllen = sizeof(cb.buf);
+                        struct cmsghdr *cm = CMSG_FIRSTHDR(&mh);
+                        cm->cmsg_level = IPPROTO_IP;
+                        cm->cmsg_type = IP_PKTINFO;
+                        cm->cmsg_len = CMSG_LEN(sizeof(struct in_pktinfo));
+                        struct in_pktinfo pi;
+                        memset(&pi, 0, sizeof(pi));
+                        pi.ipi_spec_dst.s_addr = s.daddr;
+                        memcpy(CMSG_DATA(cm), &pi, sizeof(pi));
+                        sendmsg(tx0, &mh, 0);
                     }
                     continue;
                 }
