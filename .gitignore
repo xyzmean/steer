@@ -25,6 +25,7 @@ build/dcmatch
 build/msgsplitmatch
 build/warmmatch
 build/upmatch
+build/tgwsfailmatch
 build/bench
 build/dnsmatch
 build/specmatch

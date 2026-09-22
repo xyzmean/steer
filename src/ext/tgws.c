@@ -322,13 +322,31 @@ static void alt_init(void) {
     if (!path) path = "/etc/steer/tgws-domains.lst";
     FILE *f = fopen(path, "r");
     if (!f) return;
+    /* Слишком длинное имя НАЗЫВАЕТСЯ и пропускается, а не урезается (I-155). Урезанное имя —
+     * это домен, которого человек не писал, а в журнале дозвон в него выглядит как «точка
+     * недоступна», то есть неотличимо от честно молчащего домена. Строка длиннее буфера
+     * чтения дочитывается до конца: иначе её хвост fgets отдал бы следующей «строкой», и из
+     * одной записи получилось бы два чужих имени. */
     char line[160];
+    unsigned lineno = 0;
     while (g_alt_n < MAX_ALT && fgets(line, sizeof(line), f)) {
+        lineno++;
+        int overlong = 0;
+        if (!strchr(line, '\n') && !feof(f)) {
+            int c;
+            while ((c = fgetc(f)) != EOF && c != '\n') { }
+            overlong = 1;
+        }
         char *p = line;
         while (*p == ' ' || *p == '\t') p++;
         p[strcspn(p, " \t\r\n")] = '\0';
         if (!*p || *p == '#') continue;
-        snprintf(g_alt[g_alt_n], sizeof(g_alt[0]), "%s", p);
+        if (overlong || strlen(p) >= sizeof(g_alt[0])) {
+            fprintf(stderr, LOG_W "%s, строка %u: имя длиннее %zu байт — строка пропущена, "
+                    "исправьте её\n", path, lineno, sizeof(g_alt[0]) - 1);
+            continue;
+        }
+        memcpy(g_alt[g_alt_n], p, strlen(p) + 1);
         g_alt_n++;
     }
     fclose(f);
