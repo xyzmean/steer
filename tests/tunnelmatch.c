@@ -293,6 +293,35 @@ static void t_sendagain_eof(void) {
     dev_drain(NULL);
 }
 
+/* I-321: сегмент не по порядку отбрасывается (буфера переупорядочивания нет), но ответить
+ * на него обязаны подтверждением ожидаемого номера: без дубликатов ACK у клиента не
+ * срабатывает быстрый повтор, и дыра закрывается только по таймауту. Тот же ответ нужен и
+ * на повтор уже принятого — иначе потерянный наш ACK не восстанавливается ничем. */
+static void t_out_of_order_dupack(void) {
+    struct conn *c = open_conn(65535);
+    if (!c) { check(0, "I-321: соединение не открылось"); return; }
+    const unsigned char d[100] = { 0 };
+    struct flow_key last;
+    cli_send(1001 + 500, 2, TCP_ACK | TCP_PSH, 65535, d, sizeof(d));
+    flush_acks(&g_tun);
+    memset(&last, 0, sizeof(last));
+    int n = dev_drain(&last);
+    check(n == 1 && (last.tcp_flags & TCP_ACK) && last.ack == 1001 && c->client_seq == 1001,
+          "I-321: сегмент за дырой — не принят, ушёл ACK ожидаемого номера");
+
+    cli_send(1001, 2, TCP_ACK | TCP_PSH, 65535, d, sizeof(d));      /* по порядку */
+    flush_acks(&g_tun);
+    dev_drain(NULL);
+    cli_send(1001, 2, TCP_ACK | TCP_PSH, 65535, d, sizeof(d));      /* его же повтор */
+    flush_acks(&g_tun);
+    memset(&last, 0, sizeof(last));
+    n = dev_drain(&last);
+    check(n == 1 && last.ack == 1101 && c->client_seq == 1101,
+          "I-321: повтор принятого — не принят дважды, ACK с текущим номером");
+    conn_drop(c);
+    dev_drain(NULL);
+}
+
 int main(void) {
     int sp[2];
     if (socketpair(AF_UNIX, SOCK_DGRAM, 0, sp) != 0 || pipe(g_sess_pipe) != 0) return 2;
@@ -312,6 +341,7 @@ int main(void) {
     t_sendagain_window();
     t_sendagain_retry();
     t_sendagain_eof();
+    t_out_of_order_dupack();
 
     printf(g_fail ? "\ntunnelmatch: ПРОВАЛ\n" : "\nвсе проверки прошли\n");
     return g_fail;
