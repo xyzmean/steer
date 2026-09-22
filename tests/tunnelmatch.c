@@ -47,6 +47,28 @@ int pthread_attr_setstacksize(pthread_attr_t *a, size_t s) {
     return real(a, s);
 }
 
+/* ---- сон установщика ----------------------------------------------------------- */
+
+/* connq_release ждёт доклада установщиков сном по 10 мс до 15 с. Проверке I-193 нужен не
+ * срок, а то, что решается после ПОСЛЕДНЕГО сна: сны не спят, а на заданном по счёту
+ * «докладывает» заявка g_sleep_c. Вне проверки — настоящий сон. */
+static int g_sleep_hook;
+static int g_sleep_n;
+static int g_sleep_report_at;
+static int *g_sleep_c;             /* поле done заявки, которая «доложит» */
+
+int nanosleep(const struct timespec *req, struct timespec *rem) {
+    static int (*real)(const struct timespec *, struct timespec *);
+    if (g_sleep_hook) {
+        if (++g_sleep_n == g_sleep_report_at && g_sleep_c)
+            __atomic_store_n(g_sleep_c, 1, __ATOMIC_RELEASE);
+        return 0;
+    }
+    if (!real) real = (int (*)(const struct timespec *, struct timespec *))dlsym(RTLD_NEXT,
+                                                                           "nanosleep");
+    return real(req, rem);
+}
+
 /* ---- подменённое окружение движка ---------------------------------------------- */
 
 static char g_cmd[16][256];
@@ -322,6 +344,44 @@ static void t_out_of_order_dupack(void) {
     dev_drain(NULL);
 }
 
+/* I-193: установщик доложил за время ПОСЛЕДНЕГО сна ожидания. Прежде проверка стояла перед
+ * сном, результат последнего не спрашивался, и приговор «не доложил за 15 с» ставился по
+ * счётчику кругов — таблица при этом намеренно не освобождается. */
+static void t_release_last_sleep(void) {
+    struct conn *c = &g_conns[MAX_CONNS - 1];
+    struct conn save = *c;
+    c->used = 1;
+    c->pending = 1;
+    __atomic_store_n(&c->done, 0, __ATOMIC_RELEASE);
+    g_sleep_c = (int *)&c->done;
+    g_sleep_n = 0;
+    g_sleep_report_at = 1500;
+    g_sleep_hook = 1;
+    int save_err = dup(2), nul = open("/dev/null", O_WRONLY);
+    dup2(nul, 2);
+    int rc = connq_release(g_conns);
+    fflush(stderr);
+    dup2(save_err, 2); close(save_err); close(nul);
+    g_sleep_hook = 0;
+    check(rc == 0, "I-193: доклад за последний сон ожидания принят, таблица освобождается");
+
+    /* И обратное: не доложил вовсе — приговор прежний. */
+    __atomic_store_n(&c->done, 0, __ATOMIC_RELEASE);
+    c->pending = 1;
+    g_sleep_n = 0;
+    g_sleep_report_at = 0;
+    g_sleep_hook = 1;
+    save_err = dup(2); nul = open("/dev/null", O_WRONLY);
+    dup2(nul, 2);
+    rc = connq_release(g_conns);
+    fflush(stderr);
+    dup2(save_err, 2); close(save_err); close(nul);
+    g_sleep_hook = 0;
+    check(rc == -1 && g_sleep_n == 1500, "I-193: не доложивший за 15 с — отказ, снов 1500");
+    g_sleep_c = NULL;
+    *c = save;
+}
+
 int main(void) {
     int sp[2];
     if (socketpair(AF_UNIX, SOCK_DGRAM, 0, sp) != 0 || pipe(g_sess_pipe) != 0) return 2;
@@ -342,6 +402,7 @@ int main(void) {
     t_sendagain_retry();
     t_sendagain_eof();
     t_out_of_order_dupack();
+    t_release_last_sleep();
 
     printf(g_fail ? "\ntunnelmatch: ПРОВАЛ\n" : "\nвсе проверки прошли\n");
     return g_fail;
