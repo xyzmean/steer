@@ -40,8 +40,12 @@ size_t b64_decode(const char *in, size_t n, char *out, size_t out_n) {
     unsigned acc = 0;
     int bits = 0;
     for (size_t i = 0; i < n; i++) {
+        /* '=' закрывает блок: недобранные биты — его остаток, а не начало следующего.
+         * Без сброса склеенные блоки с выравниванием внутри («QQ==QQ==») сдвигали всё
+         * дальнейшее на остаток и давали мусор (I-326). */
+        if (in[i] == '=') { acc = 0; bits = 0; continue; }
         int v = b64val((unsigned char)in[i]);
-        if (v < 0) continue;                  /* переводы строк, '=', мусор */
+        if (v < 0) continue;                  /* переводы строк, мусор */
         acc = ((acc << 6) | (unsigned)v) & 0x3FFFu;   /* хватает 14 разрядов: 7 + 6 + 1 */
         bits += 6;
         if (bits >= 8) {
