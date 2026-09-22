@@ -738,7 +738,9 @@ static int ws_upgrade(struct upstream *u, const char *host) {
     if (!resp) return -1;
 #define WS_UP_FAIL(...) do { fprintf(stderr, __VA_ARGS__); free(resp); return -1; } while (0)
 
-    if (xc_random(nonce, sizeof(nonce)) != 0) return -1;
+    /* Через макрос, как и все выходы ниже: буфер ответа уже выделен (I-196). */
+    if (xc_random(nonce, sizeof(nonce)) != 0)
+        WS_UP_FAIL(LOG_W "%s: нет случайных байт для ключа апгрейда\n", host);
     b64(nonce, sizeof(nonce), key);
 
     int n = snprintf(req, sizeof(req),
