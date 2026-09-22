@@ -272,7 +272,7 @@ int main(void) {
         put32(feed + 5, 1);
         memcpy(feed + 9, "zzzz", 4);
         io.feed = feed; io.feed_n = 13; io.feed_pos = 0;
-        unsigned char out[64];
+        unsigned char out[H2_MIN_READ_CAP];
         size_t got = 99;
         check("кадр прежнего потока: не ошибка", 0, h2_read(&h, out, sizeof(out), &got));
         check("кадр прежнего потока: в тело не попал", 0, (int)got);
@@ -510,6 +510,42 @@ int main(void) {
         io.feed_n = put_frame(feed, FR_DATA, 0x08, h.sid, bad, sizeof bad);
         check("DATA с набивкой длиннее кадра: H2_EPROTO",
               H2_EPROTO, h2_read(&h, out, sizeof(out), &got));
+    }
+
+    {
+        /* ---- H2_ETOOBIG не теряет хвост записи (I-325) ----------------------------
+         *
+         * Буфер меньше H2_MIN_READ_CAP — нарушение договора вызывающим, но последствия
+         * обязаны быть честными: отказ, после которого соединение можно читать дальше.
+         * Прежде отказ случался посреди кадра — прочитанная запись выбрасывалась вместе с
+         * хвостом, а счётчик тела оставался, и следующий кадр читался как продолжение
+         * прежнего: в тело шёл его заголовок. */
+        struct h2 h;
+        struct fake_io io;
+        static unsigned char feed[256];
+        unsigned char small[64];
+        unsigned char out[H2_MIN_READ_CAP];
+        size_t got = 0;
+
+        h2_open(&h, &io);
+        size_t n1 = put_data(feed, h.sid, 100);
+        io.feed = feed; io.feed_n = n1; io.feed_pos = 0;
+        check("буфер меньше договора: H2_ETOOBIG",
+              H2_ETOOBIG, h2_read(&h, small, sizeof(small), &got));
+        /* Дальше — чтение по договору: кадр «abcd» обязан прийти как есть. */
+        size_t n2 = put_frame(feed + n1, FR_DATA, 0, h.sid, (const unsigned char *)"abcd", 4);
+        io.feed_n = n1 + n2;
+        size_t total = 0;
+        int rc = 0;
+        unsigned char last[4] = { 0 };
+        while (io.feed_pos < io.feed_n && rc == 0) {
+            rc = h2_read(&h, out, sizeof(out), &got);
+            total += got;
+            if (got >= 4) memcpy(last, out + got - 4, 4);
+        }
+        check("после отказа: следующее чтение без ошибки", 0, rc);
+        check("после отказа: оба кадра дошли целиком", 104, (int)total);
+        check("после отказа: тело второго кадра не искажено", 0, memcmp(last, "abcd", 4));
     }
 
     printf("\n%s\n", fails ? "ЕСТЬ ПРОВАЛЫ" : "все проверки прошли");
