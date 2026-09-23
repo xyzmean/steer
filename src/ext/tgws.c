@@ -303,7 +303,8 @@ static size_t g_alt_n;
  * может вовсе не лежать в пуле, и номер перестал что-либо значить — два разных домена
  * делили бы одну отставку, а это ровно та ошибка, которую невозможно увидеть в журнале. */
 #define ALT_COOLDOWN_S 60
-#define COOL_N (2 + MAX_ALT + 12)
+/* Вдвое: у ДЦ203 отставки свои (см. cool_key). */
+#define COOL_N (2 * (2 + MAX_ALT + 12))
 static struct { char d[128]; time_t until; } g_cool[COOL_N];
 static size_t g_cool_n;
 
@@ -326,6 +327,18 @@ static int dom_ok_now(const char *d, time_t now) {
     int ok = !t || *t <= now;
     pthread_mutex_unlock(&g_cool_mx);
     return ok;
+}
+
+/* КЛЮЧ ОТСТАВКИ. У ДЦ203 она своя: записи kws203 у части доменов пула нет, и отказ по 203
+ * не должен выбивать домен из очереди ДЦ2 и ДЦ4, где у него всё в порядке. Но и совсем без
+ * отставки 203 нельзя: тогда каждый запрос картинки заново перебирал три домена по две
+ * точки, запас дозванивался туда же, и на тестовом роутере за несколько минут набралось
+ * четыре сотни брошенных соединений — ядро держало их с неподтверждённым ClientHello, пока
+ * не кончилась память и OOM не убил сам мост. */
+static const char *cool_key(char *buf, size_t cap, int dc, const char *d) {
+    if (dc != 203) return d;
+    snprintf(buf, cap, "203:%s", d);
+    return buf;
 }
 
 /* Мест под отставки может не хватить (доменов в карте и пуле вместе больше, чем слотов) —
@@ -749,6 +762,18 @@ static void up_drop(struct upstream *u) {
     if (u->fd >= 0) close(u->fd);
     u->fd = -1;
     u->tls_on = 0;
+}
+
+/* Бросить НЕПОДНЯВШЕЕСЯ соединение сбросом, а не FIN. Точка, до которой не дошёл ClientHello,
+ * не подтвердит и FIN: обычное закрытие оставляет сокет сиротой в FIN_WAIT1, и ядро минутами
+ * перепосылает ему данные, держа под них память. Сотни таких сирот на роутере в 128 МБ —
+ * это OOM. Отдавать этому соединению нечего, так что RST ничего не теряет. */
+static void up_abort(struct upstream *u) {
+    if (u->fd >= 0) {
+        struct linger lg = { 1, 0 };
+        setsockopt(u->fd, SOL_SOCKET, SO_LINGER, &lg, sizeof(lg));
+    }
+    up_drop(u);
 }
 
 static int up_write(struct upstream *u, const unsigned char *p, size_t n) {
@@ -1709,11 +1734,12 @@ static int dial_upstream(short dc, short media, struct upstream *u_out,
         if (!dup) all[all_n++] = g_alt[i];
     }
 
-    for (int pass = 0; pass < 2 && dom_n < 3; pass++)
-        for (size_t i = 0; i < all_n && dom_n < 3; i++) {
-            if ((pass == 0) != (dom_ok_now(all[i], now) != 0)) continue;
-            doms[dom_n++] = all[i];
-        }
+    char kb[160];
+    for (size_t i = 0; i < all_n && dom_n < 3; i++)
+        if (dom_ok_now(cool_key(kb, sizeof(kb), dc, all[i]), now)) doms[dom_n++] = all[i];
+    /* Все в отставке — пробуем ОДИН, а не три: «все в отказе» — это состояние сети, и три
+     * домена по две точки на каждое соединение клиента превращали его в шторм дозвонов. */
+    if (!dom_n && all_n) doms[dom_n++] = all[0];
     if (ep) {
         snprintf(epbuf, sizeof(epbuf), "%s", ep);
         char *c = strchr(epbuf, ':');
@@ -1770,21 +1796,19 @@ static int dial_upstream(short dc, short media, struct upstream *u_out,
             }
             if (trc != 0) {
                 VLOG( LOG_W "%s: TLS не поднялся (код %d)\n", sni, g_tls_rc);
-                up_drop(&u);
+                up_abort(&u);
                 continue;
             }
             if (ws_upgrade(&u, sni) != 0) {
-                up_drop(&u);
+                up_abort(&u);
                 continue;
             }
             ok = 1;
         }
         /* Прямой путь к Telegram отставляется коротко: его отказы — потери по дороге, а не
          * «точка лежит», и минута без него стоила бы всех соединений этой минуты. */
-        /* Отказ ДЦ203 домен НЕ отставляет: отставка общая для всех ДЦ, а записи kws203 у
-         * части доменов пула просто нет — из-за медийного 203 такой домен выпадал бы из
-         * очереди и для ДЦ2 с ДЦ4, где у него всё в порядке. */
-        if (!ok && dc != 203) dom_cool(doms[d], time(NULL) +
+        /* Отказ ДЦ203 отставляет домен только для 203 (см. cool_key). */
+        if (!ok) dom_cool(cool_key(kb, sizeof(kb), dc, doms[d]), time(NULL) +
                           (!strcmp(doms[d], TG_WS_DOMAIN) ? TG_COOLDOWN_S : ALT_COOLDOWN_S));
     }
     if (!ok) {
@@ -2089,8 +2113,9 @@ static void health_report(int dc, int media, const char *sni, long secs,
     int cool = !strcmp(d, TG_WS_DOMAIN) ? TG_COOLDOWN_S : ALT_COOLDOWN_S;
     fprintf(stderr, LOG_W "ДЦ%d%s: через %s данные не приходят — путь отставлен на %d с\n",
             dc, media ? "m" : "", d, cool);
-    dom_cool(d, now + cool);
-    warm_drop_domain(d);
+    char kb[160];
+    dom_cool(cool_key(kb, sizeof(kb), dc, d), now + cool);
+    if (dc != 203) warm_drop_domain(d);
 }
 
 /* ---- одно соединение ---------------------------------------------------------------- */
