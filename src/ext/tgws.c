@@ -307,6 +307,10 @@ static size_t g_alt_n;
 static struct { char d[128]; time_t until; } g_cool[COOL_N];
 static size_t g_cool_n;
 
+/* Отставки читают и пишут потоки serve, наполнитель запаса и health_report разом: без замка
+ * имя и срок могли разъехаться по разным слотам. Замок берут только dom_ok_now и dom_cool. */
+static pthread_mutex_t g_cool_mx = PTHREAD_MUTEX_INITIALIZER;
+
 static time_t *cool_slot(const char *d, int make) {
     for (size_t i = 0; i < g_cool_n; i++)
         if (!strcmp(g_cool[i].d, d)) return &g_cool[i].until;
@@ -317,16 +321,21 @@ static time_t *cool_slot(const char *d, int make) {
 }
 
 static int dom_ok_now(const char *d, time_t now) {
+    pthread_mutex_lock(&g_cool_mx);
     const time_t *t = cool_slot(d, 0);
-    return !t || *t <= now;
+    int ok = !t || *t <= now;
+    pthread_mutex_unlock(&g_cool_mx);
+    return ok;
 }
 
 /* Мест под отставки может не хватить (доменов в карте и пуле вместе больше, чем слотов) —
  * тогда домен просто не отставляется. Это хуже, чем отставить, но лучше, чем отставить
  * ЧУЖОЙ: очередь останется честной, а лишнее рукопожатие стоит полсекунды. */
 static void dom_cool(const char *d, time_t until) {
+    pthread_mutex_lock(&g_cool_mx);
     time_t *t = cool_slot(d, 1);
     if (t) *t = until;
+    pthread_mutex_unlock(&g_cool_mx);
 }
 
 static void alt_init(void) {
@@ -1722,6 +1731,7 @@ static int dial_upstream(short dc, short media, struct upstream *u_out,
      * «сообщения отправляются по полминуты», и надо знать, где эта полминута: в рукопожатии к
      * чужому домену или в повторах после отказов. */
     int tries = 0;
+    int tg_tcp_dead = 0;
     for (size_t d = 0; d < dom_n && !ok; d++) {
         tgws_hosts_at(doms[d], dc, media, cand);
         for (int i = 0; i < 2 && !ok; i++) {
@@ -1732,6 +1742,9 @@ static int dial_upstream(short dc, short media, struct upstream *u_out,
             /* Точка веб-клиента Telegram — по её адресу, а не по имени: имя kwsN.web.telegram.org
              * провайдер может подменять, а адрес у неё один. */
             int tg = !ep && !strcmp(doms[d], TG_WS_DOMAIN);
+            /* У обеих точек Telegram один адрес: не соединилась первая — вторая не соединится
+             * тоже, и повтор стоил бы клиенту ещё шести секунд до запасного домена. */
+            if (tg && i == 1 && tg_tcp_dead) break;
             if (tg) {
                 /* До точки Telegram соединение ТЕРЯЕТСЯ ПО ДОРОГЕ, а не отвергается: на
                  * тестовом роутере не доходил примерно каждый четвёртый SYN (7 из 30), при
@@ -1740,6 +1753,7 @@ static int dial_upstream(short dc, short media, struct upstream *u_out,
                  * полутора процентах случаев. */
                 for (int a = 0; a < 3 && u.fd < 0; a++)
                     u.fd = tcp_connect(tg_direct_ip(), port, 2);
+                if (u.fd < 0) tg_tcp_dead = 1;
             } else {
                 u.fd = tcp_connect(ep ? epbuf : sni, port, UP_TIMEOUT_S);
             }
@@ -1767,7 +1781,10 @@ static int dial_upstream(short dc, short media, struct upstream *u_out,
         }
         /* Прямой путь к Telegram отставляется коротко: его отказы — потери по дороге, а не
          * «точка лежит», и минута без него стоила бы всех соединений этой минуты. */
-        if (!ok) dom_cool(doms[d], time(NULL) +
+        /* Отказ ДЦ203 домен НЕ отставляет: отставка общая для всех ДЦ, а записи kws203 у
+         * части доменов пула просто нет — из-за медийного 203 такой домен выпадал бы из
+         * очереди и для ДЦ2 с ДЦ4, где у него всё в порядке. */
+        if (!ok && dc != 203) dom_cool(doms[d], time(NULL) +
                           (!strcmp(doms[d], TG_WS_DOMAIN) ? TG_COOLDOWN_S : ALT_COOLDOWN_S));
     }
     if (!ok) {
@@ -2001,6 +2018,7 @@ static void *warm_filler(void *arg) {
 #define HEALTH_STRIKES  2
 static char g_path[ROUTE_N][128];
 static time_t g_strike_t[ROUTE_N][HEALTH_STRIKES];
+static char g_strike_dom[ROUTE_N][128];
 static pthread_mutex_t g_path_mx = PTHREAD_MUTEX_INITIALIZER;
 
 /* Домен пути по имени точки: kws2-1.<домен> -> <домен>. */
@@ -2046,15 +2064,26 @@ static void warm_drop_domain(const char *d) {
 static void health_report(int dc, int media, const char *sni, long secs,
                           unsigned long up, unsigned long down) {
     int i = route_idx(dc, media);
-    if (i < 0 || down > 0 || up == 0 || secs < HEALTH_WAIT_S) return;
+    if (i < 0 || !sni || !*sni) return;
     const char *d = sni_domain(sni);
     time_t now = time(NULL);
     int fire = 0;
     pthread_mutex_lock(&g_path_mx);
-    for (int k = HEALTH_STRIKES - 1; k > 0; k--) g_strike_t[i][k] = g_strike_t[i][k - 1];
-    g_strike_t[i][0] = now;
-    fire = g_strike_t[i][HEALTH_STRIKES - 1] && now - g_strike_t[i][HEALTH_STRIKES - 1] <= HEALTH_WINDOW_S;
-    if (fire) memset(g_strike_t[i], 0, sizeof(g_strike_t[i]));
+    /* Отказы копятся по паре «ячейка ДЦ, домен»: отказ через другой путь не в счёт, а
+     * удачная сессия того же пути счёт обнуляет — иначе два случайных отказа среди сотни
+     * удачных сессий за минуту отставляли бы живой путь. */
+    if (strcmp(g_strike_dom[i], d)) {
+        snprintf(g_strike_dom[i], sizeof(g_strike_dom[0]), "%s", d);
+        memset(g_strike_t[i], 0, sizeof(g_strike_t[i]));
+    }
+    if (down > 0) {
+        memset(g_strike_t[i], 0, sizeof(g_strike_t[i]));
+    } else if (up > 0 && secs >= HEALTH_WAIT_S) {
+        for (int k = HEALTH_STRIKES - 1; k > 0; k--) g_strike_t[i][k] = g_strike_t[i][k - 1];
+        g_strike_t[i][0] = now;
+        fire = g_strike_t[i][HEALTH_STRIKES - 1] && now - g_strike_t[i][HEALTH_STRIKES - 1] <= HEALTH_WINDOW_S;
+        if (fire) memset(g_strike_t[i], 0, sizeof(g_strike_t[i]));
+    }
     pthread_mutex_unlock(&g_path_mx);
     if (!fire) return;
     int cool = !strcmp(d, TG_WS_DOMAIN) ? TG_COOLDOWN_S : ALT_COOLDOWN_S;
@@ -2147,7 +2176,10 @@ static void *serve(void *arg) {
     struct earlybuf eb;
     eb.n = 0;
     eb.over = 0;
-    if (route_direct_now(dc, media, time(NULL))) {
+    /* ДЦ203 своей строки в карте не имеет: прямой путь для него — тот же, что у ДЦ2 (так
+     * было, пока номер 203 переписывался догадкой по адресу). */
+    short rdc = dc == 203 ? 2 : dc;
+    if (route_direct_now(rdc, media, time(NULL))) {
         int dfd = direct_open(&dst);
         if (dfd >= 0 && send_all(dfd, hs0, HS_LEN) == 0 && direct_prove(cfd, dfd, &eb)) {
             struct timeval idle = { .tv_sec = IDLE_TIMEOUT_S, .tv_usec = 0 };
@@ -2170,7 +2202,7 @@ static void *serve(void *arg) {
         if (dfd >= 0) close(dfd);
         /* Молчание — это блокировка. Записываем отказ, чтобы следующие соединения к этому
          * ДЦ не платили ожиданием, и уходим в мост вместе с копией сказанного клиентом. */
-        route_direct_failed(dc, media, time(NULL));
+        route_direct_failed(rdc, media, time(NULL));
         fprintf(stderr, LOG_W "ДЦ%d%s: напрямую не отвечает — на %d с ухожу в мост\n",
                 dc, media ? "m" : "", DIRECT_BAD_S);
         (void)dsts;
@@ -2639,7 +2671,9 @@ int cmd_tgws(const char *spec, const char *name) {
                         how ? "" : (g_alt_n ? " и пул" : ""));
             }
         /* ДЦ203 — медийный ДЦ файлов: у него свой путь (точки kws203 доменов), без прямого. */
-        fprintf(stderr, LOG_I "ДЦ203: kws203 у %s и пула\n", g_domain);
+        fprintf(stderr, LOG_I "ДЦ203: kws203 у %s и пула%s\n",
+                route_domain(2, 0) ? route_domain(2, 0) : g_domain,
+                g_route[route_idx(2, 0)].how == RT_DIRECT ? " (или напрямую, как ДЦ2)" : "");
         if (tg_verbose()) fprintf(stderr, LOG_I "подробный журнал включён (STEER_TGWS_VERBOSE)\n");
     }
 
