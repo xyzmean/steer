@@ -1572,7 +1572,9 @@ static void pump(int cfd, struct upstream *u, struct pump_stat *st, struct msgsp
                         memcpy(pk, rx.buf, n);
                         if (mbedtls_aes_crypt_ctr(&st->dbg->dec, n, &st->dbg->od,
                                                   st->dbg->ncd, st->dbg->sbd, pk, dec) == 0) {
-                            size_t off = (st->tag == 0xee) ? 4 : 1;
+                            /* Префикс длины: у сжатого (0xef) один байт, у обычного (0xee) и
+                             * с набивкой (0xdd) — четыре. */
+                            size_t off = (st->tag == 0xef) ? 1 : 4;
                             if (n >= off + 4) {
                                 int32_t code = (int32_t)((unsigned)dec[off] |
                                                          ((unsigned)dec[off + 1] << 8) |
