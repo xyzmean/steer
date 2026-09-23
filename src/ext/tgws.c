@@ -1022,6 +1022,13 @@ static int tcp_connect(const char *host, const char *port, int timeout_s) {
         struct timeval tv = { .tv_sec = timeout_s, .tv_usec = 0 };
         setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
         setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+        /* МИМО ZAPRET РОУТЕРА. Мост живёт на самом роутере, и его соединения наверх шли через
+         * общий обход — а стратегия, подобранная под сайты клиентов, ломает ClientHello к
+         * Cloudflare: на тестовом роутере v4 (multisplit, seqovl 582) давала TCP без единого
+         * ответа на TLS ко всем доменам пула, и не грузилось всё, что лежит в ДЦ1, 3, 5 и 203.
+         * Домены пула для того и подобраны, чтобы открываться без ухищрений; tg-ws-proxy ходит
+         * к ним тоже без обхода. Метка — та, по которой zapret пропускает пакет (DESYNC_MARK). */
+        { unsigned mk = ZAPRET_SKIP_MARK; setsockopt(fd, SOL_SOCKET, SO_MARK, &mk, sizeof(mk)); }
         if (connect(fd, it->ai_addr, it->ai_addrlen) == 0) break;
         close(fd);
         fd = -1;
