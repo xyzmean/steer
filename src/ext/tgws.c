@@ -75,6 +75,18 @@
 #define LOG_I "steer[info] tgws: "
 #define LOG_W "steer[warn] tgws: "
 
+/* ЖУРНАЛ — СОСТОЯНИЕ, А НЕ ПОТОК. Строка на каждое соединение (куда пошло, сколько
+ * передано, «не MTProto») на живом роутере давала десятки строк в минуту: клиент Telegram
+ * открывает соединения пачками, а браузер с web.telegram.org — ещё и свои. Такой журнал
+ * нельзя читать, и владелец попросил оставить в нём ровно две вещи: параметры при запуске
+ * и переключения путей. Всё посоединенческое — только при STEER_TGWS_VERBOSE=1. */
+static int g_verbose = -1;
+static int tg_verbose(void) {
+    if (g_verbose < 0) { const char *e = getenv("STEER_TGWS_VERBOSE"); g_verbose = e && *e && strcmp(e, "0"); }
+    return g_verbose;
+}
+#define VLOG(...) do { if (tg_verbose()) fprintf(stderr, __VA_ARGS__); } while (0)
+
 /* КОНТЕКСТ AES ОБЯЗАН ЛЕЖАТЬ ПО АДРЕСУ, КРАТНОМУ ШЕСТНАДЦАТИ, и ни один заголовок mbedtls об
  * этом не предупреждает. Стоило это разбора с ядерным SIGSEGV по нулевому адресу, поэтому
  * объяснение целиком:
@@ -374,7 +386,23 @@ static void domain_init(const char *from_spec) {
  * блокируют так же, как и остальные, — а ключ авторизации у медийного и обычного ДЦ с одним
  * номером общий, и файлы обычная точка отдаёт. Поэтому: сначала своя точка, потом соседняя,
  * и только если молчат обе — насквозь. */
+/* ИМЕНА ТОЧЕК ЗАВИСЯТ ОТ ДОМЕНА.
+ *
+ * У самого Telegram (web.telegram.org) у каждого ДЦ две точки: kwsN и kwsN-1, у медийного
+ * первой идёт -1. У доменов-посредников за Cloudflare записей -1 НЕТ ВОВСЕ — там ровно
+ * kws1..kws5 и kws203 (так их заводит инструкция tg-ws-proxy, docs/CfProxy.md), и прежний
+ * порядок «медийный — сначала kwsN-1» бил первой попыткой в несуществующее имя на каждом
+ * медийном соединении. Проверено dig по пулу: kws2-1.<домен> не разрешается ни у одного.
+ *
+ * ДЦ203 у посредников — своя точка kws203 (ведёт на 91.105.192.100), а не kws2: через kws2
+ * клиент попадал в ДЦ2, где его файлов нет, и картинки грузились рывками. */
 static void tgws_hosts_at(const char *domain, int dc, int media, char out[2][160]) {
+    if (strcmp(domain, "web.telegram.org")) {
+        snprintf(out[0], 160, "kws%d.%s", dc, domain);
+        snprintf(out[1], 160, "kws%d.%s", dc, domain);   /* второй заход — повтор той же */
+        return;
+    }
+    if (dc == 203) dc = 2;
     snprintf(out[0], 160, "kws%d%s.%s", dc, media ? "-1" : "", domain);
     snprintf(out[1], 160, "kws%d%s.%s", dc, media ? "" : "-1", domain);
 }
@@ -415,6 +443,9 @@ struct dc_route { char domain[128]; unsigned char how; };
 static struct dc_route g_route[ROUTE_N];
 
 static int route_idx(int dc, int media) {
+    /* ДЦ203 — в свободную ячейку 9: ему нужны своя строка в журнале переключений и своё
+     * здоровье, а девятого дата-центра у Telegram нет. */
+    if (dc == 203) dc = 9;
     if (dc < 1 || dc > 9) return -1;
     return dc * 2 + (media ? 1 : 0);
 }
@@ -620,6 +651,19 @@ static int hs_read_dc(unsigned char hs[HS_LEN], short guess_dc, short guess_medi
     unsigned char o0 = hs[DC_POS + 0] ^ ks[DC_POS + 0];
     unsigned char o1 = hs[DC_POS + 1] ^ ks[DC_POS + 1];
     int16_t own = (int16_t)((unsigned)o0 | ((unsigned)o1 << 8));
+    /* ДЦ203 — отдельный дата-центр Telegram (91.105.192.0/23), и клиент так его и называет в
+     * init. Своих точек apiws у него нет: tg-ws-proxy ведёт его через kws2, НО В INIT
+     * ОСТАВЛЯЕТ 203. Здесь номер вне 1..5 раньше считался «не указан» и переписывался на
+     * догадку по адресу — на 2, и сервер отвечал клиенту как ДЦ2, где его ключа нет. Клиент
+     * не получал ни байта, переподключался снова и снова, и на тестовом роутере это дало 66
+     * висящих соединений к 91.105.192.100 и упор моста в предел — а с ним не грузилась ни
+     * одна картинка. Теперь 203 — свой номер (точки ДЦ2 выбирает dial_upstream), а init
+     * уходит как есть. */
+    if (own == 203 || own == -203) {
+        *out_dc = 203;
+        *out_media = (short)(own < 0);
+        return 1;
+    }
     if (own != 0 && own >= -5 && own <= 5) {
         *out_dc = (short)(own < 0 ? -own : own);
         *out_media = (short)(own < 0);
@@ -816,7 +860,9 @@ static int ws_upgrade(struct upstream *u, const char *host) {
     if (strncmp(resp, "HTTP/1.1 101", 12) != 0) {
         char *e = strchr(resp, '\r');
         if (e) *e = '\0';
-        WS_UP_FAIL(LOG_W "%s: апгрейд отклонён (%s)\n", host, resp);
+        VLOG(LOG_W "%s: апгрейд отклонён (%s)\n", host, resp);
+        free(resp);
+        return -1;
     }
     free(resp);
 #undef WS_UP_FAIL
@@ -1639,8 +1685,13 @@ static int dial_upstream(short dc, short media, struct upstream *u_out,
      * не отвечать вовсе. Общий остаётся вторым: он проверен хотя бы где-то. */
     const char *all[3 + MAX_ALT];
     size_t all_n = 0;
+    /* ДЦ203 своих точек apiws не имеет и ходит точками ДЦ2 — но ТОЛЬКО через чужие домены.
+     * Точка веб-клиента Telegram (149.154.167.220) его не обслуживает: клиент получал там
+     * сотню байт на запрос и ни одного файла, а картинки у него лежат именно в 203. У
+     * tg-ws-proxy так же: прямой адрес задан только для ДЦ2 и ДЦ4. */
+    short wdc = dc == 203 ? 2 : dc;
     if (tg_direct_dc(dc)) all[all_n++] = TG_WS_DOMAIN;   /* см. «прямо к Telegram» */
-    const char *pref = route_domain(dc, media);
+    const char *pref = route_domain(wdc, media);
     if (pref) all[all_n++] = pref;
     if (!pref || strcmp(pref, g_domain)) all[all_n++] = g_domain;
     for (size_t i = 0; i < g_alt_n && all_n < 3 + MAX_ALT; i++) {
@@ -1704,7 +1755,7 @@ static int dial_upstream(short dc, short media, struct upstream *u_out,
                 } else trc = tls_start(&u, sni);
             }
             if (trc != 0) {
-                fprintf(stderr, LOG_W "%s: TLS не поднялся (код %d)\n", sni, g_tls_rc);
+                VLOG( LOG_W "%s: TLS не поднялся (код %d)\n", sni, g_tls_rc);
                 up_drop(&u);
                 continue;
             }
@@ -1720,7 +1771,7 @@ static int dial_upstream(short dc, short media, struct upstream *u_out,
                           (!strcmp(doms[d], TG_WS_DOMAIN) ? TG_COOLDOWN_S : ALT_COOLDOWN_S));
     }
     if (!ok) {
-        fprintf(stderr, LOG_W "%s: точка ДЦ%d%s недоступна\n", cand[0], dc, media ? "m" : "");
+        VLOG( LOG_W "%s: точка ДЦ%d%s недоступна\n", cand[0], dc, media ? "m" : "");
         return 0;
     }
     snprintf(sni_out, sni_cap, "%s", sni);
@@ -1933,6 +1984,86 @@ static void *warm_filler(void *arg) {
 
 
 
+/* ---- путь дата-центра: переключения и здоровье -------------------------------------------
+ *
+ * Путь — это «домен», через который ДЦ сейчас обслуживается: web.telegram.org (прямо к
+ * Telegram) или чужой домен за Cloudflare. В журнал идёт только СМЕНА пути у ДЦ, а не каждое
+ * соединение.
+ *
+ * ЗДОРОВЬЕ. Путь может «работать» на уровне веб-сокета и при этом не отдавать данные: клиент
+ * шлёт запрос, ждёт — и закрывает, так ничего и не получив. Со стороны человека это пустой
+ * пузырь вместо картинки. Такая сессия — отказ пути; два отказа за минуту отставляют путь
+ * (dom_cool), и следующие соединения ДЦ идут следующим путём. Мгновенные закрытия (меньше
+ * трёх секунд) отказом не считаются: клиент открывает соединения наперегонки и лишние
+ * закрывает сразу. */
+#define HEALTH_WAIT_S   3
+#define HEALTH_WINDOW_S 60
+#define HEALTH_STRIKES  2
+static char g_path[ROUTE_N][128];
+static time_t g_strike_t[ROUTE_N][HEALTH_STRIKES];
+static pthread_mutex_t g_path_mx = PTHREAD_MUTEX_INITIALIZER;
+
+/* Домен пути по имени точки: kws2-1.<домен> -> <домен>. */
+static const char *sni_domain(const char *sni) {
+    const char *d = strchr(sni, '.');
+    return d ? d + 1 : sni;
+}
+
+static void path_note(int dc, int media, const char *sni) {
+    int i = route_idx(dc, media);
+    if (i < 0) return;
+    const char *d = sni_domain(sni);
+    pthread_mutex_lock(&g_path_mx);
+    if (strcmp(g_path[i], d)) {
+        if (g_path[i][0])
+            fprintf(stderr, LOG_I "ДЦ%d%s: путь %s → %s\n", dc, media ? "m" : "", g_path[i], d);
+        else
+            fprintf(stderr, LOG_I "ДЦ%d%s: путь %s\n", dc, media ? "m" : "", d);
+        snprintf(g_path[i], sizeof(g_path[0]), "%s", d);
+    }
+    pthread_mutex_unlock(&g_path_mx);
+}
+
+/* Убрать из запаса соединения отставленного домена: иначе запас ещё сорок секунд раздавал бы
+ * ровно то, от чего только что отказались. */
+static void warm_drop_domain(const char *d) {
+    for (size_t k = 0; k < WARM_SLOTS; k++) {
+        struct upstream dead;
+        int drop = 0;
+        pthread_mutex_lock(&g_warm_mx);
+        if (g_warm[k].busy && !strcmp(sni_domain(g_warm[k].sni), d)) {
+            dead = g_warm[k].u;
+            g_warm[k].busy = 0;
+            g_warm[k].u.fd = -1;
+            g_warm[k].u.tls_on = 0;
+            drop = 1;
+        }
+        pthread_mutex_unlock(&g_warm_mx);
+        if (drop) up_drop(&dead);
+    }
+}
+
+static void health_report(int dc, int media, const char *sni, long secs,
+                          unsigned long up, unsigned long down) {
+    int i = route_idx(dc, media);
+    if (i < 0 || down > 0 || up == 0 || secs < HEALTH_WAIT_S) return;
+    const char *d = sni_domain(sni);
+    time_t now = time(NULL);
+    int fire = 0;
+    pthread_mutex_lock(&g_path_mx);
+    for (int k = HEALTH_STRIKES - 1; k > 0; k--) g_strike_t[i][k] = g_strike_t[i][k - 1];
+    g_strike_t[i][0] = now;
+    fire = g_strike_t[i][HEALTH_STRIKES - 1] && now - g_strike_t[i][HEALTH_STRIKES - 1] <= HEALTH_WINDOW_S;
+    if (fire) memset(g_strike_t[i], 0, sizeof(g_strike_t[i]));
+    pthread_mutex_unlock(&g_path_mx);
+    if (!fire) return;
+    int cool = !strcmp(d, TG_WS_DOMAIN) ? TG_COOLDOWN_S : ALT_COOLDOWN_S;
+    fprintf(stderr, LOG_W "ДЦ%d%s: через %s данные не приходят — путь отставлен на %d с\n",
+            dc, media ? "m" : "", d, cool);
+    dom_cool(d, now + cool);
+    warm_drop_domain(d);
+}
+
 /* ---- одно соединение ---------------------------------------------------------------- */
 
 struct job { int fd; };
@@ -1984,7 +2115,7 @@ static void *serve(void *arg) {
         inet_ntop(AF_INET, &src.sin_addr, srcs, sizeof(srcs));
     dc = dc_of(dst.sin_addr.s_addr, &media);
     if (!dc) {
-        fprintf(stderr, LOG_I "%s: не наш дата-центр — пропускаю как есть\n", dsts);
+        VLOG( LOG_I "%s: не наш дата-центр — пропускаю как есть\n", dsts);
         relay_direct(cfd, &dst, hs, got, NULL, 0);
         goto done;
     }
@@ -1998,7 +2129,7 @@ static void *serve(void *arg) {
     {
         short want_dc = dc, want_media = media;
         if (!hs_read_dc(hs, dc, media, &tag, &want_dc, &want_media)) {
-            fprintf(stderr, LOG_I "%s: это не MTProto — пропускаю как есть\n", dsts);
+            VLOG( LOG_I "%s: это не MTProto — пропускаю как есть\n", dsts);
             relay_direct(cfd, &dst, hs, got, NULL, 0);
             goto done;
         }
@@ -2027,11 +2158,11 @@ static void *serve(void *arg) {
             keepalive_on(cfd);
             unsigned long dup_ = 0, ddown = 0;
             time_t t0 = time(NULL);
-            fprintf(stderr, LOG_I "%s -> ДЦ%d%s напрямую (транспорт 0x%02x)\n",
+            VLOG( LOG_I "%s -> ДЦ%d%s напрямую (транспорт 0x%02x)\n",
                     dsts, dc, media ? "m" : "", tag);
             relay_fd(cfd, dfd, &dup_, &ddown);
             close(dfd);
-            fprintf(stderr, LOG_I "%s -> %s ДЦ%d%s напрямую: сессия %ld с, вверх %lu Б, "
+            VLOG( LOG_I "%s -> %s ДЦ%d%s напрямую: сессия %ld с, вверх %lu Б, "
                             "вниз %lu Б\n",
                     srcs, dsts, dc, media ? "m" : "", (long)(time(NULL) - t0), dup_, ddown);
             goto done;
@@ -2040,8 +2171,9 @@ static void *serve(void *arg) {
         /* Молчание — это блокировка. Записываем отказ, чтобы следующие соединения к этому
          * ДЦ не платили ожиданием, и уходим в мост вместе с копией сказанного клиентом. */
         route_direct_failed(dc, media, time(NULL));
-        fprintf(stderr, LOG_W "%s: ДЦ%d%s напрямую не отвечает — ухожу в мост\n",
-                dsts, dc, media ? "m" : "");
+        fprintf(stderr, LOG_W "ДЦ%d%s: напрямую не отвечает — на %d с ухожу в мост\n",
+                dc, media ? "m" : "", DIRECT_BAD_S);
+        (void)dsts;
     }
 
     /* Соединение наверх: сначала из запаса — оно уже поднято, и клиент не платит ни
@@ -2083,7 +2215,8 @@ static void *serve(void *arg) {
         }
     }
 
-    fprintf(stderr, LOG_I "%s -> ДЦ%d%s через %s (транспорт 0x%02x, %s)\n",
+    path_note(dc, media, sni);
+    VLOG( LOG_I "%s -> ДЦ%d%s через %s (транспорт 0x%02x, %s)\n",
             dsts, dc, media ? "m" : "", sni, tag,
             from_warm ? "из запаса" : "дозвон");
     (void)t_dial; (void)tries;
@@ -2132,9 +2265,10 @@ static void *serve(void *arg) {
 
     time_t t_start = time(NULL);
     pump(cfd, &u, &st, &ms);
-    fprintf(stderr, LOG_I "%s -> %s ДЦ%d%s: сессия %ld с, вверх %lu Б (%lu пакетов), вниз %lu Б — %s\n",
+    VLOG( LOG_I "%s -> %s ДЦ%d%s: сессия %ld с, вверх %lu Б (%lu пакетов), вниз %lu Б — %s\n",
             srcs, dsts, dc, media ? "m" : "", (long)(time(NULL) - t_start),
             st.up, ms.pkts, st.down, st.why);
+    health_report(dc, media, sni, (long)(time(NULL) - t_start), st.up, st.down);
     obf_free(&ms.o);
     if (dbg_on) obf_free(&dbg);
     up_drop(&u);
@@ -2491,6 +2625,20 @@ int cmd_tgws(const char *spec, const char *name) {
         fprintf(stderr, LOG_I "%s: жду перехваченные соединения на :%d, домен %s, адресов ДЦ %zu, "
                         "по карте своим доменом %zu, напрямую %zu\n",
                 name, port, g_domain, g_dc_n, ws_n, dir_n);
+        /* Параметры, с которыми мост начинает, — целиком, раз в запуск: дальше в журнал идут
+         * только смены путей, и читать их не с чем, если не видно, откуда начали. */
+        for (int dc = 1; dc <= 5; dc++)
+            for (int media = 0; media <= 1; media++) {
+                int ri = route_idx(dc, media);
+                const char *how = g_route[ri].how == RT_DIRECT ? "напрямую, не перехватывая" : NULL;
+                const char *dom = route_domain(dc, media);
+                if (!how && !tg_direct_dc(dc) && !dom && media) continue;
+                fprintf(stderr, LOG_I "ДЦ%d%s: %s%s%s\n", dc, media ? "m" : "",
+                        how ? how : (tg_direct_dc(dc) ? "web.telegram.org, запасной " : ""),
+                        how ? "" : (dom ? dom : g_domain),
+                        how ? "" : (g_alt_n ? " и пул" : ""));
+            }
+        if (tg_verbose()) fprintf(stderr, LOG_I "подробный журнал включён (STEER_TGWS_VERBOSE)\n");
     }
 
     signal(SIGPIPE, SIG_IGN);
