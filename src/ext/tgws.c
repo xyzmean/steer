@@ -2638,6 +2638,8 @@ int cmd_tgws(const char *spec, const char *name) {
                         how ? "" : (dom ? dom : g_domain),
                         how ? "" : (g_alt_n ? " и пул" : ""));
             }
+        /* ДЦ203 — медийный ДЦ файлов: у него свой путь (точки kws203 доменов), без прямого. */
+        fprintf(stderr, LOG_I "ДЦ203: kws203 у %s и пула\n", g_domain);
         if (tg_verbose()) fprintf(stderr, LOG_I "подробный журнал включён (STEER_TGWS_VERBOSE)\n");
     }
 
