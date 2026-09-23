@@ -12,7 +12,11 @@
  *      а соседние строки читаются как обычно (I-155);
  *   2) ws_upgrade: отказ xc_random не оставляет выделенного буфера ответа (I-196);
  *   3) tls_start: отказ рукопожатия после разворота ключа записи не оставляет развёрнутого
- *      контекста (I-197).
+ *      контекста (I-197);
+ *   4) pump: сессия через веб-сокет кончается, когда данные MTProto молчат в обе стороны
+ *      дольше срока затишья, и ping точки этот срок не продлевает; каждый выход называет
+ *      свою причину, а не «срок затишья вышел» по умолчанию. Прогон настоящего бинаря этого
+ *      не достаёт: срок там пять минут, а обрыв TLS и негодный кадр стенд не изображает.
  *
  * Файл включает исходник моста: alt_init, ws_upgrade и tls_start статические (тот же приём,
  * что в dcmatch.c, msgsplitmatch.c, warmmatch.c и upmatch.c). Выделение памяти считается
@@ -22,6 +26,8 @@
 #include <stdlib.h>
 #include <stdio.h>
 #include <string.h>
+#include <signal.h>
+#include <sys/wait.h>
 
 static long live_allocs;
 static void *t_malloc(size_t n) { void *p = malloc(n); if (p) live_allocs++; return p; }
@@ -81,6 +87,30 @@ static void eqs(const char *what, const char *got, const char *want) {
     if (!strcmp(got, want)) { printf("%-62s ok\n", what); return; }
     printf("%-62s БРАК: получили «%s», ждали «%s»\n", what, got, want);
     fails++;
+}
+
+static void pump_pairs(int c[2], int sp[2]) {
+    if (socketpair(AF_UNIX, SOCK_STREAM, 0, c) != 0 ||
+        socketpair(AF_UNIX, SOCK_STREAM, 0, sp) != 0) { perror("socketpair"); exit(1); }
+}
+
+static void pump_close(int c[2], int sp[2]) {
+    for (int i = 0; i < 2; i++) {
+        if (c[i] >= 0) close(c[i]);
+        if (sp[i] >= 0) close(sp[i]);
+    }
+}
+
+/* Один прогон pump на голом транспорте без нарезки; возвращает длительность в мс. */
+static long run_pump(int cfd, int ufd, struct pump_stat *st) {
+    struct upstream u;
+    struct msgsplit ms;
+    memset(&u, 0, sizeof(u));
+    memset(&ms, 0, sizeof(ms));
+    u.fd = ufd;
+    long long t0 = mono_ms();
+    pump(cfd, &u, st, &ms);
+    return (long)(mono_ms() - t0);
 }
 
 int main(void) {
@@ -145,6 +175,115 @@ int main(void) {
         eq("и ключ записи не остался развёрнутым", u.tls.wr.ctx_ready, 0);
         close(sv[0]);
         close(sv[1]);
+    }
+
+    /* ---- 4. pump: срок затишья и причины конца ----------------------------------------
+     *
+     * Обе стороны — пары сокетов: клиент на c[0] (его конец у стенда — c[1]), точка на s[0]
+     * (её конец — s[1]). Транспорт голый (tls_on = 0), нарезка выключена: проверяется
+     * цикл переливания, а не TLS и не разбор пакетов. Срок затишья — одна секунда. */
+    signal(SIGPIPE, SIG_IGN);
+    {
+        int c[2], sp[2];
+        struct pump_stat st;
+        long ms;
+
+        /* 4а. Полная тишина: сессия кончается сроком, а не висит. */
+        pump_pairs(c, sp);
+        memset(&st, 0, sizeof(st)); st.idle_s = 1;
+        ms = run_pump(c[0], sp[0], &st);
+        eqs("тишина в обе стороны: причина", st.why ? st.why : "(нет)", "срок затишья вышел");
+        eq("тишина в обе стороны: конец за 1..2 с", ms >= 900 && ms < 2000, 1);
+        pump_close(c, sp);
+
+        /* 4б. Точка пингует каждые 250 мс, данных нет: ping — не разговор, срок идёт. */
+        pump_pairs(c, sp);
+        pid_t kid = fork();
+        if (kid == 0) {
+            static const unsigned char ping[] = { 0x89, 0x02, 'h', 'i' };
+            int pongs = 0;
+            for (int i = 0; i < 16; i++) {
+                if (send(sp[1], ping, sizeof(ping), MSG_NOSIGNAL) != (ssize_t)sizeof(ping)) break;
+                usleep(250 * 1000);
+                unsigned char b[64];
+                ssize_t r;
+                while ((r = recv(sp[1], b, sizeof(b), MSG_DONTWAIT)) > 0)
+                    for (ssize_t k = 0; k < r; k++) if (b[k] == 0x8a) pongs++;
+                if (r == 0) break;
+            }
+            _exit(pongs > 250 ? 250 : pongs);
+        }
+        memset(&st, 0, sizeof(st)); st.idle_s = 1;
+        ms = run_pump(c[0], sp[0], &st);
+        pump_close(c, sp);
+        int ws = 0;
+        waitpid(kid, &ws, 0);
+        eqs("только ping от точки: причина", st.why ? st.why : "(нет)", "срок затишья вышел");
+        eq("только ping от точки: конец за 1..2 с, ping срок не продлил",
+           ms >= 900 && ms < 2000, 1);
+        eq("и на ping ушёл pong", WIFEXITED(ws) && WEXITSTATUS(ws) > 0, 1);
+
+        /* 4в. Данные от точки каждые 300 мс в течение двух секунд: сессия живёт, пока они
+         * идут, и кончается сроком после них. */
+        pump_pairs(c, sp);
+        kid = fork();
+        if (kid == 0) {
+            static const unsigned char data[] = { 0x82, 0x04, 1, 2, 3, 4 };
+            for (int i = 0; i < 7; i++) {
+                if (send(sp[1], data, sizeof(data), MSG_NOSIGNAL) != (ssize_t)sizeof(data)) break;
+                usleep(300 * 1000);
+            }
+            pause();
+            _exit(0);
+        }
+        memset(&st, 0, sizeof(st)); st.idle_s = 1;
+        ms = run_pump(c[0], sp[0], &st);
+        kill(kid, SIGKILL);
+        waitpid(kid, NULL, 0);
+        pump_close(c, sp);
+        eqs("данные от точки, потом тишина: причина", st.why ? st.why : "(нет)",
+            "срок затишья вышел");
+        eq("данные от точки продлевают срок: сессия дольше 2 с", ms >= 2000 && ms < 4000, 1);
+        eq("и все данные дошли клиенту", (long)st.down, 7 * 4);
+
+        /* 4г. Точка закрыла соединение. */
+        pump_pairs(c, sp);
+        close(sp[1]); sp[1] = -1;
+        memset(&st, 0, sizeof(st)); st.idle_s = 1;
+        run_pump(c[0], sp[0], &st);
+        eqs("точка закрыла соединение: причина", st.why ? st.why : "(нет)",
+            "точка закрыла соединение");
+        pump_close(c, sp);
+
+        /* 4д. Замаскированный кадр от точки — нарушение RFC 6455, а не затишье. */
+        pump_pairs(c, sp);
+        {
+            static const unsigned char bad[] = { 0x82, 0x81, 0, 0, 0, 0, 7 };
+            send(sp[1], bad, sizeof(bad), MSG_NOSIGNAL);
+        }
+        memset(&st, 0, sizeof(st)); st.idle_s = 1;
+        run_pump(c[0], sp[0], &st);
+        eqs("негодный кадр: причина", st.why ? st.why : "(нет)", "ошибка кадра веб-сокета");
+        pump_close(c, sp);
+
+        /* 4е. Кадр close от точки. */
+        pump_pairs(c, sp);
+        {
+            static const unsigned char cl[] = { 0x88, 0x00 };
+            send(sp[1], cl, sizeof(cl), MSG_NOSIGNAL);
+        }
+        memset(&st, 0, sizeof(st)); st.idle_s = 1;
+        run_pump(c[0], sp[0], &st);
+        eqs("close от точки: причина", st.why ? st.why : "(нет)", "точка закрыла веб-сокет");
+        pump_close(c, sp);
+
+        /* 4ж. Клиент закрыл. */
+        pump_pairs(c, sp);
+        close(c[1]); c[1] = -1;
+        memset(&st, 0, sizeof(st)); st.idle_s = 1;
+        run_pump(c[0], sp[0], &st);
+        eqs("клиент закрыл: причина", st.why ? st.why : "(нет)", "клиент закрыл");
+        pump_close(c, sp);
     }
 
     printf("\n%s\n", fails ? "ЕСТЬ БРАК" : "все проверки прошли");

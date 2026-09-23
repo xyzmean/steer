@@ -164,8 +164,8 @@ $(BUILD)/upmatch: tests/upmatch.c src/ext/tgws.c
 
 # Пути отказа моста, которых прогон настоящего бинаря не достаёт: длинная строка списка
 # запасных доменов, отказ источника случайности, отказ рукопожатия после разворота ключа
-# (I-155, I-196, I-197). Там же и по той же причине: alt_init, ws_upgrade и tls_start
-# статические.
+# (I-155, I-196, I-197), срок затишья сессии через веб-сокет и причины её конца. Там же и по
+# той же причине: alt_init, ws_upgrade, tls_start и pump статические.
 $(BUILD)/tgwsfailmatch: tests/tgwsfailmatch.c src/ext/tgws.c
 	@mkdir -p $(BUILD)
 	$(CC) $(CFLAGS) -Itests/stub -Isrc -o $@ tests/tgwsfailmatch.c

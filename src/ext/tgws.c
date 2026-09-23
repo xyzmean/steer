@@ -737,8 +737,13 @@ static int hs_build(unsigned char hs[HS_LEN], unsigned char tag, short dc, short
  * Голый нужен стенду: поднимать в нём настоящий TLS означало бы проверять чужую библиотеку
  * вместо своего моста. Включается STEER_TGWS_PLAIN=1 и в бою не встречается. */
 /* Код последней неудачи TLS — только для сообщений: без него «не поднялось» неотличимо от
- * «узел молчит», а это разные причины с разными действиями. */
-static int g_tls_rc;
+ * «узел молчит», а это разные причины с разными действиями.
+ *
+ * СВОЙ У КАЖДОГО ПОТОКА. Мост обслуживает соединение своим потоком, и общий код означал бы,
+ * что причина конца одной сессии (pump читает его сразу после отказа) могла прийти от
+ * соседней. У голого сокета (стенд) сюда же пишется «закрыто» или «ошибка ввода-вывода» —
+ * тем же языком, что у TLS, чтобы pump называл причину одинаково на обоих транспортах. */
+static __thread int g_tls_rc;
 
 struct upstream {
     /* «Дескриптора нет» — это -1, а НЕ ноль. Ноль — совершенно годный дескриптор: он
@@ -805,7 +810,9 @@ static int up_read(struct upstream *u, unsigned char *p, size_t cap) {
     }
     ssize_t r = recv(u->fd, p, cap, 0);
     if (r < 0 && (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR)) return 0;
-    return r > 0 ? (int)r : -1;
+    if (r > 0) return (int)r;
+    g_tls_rc = r == 0 ? TLS13_ECLOSED : TLS13_EIO;
+    return -1;
 }
 
 /* ---- WebSocket (RFC 6455), ровно столько, сколько нужно ---------------------------
@@ -1451,7 +1458,15 @@ give_up:
  * мост обслуживает каждое соединение своим потоком, и общие счётчики однажды показали у всех
  * сессий подряд одинаковые числа — по такой диагностике я и сделал неверный вывод. */
 struct pump_stat {
+    /* Причина конца — её ставит КАЖДЫЙ выход из pump, умолчания нет. Раньше умолчанием было
+     * «срок затишья вышел», а отказ TLS, ошибка кадра и обрыв его не перезаписывали: в журнале
+     * все такие сессии кончались «затишьем», в том числе те, где затишья не было вовсе, —
+     * а затишье, наоборот, не кончало сессию никогда (см. idle_s). */
     const char *why;
+    int rc;                     /* код отказа чтения наверх (TLS13_E*), 0 — не было */
+    /* Срок полной тишины в обе стороны, секунды; 0 — IDLE_TIMEOUT_S. Полем, а не только
+     * константой, ради стенда: ждать пять минут в tests/tgwsfailmatch.c незачем. */
+    int idle_s;
     unsigned long up, down;
     struct obf *dbg;            /* расшифровщик первых байт ответа, только для журнала */
     unsigned char tag;          /* транспорт: 0xef сжатый, 0xee обычный, 0xdd с набивкой */
@@ -1474,38 +1489,56 @@ static void keepalive_on(int fd) {
 #endif
 }
 
+/* Монотонные миллисекунды: срок затишья не должен сдвигаться от перевода часов роутера —
+ * у роутера без батарейки часов их после загрузки переводит скачком NTP. */
+static long long mono_ms(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (long long)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
+}
+
+/* СРОК ЗАТИШЬЯ У ВЕБ-СОКЕТА — СВОЙ, в самом цикле. У прямых путей его держит poll в relay_fd
+ * (IDLE_TIMEOUT_S без единого события — конец), а здесь poll просыпался раз в минуту, и
+ * пустое пробуждение просто начинало цикл заново: сессия, в которой обе стороны замолчали
+ * навсегда, жила, пока держались сокеты, и занимала поток и слот из MAX_CONNS.
+ *
+ * ТИШИНОЙ СЧИТАЕТСЯ ОТСУТСТВИЕ ДАННЫХ MTProto в обе стороны, а не отсутствие событий на
+ * сокетах. Ping от точки и наш pong — это жизнь веб-сокета, а не разговор клиента: будь они
+ * в счёт, точка, пингующая раз в полминуты, держала бы брошенную сессию вечно. Поэтому срок
+ * сдвигают только байты от клиента и байты кадров данных, отданные клиенту. */
 static void pump(int cfd, struct upstream *u, struct pump_stat *st, struct msgsplit *ms) {
     struct ws_rx rx;
     unsigned char buf[BUF_N];
     rx.n = 0;
     rx.pend = 0;
     rx.pend_op = 0;
+    const long long idle_ms = (long long)(st->idle_s > 0 ? st->idle_s : IDLE_TIMEOUT_S) * 1000;
+    long long quiet_since = mono_ms();
+#define PUMP_END(w) do { st->why = (w); return; } while (0)
 
     for (;;) {
+        long long left = quiet_since + idle_ms - mono_ms();
+        if (left <= 0) PUMP_END("срок затишья вышел");
         struct pollfd p[2];
         p[0].fd = cfd;   p[0].events = POLLIN;  p[0].revents = 0;
         p[1].fd = u->fd; p[1].events = POLLIN;  p[1].revents = 0;
         /* Записи TLS могут уже лежать у нас в буфере — тогда ждать события на сокете
          * нельзя, иначе хвост ответа простоит до таймаута клиента (та же ловушка, что
          * закрыта в tls13_has_record). */
-        int wait = (u->tls_on && tls13_has_record(&u->tls)) ? 0 : 60000;
+        int wait = (u->tls_on && tls13_has_record(&u->tls)) ? 0 : (int)(left < 60000 ? left : 60000);
         if (poll(p, 2, wait) < 0) {
             if (errno == EINTR) continue;
-            return;
+            PUMP_END("ожидание событий отказало");
         }
 
         if (p[0].revents & POLLIN) {
             ssize_t r = recv(cfd, buf, sizeof(buf), 0);
-            if (r <= 0) {
-                st->why = r == 0 ? "клиент закрыл" : "чтение от клиента отказало";
-                return;
-            }
+            if (r <= 0)
+                PUMP_END(r == 0 ? "клиент закрыл" : "чтение от клиента отказало");
+            quiet_since = mono_ms();
             /* ОДИН ПАКЕТ — ОДИН КАДР: границы кадров задаёт клиент, а не сетевой стек
              * (см. пояснение у msgsplit). */
-            if (ms_feed(ms, u, buf, (size_t)r) < 0) {
-                st->why = "запись наверх отказала";
-                return;
-            }
+            if (ms_feed(ms, u, buf, (size_t)r) < 0) PUMP_END("запись наверх отказала");
             st->up += (unsigned long)r;
         }
 
@@ -1514,7 +1547,11 @@ static void pump(int cfd, struct upstream *u, struct pump_stat *st, struct msgsp
              * кадра, а тело через него только протекает. */
             if (sizeof(rx.buf) - rx.n >= TLS_REC_MAX) {
                 int r = up_read(u, rx.buf + rx.n, sizeof(rx.buf) - rx.n);
-                if (r < 0) return;
+                if (r < 0) {
+                    st->rc = g_tls_rc;
+                    if (g_tls_rc == TLS13_ECLOSED) PUMP_END("точка закрыла соединение");
+                    PUMP_END(u->tls_on ? "TLS наверх отказал" : "чтение от точки отказало");
+                }
                 if (r > 0) rx.n += (size_t)r;
             }
             for (;;) {
@@ -1552,9 +1589,13 @@ static void pump(int cfd, struct upstream *u, struct pump_stat *st, struct msgsp
                         size_t off = 0;
                         while (off < take) {
                             ssize_t w = send(cfd, rx.buf + off, take - off, MSG_NOSIGNAL);
-                            if (w <= 0) { if (errno == EINTR) continue; return; }
+                            if (w <= 0) {
+                                if (w < 0 && errno == EINTR) continue;
+                                PUMP_END("запись клиенту отказала");
+                            }
                             off += (size_t)w;
                         }
+                        quiet_since = mono_ms();
                     }
                     st->down += (unsigned long)take;
                     ws_consume(&rx, take);
@@ -1566,11 +1607,8 @@ static void pump(int cfd, struct upstream *u, struct pump_stat *st, struct msgsp
                 int op;
                 int h = ws_head(&rx, &need, &len, &op);
                 if (h == 0) break;
-                if (h < 0) return;
-                if (op == 0x8) {                      /* close */
-                    st->why = "точка закрыла веб-сокет";
-                    return;
-                }
+                if (h < 0) PUMP_END("ошибка кадра веб-сокета");
+                if (op == 0x8) PUMP_END("точка закрыла веб-сокет");      /* close */
                 if (op == 0x9) {                      /* ping — отвечаем тем же телом */
                     unsigned char pong[128];
                     size_t pn = len > sizeof(pong) ? sizeof(pong) : len;
@@ -1582,11 +1620,11 @@ static void pump(int cfd, struct upstream *u, struct pump_stat *st, struct msgsp
                     hdr[0] = 0x8a;
                     hdr[1] = (unsigned char)(0x80 | pn);
                     unsigned char mask[4];
-                    if (xc_random(mask, 4) != 0) return;
+                    if (xc_random(mask, 4) != 0) PUMP_END("нет случайных байт для pong");
                     memcpy(hdr + 2, mask, 4);
-                    if (up_write(u, hdr, 6) < 0) return;
+                    if (up_write(u, hdr, 6) < 0) PUMP_END("запись наверх отказала");
                     for (size_t i = 0; i < pn; i++) pong[i] ^= mask[i & 3];
-                    if (pn && up_write(u, pong, pn) < 0) return;
+                    if (pn && up_write(u, pong, pn) < 0) PUMP_END("запись наверх отказала");
                     continue;
                 }
                 if (op & 0x8) { ws_consume(&rx, need + len); continue; }  /* прочее управление */
@@ -1597,9 +1635,12 @@ static void pump(int cfd, struct upstream *u, struct pump_stat *st, struct msgsp
             }
         }
         if ((p[0].revents | p[1].revents) & (POLLERR | POLLHUP)) {
-            if (!rx.n) return;
+            if (!rx.n)
+                PUMP_END((p[0].revents & (POLLERR | POLLHUP)) ? "клиент оборвал соединение"
+                                                               : "точка оборвала соединение");
         }
     }
+#undef PUMP_END
 }
 
 /* Переливание без перехвата: соединение уходит туда, куда шло. Так обрабатывается всё, чего
@@ -2479,7 +2520,7 @@ static void *serve(void *arg) {
     struct obf dbg;
     int dbg_on = (obf_init(&dbg, hs0) == 0);
 
-    struct pump_stat st = { .why = "срок затишья вышел", .up = 0, .down = 0 };
+    struct pump_stat st = { .why = NULL, .rc = 0, .idle_s = IDLE_TIMEOUT_S, .up = 0, .down = 0 };
     st.dbg = dbg_on ? &dbg : NULL;
     st.tag = tag;
     st.dsts = dsts;
@@ -2508,9 +2549,11 @@ static void *serve(void *arg) {
 
     time_t t_start = time(NULL);
     pump(cfd, &u, &st, &ms);
-    VLOG( LOG_I "%s -> %s ДЦ%d%s: сессия %ld с, вверх %lu Б (%lu пакетов), вниз %lu Б — %s\n",
+    char rcb[24] = "";
+    if (st.rc && st.rc != TLS13_ECLOSED) snprintf(rcb, sizeof(rcb), " (код %d)", st.rc);
+    VLOG( LOG_I "%s -> %s ДЦ%d%s: сессия %ld с, вверх %lu Б (%lu пакетов), вниз %lu Б — %s%s\n",
             srcs, dsts, dc, media ? "m" : "", (long)(time(NULL) - t_start),
-            st.up, ms.pkts, st.down, st.why);
+            st.up, ms.pkts, st.down, st.why ? st.why : "?", rcb);
     health_report(dc, media, sni, (long)(time(NULL) - t_start), st.up, st.down);
     obf_free(&ms.o);
     if (dbg_on) obf_free(&dbg);
