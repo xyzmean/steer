@@ -63,6 +63,8 @@
 #include <netinet/in.h>
 #include <netinet/tcp.h>
 #include <sys/socket.h>
+#include <sys/stat.h>
+#include <net/if.h>
 #include <linux/netfilter_ipv4.h>
 
 #include <mbedtls/aes.h>
@@ -1006,6 +1008,122 @@ static void ws_consume(struct ws_rx *rx, size_t used) {
     rx->n -= used;
 }
 
+/* ---- WARP: путь поверх туннеля -------------------------------------------------------
+ *
+ * ЗАЧЕМ. Мост прячет MTProto от DPI провайдера, но у каждого его пути свои беды: к
+ * web.telegram.org ходят только ДЦ2 и ДЦ4, домены пула за Cloudflare отвечают 503 и живут
+ * недолго, а прямой путь к дата-центрам провайдер обычно режет. Туннель WARP с выходом за
+ * границей снимает всё это разом: через него настоящие дата-центры открываются как есть. Но
+ * туннель тоже падает — и тогда мост должен работать как без него, сам и сразу, а не ждать,
+ * пока кто-то пересоберёт правила. Поэтому WARP здесь — ещё один путь, который мост пробует
+ * первым и бросает сам:
+ *
+ *   1. прямо к дата-центру через WARP — с той же проверкой боем, что у прямого пути (ДЦ
+ *      должен заговорить); не заговорил — этот ДЦ на DIRECT_BAD_S идёт следующим путём;
+ *   2. веб-сокет (web.telegram.org или домены пула) через WARP;
+ *   3. всё как раньше, без WARP.
+ *
+ * Туннель, к которому не вышло даже TCP, отставляется на WARP_BAD_S: он лёг, и платить
+ * тайм-аутом за каждое соединение незачем.
+ *
+ * СПИСОК ТУННЕЛЕЙ — ФАЙЛОМ (STEER_TGWS_WARP, по умолчанию /etc/stgws/warp.lst): имена
+ * интерфейсов по строке. Пишет его тот, кто туннели поднимает (Zapret Manager), и туннели в
+ * российских колониях туда не кладёт: выход у них внутри страны. Файл перечитывается, когда
+ * меняется, — перезапускать мост ради новой точки входа не нужно. Нет файла — нет WARP. */
+#define WARP_MAX   4
+#define WARP_BAD_S 30
+static char g_warp[WARP_MAX][IFNAMSIZ];
+static size_t g_warp_n;
+static time_t g_warp_bad[WARP_MAX];
+static time_t g_warp_mtime;
+static time_t g_warp_checked;
+static pthread_mutex_t g_warp_mx = PTHREAD_MUTEX_INITIALIZER;
+
+static void warp_reload_locked(time_t now) {
+    if (now == g_warp_checked) return;
+    g_warp_checked = now;
+    const char *path = getenv("STEER_TGWS_WARP");
+    if (!path) path = "/etc/stgws/warp.lst";
+    struct stat sb;
+    if (stat(path, &sb) != 0) { g_warp_n = 0; g_warp_mtime = 0; return; }
+    if (sb.st_mtime == g_warp_mtime && g_warp_n) return;
+    FILE *f = fopen(path, "r");
+    if (!f) { g_warp_n = 0; return; }
+    char line[64];
+    size_t n = 0;
+    while (n < WARP_MAX && fgets(line, sizeof(line), f)) {
+        char *p = line;
+        while (*p == ' ' || *p == '\t') p++;
+        p[strcspn(p, " \t\r\n")] = '\0';
+        if (!*p || *p == '#' || strlen(p) >= IFNAMSIZ) continue;
+        memcpy(g_warp[n], p, strlen(p) + 1);
+        g_warp_bad[n] = 0;
+        n++;
+    }
+    fclose(f);
+    if (n != g_warp_n || sb.st_mtime != g_warp_mtime)
+        fprintf(stderr, LOG_I "WARP: туннелей для моста %zu\n", n);
+    g_warp_n = n;
+    g_warp_mtime = sb.st_mtime;
+}
+
+/* Туннель для очередного соединения: первый поднятый и не отставленный. NULL — идём без WARP.
+ * Возвращает указатель в g_warp: имена меняются только при перечитывании файла, а оно
+ * случается не чаще раза в секунду — за это время соединение имя уже прочитало. */
+static const char *warp_dev_now(void) {
+    time_t now = time(NULL);
+    const char *dev = NULL;
+    pthread_mutex_lock(&g_warp_mx);
+    warp_reload_locked(now);
+    for (size_t i = 0; i < g_warp_n && !dev; i++) {
+        if (g_warp_bad[i] > now) continue;
+        char sys[64];
+        snprintf(sys, sizeof(sys), "/sys/class/net/%s", g_warp[i]);
+        if (access(sys, F_OK) != 0) continue;
+        dev = g_warp[i];
+    }
+    pthread_mutex_unlock(&g_warp_mx);
+    return dev;
+}
+
+static void warp_dev_failed(const char *dev) {
+    if (!dev) return;
+    time_t now = time(NULL);
+    pthread_mutex_lock(&g_warp_mx);
+    for (size_t i = 0; i < g_warp_n; i++)
+        if (!strcmp(g_warp[i], dev) && g_warp_bad[i] <= now) {
+            g_warp_bad[i] = now + WARP_BAD_S;
+            fprintf(stderr, LOG_W "WARP %s: не соединяется — %d с без него\n", dev, WARP_BAD_S);
+        }
+    pthread_mutex_unlock(&g_warp_mx);
+}
+
+/* Прямо к ДЦ через WARP — своя отставка на ячейку: ДЦ, промолчавший через туннель, ещё не
+ * значит, что туннель лёг (другие ДЦ через него могут отвечать). */
+static time_t g_warp_direct_bad[ROUTE_N];
+
+/* Через какой туннель идёт дозвон этого потока. Выставляет dial_upstream, читает
+ * tcp_connect; сквозь цепочку вызовов не протаскивается, потому что между ними — выбор домена
+ * и повторы, которым туннель безразличен. */
+static __thread const char *t_via;
+static __thread int t_tcp_ok;
+
+/* Привязать сокет к туннелю или, без туннеля, пустить мимо zapret роутера. */
+static void sock_path(int fd, const char *via) {
+    if (via) {
+        setsockopt(fd, SOL_SOCKET, SO_BINDTODEVICE, via, (socklen_t)strlen(via));
+        return;
+    }
+    /* МИМО ZAPRET РОУТЕРА. Мост живёт на самом роутере, и его соединения наверх шли через
+     * общий обход — а стратегия, подобранная под сайты клиентов, ломает ClientHello к
+     * Cloudflare: на тестовом роутере v4 (multisplit, seqovl 582) давала TCP без единого
+     * ответа на TLS ко всем доменам пула, и не грузилось всё, что лежит в ДЦ1, 3, 5 и 203.
+     * Домены пула для того и подобраны, чтобы открываться без ухищрений; tg-ws-proxy ходит
+     * к ним тоже без обхода. Метка — та, по которой zapret пропускает пакет (DESYNC_MARK). */
+    unsigned mk = ZAPRET_SKIP_MARK;
+    setsockopt(fd, SOL_SOCKET, SO_MARK, &mk, sizeof(mk));
+}
+
 /* ---- соединение с точкой apiws ---------------------------------------------------- */
 
 static int tcp_connect(const char *host, const char *port, int timeout_s) {
@@ -1022,14 +1140,8 @@ static int tcp_connect(const char *host, const char *port, int timeout_s) {
         struct timeval tv = { .tv_sec = timeout_s, .tv_usec = 0 };
         setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
         setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
-        /* МИМО ZAPRET РОУТЕРА. Мост живёт на самом роутере, и его соединения наверх шли через
-         * общий обход — а стратегия, подобранная под сайты клиентов, ломает ClientHello к
-         * Cloudflare: на тестовом роутере v4 (multisplit, seqovl 582) давала TCP без единого
-         * ответа на TLS ко всем доменам пула, и не грузилось всё, что лежит в ДЦ1, 3, 5 и 203.
-         * Домены пула для того и подобраны, чтобы открываться без ухищрений; tg-ws-proxy ходит
-         * к ним тоже без обхода. Метка — та, по которой zapret пропускает пакет (DESYNC_MARK). */
-        { unsigned mk = ZAPRET_SKIP_MARK; setsockopt(fd, SOL_SOCKET, SO_MARK, &mk, sizeof(mk)); }
-        if (connect(fd, it->ai_addr, it->ai_addrlen) == 0) break;
+        sock_path(fd, t_via);
+        if (connect(fd, it->ai_addr, it->ai_addrlen) == 0) { t_tcp_ok++; break; }
         close(fd);
         fd = -1;
     }
@@ -1584,16 +1696,17 @@ static void relay_fd(int cfd, int fd, unsigned long *up, unsigned long *down) {
 /* pre — то, что мы уже сняли с клиента и обязаны отдать первым (рукопожатие); pre2 — то,
  * что он сказал следом, пока проверялся прямой путь. Два куска, а не один буфер, потому что
  * второй бывает в шестнадцать килобайт, и склеивать их значило бы держать третью копию. */
+static int direct_open(const struct sockaddr_in *dst, const char *via);
+
 static void relay_direct(int cfd, const struct sockaddr_in *dst,
                          const unsigned char *pre, size_t pre_n,
                          const unsigned char *pre2, size_t pre2_n) {
-    int fd = socket(AF_INET, SOCK_STREAM, 0);
+    /* Насквозь — тоже через WARP, если он есть: без туннеля провайдер это соединение, скорее
+     * всего, и режет. Туннель не соединился — отставляем его и идём как раньше. */
+    const char *via = getenv("STEER_TGWS_ENDPOINT") ? NULL : warp_dev_now();
+    int fd = direct_open(dst, via);
+    if (fd < 0 && via) { warp_dev_failed(via); fd = direct_open(dst, NULL); }
     if (fd < 0) return;
-    struct timeval tv = { .tv_sec = UP_TIMEOUT_S, .tv_usec = 0 };
-    setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
-    setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
-    if (connect(fd, (const struct sockaddr *)dst, sizeof(*dst)) != 0) { close(fd); return; }
-    { int one = 1; setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one)); }
     if (pre_n && send_all(fd, pre, pre_n) < 0) { close(fd); return; }
     if (pre2_n && send_all(fd, pre2, pre2_n) < 0) { close(fd); return; }
     relay_fd(cfd, fd, NULL, NULL);
@@ -1635,9 +1748,10 @@ static void eb_put(struct earlybuf *e, const unsigned char *p, size_t n) {
 }
 
 /* Соединиться туда, куда шёл клиент. -1 — не вышло. */
-static int direct_open(const struct sockaddr_in *dst) {
+static int direct_open(const struct sockaddr_in *dst, const char *via) {
     int fd = socket(AF_INET, SOCK_STREAM, 0);
     if (fd < 0) return -1;
+    if (via) sock_path(fd, via);
     struct timeval tv = { .tv_sec = UP_TIMEOUT_S, .tv_usec = 0 };
     setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
     setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
@@ -1693,8 +1807,10 @@ static int direct_prove(int cfd, int dfd, struct earlybuf *eb) {
  * общественные домены отвечают 503 почти на половину запросов. Каждый отказ стоит полного
  * рукопожатия, и владелец видел это как «сообщения отправляются по полминуты». Отказы никуда
  * не денутся, но переживать их должен наполнитель в фоне, а не человек. */
-static int dial_upstream(short dc, short media, struct upstream *u_out,
-                         char *sni_out, size_t sni_cap, int *tries_out) {
+static __thread int t_used_via;   /* 1 — последнее соединение потока поднято через WARP */
+
+static int dial_core(short dc, short media, struct upstream *u_out,
+                     char *sni_out, size_t sni_cap, int *tries_out) {
     /* Куда идём. Имя точки — kwsN[-1].<домен>, оно же SNI и Host; АДРЕС подключения обычно
      * тот же, но стенду его задают отдельно (там поднят свой сервер на петле). */
     char cand[2][160];
@@ -1766,6 +1882,7 @@ static int dial_upstream(short dc, short media, struct upstream *u_out,
     int tries = 0;
     int tg_tcp_dead = 0;
     for (size_t d = 0; d < dom_n && !ok; d++) {
+        int tcp0 = t_tcp_ok;
         tgws_hosts_at(doms[d], dc, media, cand);
         for (int i = 0; i < 2 && !ok; i++) {
             sni = cand[i];
@@ -1815,7 +1932,9 @@ static int dial_upstream(short dc, short media, struct upstream *u_out,
         /* Прямой путь к Telegram отставляется коротко: его отказы — потери по дороге, а не
          * «точка лежит», и минута без него стоила бы всех соединений этой минуты. */
         /* Отказ ДЦ203 отставляет домен только для 203 (см. cool_key). */
-        if (!ok) dom_cool(cool_key(kb, sizeof(kb), dc, doms[d]), time(NULL) +
+        /* Через WARP, не дойдя до домена даже по TCP, домен не винят: лёг туннель, и отставить
+         * домен значило бы выбить его и из пути без WARP. */
+        if (!ok && !(t_via && t_tcp_ok == tcp0)) dom_cool(cool_key(kb, sizeof(kb), dc, doms[d]), time(NULL) +
                           (!strcmp(doms[d], TG_WS_DOMAIN) ? TG_COOLDOWN_S : ALT_COOLDOWN_S));
     }
     if (!ok) {
@@ -1826,6 +1945,24 @@ static int dial_upstream(short dc, short media, struct upstream *u_out,
     *u_out = u;
     if (tries_out) *tries_out = tries;
     return 1;
+}
+
+/* Дозвон с WARP: сначала через туннель, не вышло — как без него. Туннель, до которого не
+ * дошло ни одно TCP, отставляется (см. «WARP: путь поверх туннеля»). */
+static int dial_upstream(short dc, short media, struct upstream *u_out,
+                         char *sni_out, size_t sni_cap, int *tries_out) {
+    const char *via = getenv("STEER_TGWS_ENDPOINT") ? NULL : warp_dev_now();
+    t_used_via = 0;
+    if (via) {
+        t_via = via;
+        t_tcp_ok = 0;
+        int ok = dial_core(dc, media, u_out, sni_out, sni_cap, tries_out);
+        int tcp = t_tcp_ok;
+        t_via = NULL;
+        if (ok) { t_used_via = 1; return 1; }
+        if (!tcp) warp_dev_failed(via);
+    }
+    return dial_core(dc, media, u_out, sni_out, sni_cap, tries_out);
 }
 
 /* ЗАПАС ПОДНЯТЫХ СОЕДИНЕНИЙ.
@@ -1865,10 +2002,12 @@ struct warm_slot {
     short dc, media;
     time_t born;
     char sni[160];
+    int via;                    /* поднято через WARP */
     struct upstream u;
 };
 
 static struct warm_slot g_warm[WARM_SLOTS];
+static __thread int t_took_via;   /* warm_take: отданное поднято через WARP */
 static pthread_mutex_t g_warm_mx = PTHREAD_MUTEX_INITIALIZER;
 
 /* Чего просят клиенты. Держать запас на все пять дата-центров сразу незачем: роутер обычно
@@ -1905,6 +2044,7 @@ static int warm_take(short dc, short media, struct upstream *u_out, char *sni, s
         if (now - g_warm[i].born > WARM_TTL_S) continue;        /* тухлое — пусть уберут */
         *u_out = g_warm[i].u;
         snprintf(sni, sni_cap, "%s", g_warm[i].sni);
+        t_took_via = g_warm[i].via;
         g_warm[i].busy = 0;
         g_warm[i].u.fd = -1;            /* владелец теперь один — тот, кому отдали */
         g_warm[i].u.tls_on = 0;
@@ -1986,6 +2126,7 @@ static int warm_pass(warm_dial_fn dial) {
             g_warm[k].media = want[i].media;
             g_warm[k].born = time(NULL);
             snprintf(g_warm[k].sni, sizeof(g_warm[k].sni), "%s", sni);
+            g_warm[k].via = t_used_via;
             g_warm[k].u = u;
             placed = 1;
             free_n--;
@@ -2058,10 +2199,12 @@ static const char *sni_domain(const char *sni) {
     return d ? d + 1 : sni;
 }
 
-static void path_note(int dc, int media, const char *sni) {
+static void path_note(int dc, int media, const char *sni, int via) {
     int i = route_idx(dc, media);
     if (i < 0) return;
-    const char *d = sni_domain(sni);
+    char db[160];
+    snprintf(db, sizeof(db), "%s%s", sni_domain(sni), via ? " через WARP" : "");
+    const char *d = db;
     pthread_mutex_lock(&g_path_mx);
     if (strcmp(g_path[i], d)) {
         if (g_path[i][0])
@@ -2130,6 +2273,43 @@ static void health_report(int dc, int media, const char *sni, long secs,
 struct job { int fd; };
 static volatile int g_live;
 static pthread_mutex_t g_mu = PTHREAD_MUTEX_INITIALIZER;
+
+/* Один прямой путь к ДЦ — без WARP (via = NULL) или через туннель. Отдаёт рукопожатие
+ * клиента и всё, что он успел сказать прежним путям (eb), и ждёт, заговорит ли ДЦ.
+ * 1 — заговорил, сессия отработана до конца; 0 — молчит (eb пополнен сказанным за это
+ * время); -1 — не соединился вовсе. Сессия, в которой клиент ждал и ничего не получил,
+ * отставляет этот путь так же, как молчание (см. здоровье пути у моста). */
+static int direct_try(int cfd, const struct sockaddr_in *dst, const char *via,
+                      const unsigned char *hs0, struct earlybuf *eb,
+                      int dc, int media, const char *srcs, const char *dsts) {
+    int dfd = direct_open(dst, via);
+    if (dfd < 0) return -1;
+    if (send_all(dfd, hs0, HS_LEN) < 0 || (eb->n && send_all(dfd, eb->b, eb->n) < 0) ||
+        !direct_prove(cfd, dfd, eb)) {
+        close(dfd);
+        return 0;
+    }
+    struct timeval idle = { .tv_sec = IDLE_TIMEOUT_S, .tv_usec = 0 };
+    setsockopt(cfd, SOL_SOCKET, SO_RCVTIMEO, &idle, sizeof(idle));
+    setsockopt(cfd, SOL_SOCKET, SO_SNDTIMEO, &idle, sizeof(idle));
+    setsockopt(dfd, SOL_SOCKET, SO_RCVTIMEO, &idle, sizeof(idle));
+    setsockopt(dfd, SOL_SOCKET, SO_SNDTIMEO, &idle, sizeof(idle));
+    keepalive_on(cfd);
+    unsigned long up = 0, down = 0;
+    time_t t0 = time(NULL);
+    path_note(dc, media, "ДЦ.напрямую", via != NULL);
+    relay_fd(cfd, dfd, &up, &down);
+    close(dfd);
+    long secs = (long)(time(NULL) - t0);
+    VLOG( LOG_I "%s -> %s ДЦ%d%s напрямую%s: сессия %ld с, вверх %lu Б, вниз %lu Б\n",
+            srcs, dsts, dc, media ? "m" : "", via ? " через WARP" : "", secs, up, down);
+    if (up > 0 && down == 0 && secs >= HEALTH_WAIT_S) {
+        int i = route_idx(dc, media);
+        if (via) { if (i >= 0) g_warp_direct_bad[i] = time(NULL) + DIRECT_BAD_S; }
+        else route_direct_failed(dc == 203 ? 2 : dc, media, time(NULL));
+    }
+    return 1;
+}
 
 static void *serve(void *arg) {
     struct job *j = arg;
@@ -2211,33 +2391,32 @@ static void *serve(void *arg) {
     /* ДЦ203 своей строки в карте не имеет: прямой путь для него — тот же, что у ДЦ2 (так
      * было, пока номер 203 переписывался догадкой по адресу). */
     short rdc = dc == 203 ? 2 : dc;
+
+    /* ПРЯМЫЕ ПУТИ — ПО ЦЕНЕ. Сначала без WARP (если карта говорит, что ДЦ открыт и так): нет
+     * ни туннеля, ни лишнего круга до его колонии. Потом через WARP. Потом мост.
+     *
+     * Каждый прямой путь проверяется боем: ДЦ должен заговорить. Пока он молчит, клиент
+     * успевает прислать своё — это копится в eb, и СЛЕДУЮЩИЙ путь получает рукопожатие и
+     * ровно эти байты, то есть тот же поток с начала. Поэтому пути складываются в цепочку:
+     * молчание первого не мешает второму. */
+    const char *wvia = getenv("STEER_TGWS_ENDPOINT") ? NULL : warp_dev_now();
+    int wi = route_idx(dc, media);
     if (route_direct_now(rdc, media, time(NULL))) {
-        int dfd = direct_open(&dst);
-        if (dfd >= 0 && send_all(dfd, hs0, HS_LEN) == 0 && direct_prove(cfd, dfd, &eb)) {
-            struct timeval idle = { .tv_sec = IDLE_TIMEOUT_S, .tv_usec = 0 };
-            setsockopt(cfd, SOL_SOCKET, SO_RCVTIMEO, &idle, sizeof(idle));
-            setsockopt(cfd, SOL_SOCKET, SO_SNDTIMEO, &idle, sizeof(idle));
-            setsockopt(dfd, SOL_SOCKET, SO_RCVTIMEO, &idle, sizeof(idle));
-            setsockopt(dfd, SOL_SOCKET, SO_SNDTIMEO, &idle, sizeof(idle));
-            keepalive_on(cfd);
-            unsigned long dup_ = 0, ddown = 0;
-            time_t t0 = time(NULL);
-            VLOG( LOG_I "%s -> ДЦ%d%s напрямую (транспорт 0x%02x)\n",
-                    dsts, dc, media ? "m" : "", tag);
-            relay_fd(cfd, dfd, &dup_, &ddown);
-            close(dfd);
-            VLOG( LOG_I "%s -> %s ДЦ%d%s напрямую: сессия %ld с, вверх %lu Б, "
-                            "вниз %lu Б\n",
-                    srcs, dsts, dc, media ? "m" : "", (long)(time(NULL) - t0), dup_, ddown);
-            goto done;
-        }
-        if (dfd >= 0) close(dfd);
-        /* Молчание — это блокировка. Записываем отказ, чтобы следующие соединения к этому
-         * ДЦ не платили ожиданием, и уходим в мост вместе с копией сказанного клиентом. */
+        int r = direct_try(cfd, &dst, NULL, hs0, &eb, dc, media, srcs, dsts);
+        if (r == 1) goto done;
         route_direct_failed(rdc, media, time(NULL));
-        fprintf(stderr, LOG_W "ДЦ%d%s: напрямую не отвечает — на %d с ухожу в мост\n",
+        fprintf(stderr, LOG_W "ДЦ%d%s: напрямую не отвечает — на %d с дальше по цепочке\n",
                 dc, media ? "m" : "", DIRECT_BAD_S);
-        (void)dsts;
+    }
+    if (!eb.over && wvia && wi >= 0 && g_warp_direct_bad[wi] <= time(NULL)) {
+        int r = direct_try(cfd, &dst, wvia, hs0, &eb, dc, media, srcs, dsts);
+        if (r == 1) goto done;
+        if (r < 0) warp_dev_failed(wvia);
+        else {
+            g_warp_direct_bad[wi] = time(NULL) + DIRECT_BAD_S;
+            VLOG( LOG_W "ДЦ%d%s: напрямую через WARP не отвечает — на %d с веб-сокет\n",
+                    dc, media ? "m" : "", DIRECT_BAD_S);
+        }
     }
 
     /* Соединение наверх: сначала из запаса — оно уже поднято, и клиент не платит ни
@@ -2279,7 +2458,7 @@ static void *serve(void *arg) {
         }
     }
 
-    path_note(dc, media, sni);
+    path_note(dc, media, sni, from_warm ? t_took_via : t_used_via);
     VLOG( LOG_I "%s -> ДЦ%d%s через %s (транспорт 0x%02x, %s)\n",
             dsts, dc, media ? "m" : "", sni, tag,
             from_warm ? "из запаса" : "дозвон");
@@ -2659,6 +2838,7 @@ int cmd_tgws(const char *spec, const char *name) {
     domain_init(o->tg_domain);
     alt_init();
     route_init();
+    (void)warp_dev_now();   /* строка «WARP: туннелей для моста N» при запуске */
     int port = out_tgws_port(o);
 
     int srv = socket(AF_INET, SOCK_STREAM, 0);
