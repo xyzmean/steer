@@ -509,6 +509,42 @@ static void route_direct_failed(int dc, int media, time_t now) {
     if (i >= 0) g_direct_bad[i] = now + DIRECT_BAD_S;
 }
 
+/* ---- прямо к Telegram ----------------------------------------------------------------
+ *
+ * ВЕБ-СОКЕТ К САМОМУ TELEGRAM — ПЕРВЫМ, до чужих доменов. Так ходит tg-ws-proxy (Flowseal):
+ * ДЦ2 и ДЦ4 открываются как `wss://kwsN[-1].web.telegram.org/apiws` по адресу
+ * 149.154.167.220 — это точка веб-клиента Telegram, и провайдеры, режущие MTProto к адресам
+ * дата-центров, её обычно пропускают. Чужие домены за Cloudflare остаются запасным путём.
+ *
+ * Почему это лучше, чем только домены. На тестовом роутере (провайдер РФ, 2026-09-23) за семь
+ * минут мост дал 205 отказов на домены-посредники — 190 рукопожатий TLS без ответа и ответы
+ * 503, — а 39 сессий клиент закрыл, не дождавшись ни байта: каждый отказ стоил полного
+ * рукопожатия и повтора. Прямой веб-сокет к 149.154.167.220 на той же сети отвечал 101 в
+ * восьми случаях из десяти, за полсекунды.
+ *
+ * Только ДЦ2 и ДЦ4: на этом адресе веб-клиент обслуживает их, а kws1/kws3/kws5 там не
+ * отвечают (проверено там же). ДЦ203 у нас и так считается ДЦ2 (91.105.192.0/23 в таблице).
+ * Отказ отставляет «домен» web.telegram.org тем же механизмом, что и чужие (dom_cool), — и
+ * следующие соединения минуту идут сразу к доменам, не платя тайм-аутом.
+ *
+ * Выключается переменной STEER_TGWS_TG_DIRECT=0, адрес задаётся STEER_TGWS_TG_IP. Стенду,
+ * который подставляет свой сервер (STEER_TGWS_ENDPOINT), этот путь не нужен вовсе. */
+#define TG_WS_DOMAIN "web.telegram.org"
+#define TG_WS_IP     "149.154.167.220"
+#define TG_COOLDOWN_S 20
+
+static int tg_direct_dc(int dc) {
+    const char *e = getenv("STEER_TGWS_TG_DIRECT");
+    if (e && !strcmp(e, "0")) return 0;
+    if (getenv("STEER_TGWS_ENDPOINT")) return 0;
+    return dc == 2 || dc == 4;
+}
+
+static const char *tg_direct_ip(void) {
+    const char *e = getenv("STEER_TGWS_TG_IP");
+    return (e && *e) ? e : TG_WS_IP;
+}
+
 /* Номер ДЦ по адресу назначения. 0 — адрес неизвестен, перехватывать нельзя. */
 /* Самая длинная подходящая маска. Порядок записей в таблице при этом не важен — важно
  * только, насколько запись точна. */
@@ -1601,12 +1637,13 @@ static int dial_upstream(short dc, short media, struct upstream *u_out,
     /* ПЕРВЫМ ИДЁТ ДОМЕН ЭТОГО ДАТА-ЦЕНТРА, а не общий. Карта — результат замера именно по
      * этому ДЦ (см. route_init), и общий домен, выбранный как лучший в среднем, у него может
      * не отвечать вовсе. Общий остаётся вторым: он проверен хотя бы где-то. */
-    const char *all[2 + MAX_ALT];
+    const char *all[3 + MAX_ALT];
     size_t all_n = 0;
+    if (tg_direct_dc(dc)) all[all_n++] = TG_WS_DOMAIN;   /* см. «прямо к Telegram» */
     const char *pref = route_domain(dc, media);
     if (pref) all[all_n++] = pref;
     if (!pref || strcmp(pref, g_domain)) all[all_n++] = g_domain;
-    for (size_t i = 0; i < g_alt_n && all_n < 2 + MAX_ALT; i++) {
+    for (size_t i = 0; i < g_alt_n && all_n < 3 + MAX_ALT; i++) {
         int dup = 0;
         for (size_t k = 0; k < all_n; k++) if (!strcmp(all[k], g_alt[i])) dup = 1;
         if (!dup) all[all_n++] = g_alt[i];
@@ -1640,9 +1677,33 @@ static int dial_upstream(short dc, short media, struct upstream *u_out,
             sni = cand[i];
             tries++;
             memset(&u, 0, sizeof(u));
-            u.fd = tcp_connect(ep ? epbuf : sni, port, UP_TIMEOUT_S);
+            u.fd = -1;
+            /* Точка веб-клиента Telegram — по её адресу, а не по имени: имя kwsN.web.telegram.org
+             * провайдер может подменять, а адрес у неё один. */
+            int tg = !ep && !strcmp(doms[d], TG_WS_DOMAIN);
+            if (tg) {
+                /* До точки Telegram соединение ТЕРЯЕТСЯ ПО ДОРОГЕ, а не отвергается: на
+                 * тестовом роутере не доходил примерно каждый четвёртый SYN (7 из 30), при
+                 * пинге без потерь. Одна попытка с долгим сроком превращала такую потерю в
+                 * отставку всего пути; три коротких подряд не проходят все сразу примерно в
+                 * полутора процентах случаев. */
+                for (int a = 0; a < 3 && u.fd < 0; a++)
+                    u.fd = tcp_connect(tg_direct_ip(), port, 2);
+            } else {
+                u.fd = tcp_connect(ep ? epbuf : sni, port, UP_TIMEOUT_S);
+            }
             if (u.fd < 0) continue;
-            if (!getenv("STEER_TGWS_PLAIN") && tls_start(&u, sni) != 0) {
+            /* Точка веб-клиента Telegram говорит только TLS 1.2 — на 1.3 она отвечает
+             * alert «protocol version» (проверено openssl), поэтому у неё своё рукопожатие. */
+            int trc = 0;
+            if (!getenv("STEER_TGWS_PLAIN")) {
+                if (tg) {
+                    memset(&u.tls, 0, sizeof(u.tls));
+                    g_tls_rc = tls12_handshake(&u.tls, u.fd, sni);
+                    if (g_tls_rc == 0) u.tls_on = 1; else { tls13_free(&u.tls); trc = -1; }
+                } else trc = tls_start(&u, sni);
+            }
+            if (trc != 0) {
                 fprintf(stderr, LOG_W "%s: TLS не поднялся (код %d)\n", sni, g_tls_rc);
                 up_drop(&u);
                 continue;
@@ -1653,7 +1714,10 @@ static int dial_upstream(short dc, short media, struct upstream *u_out,
             }
             ok = 1;
         }
-        if (!ok) dom_cool(doms[d], time(NULL) + ALT_COOLDOWN_S);
+        /* Прямой путь к Telegram отставляется коротко: его отказы — потери по дороге, а не
+         * «точка лежит», и минута без него стоила бы всех соединений этой минуты. */
+        if (!ok) dom_cool(doms[d], time(NULL) +
+                          (!strcmp(doms[d], TG_WS_DOMAIN) ? TG_COOLDOWN_S : ALT_COOLDOWN_S));
     }
     if (!ok) {
         fprintf(stderr, LOG_W "%s: точка ДЦ%d%s недоступна\n", cand[0], dc, media ? "m" : "");

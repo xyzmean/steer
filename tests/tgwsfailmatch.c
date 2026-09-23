@@ -54,6 +54,8 @@ int tls13_write(struct tls13 *t, const unsigned char *d, size_t n)
 int tls13_read(struct tls13 *t, unsigned char *o, size_t c, size_t *g)
                                         { (void)t; (void)o; (void)c; *g = 0; return -1; }
 void tls13_free(struct tls13 *t) { t->wr.ctx_ready = 0; t->rd.ctx_ready = 0; }
+int tls12_handshake(struct tls13 *t, int fd, const char *sni)
+{ (void)t; (void)fd; (void)sni; return -1; }
 void mbedtls_aes_init(mbedtls_aes_context *c) { (void)c; }
 void mbedtls_aes_free(mbedtls_aes_context *c) { (void)c; }
 int mbedtls_aes_setkey_enc(mbedtls_aes_context *c, const unsigned char *k, unsigned int b)

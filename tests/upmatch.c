@@ -53,6 +53,8 @@ int tls13_read(struct tls13 *t, unsigned char *o, size_t c, size_t *g)
  * а вопрос стенда — не как освобождают, а освобождают ли вообще. */
 static int frees;
 void tls13_free(struct tls13 *t) { (void)t; frees++; }
+int tls12_handshake(struct tls13 *t, int fd, const char *sni)
+{ (void)t; (void)fd; (void)sni; return -1; }
 
 void mbedtls_aes_init(mbedtls_aes_context *c) { (void)c; }
 void mbedtls_aes_free(mbedtls_aes_context *c) { (void)c; }
