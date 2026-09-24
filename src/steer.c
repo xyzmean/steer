@@ -33,6 +33,7 @@
 #include <time.h>
 
 #include "spec.h"
+#include "awg.h"
 #include "hwid.h"
 #include "obfs.h"
 #include "cli.h"
@@ -2309,6 +2310,9 @@ static int cmd_down(void) {
 #ifdef STEER_ANDROID
     android_masq_drop_all();
 #endif
+    /* Туннели kind=awg заводил движок — ему их и снимать; без этого интерфейс с ключами пира
+     * пережил бы выключение и продолжал бы отвечать на рукопожатия. */
+    awg_down_all();
     return 0;
 }
 
@@ -2332,7 +2336,9 @@ static int cmd_down(void) {
  *
  * Только наш помеченный трафик и только на устройствах выхода. Правила узнаются по маске
  * поля метки в тексте `iptables -S` — чужих с нашей маской не бывает. Выходы vless и xsteer
- * здесь не нужны: их устройство обслуживает наш процесс, адреса он переводит сам. */
+ * здесь не нужны: их устройство обслуживает наш процесс, адреса он переводит сам. Выход
+ * kind=awg — нужен, как interface: туннель в ядре несёт пакет с тем адресом источника, что
+ * был, а сервер WireGuard примет только адрес из своих AllowedIPs, то есть адрес туннеля. */
 static void android_masq_drop_all(void) {
     char mask[24];
     snprintf(mask, sizeof(mask), "/0x%x ", STEER_MARK_MASK);
@@ -2362,7 +2368,7 @@ static void android_masq_drop_all(void) {
 static void android_masq_ensure(void) {
     for (size_t i = 0; i < g_out_n; i++) {
         const struct output *o = &g_out[i];
-        if (o->kind != OUT_INTERFACE) continue;
+        if (o->kind != OUT_INTERFACE && o->kind != OUT_AWG) continue;
         char mk[32];
         snprintf(mk, sizeof(mk), "0x%x/0x%x", o->mark, STEER_MARK_MASK);
         for (size_t k = 0; k < o->devices_n; k++) {
@@ -2384,7 +2390,7 @@ static void android_masq_sync(void) {
     android_masq_drop_all();
     for (size_t i = 0; i < g_out_n; i++) {
         const struct output *o = &g_out[i];
-        if (o->kind != OUT_INTERFACE) continue;
+        if (o->kind != OUT_INTERFACE && o->kind != OUT_AWG) continue;
         char mk[32];
         snprintf(mk, sizeof(mk), "0x%x/0x%x", o->mark, STEER_MARK_MASK);
         for (size_t k = 0; k < o->devices_n; k++) {
@@ -2592,7 +2598,10 @@ static int cmd_apply(const char *spec, int dry) {
     /* Ни одной группы — таблица всё равно ставится, с пустой цепочкой: так status
      * продолжает отвечать, а следующий apply не зависит от того, была ли таблица
      * раньше. */
-    if (dry) { generate(stdout); return 0; }
+    /* Файлы выходов kind=awg — проверяются и при --dry-run: им интерфейс проверяет спеку
+     * перед записью, и ошибка в файле туннеля должна быть видна тогда же, а не после
+     * применения. Предупреждением в stderr: набор правил от файла туннеля не зависит. */
+    if (dry) { awg_check_all(); generate(stdout); return 0; }
 
     /* Отказываем ДО транзакции и НАЗЫВАЕМ причину: иначе человек получит отказ всей
      * маршрутизации с сообщением про несуществующий файл. Пакет назван прямо — его же
@@ -2676,6 +2685,11 @@ static int cmd_apply(const char *spec, int dry) {
         return 1;
     }
     unlink(tmp);
+    /* Устройства выходов kind=awg — до привязки таблиц: apply_routing ставит маршрут в
+     * устройство, и устройства к этому мгновению обязаны быть (см. src/awg.c). Отказ одного
+     * туннеля не отменяет применённых правил: его таблица получит то же, что у любого выхода
+     * без устройства (blackhole при on_fail=drop), а причина уже названа в журнале. */
+    awg_apply_all();
     apply_routing();
 #ifdef STEER_ANDROID
     android_masq_sync();
@@ -2798,7 +2812,7 @@ static void status_emit(FILE *out) {
      * нулевой, и это тот же контракт, а не особый случай. */
     fprintf(out, "{\"schema\":1,\"at\":%ld,"
                  "\"features\":[\"lan_devices\",\"nodes\",\"pool\",\"active_device\","
-                 "\"status_cache\",\"xslink\",\"xsteer_state\",\"spec_schema2\"]",
+                 "\"status_cache\",\"xslink\",\"xsteer_state\",\"spec_schema2\",\"awg\"]",
             (long)time(NULL));
     /* Локальные устройства — следом: интерфейс показывает, с чего забирается трафик, и
      * без этого поля ему пришлось бы читать спеку вторым источником, то есть однажды
@@ -2882,6 +2896,8 @@ static void status_emit(FILE *out) {
                        ",\"listen\":\"%s:%d\"}",
                        g_out[i].obfs.server, g_out[i].obfs.server_port,
                        g_out[i].obfs.listen, g_out[i].obfs.listen_port);
+            /* Туннель kind=awg: рукопожатие, счётчики, эндпоинт — из ядра, см. awg_status_json. */
+            if (g_out[i].kind == OUT_AWG) awg_status_json(out, &g_out[i]);
         }
         /* Выход kind=zapret: устройства нет, поэтому и ветка своя. Печатается всё, что о
          * нём вообще можно знать снаружи, и ничего сверх того:

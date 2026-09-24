@@ -52,7 +52,7 @@ check "help КОМАНДА и КОМАНДА --help совпадают" "$a" "$b
 # Разделы справки идут подряд: «Диагностика:» печатается один раз, а не трижды (три команды
 # лежали среди VLESS и Telegram). И у --kind перечислены ВСЕ виды выходов, которые знает спека.
 check "help: раздел «Диагностика» один" "1" "$("$BIN" help 2>/dev/null | grep -c '^Диагностика:')"
-for k in direct interface vless xsteer zapret tgws; do
+for k in direct interface vless xsteer zapret tgws awg; do
     check "help outputs: --kind знает вид $k" "1" \
         "$("$BIN" help outputs 2>/dev/null | grep -c "только выходы этого вида:.*\b$k\b")"
 done

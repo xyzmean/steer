@@ -10,6 +10,7 @@
 #include <time.h>
 #include <arpa/inet.h>
 #include "spec.h"
+#include "awg.h"   /* имя устройства kind=awg — static inline, без awg.c */
 #include "obfs.h"
 
 /* Marks and tables live well away from what splify (0x40000/0x80000, tables
@@ -651,6 +652,7 @@ static const struct { const char *name; enum out_kind kind; } KINDS[] = {
     { "xsteer",    OUT_XSTEER },
     { "zapret",    OUT_ZAPRET },
     { "tgws",      OUT_TGWS },
+    { "awg",       OUT_AWG },
 };
 #define KINDS_N (sizeof(KINDS) / sizeof(KINDS[0]))
 
@@ -893,6 +895,39 @@ static void parse_outputs(struct js *j) {
                 die("outputs.%s: у kind tgws нет устройства — соединение перехватывается",
                     o.name);
         }
+        else if (!strcmp(kind, "awg")) {
+            /* Туннель AmneziaWG/WireGuard, который заводит сам движок (src/awg.c). В базовой
+             * сборке, а не в extended: ни TLS, ни mbedtls ему не нужны, только netlink. */
+            o.kind = OUT_AWG;
+            /* Устройство у выхода ОДНО — его создаёт этот выход. Пул из нескольких туннелей
+             * собирается выходом kind=interface, в devices которого названо и это устройство;
+             * список здесь означал бы устройства, которые никто не создаст. */
+            if (o.devices_n > 1 ||
+                (o.devices_n == 1 && o.device[0] && strcmp(o.device, o.devices[0]) != 0))
+                die("outputs.%s: у kind awg одно устройство — его заводит движок; пул "
+                    "собирается выходом kind=interface", o.name);
+            if (o.devices_n == 1 && !o.device[0])
+                snprintf(o.device, sizeof(o.device), "%s", o.devices[0]);
+            /* Имя устройства выбирает движок так, чтобы оно не выдавало туннель (см.
+             * awg_default_ifname в awg.h). Названное явно обязано тому же правилу: приложение
+             * видит имена интерфейсов, и «wg0» рядом с wlan0 — это ровно тот след, которого
+             * владелец просил не оставлять. */
+            if (o.device[0]) {
+                if (strlen(o.device) > 15)
+                    die("outputs.%s: имя устройства длиннее 15 символов", o.name);
+                if (awg_ifname_conspicuous(o.device))
+                    die("outputs.%s: имя устройства выдаёт туннель (tun, wg, awg, ppp, vpn…) — "
+                        "уберите device, и движок выберет имя сам", o.name);
+            } else awg_default_ifname(o.name, o.device, sizeof(o.device));
+            o.devices_n = 0;
+            snprintf(o.devices[o.devices_n++], 32, "%s", o.device);
+            /* Путь к файлу — тем же порядком, что у xsteer: по умолчанию из имени выхода, иначе
+             * абсолютный и годный к JSON (печатается в status и diag). */
+            if (!o.xs_conf[0])
+                snprintf(o.xs_conf, sizeof(o.xs_conf), STEER_ETC_DIR "/awg/%.200s.conf", o.name);
+            else if (o.xs_conf[0] != '/' || !label_ok(o.xs_conf))
+                die("outputs.%s: conf должен быть абсолютным путём без кавычек", o.name);
+        }
         else if (!strcmp(kind, "interface")) {
             o.kind = OUT_INTERFACE;
             /* device и devices описывают одно и то же с разных сторон: device — что
@@ -902,7 +937,7 @@ static void parse_outputs(struct js *j) {
             if (!o.device[0] && o.devices_n) snprintf(o.device, sizeof(o.device), "%s", o.devices[0]);
             if (!o.device[0]) die("outputs.%s: kind interface needs a device", o.name);
         } else die("outputs.%s: неизвестный kind "
-                   "(нужен direct, interface, vless, xsteer, zapret или tgws)", o.name);
+                   "(нужен direct, interface, vless, xsteer, zapret, tgws или awg)", o.name);
         /* Обфускация осмысленна только там, где транспорт — чужой UDP, до которого
          * движку не дотянуться иначе. У vless свой транспорт внутри движка (и свои
          * средства маскировки — Reality), у xsteer он свой и поддельный TCP уже внутри

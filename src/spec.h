@@ -136,7 +136,13 @@ static inline int l4match_empty(const struct l4match *m) {
  * postrouting), а таблица маршрутизации — нет: пакет уходит тем же маршрутом, что ушёл бы
  * без правила. Поэтому out_has_device про него ложь, а out_needs_mark — правда, и это первый
  * вид, у которого две эти вещи разошлись. */
-enum out_kind { OUT_DIRECT, OUT_INTERFACE, OUT_VLESS, OUT_XSTEER, OUT_ZAPRET, OUT_TGWS };
+/* awg — туннель AmneziaWG/WireGuard в ядре, который создаёт и настраивает сам движок (src/awg.c,
+ * зачем — в шапке src/awg.h). Для остальной части движка это выход С УСТРОЙСТВОМ, как
+ * interface: метка, таблица, masquerade. Отличие — чья жизнь устройства: его заводит apply и
+ * снимает down, поэтому out_engine_managed про него правда (ifdown/ifup netifd бесполезны), а
+ * out_self_natting — ложь: адреса клиентов уходят в туннель как есть и переводятся в адрес
+ * туннеля, ровно как у wireguard под netifd. */
+enum out_kind { OUT_DIRECT, OUT_INTERFACE, OUT_VLESS, OUT_XSTEER, OUT_ZAPRET, OUT_TGWS, OUT_AWG };
 
 /* Что делать с трафиком выхода, когда ни одно его устройство не работает.
  *
@@ -238,6 +244,9 @@ struct output {
      * имени выхода — держать два имени, которым позволено разойтись, незачем (то же
      * решение, что с device). */
     char xs_conf[256];
+    /* У kind=awg в том же поле — путь к файлу awg-quick/wg-quick (ключ спеки тот же, `conf`, и
+     * довод тот же: ключи в спеке не живут). Одно поле на два вида, а не второе рядом: вид у
+     * выхода один, и второе поле было бы пустым всегда, когда заполнено первое. */
     /* Режим потока для kind=xsteer: записи по НАСТОЯЩЕМУ TCP вместо поддельного (см.
      * ext/xsstream.h). Нужен там, где сырой сокет недоступен — у провайдера, который его
      * режет, в контейнере без CAP_NET_RAW, — и там, где хаб держит только этот режим.
@@ -368,7 +377,8 @@ extern const char *g_rt_tables_d;
  * иначе добавление нового вида требовало бы найти их все, а забытое место означало бы
  * выход, который настроен, но не маршрутизируется. */
 static inline int out_has_device(const struct output *o) {
-    return o->kind == OUT_INTERFACE || o->kind == OUT_VLESS || o->kind == OUT_XSTEER;
+    return o->kind == OUT_INTERFACE || o->kind == OUT_VLESS || o->kind == OUT_XSTEER
+        || o->kind == OUT_AWG;
 }
 
 /* Выход, которому нужна СВОЯ МЕТКА, чтобы его трафик можно было узнать в ядре.
@@ -383,7 +393,7 @@ static inline int out_has_device(const struct output *o) {
  * direct метки не получает по-прежнему: заявлять пакет ничем не нужно, он и так идёт туда. */
 static inline int out_needs_mark(const struct output *o) {
     return o->kind == OUT_INTERFACE || o->kind == OUT_VLESS || o->kind == OUT_XSTEER
-        || o->kind == OUT_ZAPRET || o->kind == OUT_TGWS;
+        || o->kind == OUT_ZAPRET || o->kind == OUT_TGWS || o->kind == OUT_AWG;
 }
 
 /* Выход, которому нужна метка СОЕДИНЕНИЯ, а не только метка пакета.
@@ -421,7 +431,7 @@ static inline int out_needs_ctmark(const struct output *o) {
  * «Interface … not found», и на живом роутере это вечный холостой цикл в журнале), а
  * поднимает замену procd. */
 static inline int out_engine_managed(const struct output *o) {
-    return o->kind == OUT_VLESS || o->kind == OUT_XSTEER;
+    return o->kind == OUT_VLESS || o->kind == OUT_XSTEER || o->kind == OUT_AWG;
 }
 
 /* Выход, которому masquerade не нужен: наружу он ходит от своего имени.
