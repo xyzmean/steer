@@ -1,0 +1,46 @@
+// steer for the Android platform build (DerpFest 16.2 / lineage-23.2).
+//
+// The base engine only: the same ten sources as the Makefile's build/steer
+// target, compiled with -DSTEER_ANDROID (mark field above netd's bits,
+// ip rule priorities below netd's ladder, directories under /data/misc/steer,
+// see src/spec.h). It calls `nft -f` and `ip` as external programs, so it is
+// installed next to `nft` (external/nftables) and gets both through the PATH
+// its init service sets.
+//
+// Installed in system_ext/bin/der/ rather than system_ext/bin/: every domain
+// may list /system_ext/bin (system_file:dir r_dir_perms), and the directory
+// der/ carries its own SELinux label that apps cannot search, so neither the
+// name nor the attributes of the binary are visible to them. See
+// vendor/der/sepolicy.
+//
+// The extended engine (src/ext: VLESS client, xsteer, tgws) is NOT built here:
+// it needs mbedtls 3.x, which the platform does not ship. See the notes in
+// vendor/der/README.md.
+
+cc_binary {
+    name: "steer",
+    system_ext_specific: true,
+    relative_install_path: "der",
+    srcs: [
+        "src/steer.c",
+        "src/spec.c",
+        "src/dnsd.c",
+        "src/failover.c",
+        "src/aggregate.c",
+        "src/obfs.c",
+        "src/cli.c",
+        "src/srs.c",
+        "src/puff.c",
+        "src/hwid.c",
+    ],
+    cflags: [
+        "-DSTEER_ANDROID",
+        // Keep in step with VERSION (build.sh and the Makefile read it from
+        // there; Soong cannot read a file into a define).
+        "-DSTEER_VERSION=\"1.5.8\"",
+    ],
+    // No binary with steer's name should linger in a symbol table either.
+    strip: {
+        all: true,
+    },
+}
