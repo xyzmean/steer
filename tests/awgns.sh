@@ -240,7 +240,10 @@ nft add rule inet awgvia post oifname ux0 udp dport 51820 counter
 check "via: apply проходит" "0" "$?"
 omark() { st | grep -o "\"$1\":{[^}]*" | grep -o '"mark":"0x[0-9a-f]*"' | cut -d'"' -f4; }
 uxmark="$(omark ux)"; nlmark="$(omark nl)"
-check "via: метка сокета туннеля — метка выхода ux" "$(printf '0x%x' "$((uxmark))")" \
+# У Android-сборки к метке цели добавлен бит «собственный трафик туннеля» (STEER_TUNNEL_BIT,
+# 0x10000000): по нему заворот DNS приложений пропускает туннель через via.
+tunbit=0; [ "${AWG_FWMARK:-off}" != off ] && tunbit=$((0x10000000))
+check "via: метка сокета туннеля — метка выхода ux" "$(printf '0x%x' "$((uxmark | tunbit))")" \
       "$(wg show nl fwmark 2>/dev/null)"
 check "via: status называет цель" "1" "$(st | grep -o '"nl":{[^}]*' | grep -c '"via":"ux"')"
 ping -q -c 3 -W 2 -m "$((nlmark))" -I 10.77.0.2 198.51.100.1 >"$tmp/ping.out" 2>&1

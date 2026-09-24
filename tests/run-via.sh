@@ -24,7 +24,8 @@
 #
 # Затем — отказ цели (vx0 лёг — сторож объявляет нерабочим и vl, ожил — возвращает тем же
 # проходом) и контроль, без которого первая часть ничего не доказывает: тот же выход без via
-# обязан ходить к серверу через WAN. Последняя часть — пример владельца, WireGuard внутри VLESS:
+# обязан ходить к серверу через WAN. В режиме android последняя часть — сервер VLESS на 53-м
+# порту при доменном канале телефона: заворот DNS приложений не должен забирать туннель через via. Последняя часть — пример владельца, WireGuard внутри VLESS:
 # выход awg с via на vl, то есть цепочка nl → vl → vx из трёх выходов, с настоящим пиром
 # WireGuard за сервером VLESS (fake-vless.py --udp-relay пересылает UDP по адресу из запроса);
 # без wg или модуля wireguard эта часть пропускается вслух.
@@ -200,10 +201,14 @@ src=$(inS ss -tnH state established "( sport = :$PORT )" | awk '{print $4}' | se
 case "$src" in *10.71.0.2*) ok "сервер видит клиента с адреса vx0 ($src)" ;;
                 *) bad "сервер видит клиента с $src, а не с 10.71.0.2" ;; esac
 # Метка сокета туннеля — метка выхода vx из реестра (ss печатает её как fwmark).
+# На телефоне к метке цели добавлен бит «собственный трафик туннеля» (STEER_TUNNEL_BIT,
+# 0x10000000): по нему заворот DNS приложений пропускает туннель через via (часть 5).
 mk_of() { awk -v n="$1" '$1==n{print $2}' "$WORK/state/registry" | sed 's/^0*//'; }
+TUNBIT=0; [ "$MODE" = android ] && TUNBIT=$((0x10000000))
+sock_mk() { printf '%x' "$((0x$(mk_of "$1") | TUNBIT))"; }
 fwm=$(inA ss -tneH "( dport = :$PORT )" 2>/dev/null | grep -o 'fwmark:0x[0-9a-f]*' | sort -u | tr '\n' ' ')
-case "$fwm" in *"fwmark:0x$(mk_of vx)"*) ok "сокет туннеля несёт метку vx ($fwm)" ;;
-               *) bad "метка сокета туннеля $fwm, а у vx 0x$(mk_of vx)" ;; esac
+case "$fwm" in *"fwmark:0x$(sock_mk vx)"*) ok "сокет туннеля несёт метку vx ($fwm)" ;;
+               *) bad "метка сокета туннеля $fwm, а у vx 0x$(sock_mk vx)" ;; esac
 if [ "$MODE" = android ]; then
     if inA iptables -w -t nat -S POSTROUTING | grep -q -- '-o vx0 .*MASQUERADE'; then
         ok "masquerade на vx0 (iptables)"; else bad "masquerade на vx0 не встал"; fi
@@ -291,7 +296,7 @@ SPEC
     if inA "$BIN" apply --spec "$WORK/spec.json" --state-dir "$WORK/state" > "$WORK/apply3.log" 2>&1
     then ok "awg: apply цепочки nl → vl → vx"; else bad "awg: apply"; sed 's/^/    /' "$WORK/apply3.log"; fi
     start_vless || { bad "awg: устройство vl не поднялось"; sed 's/^/    /' "$WORK/tun.log"; }
-    mk_hex() { printf '0x%x' "$((0x$(mk_of "$1")))"; }
+    mk_hex() { printf '0x%x' "$((0x$(mk_of "$1") | TUNBIT))"; }
     [ "$(inA wg show nl fwmark 2>/dev/null)" = "$(mk_hex vl)" ] && ok "awg: метка сокета туннеля — метка vl" \
         || bad "awg: fwmark $(inA wg show nl fwmark 2>/dev/null), у vl $(mk_hex vl)"
     cnt_zero
@@ -308,6 +313,43 @@ SPEC
     inA "$BIN" down --state-dir "$WORK/state" >/dev/null 2>&1 || true
 else
     echo "  skip awg через vl: нет wg или модуля wireguard"
+fi
+
+# ---- 5. телефон: заворот DNS не забирает туннель через via ------------------------------
+# Сервер туннеля на 53-м порту (его и выбирают, чтобы пройти там, где режут остальное). На
+# телефоне с доменным каналом стоит заворот DNS приложений на output, и пропускал он только
+# значение «сам движок» — а сокет туннеля через via несёт метку цели. Заворот забирал соединение
+# VLESS к резолверу движка, и туннель не вставал. Теперь сокет несёт ещё бит «собственный трафик
+# туннеля» (STEER_TUNNEL_BIT), и заворот его пропускает. Доменный канал здесь только ради самого
+# заворота: резолвер не запущен, и забранное соединение упёрлось бы в пустой порт.
+if [ "$MODE" = android ]; then
+    inS python3 tests/fake-vless.py --port 53 --uuid $UUID --mb $MB --bind $NODE \
+        > "$WORK/srv53.log" 2>&1 &
+    sleep 1
+    printf '%s\n' "vless://$UUID@$NODE:53?security=none&type=tcp#p53" > "$WORK/sub53.txt"
+    printf 'example.com\n' > "$WORK/d.lst"
+    cat > "$WORK/spec.json" <<SPEC
+{"schema":2,"lan_devices":["$LAN_DEV"],
+ "outputs":{
+   "vx":{"kind":"interface","device":"vx0","on_fail":"drop"},
+   "vl":{"kind":"vless","sub_file":"$WORK/sub53.txt","node":0,"via":"vx"}},
+ "channels":[{"name":"d","out":"vx","from":[$FROM],"match":{"domains_files":["$WORK/d.lst"]}},
+             {"name":"all","out":"vl","scope":"device","from":[$FROM],"match":{"any":true}}]}
+SPEC
+    inA nft add rule inet viacnt post oifname '"vx0"' ip daddr $NODE tcp dport 53 counter comment '"node53-vx0"'
+    if inA "$BIN" apply --spec "$WORK/spec.json" --state-dir "$WORK/state" > "$WORK/apply5.log" 2>&1
+    then ok "53: apply с доменным каналом телефона и via"; else bad "53: apply"; sed 's/^/    /' "$WORK/apply5.log"; fi
+    [ "$(inA nft list ruleset | grep -c 'steer-dns-local')" -gt 0 ] && ok "53: заворот DNS приложений стоит" \
+        || bad "53: заворота DNS нет — часть ничего не проверяет"
+    start_vless || { bad "53: устройство vl не поднялось"; sed 's/^/    /' "$WORK/tun.log"; }
+    cnt_zero
+    if fetch; then ok "53: канал через vl, сервер VLESS на 53-м порту: скачано $MB МБ"
+    else bad "53: скачано $got байт — соединение туннеля забрал заворот DNS?"; sed 's/^/    /' "$WORK/tun.log" | tail -5; fi
+    n53=$(cnt node53-vx0)
+    [ "${n53:-0}" -gt 0 ] && ok "53: соединение с сервером ушло в vx0 ($n53 пакетов)" \
+        || bad "53: к серверу на 53-м порту в vx0 — ноль"
+    PORT=53 stop_vless
+    inA "$BIN" down --state-dir "$WORK/state" >/dev/null 2>&1 || true
 fi
 
 echo "run-via ($MODE): $pass passed, $fail failed"

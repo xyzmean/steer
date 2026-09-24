@@ -434,7 +434,12 @@ int main(void) {
         check("без via — метка «сам движок» (на роутере 0)", 0, awg_sock_mark(NULL, &mk));
         check("  значение", (long)self, (long)mk);
         check("via на выход с меткой — его метка", 0, awg_sock_mark("up", &mk));
+#ifdef STEER_TUNNEL_BIT
+        /* Телефон: к метке цели — бит «собственный трафик туннеля» (заворот DNS его пропускает). */
+        check("  значение (с битом туннеля)", 0x10300000, (long)mk);
+#else
         check("  значение", 0x00300000, (long)mk);
+#endif
         check("via на direct — как без via", 0, (awg_sock_mark("d", &mk), (long)(mk != self)));
         check("via на несуществующий выход — отказ", -1, awg_sock_mark("nope", &mk));
     }

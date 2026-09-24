@@ -584,6 +584,13 @@ static int has_local_domains(void) {
     return 0;
 }
 
+/* Есть ли в спеке туннель через via — тогда его сокет несёт STEER_TUNNEL_BIT, и заворот DNS
+ * обязан его пропускать (см. emit_local_dns_redirect). */
+static int has_via(void) {
+    for (size_t i = 0; i < g_out_n; i++) if (g_out[i].via[0]) return 1;
+    return 0;
+}
+
 /* ---- DNS приложений телефона — к резолверу движка -------------------------------------
  *
  * Доменный канал на сам телефон видит только те имена, что спросили через наш резолвер. DNS
@@ -613,8 +620,9 @@ static int has_local_domains(void) {
 
 /* Само правило заворота — одно на всех раскладках и семействах (по правилу на протокол).
  *
- * Всех, кроме собственного запроса резолвера наверх (STEER_SELF_MARK): DnsResolver шлёт
- * запросы приложений от root. Метка «сам движок» у переспроса по TCP та же, что по UDP
+ * Всех, кроме собственного запроса резолвера наверх (STEER_SELF_MARK) и собственного трафика
+ * туннелей (без via — тот же STEER_SELF_MARK, с via — STEER_TUNNEL_BIT, см. ниже): DnsResolver
+ * шлёт запросы приложений от root, поэтому по UID отличить нельзя. Метка «сам движок» у переспроса по TCP та же, что по UDP
  * (tcpu_open в dnsd.c).
  *
  * `ct mark set mark` — чтобы резолвер узнал метку сети исходного запроса: на 4.9 принятому сокету
@@ -630,13 +638,22 @@ static int has_local_domains(void) {
  * значит. Смешать метку пакета со старой ct mark (`ct mark and … or mark`) на 4.9 нельзя вовсе:
  * там нет bitwise двух регистров. Цепочка nat видит только первый пакет соединения — ровно тот
  * момент, когда метку и надо запомнить. */
+/* Туннели через via — тоже мимо заворота. Сокет наверх такого туннеля несёт метку ЦЕЛИ, а не
+ * «сам движок», и у сервера на 53-м порту (UDP или TCP — их и выбирают, чтобы пройти там, где
+ * режут остальное) заворот забрал бы соединение туннеля к нашему резолверу: туннель не встал бы
+ * вовсе. Пропуск — по биту STEER_TUNNEL_BIT, который такой сокет несёт рядом с меткой цели (почему
+ * бит, а не UID помощника, — у определения в spec.h). Условие пишется только в спеке с via: у
+ * остальных текст правил остаётся прежним побайтно, а бита там не ставит никто. */
 static void emit_local_dns_redirect(FILE *f) {
-    fprintf(f, "        meta mark and 0x%08x != 0x%08x udp dport 53 ct mark set mark counter "
+    char tun[64] = "";
+    if (has_via())
+        snprintf(tun, sizeof(tun), "meta mark and 0x%08x == 0x00000000 ", STEER_TUNNEL_BIT);
+    fprintf(f, "        meta mark and 0x%08x != 0x%08x %sudp dport 53 ct mark set mark counter "
                "redirect to :%d comment \"steer-dns-local\"\n",
-            STEER_MARK_MASK, STEER_SELF_MARK, DNS_PORT);
-    fprintf(f, "        meta mark and 0x%08x != 0x%08x tcp dport 53 ct mark set mark counter "
+            STEER_MARK_MASK, STEER_SELF_MARK, tun, DNS_PORT);
+    fprintf(f, "        meta mark and 0x%08x != 0x%08x %stcp dport 53 ct mark set mark counter "
                "redirect to :%d comment \"steer-dns-local-tcp\"\n",
-            STEER_MARK_MASK, STEER_SELF_MARK, DNS_PORT);
+            STEER_MARK_MASK, STEER_SELF_MARK, tun, DNS_PORT);
 }
 
 static void emit_local_dns(FILE *f, const char *dnat_kw) {

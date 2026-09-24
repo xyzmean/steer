@@ -172,6 +172,28 @@ spec_bad "диапазон UID в правиле на устройство — �
 { "schema": 2, "outputs": { "vpn": { "kind": "interface", "device": "wg0" } },
   "channels": [ { "name": "a", "scope": "device", "from": ["uid:10100-10200"], "match": { "prefixes_file": "$tmp/a.lst" }, "out": "vpn" } ] }
 EOF2
+# Туннель через via: его сокет несёт метку цели плюс бит «собственный трафик туннеля»
+# (STEER_TUNNEL_BIT, 0x10000000), и заворот DNS приложений обязан его пропускать — иначе туннель
+# с сервером на 53-м порту (UDP или TCP) уходил бы к нашему резолверу и не вставал. Условие
+# пишется только в спеке с via: без via текст правил прежний побайтно (проверки выше).
+sed 's|"outputs": { "vpn": { "kind": "interface", "device": "wg0" } }|"outputs": { "vpn": { "kind": "interface", "device": "wg0" }, "nl": { "kind": "awg", "conf": "/nonexistent/nl.conf", "via": "vpn" } }|' \
+    "$tmp/loc2.json" > "$tmp/via.json"
+mv3="$(STEER_NFT_COMPAT=modern "$BIN" apply --dry-run --spec "$tmp/via.json" --state-dir "$tmp/state" 2>/dev/null)"
+lv3="$(STEER_NFT_COMPAT=legacy-min "$BIN" apply --dry-run --spec "$tmp/via.json" --state-dir "$tmp/state" 2>/dev/null)"
+vdns='meta mark and 0x0fc00000 != 0x0fc00000 meta mark and 0x10000000 == 0x00000000 udp dport 53 ct mark set mark counter redirect to :5300'
+vtcp='meta mark and 0x0fc00000 != 0x0fc00000 meta mark and 0x10000000 == 0x00000000 tcp dport 53 ct mark set mark counter redirect to :5300'
+check "via: заворот UDP/53 пропускает туннель (бит 0x10000000)" "1" "$(c "$mv3" "$vdns")"
+check "via: заворот TCP/53 пропускает туннель" "1" "$(c "$mv3" "$vtcp")"
+check "via: и на старой раскладке, в таблице ip" "2" \
+    "$(printf '%s\n' "$lv3" | sed -n '/^table ip steer/,/^}/p' | grep -c -- 'meta mark and 0x10000000 == 0x00000000 [ut][dc]p dport 53')"
+check "без via бита туннеля в правилах нет" "0" "$(c "$m2$l2" '0x10000000')"
+# Ядро машины разработки принимает такое правило (ядро 4.9 — стенд local49 на vm49).
+if [ "$(id -u)" = 0 ] && command -v nft >/dev/null 2>&1 && unshare -n true 2>/dev/null; then
+    printf '%s\n' "$mv3" > "$tmp/via.nft"
+    unshare -n nft -c -f "$tmp/via.nft" >/dev/null 2>"$tmp/via.err"
+    check "via: nft -c принимает правила с битом туннеля" "0" "$?"
+fi
+
 ROUTER="${ROUTER:-./build/steer}"
 if [ -x "$ROUTER" ]; then
     "$ROUTER" apply --dry-run --spec "$tmp/local.json" --state-dir "$tmp/state" >/dev/null 2>"$tmp/r.err"

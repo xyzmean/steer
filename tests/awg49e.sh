@@ -200,7 +200,10 @@ EOF
 steer apply $S >$T/apply5.out 2>&1
 check "via: apply проходит" "0" "$?"
 omark() { st | grep -o "\"$1\":{[^}]*" | grep -o '"mark":"0x[0-9a-f]*"' | cut -d'"' -f4; }
-check "via: метка сокета туннеля — метка выхода ux" "$(printf '0x%x' "$(($(omark ux)))")" \
+# У Android-сборки к метке цели добавлен бит «собственный трафик туннеля» (STEER_TUNNEL_BIT,
+# 0x10000000): по нему заворот DNS приложений пропускает туннель через via.
+tunbit=0; [ "$want_fw" != off ] && tunbit=$((0x10000000))
+check "via: метка сокета туннеля — метка выхода ux" "$(printf '0x%x' "$(($(omark ux) | tunbit))")" \
       "$(awg show nl fwmark)"
 cping 3
 check "via: клиент раздачи → 198.51.100.1 через awg, awg — через ux" "0" "$?"
