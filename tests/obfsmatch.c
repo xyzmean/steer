@@ -328,7 +328,17 @@ int main(void) {
         memset(longname, 'a', sizeof(longname) - 1);
         longname[sizeof(longname) - 1] = '\0';
         chain_name('o', longname, c, sizeof(c));
-        check("цепочка: длинное имя обрезано по буферу", 63, (long)strlen(c));
+        check("цепочка: длинное имя — не длиннее 31 символа (предел ядра 4.9)", 31, (long)strlen(c));
+        /* Выход в 29 символов даёт цепочку ровно в 31 — она остаётся как была. */
+        chain_name('o', "abcdefghijklmnopqrstuvwxyz012", c, sizeof(c));
+        check_str("цепочка: имя в 31 символ не тронуто", "o_abcdefghijklmnopqrstuvwxyz012", c);
+        /* Два длинных выхода с общим началом — разные цепочки: иначе выход одного процесса
+         * снимал бы правило против RST у другого. */
+        char c2[64];
+        chain_name('o', "abcdefghijklmnopqrstuvwxyz0123", c, sizeof(c));
+        chain_name('o', "abcdefghijklmnopqrstuvwxyz0124", c2, sizeof(c2));
+        check("цепочка: длинные имена с общим началом различаются", 1, (long)(strcmp(c, c2) != 0));
+        check("цепочка: и каждое не длиннее 31", 31, (long)strlen(c2));
         /* Буква вида различает цепочки обфускатора и xsteer в ОДНОЙ таблице. Без неё
          * выход из одного процесса снимал бы правило против RST у другого — и тот
          * продолжал бы работать, пока его сессии не начнёт рвать собственное ядро. */
