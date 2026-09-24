@@ -21,22 +21,22 @@ DEFS    := -DSTEER_VERSION='"$(VERSION)"' $(if $(REV),-DSTEER_REV='"$(REV)"',)
 all: $(BUILD)/steer
 
 $(BUILD)/steer: src/steer.c src/spec.c src/dnsd.c src/failover.c src/aggregate.c \
-                src/obfs.c src/cli.c src/srs.c src/puff.c src/hwid.c src/spec.h src/obfs.h \
+                src/obfs.c src/cli.c src/srs.c src/puff.c src/hwid.c src/ctl.c src/ctl.h src/spec.h src/obfs.h \
                 src/cli.h src/srs.h src/puff.h src/hwid.h src/paths.h VERSION
 	@mkdir -p $(BUILD)
 	$(CC) $(CFLAGS) $(DEFS) -o $@ src/steer.c src/spec.c src/dnsd.c src/failover.c \
-	      src/aggregate.c src/obfs.c src/cli.c src/srs.c src/puff.c src/hwid.c
+	      src/aggregate.c src/obfs.c src/cli.c src/srs.c src/puff.c src/hwid.c src/ctl.c
 
 # Сборка под Android — тот же движок с -DSTEER_ANDROID: своё поле метки (биты 22-27, в 0-21
 # пишет netd), свои каталоги (/data/misc/steer) и приоритет ip rule ниже лестницы netd. Здесь
 # она собирается хостовым компилятором ради стенда androidmatch: он проверяет, что сборка
 # вообще компилируется и что поле и пути у неё свои. Настоящая сборка под телефон — не здесь.
 $(BUILD)/steer-android: src/steer.c src/spec.c src/dnsd.c src/failover.c src/aggregate.c \
-                        src/obfs.c src/cli.c src/srs.c src/puff.c src/hwid.c src/spec.h \
+                        src/obfs.c src/cli.c src/srs.c src/puff.c src/hwid.c src/ctl.c src/ctl.h src/spec.h \
                         src/obfs.h src/cli.h src/srs.h src/puff.h src/hwid.h src/paths.h VERSION
 	@mkdir -p $(BUILD)
 	$(CC) $(CFLAGS) $(DEFS) -DSTEER_ANDROID -o $@ src/steer.c src/spec.c src/dnsd.c \
-	      src/failover.c src/aggregate.c src/obfs.c src/cli.c src/srs.c src/puff.c src/hwid.c
+	      src/failover.c src/aggregate.c src/obfs.c src/cli.c src/srs.c src/puff.c src/hwid.c src/ctl.c
 
 test: all ext-syntax $(BUILD)/steer-android $(BUILD)/tgwssim $(BUILD)/dnsmatch $(BUILD)/specmatch $(BUILD)/specmatch-ext $(BUILD)/xswirematch $(BUILD)/xsconnmatch $(BUILD)/xsstreammatch $(BUILD)/tungromatch $(BUILD)/tunnelmatch $(BUILD)/tunnamematch $(BUILD)/xsconfmatch $(BUILD)/xslinkmatch $(BUILD)/xsroutematch $(BUILD)/chellomatch $(BUILD)/failovermatch $(BUILD)/dcmatch $(BUILD)/msgsplitmatch $(BUILD)/warmmatch $(BUILD)/upmatch $(BUILD)/tgwsfailmatch $(BUILD)/h2match $(BUILD)/xhupmatch $(BUILD)/submatch $(BUILD)/subfetchmatch $(BUILD)/fwmatch $(BUILD)/obfsmatch $(BUILD)/visionmatch $(BUILD)/tlsprobematch $(BUILD)/diagsim $(BUILD)/hwidsum
 	@sh tests/run.sh
@@ -49,6 +49,7 @@ test: all ext-syntax $(BUILD)/steer-android $(BUILD)/tgwssim $(BUILD)/dnsmatch $
 	@sh tests/applynft-legacy.sh
 	@sh tests/androidmatch.sh
 	@sh tests/supervisematch.sh
+	@sh tests/ctlmatch.sh
 	@sh tests/diagmatch.sh
 	@sh tests/statusmatch.sh
 	@sh tests/buildmatch.sh
@@ -88,11 +89,11 @@ test: all ext-syntax $(BUILD)/steer-android $(BUILD)/tgwssim $(BUILD)/dnsmatch $
 # Проверяется не мост, а ruleset рядом с полным движком: свой бит метки, свой порт, свой ряд
 # таблиц, чужой реестр.
 $(BUILD)/tgwssim: src/steer.c src/spec.c src/dnsd.c src/failover.c src/aggregate.c \
-                  src/obfs.c src/cli.c src/srs.c src/puff.c src/hwid.c src/spec.h src/cli.h \
+                  src/obfs.c src/cli.c src/srs.c src/puff.c src/hwid.c src/ctl.c src/ctl.h src/spec.h src/cli.h \
                   src/paths.h tests/tgws-stub.c VERSION
 	@mkdir -p $(BUILD)
 	$(CC) $(CFLAGS) $(DEFS) -DSTEER_TGWS -o $@ src/steer.c src/spec.c src/dnsd.c \
-	      src/failover.c src/aggregate.c src/obfs.c src/cli.c src/srs.c src/puff.c src/hwid.c \
+	      src/failover.c src/aggregate.c src/obfs.c src/cli.c src/srs.c src/puff.c src/hwid.c src/ctl.c \
 	      tests/tgws-stub.c
 
 # Движок, собранный как расширенный, но без самой расширенной части: нужен стенду
@@ -100,11 +101,11 @@ $(BUILD)/tgwssim: src/steer.c src/spec.c src/dnsd.c src/failover.c src/aggregate
 # проверять диагностику интереснее всего именно на VLESS-выходе. Три подкоманды
 # расширенной сборки заменены заглушками — см. tests/vless-stub.c.
 $(BUILD)/diagsim: src/steer.c src/spec.c src/dnsd.c src/failover.c src/aggregate.c \
-                  src/obfs.c src/cli.c src/srs.c src/puff.c src/hwid.c src/spec.h src/cli.h \
+                  src/obfs.c src/cli.c src/srs.c src/puff.c src/hwid.c src/ctl.c src/ctl.h src/spec.h src/cli.h \
                   src/srs.h src/puff.h src/hwid.h src/paths.h tests/vless-stub.c
 	@mkdir -p $(BUILD)
 	$(CC) $(CFLAGS) $(DEFS) -DSTEER_EXTENDED -o $@ src/steer.c src/spec.c src/dnsd.c \
-	      src/failover.c src/aggregate.c src/obfs.c src/cli.c src/srs.c src/puff.c src/hwid.c \
+	      src/failover.c src/aggregate.c src/obfs.c src/cli.c src/srs.c src/puff.c src/hwid.c src/ctl.c \
 	      tests/vless-stub.c
 
 # SHA-256 движка против sha256sum оболочки. Отдельная цель, потому что стенду нужен ПОЛНЫЙ
@@ -214,11 +215,11 @@ $(BUILD)/failovermatch: tests/failovermatch.c src/failover.c
 # nft, и проверить эвристику можно только примерами. Стенд включает исходник движка и
 # подменяет popen на чтение из памяти — см. tests/fwmatch.c.
 $(BUILD)/fwmatch: tests/fwmatch.c src/steer.c src/spec.c src/dnsd.c src/failover.c \
-                  src/aggregate.c src/obfs.c src/cli.c src/srs.c src/puff.c src/hwid.c \
+                  src/aggregate.c src/obfs.c src/cli.c src/srs.c src/puff.c src/hwid.c src/ctl.c \
                   src/spec.h src/cli.h src/srs.h
 	@mkdir -p $(BUILD)
 	$(CC) $(CFLAGS) -o $@ tests/fwmatch.c src/spec.c src/dnsd.c src/failover.c \
-	      src/aggregate.c src/obfs.c src/cli.c src/srs.c src/puff.c src/hwid.c
+	      src/aggregate.c src/obfs.c src/cli.c src/srs.c src/puff.c src/hwid.c src/ctl.c
 
 # Управление потоком HTTP/2 проверяется в памяти: h2.c общается с сетью только через
 # struct h2_io, поэтому стенд подменяет его целиком. -Itests/stub нужен, чтобы не тянуть

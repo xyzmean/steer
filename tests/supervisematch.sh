@@ -7,7 +7,9 @@
 #
 # Что проверяется: по помощнику на выход с процессом; убитый помощник перезапускается; SIGHUP
 # после удаления выхода из спеки гасит его помощника и не трогает остальных; SIGHUP с
-# новым выходом поднимает его; SIGTERM гасит всех и завершает супервизор.
+# новым выходом поднимает его; SIGHUP со сменой параметров выхода (сервер обфускации)
+# перезапускает его помощника сразу и не трогает соседей, а SIGHUP без изменений не трогает
+# никого; SIGTERM гасит всех и завершает супервизор.
 set -u
 BIN="${STEER:-./build/steer}"
 [ -x "$BIN" ] || { echo "not built: $BIN (make test)"; exit 2; }
@@ -27,12 +29,14 @@ trap 'echo "stop \$2 \$\$" >> "$tmp/log"; sleep 2; exit 0' TERM
 while :; do sleep 1; done
 H
 chmod +x "$tmp/helper"
-spec() {   # spec ВЫХОД... — выходы с obfs
+spec() {   # spec ВЫХОД... — выходы с obfs; у выхода $CHG другой сервер обфускации
     printf '{"schema":2,"from_default":["192.168.1.0/24"],"outputs":{' > "$tmp/spec.json"
     sep=""
     for o in "$@"; do
-        printf '%s"%s":{"kind":"interface","device":"wg%s","obfs":{"mode":"wg-over-tcp","server":"10.99.0.3:4443","listen":"127.0.0.1:5%s"}}' \
-            "$sep" "$o" "${#o}" "$(printf '%04d' "${#o}")" >> "$tmp/spec.json"
+        srv=10.99.0.3:4443
+        [ "$o" = "${CHG:-}" ] && srv=10.99.0.4:4443
+        printf '%s"%s":{"kind":"interface","device":"wg%s","obfs":{"mode":"wg-over-tcp","server":"%s","listen":"127.0.0.1:5%s"}}' \
+            "$sep" "$o" "${#o}" "$srv" "$(printf '%04d' "${#o}")" >> "$tmp/spec.json"
         sep=","
     done
     printf '},"channels":[]}\n' >> "$tmp/spec.json"
@@ -87,6 +91,22 @@ for pid in $(grep '^obfs ccc ' "$tmp/log" | cut -d' ' -f3); do kill -0 "$pid" 2>
 check "возвращённый выход, пока прежний гаснет, — не второй экземпляр рядом" "1" "$live"
 wait_for '[ "$(running ccc)" = 2 ] && [ "$(alive ccc)" = yes ]' 10
 check "  и после выхода прежнего поднят заново" "2 yes" "$(running ccc) $(alive ccc)"
+
+# Сменился сервер обфускации у bb: его помощник перезапускается — сразу после выхода прежнего
+# (тот гаснет две секунды), а не через пятисекундную паузу упавшего; ccc не тронут.
+bb_pid="$(grep '^obfs bb ' "$tmp/log" | tail -1 | cut -d' ' -f3)"
+CHG=bb spec bb ccc
+kill -HUP $SUP
+wait_for '[ "$(running bb)" = 2 ]' 4
+check "SIGHUP: параметры bb изменились — помощник поднят заново за 4 с" "2 yes" \
+    "$(running bb) $(alive bb)"
+check "  прежний помощник bb погашен" "no" "$(kill -0 "$bb_pid" 2>/dev/null && echo yes || echo no)"
+check "  ccc не тронут" "2 yes" "$(running ccc) $(alive ccc)"
+check "  и о причине сказано" "1" "$(grep -c 'supervise: obfs bb — параметры выхода изменились' "$tmp/sup.err")"
+# Та же спека ещё раз: подпись та же — никого не трогать.
+kill -HUP $SUP
+sleep 3
+check "SIGHUP без изменений: никто не перезапущен" "2 2" "$(running bb) $(running ccc)"
 
 kill -TERM $SUP
 wait_for '! kill -0 $SUP 2>/dev/null' 5

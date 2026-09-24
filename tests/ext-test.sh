@@ -291,7 +291,7 @@ $CC -O2 -w -Isrc $MBED_INC "$PRIV" -o "$BUILD/devupmatch" tests/devupmatch.c \
 echo "ext-test: собираю серверный бинарник для стенда зондирования..."
 $CC -O1 -w -Isrc $MBED_INC "$PRIV" -DSTEER_SERVER -o "$BUILD/steer-hub-native" \
 	src/steer.c src/spec.c src/dnsd.c src/failover.c src/aggregate.c src/obfs.c src/cli.c \
-	src/srs.c src/puff.c src/hwid.c \
+	src/srs.c src/puff.c src/hwid.c src/ctl.c \
 	src/ext/xswire.c src/ext/xsconf.c src/ext/xslink.c src/ext/xsroute.c src/ext/chello.c src/ext/xshake.c \
 	src/ext/xsconn.c src/ext/xsstream.c src/ext/xsepoch.c src/ext/tls13.c src/ext/certverify.c src/ext/reality.c \
 	src/ext/tun.c src/ext/h2.c src/ext/xsadmin.c src/ext/xshub.c \
