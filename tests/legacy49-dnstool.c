@@ -1,0 +1,50 @@
+/* Помощник стенда tests/legacy49.sh (ядро 4.9 в tools/vm49): поддельный вышестоящий DNS и
+ * клиент к нему. Python в initramfs стенда нет, поэтому оба — одной статической программой.
+ *   dnstool serve PORT A.B.C.D    — отвечает на любой A-запрос этим адресом (TTL 60)
+ *   dnstool ask SERVER PORT NAME  — печатает первый адрес ответа, «timeout» или «rcodeN» */
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/socket.h>
+#include <sys/time.h>
+#include <netinet/in.h>
+#include <arpa/inet.h>
+int main(int argc, char **argv) {
+    if (argc == 4 && !strcmp(argv[1], "serve")) {
+        int s = socket(AF_INET, SOCK_DGRAM, 0);
+        struct sockaddr_in a = { .sin_family = AF_INET, .sin_port = htons(atoi(argv[2])) };
+        a.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+        if (bind(s, (void *)&a, sizeof a)) { perror("bind"); return 1; }
+        struct in_addr ip; inet_pton(AF_INET, argv[3], &ip);
+        for (;;) {
+            unsigned char q[512], r[600]; struct sockaddr_in f; socklen_t fl = sizeof f;
+            int n = recvfrom(s, q, sizeof q, 0, (void *)&f, &fl);
+            if (n < 13) continue;
+            int e = 12; while (e < n && q[e]) e += 1 + q[e]; e += 5;
+            if (e > n) continue;
+            memcpy(r, q, e); r[2] = 0x81; r[3] = 0x80; r[6] = 0; r[7] = 1; r[8]=r[9]=r[10]=r[11]=0;
+            unsigned char ans[16] = { 0xc0, 0x0c, 0, 1, 0, 1, 0, 0, 0, 60, 0, 4 };
+            memcpy(ans + 12, &ip, 4); memcpy(r + e, ans, 16);
+            sendto(s, r, e + 16, 0, (void *)&f, fl);
+        }
+    }
+    if (argc == 5 && !strcmp(argv[1], "ask")) {
+        unsigned char q[512]; int n = 12;
+        memset(q, 0, 12); q[0] = 0x42; q[1] = 0x42; q[2] = 1; q[5] = 1;
+        char name[256]; snprintf(name, sizeof name, "%s", argv[4]);
+        for (char *t = strtok(name, "."); t; t = strtok(NULL, ".")) { q[n++] = strlen(t); memcpy(q + n, t, strlen(t)); n += strlen(t); }
+        q[n++] = 0; q[n++] = 0; q[n++] = 1; q[n++] = 0; q[n++] = 1;
+        int s = socket(AF_INET, SOCK_DGRAM, 0);
+        struct timeval tv = { 3, 0 }; setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof tv);
+        struct sockaddr_in a = { .sin_family = AF_INET, .sin_port = htons(atoi(argv[3])) };
+        inet_pton(AF_INET, argv[2], &a.sin_addr);
+        sendto(s, q, n, 0, (void *)&a, sizeof a);
+        unsigned char r[600]; int m = recv(s, r, sizeof r, 0);
+        if (m < 0) { puts("timeout"); return 0; }
+        if (r[3] & 15) { printf("rcode%d\n", r[3] & 15); return 0; }
+        if (m < 4 || (r[6] == 0 && r[7] == 0)) { puts("empty"); return 0; }
+        printf("%d.%d.%d.%d\n", r[m-4], r[m-3], r[m-2], r[m-1]);
+        return 0;
+    }
+    fprintf(stderr, "usage\n"); return 2;
+}

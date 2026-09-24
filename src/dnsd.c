@@ -655,6 +655,14 @@ static size_t build_rewritten_response(const uint8_t *orig, size_t qend,
 #include <linux/netfilter/nf_tables.h>
 
 static const char *g_nft_table = "inet steer"; /* "<family> <table>" */
+/* Где лежит карта fakeip. В современной раскладке — там же, где наборы каналов; в старой
+ * (ядро 4.9, см. nft_compat в spec.h) — в таблице ip, рядом с единственной цепочкой nat,
+ * потому что наборы между таблицами не видны, а nat в inet на таком ядре нет вовсе. */
+static const char *g_nft_map_table = "inet steer";
+/* Интервальные ли наборы каналов. В старой раскладке доменный набор — hash со сроками
+ * (интервальный набор со сроками ядро 4.9 не умеет), и элемент туда идёт ОДИН, без пары
+ * «начало + конец диапазона»: конец с флагом INTERVAL_END hash-набор отверг бы. */
+static int g_nft_sets_interval = 1;
 
 /* nfgenmsg::nfgen_family takes a NFPROTO_* constant (NOT AF_* despite the
  * kernel header's misleading "AF_xxx" comment — nf_tables predates that
@@ -674,6 +682,10 @@ static const char *g_nft_table = "inet steer"; /* "<family> <table>" */
 
 /* Map the textual table family (first token of "--table", e.g. "inet") to its
  * NFPROTO number. Defaults to INET — this daemon only ever targets "inet fw4". */
+/* Сравнивается ПЕРВОЕ СЛОВО, а не строка целиком: nftlk_split_table отдаёт семейство
+ * указателем на начало «ip steer», без обрезки, и strcmp с "ip" там не совпадал никогда —
+ * любое семейство молча становилось inet. Пока все наши объекты жили в inet, этого не было
+ * видно; карта fakeip в таблице ip (старая раскладка, см. nft_compat) получала ENOENT. */
 static uint8_t nftlk_family(const char *fam) {
     if (!fam) return SPL_NFPROTO_INET;
     size_t n = strcspn(fam, " ");
@@ -1080,8 +1092,8 @@ static int nft_add_element(const char *set_name, uint32_t key_host, uint32_t ttl
     }
     uint32_t key_net = htonl(key_host);
     int rc = nftlk_elem_msg(NFT_MSG_NEWSETELEM, g_nft_table, set_name,
-                            &key_net, 1 /* interval set */, NULL, timeout_ms);
-    if (rc == -EINVAL)
+                            &key_net, g_nft_sets_interval, NULL, timeout_ms);
+    if (rc == -EINVAL && g_nft_sets_interval)
         /* Имя splify-dnsd осталось от предыдущего проекта, и строка из-за него не
          * доезжала до интерфейса вовсе: журнал там собирается как `logread | grep steer`,
          * а подстроки steer в ней не было. При этом сообщение важное — доменная
@@ -1136,10 +1148,10 @@ static int nft_map_set_element(const char *map_name, uint32_t fake_host,
         uint8_t del[NFTLK_MSG_CAP], add[NFTLK_MSG_CAP];
         uint32_t seq = nftlk_seq_reserve(2);
         size_t lens[2];
-        lens[0] = nftlk_elem_build(del, sizeof(del), seq, NFT_MSG_DELSETELEM, g_nft_table,
+        lens[0] = nftlk_elem_build(del, sizeof(del), seq, NFT_MSG_DELSETELEM, g_nft_map_table,
                                    map_name, &k, 0, NULL, 0);
         lens[1] = nftlk_elem_build(add, sizeof(add), seq + 1, NFT_MSG_NEWSETELEM,
-                                   g_nft_table, map_name, &k, 0, &d, 0);
+                                   g_nft_map_table, map_name, &k, 0, &d, 0);
         uint8_t *msgs[2] = { del, add };
         int errs[2] = { 0, 0 };
         if (nftlk_txn(msgs, lens, 2, seq, errs) != 0) return -ETIMEDOUT;
@@ -1151,7 +1163,7 @@ static int nft_map_set_element(const char *map_name, uint32_t fake_host,
          * anything else leaves the old mapping in place and fails the update. */
         if (errs[0] != -ENOENT) return errs[0] ? errs[0] : errs[1];
     }
-    int rc = nftlk_elem_msg(NFT_MSG_NEWSETELEM, g_nft_table, map_name,
+    int rc = nftlk_elem_msg(NFT_MSG_NEWSETELEM, g_nft_map_table, map_name,
                             &k, 0 /* plain map, not interval */, &d, 0);
     if (rc == -EEXIST) {
         /* Present with the value we wanted (known_real told us so, or a restart
@@ -1635,7 +1647,7 @@ static void fakeip_route_set(const char *domain, uint64_t want) {
         if (!(old & (1ULL << i)) || (want & (1ULL << i))) continue;
         uint32_t k_net = htonl(g_fakeip.entries[at].addr);
         int drc = nftlk_elem_msg(NFT_MSG_DELSETELEM, g_nft_table, g_dch[i].set,
-                                 &k_net, 1, NULL, 0);
+                                 &k_net, g_nft_sets_interval, NULL, 0);
         if (drc != 0 && drc != -ENOENT && dbg())
             fprintf(stderr, "nftlk: channel-move delete from %s rc=%d\n",
                     g_dch[i].set, drc);
@@ -2776,6 +2788,20 @@ int dnsd_main(int argc, char **argv) {
      * generated. */
     load_spec(spec);
     dch_build();
+    /* Раскладка — та же проба, что у apply, и тем же ответом: наборы и карту резолвер находит
+     * по именам, и искать их не в той таблице значило бы наполнять пустоту. Спрашивается у
+     * ядра, а не у файла, который оставил apply: резолвер поднимается и раньше первого apply
+     * (загрузка), и ответ ядра от порядка запуска не зависит. Имя таблицы — своё у сборки
+     * (nft_table), как у всего остального движка. */
+    {
+        static char sets_tbl[64], map_tbl[64];
+        int legacy = nft_compat() & NFTC_LEGACY;
+        snprintf(sets_tbl, sizeof(sets_tbl), "inet %s", nft_table());
+        snprintf(map_tbl, sizeof(map_tbl), "%s %s", legacy ? "ip" : "inet", nft_table());
+        g_nft_table = sets_tbl;
+        g_nft_map_table = map_tbl;
+        g_nft_sets_interval = !legacy;
+    }
     /* Подпись пишется СРАЗУ ПОСЛЕ сборки таблицы и до всего остального: с этой секунды
      * `reload_dnsd` вправе сравнивать её со свежей и выбирать HUP вместо перезапуска. */
     dch_sig_write();

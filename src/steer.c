@@ -870,6 +870,16 @@ static void counters_load(void) {
         if (pc) sscanf(pc, "packets %lu bytes %lu", &p, &b);
         struct ctr *arr = down ? g_ctr_down : g_ctr_up;
         size_t *n = down ? &g_ctr_down_n : &g_ctr_up_n;
+        /* Одно имя — одно число. В современной раскладке имена в цепочке уникальны и эта
+         * ветка не срабатывает; в старой у доменной группы с префиксами правил два (по одному
+         * на половину набора, см. generate), и объём канала — их сумма. */
+        size_t k = 0;
+        while (k < *n && strcmp(arr[k].name, c) != 0) k++;
+        if (k < *n) {
+            arr[k].pkts += p;
+            arr[k].bytes += b;
+            continue;
+        }
         if (*n < CTR_MAX) {
             snprintf(arr[*n].name, sizeof(arr[*n].name), "%s", c);
             arr[*n].pkts = p;
@@ -899,6 +909,184 @@ static void emit_counter(FILE *f, const char *name, int down) {
         fprintf(f, "counter ");
 }
 
+/* РАСКЛАДКА НАБОРА ПРАВИЛ ЭТОГО ЗАПУСКА — флаги NFTC_* из nft_compat (spec.h). Ставит cmd_apply
+ * перед генерацией; ноль — современное ядро, и тогда текст печатается ровно тот же, что до
+ * появления старой раскладки, байт в байт: ветки legacy стоят рядом с прежними строками, а то,
+ * что печатают обе раскладки, перенесено в функции дословно. На этом держатся все стенды
+ * компилятора и то, что роутеры после обновления получают тот же набор правил.
+ *
+ * Что меняется в старой раскладке — коротко; доводы у каждого места ниже:
+ *   - таблиц становится две-три: `inet` (наборы, разметка, счётчики, очереди — всё, что
+ *     filter), `ip` (карта fakeip и ОДНА цепочка nat на prerouting) и `ip6` (заворот DNS по
+ *     IPv6, если ядро умеет nat в ip6). Наборы между таблицами не видны, поэтому карта fakeip
+ *     живёт там же, где правило dnat, — в ip;
+ *   - доменный набор делится надвое: интервальный без сроков (<имя>_n, префиксы из списков) и
+ *     hash со сроками (<имя>, туда пишет резолвер); правило канала повторяется на каждую
+ *     половину;
+ *   - notrack — только если ядро его знает (NFTC_NOTRACK), `exthdr … exists` — заменён. */
+static int g_nftc;
+#define NFT_LEGACY (g_nftc & NFTC_LEGACY)
+
+/* Есть ли у доменной группы статическая половина в старой раскладке: адресные строки в её
+ * списках. Та же проверка, что решает про строку elements в современном наборе. */
+static int legacy_has_static(const struct group *g) {
+    return NFT_LEGACY && g->domains && g->files_n && g->addrs;
+}
+
+/* То же для читателей ядра — diag и explain. Они списков не разбирают (addrs считает только
+ * check_address_lists в apply), поэтому спрашивают вторую половину у всякой доменной группы с
+ * адресными списками; нет её в ядре — ответ «набора нет», и он просто не прибавляется. */
+static int legacy_may_have_static(const struct group *g) {
+    return NFT_LEGACY && g->domains && g->files_n;
+}
+
+/* Интервальный набор с элементами из адресных списков группы — статическая половина доменного
+ * набора в старой раскладке. Тот же текст, что у адресного набора в generate. */
+static void emit_static_set(FILE *f, const struct group *g, const char *name) {
+    fprintf(f, "    set %s {\n        type ipv4_addr\n"
+               "        flags interval\n        auto-merge\n", name);
+    if (g->files_n && g->addrs) {
+        fprintf(f, "        elements = { ");
+        size_t written = 0;
+        for (size_t k = 0; k < g->files_n; k++)
+            written += emit_elements(f, g->files[k], written);
+        fprintf(f, " }\n");
+    }
+    fprintf(f, "    }\n");
+}
+
+/* Цепочка для traceroute_hops — объяснение у места вызова в generate. Функцией, потому что
+ * печатают её две раскладки. */
+static void emit_traceroute_raw(FILE *f) {
+    fprintf(f, "    chain prerouting_raw {\n"
+               "        type filter hook prerouting priority raw; policy accept;\n"
+               "        meta l4proto icmp icmp type time-exceeded counter notrack "
+               "comment \"steer:traceroute-hops\"\n"
+               "    }\n");
+}
+
+/* Правила перехвата Telegram — объяснение у цепочки tgws_redirect в generate. Функцией по
+ * той же причине: в старой раскладке они живут в общей цепочке nat таблицы ip. */
+static void emit_tgws_rules(FILE *f) {
+    for (size_t i = 0; i < g_out_n; i++) {
+        struct output *o = &g_out[i];
+        if (o->kind != OUT_TGWS) continue;
+        fprintf(f, "        meta mark and 0x%08x == 0x%08x tcp dport { 443, 80, 5222 } "
+                   "counter redirect to :%d comment \"steer:tgws:%s\"\n",
+                STEER_MARK_MASK, o->mark, out_tgws_port(o), o->name);
+    }
+}
+
+/* Какие таблицы, кроме inet, есть в старой раскладке. Спрашивают двое — генератор и шапка
+ * файла в cmd_apply (добавить-и-удалить каждую таблицу раскладки одной транзакцией), — и
+ * ответ у них обязан совпадать, иначе `delete table` встретил бы таблицу, которой файл не
+ * создаёт, или наоборот. */
+static int legacy_has_ip(void) {
+    if (!NFT_LEGACY) return 0;
+    if (has_tgws()) return 1;
+#ifdef STEER_TGWS
+    return 0;
+#else
+    return 1;                       /* заворот DNS стоит всегда — см. prerouting_dns */
+#endif
+}
+
+static int legacy_has_ip6(void) {
+#ifdef STEER_TGWS
+    return 0;
+#else
+    return NFT_LEGACY && (g_nftc & NFTC_IP6NAT);
+#endif
+}
+
+/* ХВОСТ НАБОРА ПРАВИЛ В СТАРОЙ РАСКЛАДКЕ: закрыть inet и собрать nat в ip/ip6.
+ *
+ * ПОЧЕМУ ОДНА ЦЕПОЧКА NAT, а не три, как в современной раскладке (prerouting_dns,
+ * prerouting_dnat, tgws_redirect). До 4.18 каждая базовая цепочка nat — отдельный хук, и
+ * первый из них, где ни одно правило не совпало, ставит новому соединению «пустую»
+ * трансляцию (nf_nat_alloc_null_binding в nf_nat_ipv4_fn); остальные хуки видят
+ * nf_nat_initialized и своих правил уже не проверяют. Три цепочки на 4.9 значили бы, что для
+ * запроса DNS работает только первая, а для поддельного адреса — ни одна, если первой стоит
+ * цепочка DNS. В одной цепочке правила проверяются по очереди и первое совпавшее ставит
+ * трансляцию — ровно то, что делают три цепочки на современном ядре (там после первой
+ * состоявшейся трансляции остальные цепочки тоже пропускаются). Порядок правил повторяет
+ * порядок цепочек: DNS и fakeip на dstnat в порядке регистрации, мост на dstnat + 1.
+ *
+ * ПОЧЕМУ dstnat - 1. Тот же механизм «пустой трансляции» действует между нами и таблицей
+ * nat iptables: её хук на том же приоритете -100 зарегистрирован раньше (при загрузке), и
+ * при равном приоритете идёт первым. На Android iptables nat есть всегда (netd держит там
+ * правила раздачи интернета), то есть на -100 наша цепочка не увидела бы ни одного нового
+ * соединения: ни заворота DNS, ни fakeip. На -101 первыми идём мы. Цена — обратная: для
+ * соединения, которое не забрали мы, «пустую» трансляцию назначения ставим уже мы, и правила
+ * PREROUTING в iptables nat до него не доходят. У netd там только пустая цепочка oem_nat_pre,
+ * раздача интернета живёт в POSTROUTING, которого мы не касаемся; на прочих старых системах
+ * с пробросами портов в iptables apply об этом предупреждает (report_legacy_gaps).
+ *
+ * Карта fakeip — в той же таблице ip, что и правило dnat: наборы между таблицами не видны.
+ * Синтаксис `dnat to` без слова ip: в таблице одного семейства семейство и так известно.
+ *
+ * ПОЧЕМУ ПУСТАЯ ЦЕПОЧКА postrouting_nat. До 4.18 ядро переписывает адреса только в тех хуках,
+ * где зарегистрирована хоть одна цепочка nat, — и обратную трансляцию ответов тоже. Ответ на
+ * заворот DNS или на dnat по карте fakeip уходит клиенту через POSTROUTING, и там его адрес
+ * источника обязан вернуться к тому, куда клиент спрашивал (1.1.1.1, поддельный 198.18.x.x).
+ * Без цепочки на этом хуке ответ ушёл бы с настоящим адресом, и клиент его отбросил бы как
+ * чужой. Снято на стенде tools/vm49: правила prerouting срабатывают (счётчики по единице), а
+ * SYN-ACK приходит от 10.99.0.1:8080 вместо 198.18.0.0:8080 — пока цепочки нет. На Android её
+ * роль и так выполнял бы хук nat iptables, но полагаться на чужую таблицу незачем.
+ * Приоритет srcnat + 1, то есть ПОСЛЕ nat iptables (100): пустая цепочка тоже ставит
+ * соединению «пустую» трансляцию источника, и окажись она первой — MASQUERADE раздачи
+ * интернета у netd больше не сработал бы.
+ *
+ * ip6 — только заворот DNS, и только если ядро умеет nat в ip6 (NFTC_IP6NAT): без этого вся
+ * транзакция отверглась бы из-за одной таблицы. Пустая цепочка postrouting — там же и по той
+ * же причине. */
+static void generate_legacy_tail(FILE *f) {
+    if (has_domains() && g_traceroute_hops && (g_nftc & NFTC_NOTRACK)) emit_traceroute_raw(f);
+    fprintf(f, "}\n");
+    int fakeip = has_domains() && has_fakeip();
+    if (legacy_has_ip()) {
+        fprintf(f, "table ip %s {\n", nft_table());
+        if (fakeip) {
+            fprintf(f, "    map fakeip {\n        type ipv4_addr : ipv4_addr;\n");
+            emit_fakeip_elements(f);
+            fprintf(f, "    }\n");
+        }
+        fprintf(f, "    chain prerouting_nat {\n"
+                   "        type nat hook prerouting priority dstnat - 1; policy accept;\n");
+#ifndef STEER_TGWS
+        /* IPv4-половина prerouting_dns: подсети клиентов по адресу, а без подсетей — по
+         * устройству. Устройственное правило при заданных подсетях в современной раскладке
+         * помечено `meta nfproto ipv6` — здесь оно уезжает в таблицу ip6. */
+        for (size_t i = 0; i < g_from_default_n; i++)
+            fprintf(f, "        ip saddr %s udp dport 53 counter redirect to :%d\n",
+                    g_from_default[i], DNS_PORT);
+        if (!g_from_default_n) {
+            fprintf(f, "        ");
+            emit_ifs(f, 0);
+            fprintf(f, "udp dport 53 counter redirect to :%d\n", DNS_PORT);
+        }
+#endif
+        if (fakeip)
+            fprintf(f, "        ip daddr 198.18.0.0/15 counter dnat to ip daddr map @fakeip\n");
+        emit_tgws_rules(f);
+        fprintf(f, "    }\n"
+                   "    chain postrouting_nat {\n"
+                   "        type nat hook postrouting priority srcnat + 1; policy accept;\n"
+                   "    }\n}\n");
+    }
+    if (legacy_has_ip6()) {
+        fprintf(f, "table ip6 %s {\n"
+                   "    chain prerouting_nat {\n"
+                   "        type nat hook prerouting priority dstnat - 1; policy accept;\n"
+                   "        ", nft_table());
+        emit_ifs(f, 0);
+        fprintf(f, "udp dport 53 counter redirect to :%d\n    }\n"
+                   "    chain postrouting_nat {\n"
+                   "        type nat hook postrouting priority srcnat + 1; policy accept;\n"
+                   "    }\n}\n", DNS_PORT);
+    }
+}
+
 static void generate(FILE *f) {
     fprintf(f, "table inet %s {\n", nft_table());
     for (size_t i = 0; i < g_grp_n; i++) {
@@ -906,6 +1094,28 @@ static void generate(FILE *f) {
         /* `any`-группе набор не нужен; опустевшей — нужен, иначе её правило потеряет
          * `ip daddr` и станет безусловным (см. поле `emptied`). */
         if (!g->files_n && !g->domains && !g->emptied) continue;
+        if (g->domains && NFT_LEGACY) {
+            /* СТАРОЕ ЯДРО: интервальный набор со сроками не грузится (у nft_set_rbtree в 4.9
+             * нет NFT_SET_TIMEOUT), а одному набору здесь нужно и то и другое — префиксы из
+             * списков навсегда и адреса резолвера на TTL. Поэтому набора два.
+             *
+             * Динамический — hash со сроками, и он сохраняет ИМЯ ГРУППЫ: резолвер вычисляет
+             * имя той же group_set_name и пишет туда не зная про раскладку ничего, кроме
+             * одного — что интервальной пары там больше нет (см. nft_add_element в dnsd.c).
+             * auto-merge здесь не нужен и не принимается: сливать в hash нечего.
+             *
+             * Статический — интервальный, с суффиксом _n, и только когда в списках группы
+             * есть адресные строки: пустой интервальный набор на каждый доменный канал был бы
+             * лишним поиском на каждом пакете. */
+            fprintf(f, "    set %s {\n        type ipv4_addr\n        flags timeout\n    }\n",
+                    g->name);
+            if (legacy_has_static(g)) {
+                char sn[80];
+                nft_static_set_name(sn, sizeof(sn), g->name);
+                emit_static_set(f, g, sn);
+            }
+            continue;
+        }
         if (g->domains) {
             /* timeout — из-за резолвера: он кладёт адреса с TTL ответа, и адрес, который CDN
              * перестал отдавать, истекает сам, а не копится вечно.
@@ -952,50 +1162,65 @@ static void generate(FILE *f) {
         struct group *g = &g_grp[i];
         struct output *o = out_by_name(g->out);
         if (!o) die("channel group %s points at a missing output", g->name);
-        fprintf(f, "        ");
-        emit_from(f, g);
-        emit_l4(f, g->l4, 0);
-        if (g->files_n || g->domains || g->emptied) fprintf(f, "ip daddr @%s ", g->name);
-        /* НАШИ биты, а не всё слово: `mark and ~маска or метка`. Перезапись стирала метку
-         * mwan3/pbr/sqm молча, а их перезапись — нашу, и тогда помеченный пакет уходил по
-         * таблице main, минуя запрет on_fail=drop (I-135). Диапазон объявлен в spec.h и в
-         * контракте. Ядро при выводе канонизирует выражение (оно само выставляет в маске
-         * бит, который следующий `or` всё равно поднимает) — на поведение это не влияет,
-         * проверено на живом роутере. */
-        if (out_needs_mark(o))
-            /* Метка ПАКЕТА решает маршрут, метка СОЕДИНЕНИЯ позволяет с этим соединением
-             * потом что-то сделать. Без второй запись conntrack про выход не знает ничего
-             * (mark=0 в дампе), и «сними соединения этого выхода» выразить нечем — а это
-             * единственный способ пересмотреть маршрут уже установленного соединения.
-             *
-             * Понадобилось это из-за выгрузки потоков: замер на роутере показал, что при
-             * flow_offloading=1 наша цепочка видит 2-7 пакетов соединения вместо
-             * одиннадцати тысяч, то есть после установления маршрут больше не
-             * пересматривается — и запрет on_fail=drop до такого соединения не доходит
-             * (R-096). Тот же приём и по той же причине использует mwan3. */
-            /* Ко всем выходам, КРОМЕ kind=direct, к нашей метке добавляется чужой бит —
-             * тот, которым системный zapret узнаёт «этот пакет не мой» (ZAPRET_SKIP_MARK,
-             * см. spec.h; кому именно и почему — out_skips_zapret там же).
-             *
-             * У kind=zapret без него трафик разбирали бы двое: сначала общий обход своей
-             * стратегией, потом наш экземпляр своей, — и вышло бы не то, что выбрал
-             * человек, ни в одном из двух смыслов. У туннельных выходов причина другая и
-             * не менее веская: обход стал бы рассинхронизировать ВНЕШНИЕ пакеты туннеля,
-             * до полезной нагрузки не добираясь вовсе.
-             *
-             * Ставится ЗДЕСЬ, в prerouting, потому что цепочки zapret висят на
-             * postrouting: позже было бы поздно. */
-            /* Метка СОЕДИНЕНИЯ ставится не всем: она живёт в conntrack и переживает
-             * снятие правил, поэтому у выходов, которым она не нужна, её нет вовсе — см.
-             * out_needs_ctmark в spec.h и что из-за неё случалось после удаления tgws. */
-            fprintf(f, "meta mark set mark and 0x%08x or 0x%08x %s",
-                    ~STEER_MARK_MASK,
-                    out_skips_zapret(o) ? (o->mark | ZAPRET_SKIP_MARK) : o->mark,
-                    out_needs_ctmark(o) ? "ct mark set mark " : "");
-        /* `return` and not `accept`: it ends OUR chain, letting the rest of the
-         * firewall proceed, while making the first matching group the winner. */
-        emit_counter(f, g->name, 0);
-        fprintf(f, "return comment \"steer:%s\"\n", g->name);
+        /* ПРАВИЛ У ГРУППЫ ОБЫЧНО ОДНО, в старой раскладке у доменной группы с префиксами — два:
+         * по правилу на каждую половину набора (см. generate выше). nft не умеет «или» внутри
+         * правила, а объединить интервальный набор с hash-набором нечем. Оба правила
+         * одинаковы во всём, кроме набора, и оба кончаются return — первое совпавшее решает,
+         * как и раньше. Комментарий у них ОДИН И ТОТ ЖЕ: счётчики читаются по нему, и
+         * counters_load складывает правила с одним именем — объём канала остаётся одним
+         * числом. Перенесённое значение ложится в первое правило, второе начинает с нуля:
+         * сумма от этого не меняется. */
+        int halves = legacy_has_static(g) ? 2 : 1;
+        for (int h = 0; h < halves; h++) {
+            char sn[80];
+            const char *set = g->name;
+            if (halves == 2 && h == 0) { nft_static_set_name(sn, sizeof(sn), g->name); set = sn; }
+            fprintf(f, "        ");
+            emit_from(f, g);
+            emit_l4(f, g->l4, 0);
+            if (g->files_n || g->domains || g->emptied) fprintf(f, "ip daddr @%s ", set);
+            /* НАШИ биты, а не всё слово: `mark and ~маска or метка`. Перезапись стирала метку
+             * mwan3/pbr/sqm молча, а их перезапись — нашу, и тогда помеченный пакет уходил по
+             * таблице main, минуя запрет on_fail=drop (I-135). Диапазон объявлен в spec.h и в
+             * контракте. Ядро при выводе канонизирует выражение (оно само выставляет в маске
+             * бит, который следующий `or` всё равно поднимает) — на поведение это не влияет,
+             * проверено на живом роутере. */
+            if (out_needs_mark(o))
+                /* Метка ПАКЕТА решает маршрут, метка СОЕДИНЕНИЯ позволяет с этим соединением
+                 * потом что-то сделать. Без второй запись conntrack про выход не знает ничего
+                 * (mark=0 в дампе), и «сними соединения этого выхода» выразить нечем — а это
+                 * единственный способ пересмотреть маршрут уже установленного соединения.
+                 *
+                 * Понадобилось это из-за выгрузки потоков: замер на роутере показал, что при
+                 * flow_offloading=1 наша цепочка видит 2-7 пакетов соединения вместо
+                 * одиннадцати тысяч, то есть после установления маршрут больше не
+                 * пересматривается — и запрет on_fail=drop до такого соединения не доходит
+                 * (R-096). Тот же приём и по той же причине использует mwan3. */
+                /* Ко всем выходам, КРОМЕ kind=direct, к нашей метке добавляется чужой бит —
+                 * тот, которым системный zapret узнаёт «этот пакет не мой» (ZAPRET_SKIP_MARK,
+                 * см. spec.h; кому именно и почему — out_skips_zapret там же).
+                 *
+                 * У kind=zapret без него трафик разбирали бы двое: сначала общий обход своей
+                 * стратегией, потом наш экземпляр своей, — и вышло бы не то, что выбрал
+                 * человек, ни в одном из двух смыслов. У туннельных выходов причина другая и
+                 * не менее веская: обход стал бы рассинхронизировать ВНЕШНИЕ пакеты туннеля,
+                 * до полезной нагрузки не добираясь вовсе.
+                 *
+                 * Ставится ЗДЕСЬ, в prerouting, потому что цепочки zapret висят на
+                 * postrouting: позже было бы поздно. */
+                /* Метка СОЕДИНЕНИЯ ставится не всем: она живёт в conntrack и переживает
+                 * снятие правил, поэтому у выходов, которым она не нужна, её нет вовсе — см.
+                 * out_needs_ctmark в spec.h и что из-за неё случалось после удаления tgws. */
+                fprintf(f, "meta mark set mark and 0x%08x or 0x%08x %s",
+                        ~STEER_MARK_MASK,
+                        out_skips_zapret(o) ? (o->mark | ZAPRET_SKIP_MARK) : o->mark,
+                        out_needs_ctmark(o) ? "ct mark set mark " : "");
+            /* `return` and not `accept`: it ends OUR chain, letting the rest of the
+             * firewall proceed, while making the first matching group the winner. */
+            if (h == 0) emit_counter(f, g->name, 0);
+            else fprintf(f, "counter ");
+            fprintf(f, "return comment \"steer:%s\"\n", g->name);
+        }
     }
     fprintf(f, "    }\n");
 
@@ -1048,15 +1273,24 @@ static void generate(FILE *f) {
                "        type filter hook postrouting priority srcnat + 10; policy accept;\n");
     for (size_t i = 0; i < g_grp_n; i++) {
         struct group *g = &g_grp[i];
-        fprintf(f, "        ");
-        emit_to(f, g);
-        /* Зеркало сужения: без него счётчик скачанного считал бы и тот трафик, который
-         * правило разметки не берёт, — то есть врал бы ровно на ту величину, ради которой
-         * порты и заведены. Тот же довод, что у emit_to рядом. */
-        emit_l4(f, g->l4, 1);
-        if (g->files_n || g->domains) fprintf(f, "ip saddr @%s ", g->name);
-        emit_counter(f, g->name, 1);
-        fprintf(f, "comment \"steer-down:%s\"\n", g->name);
+        /* Две половины доменного набора в старой раскладке — два правила с одним
+         * комментарием, как в prerouting_mark и по той же причине. */
+        int halves = legacy_has_static(g) ? 2 : 1;
+        for (int h = 0; h < halves; h++) {
+            char sn[80];
+            const char *set = g->name;
+            if (halves == 2 && h == 0) { nft_static_set_name(sn, sizeof(sn), g->name); set = sn; }
+            fprintf(f, "        ");
+            emit_to(f, g);
+            /* Зеркало сужения: без него счётчик скачанного считал бы и тот трафик, который
+             * правило разметки не берёт, — то есть врал бы ровно на ту величину, ради которой
+             * порты и заведены. Тот же довод, что у emit_to рядом. */
+            emit_l4(f, g->l4, 1);
+            if (g->files_n || g->domains) fprintf(f, "ip saddr @%s ", set);
+            if (h == 0) emit_counter(f, g->name, 1);
+            else fprintf(f, "counter ");
+            fprintf(f, "comment \"steer-down:%s\"\n", g->name);
+        }
     }
     fprintf(f, "    }\n");
 
@@ -1183,6 +1417,11 @@ static void generate(FILE *f) {
          * данные без ACK), и на том же приоритете -401 — до conntrack. Две одинаковые
          * цепочки при работающем общем обходе не мешают друг другу: notrack дважды — это
          * notrack. */
+        /* СТАРОЕ ЯДРО БЕЗ notrack — цепочки нет вовсе. На ядре телефона выражения нет
+         * (nft_ct.c в 4.9 его не знает), и строка с ним отвергла бы всю транзакцию. Цена
+         * названа при apply (report_legacy_gaps): порождённые обработчиком пакеты остаются на
+         * учёте conntrack. Очередь при этом работает — это другие цепочки выше. */
+        if (!NFT_LEGACY || (g_nftc & NFTC_NOTRACK))
         fprintf(f, "\n    chain zapret_predefrag {\n"
                    "        type filter hook output priority -401; policy accept;\n"
                    "        meta mark and 0x%08x != 0x00000000 jump zapret_predefrag_nfqws "
@@ -1218,10 +1457,24 @@ static void generate(FILE *f) {
                     * Остальные три правила остаются: фрагменты и данные без ACK для conntrack
                     * действительно мусор, и учтённые они стали бы INVALID. */
                    "        ip frag-off and 0x1fff != 0x0 notrack comment \"ipfrag\"\n"
-                   "        exthdr frag exists notrack comment \"ipfrag\"\n"
+                   /* `exthdr frag exists` на 4.9 НЕ отвергается, а ПОДМЕНЯЕТСЯ: флага «есть
+                    * ли заголовок» там нет, ядро выбрасывает незнакомый атрибут и грузит
+                    * сравнение поля frag nexthdr с единицей (снято на стенде tools/vm49).
+                    * Замена `frag frag-off >= 0` значит то же самое на любом ядре: выражение
+                    * exthdr без флага ищет заголовок фрагмента в цепочке заголовков и при
+                    * его отсутствии правило не совпадает, а сравнение `>= 0` верно всегда.
+                    * Проверено там же сырыми пакетами: совпадает и [ipv6][frag], и
+                    * [ipv6][hop-by-hop][frag], и не совпадает с пакетом без фрагмента. */
+                   "        %s notrack comment \"ipfrag\"\n"
                    "        tcp flags ! syn,rst,ack notrack comment \"datanoack\"\n"
-                   "    }\n", ZAPRET_SKIP_MARK);
+                   "    }\n", ZAPRET_SKIP_MARK,
+                NFT_LEGACY ? "frag frag-off >= 0" : "exthdr frag exists");
     }
+
+    /* Всё, что ниже, — nat и то, что стоит рядом с ним. В старой раскладке оно устроено
+     * иначе целиком (другие таблицы, одна цепочка nat), и смешивать две раскладки строками
+     * через одну значило бы читать каждую строку дважды. Поэтому отдельная функция. */
+    if (NFT_LEGACY) { generate_legacy_tail(f); return; }
 
     /* ---- перехват Telegram у выходов kind=tgws ------------------------------------
      *
@@ -1250,13 +1503,7 @@ static void generate(FILE *f) {
     if (has_tgws()) {
         fprintf(f, "\n    chain tgws_redirect {\n"
                    "        type nat hook prerouting priority dstnat + 1; policy accept;\n");
-        for (size_t i = 0; i < g_out_n; i++) {
-            struct output *o = &g_out[i];
-            if (o->kind != OUT_TGWS) continue;
-            fprintf(f, "        meta mark and 0x%08x == 0x%08x tcp dport { 443, 80, 5222 } "
-                       "counter redirect to :%d comment \"steer:tgws:%s\"\n",
-                    STEER_MARK_MASK, o->mark, out_tgws_port(o), o->name);
-        }
+        emit_tgws_rules(f);
         fprintf(f, "    }\n");
     }
 
@@ -1353,13 +1600,7 @@ static void generate(FILE *f) {
          *
          * Scope is just time-exceeded (type 11): dest-unreachable must stay tracked or
          * path-MTU discovery breaks, which trades a cosmetic win for broken transfers. */
-        if (g_traceroute_hops) {
-            fprintf(f, "    chain prerouting_raw {\n"
-                       "        type filter hook prerouting priority raw; policy accept;\n"
-                       "        meta l4proto icmp icmp type time-exceeded counter notrack "
-                       "comment \"steer:traceroute-hops\"\n"
-                       "    }\n");
-        }
+        if (g_traceroute_hops) emit_traceroute_raw(f);
         /* The resolver only sees what is steered to it. IPv6 as well as IPv4: the
          * router advertises itself as an IPv6 resolver by default and clients prefer
          * that server, so an IPv4-only redirect catches almost nothing — measured on a
@@ -1793,6 +2034,74 @@ static void apply_routing(void) {
     }
 }
 
+/* Стоит ли в ядре таблица «<семейство> <наша таблица>». Один `nft list tables` на процесс:
+ * спрашивают о двух семействах подряд, а перечень таблиц за это время не меняется. Не смогли
+ * спросить — «нет»: лишний `delete` отверг бы весь набор правил, а пропущенный оставляет
+ * только чужую теперь таблицу, о которой скажет diag. */
+static int nft_table_exists(const char *fam) {
+    static char list[4096];
+    static int loaded;
+    if (!loaded) {
+        loaded = 1;
+        FILE *p = popen("nft list tables 2>/dev/null", "r");
+        if (p) {
+            size_t n = fread(list, 1, sizeof(list) - 1, p);
+            list[n] = '\0';
+            pclose(p);
+        }
+    }
+    char want[96];
+    snprintf(want, sizeof(want), "table %s %s", fam, nft_table());
+    size_t wn = strlen(want);
+    for (const char *q = list; (q = strstr(q, want)) != NULL; q += wn)
+        if ((q == list || q[-1] == '\n') && (q[wn] == '\n' || q[wn] == '\0')) return 1;
+    return 0;
+}
+
+/* ЧЕГО НЕ БУДЕТ НА СТАРОМ ЯДРЕ — вслух, при каждом apply в старой раскладке.
+ *
+ * Раскладка для 4.9 собирает всё, что ядро умеет, а без чего-то приходится обходиться. Молча
+ * выбросить правило значило бы, что человек узнает о нём по симптому, — поэтому каждое
+ * выброшенное называется здесь вместе с последствием. Строки идут в stderr и в журнал, как
+ * остальные предупреждения apply. */
+static void report_legacy_gaps(void) {
+    if (!NFT_LEGACY) return;
+    fprintf(stderr, "steer[info] apply: ядро без nat в семействе inet — правила собраны для "
+                    "nftables старого ядра: таблицы inet и ip%s\n",
+            legacy_has_ip6() ? " и ip6" : "");
+    if (has_zapret() && !(g_nftc & NFTC_NOTRACK))
+        fprintf(stderr, LOG_W "ядро не знает notrack: порождённые обработчиком zapret пакеты "
+                        "(подделки, куски разрезанного) остаются на учёте conntrack. Где "
+                        "firewall отбрасывает ct state invalid, обход выходов kind=zapret "
+                        "может не срабатывать\n");
+    if (g_traceroute_hops && has_domains() && !(g_nftc & NFTC_NOTRACK))
+        fprintf(stderr, LOG_W "ядро не знает notrack: traceroute_hops на нём не действует, "
+                        "промежуточные узлы будут видны как прежде\n");
+#ifndef STEER_TGWS
+    if (!(g_nftc & NFTC_IP6NAT))
+        fprintf(stderr, LOG_W "ядро не умеет nat для IPv6: запросы DNS клиентов по IPv6 идут "
+                        "мимо резолвера движка, и доменные каналы видят только тех, кто "
+                        "спрашивает по IPv4\n");
+#endif
+#ifndef STEER_ANDROID
+    /* На Android таблица nat iptables есть всегда, но PREROUTING в ней у netd — пустая
+     * oem_nat_pre, и предупреждать там не о чем. Почему это вообще важно — у
+     * generate_legacy_tail. */
+    FILE *t = fopen("/proc/net/ip_tables_names", "r");
+    if (t) {
+        char line[64];
+        int nat = 0;
+        while (fgets(line, sizeof(line), t)) if (!strncmp(line, "nat", 3)) nat = 1;
+        fclose(t);
+        if (nat)
+            fprintf(stderr, LOG_W "на этом ядре работает и nat iptables: для соединений, "
+                            "которые не забрал движок, его правила PREROUTING (пробросы "
+                            "портов) не сработают — старое ядро не даёт двум таблицам nat "
+                            "поделить один хук\n");
+    }
+#endif
+}
+
 /* Умеет ли ЯДРО отдавать пакеты в очередь nfqueue.
  *
  * ЗАЧЕМ ОТДЕЛЬНАЯ ПРОВЕРКА. Без модуля nft_queue правило `queue num N` не отвергается
@@ -1813,7 +2122,8 @@ static void apply_routing(void) {
  * Поэтому спрашивается ровно то, что нам нужно: примет ли ядро правило с queue. Стоит это
  * одного запуска nft и только когда в спеке есть выход kind=zapret. */
 static int nfqueue_supported(void) {
-    char tmp[] = "/tmp/steer-qprobe.XXXXXX";
+    char tmp[256];
+    steer_tmp_template(tmp, sizeof(tmp), "steer-qprobe");
     int fd = mkstemp(tmp);
     if (fd < 0) return 1;   /* не смогли проверить — не мешаем: решать будет сам nft */
     FILE *f = fdopen(fd, "w");
@@ -1865,6 +2175,10 @@ static int cmd_apply(const char *spec, int dry) {
      * Значит человек узнает про не тот список сразу при сохранении, а не потом, когда
      * apply молча не подействует. */
     check_address_lists();
+    /* Раскладка набора правил — до генерации и до dry-run: интерфейс проверяет спеку именно
+     * dry-run'ом, и печатать ему надо то, что реально встанет на этом ядре. */
+    g_nftc = nft_compat();
+    report_legacy_gaps();
     /* Снять накопленное ДО генерации: она вписывает эти значения в новые правила, иначе
      * каждый apply обнулял бы объёмы. Читаем и при --dry-run — так печатаемый текст остаётся
      * тем, что реально применится, а на машине без таблицы вывод не меняется вовсе. */
@@ -1883,7 +2197,8 @@ static int cmd_apply(const char *spec, int dry) {
             "nft грузит набор целиком, и отказ на очереди снял бы заодно наборы, метки и "
             "перенаправление DNS", NULL);
 
-    char tmp[] = "/tmp/steer-ruleset.XXXXXX";
+    char tmp[256];
+    steer_tmp_template(tmp, sizeof(tmp), "steer-ruleset");
     int fd = mkstemp(tmp);
     if (fd < 0) die("cannot create a temporary ruleset", NULL);
     FILE *f = fdopen(fd, "w");
@@ -1922,6 +2237,26 @@ static int cmd_apply(const char *spec, int dry) {
      * В --dry-run эти две строки не печатаются: там выводится сам набор правил (его сверяют
      * стенды и интерфейс), а замена — дело применения. */
     fprintf(f, "table inet %s\ndelete table inet %s\n", nft_table(), nft_table());
+    /* Таблицы ip и ip6 — тем же приёмом и в той же транзакции. Их создаёт только старая
+     * раскладка (generate_legacy_tail), но УДАЛЯТЬ их обязана любая: ядро телефона обновится
+     * до нового (Android 17 — ядра новее 5.2), apply выберет современную раскладку, и
+     * оставшаяся от старой цепочка nat заворачивала бы DNS второй раз, а карта fakeip в ней
+     * отставала бы от резолвера. И наоборот, выход раскладки из ip6 (ядро перестало
+     * принимать nat в ip6) не должен оставлять прежнюю таблицу. Отсутствующую таблицу
+     * удалять нельзя — `delete` отверг бы весь файл, — поэтому для таблицы вне раскладки
+     * спрашиваем ядро, есть ли она (один `nft list tables` на apply). На роутере, где старой
+     * раскладки не было никогда, файл остаётся прежним, байт в байт. */
+    {
+        static const char *const fams[2] = { "ip", "ip6" };
+        int want[2] = { legacy_has_ip(), legacy_has_ip6() };
+        for (int k = 0; k < 2; k++) {
+            if (want[k])
+                fprintf(f, "table %s %s\ndelete table %s %s\n",
+                        fams[k], nft_table(), fams[k], nft_table());
+            else if (nft_table_exists(fams[k]))
+                fprintf(f, "delete table %s %s\n", fams[k], nft_table());
+        }
+    }
     generate(f);
     fclose(f);
 
@@ -2301,7 +2636,7 @@ static long set_count(const char *name) {
               (*q >= '0' && *q <= '9') || *q == '_' || *q == '-' || *q == '.'))
             return -1;
     char cmd[256];
-    snprintf(cmd, sizeof(cmd), "nft list set inet steer %.64s 2>/dev/null", name);
+    snprintf(cmd, sizeof(cmd), "nft list set inet %s %.64s 2>/dev/null", nft_table(), name);
     FILE *p = popen(cmd, "r");
     if (!p) return -1;
     long n = -1;
@@ -2330,13 +2665,23 @@ static long set_count(const char *name) {
 }
 
 static int nft_has(const char *what) {
-    char cmd[256];
+    char cmd[512];
     /* --terse: ищутся цепочки, элементы наборов не нужны — а их дамп на большом
      * наборе стоит дороже всех остальных проверок diag вместе взятых. */
-    snprintf(cmd, sizeof(cmd),
-             "{ nft -t list table inet %s 2>/dev/null || "
-             "nft list table inet %s 2>/dev/null; } | grep -qF '%s'",
-             nft_table(), nft_table(), what);
+    /* В старой раскладке nat живёт в таблице ip (generate_legacy_tail), и искать заворот DNS
+     * только в inet значило бы объявить его пропавшим на исправном телефоне. */
+    if (NFT_LEGACY)
+        snprintf(cmd, sizeof(cmd),
+                 "{ nft -t list table inet %s 2>/dev/null || "
+                 "nft list table inet %s 2>/dev/null; "
+                 "nft -t list table ip %s 2>/dev/null || "
+                 "nft list table ip %s 2>/dev/null; } | grep -qF '%s'",
+                 nft_table(), nft_table(), nft_table(), nft_table(), what);
+    else
+        snprintf(cmd, sizeof(cmd),
+                 "{ nft -t list table inet %s 2>/dev/null || "
+                 "nft list table inet %s 2>/dev/null; } | grep -qF '%s'",
+                 nft_table(), nft_table(), what);
     return system(cmd) == 0;
 }
 
@@ -2498,6 +2843,8 @@ static int cmd_diag(const char *spec) {
     /* Приговор выносится тому устройству, которое несёт трафик, — тому же, о котором
      * рассказывает status и к которому привязал таблицу apply (outputs_adopt_active). */
     outputs_adopt_active();
+    /* Раскладка — чтобы искать правила там, где их ставит apply (nft_has, наборы ниже). */
+    g_nftc = nft_compat();
     printf("{\"schema\":1,\"checks\":[");
 
     /* 1. Таблица. Без неё всё остальное бессмысленно: apply не применялся или его снесли. */
@@ -2521,6 +2868,14 @@ static int cmd_diag(const char *spec) {
         struct group *g = &g_grp[i];
         if (!g->files_n && !g->domains) continue;
         long n = set_count(g->name);
+        /* Старая раскладка: префиксы доменной группы лежат во второй половине набора (<имя>_n,
+         * см. generate). Адресов у канала — сумма обеих. */
+        if (n >= 0 && legacy_may_have_static(g)) {
+            char sn[80];
+            nft_static_set_name(sn, sizeof(sn), g->name);
+            long m = set_count(sn);
+            if (m > 0) n += m;
+        }
         char what[160], why[240];
         if (n < 0) {
             snprintf(what, sizeof(what), "канал %.48s: набора в ядре нет", g->name);
@@ -2621,7 +2976,11 @@ static int cmd_diag(const char *spec) {
     /* 4. Резолвер и редирект. Доменные каналы держатся на обоих: без редиректа клиент
      *    спрашивает не нас, без процесса спрашивать некого. */
     if (has_domains()) {
-        int redir = nft_has("chain prerouting_dns");
+        /* В старой раскладке у заворота нет своей цепочки — он правило общей цепочки nat
+         * (generate_legacy_tail), и узнаётся по самому правилу. */
+        char redir_rule[40];
+        snprintf(redir_rule, sizeof(redir_rule), "redirect to :%d", DNS_PORT);
+        int redir = nft_has(NFT_LEGACY ? redir_rule : "chain prerouting_dns");
         diag("dns_redirect", redir ? "ok" : "fail",
              redir ? "запросы DNS заворачиваются на движок"
                    : "запросы DNS на движок не заворачиваются",
@@ -3081,10 +3440,99 @@ static int looks_like_name(const char *s) {
 /* Asks the KERNEL, channel by channel in spec order, instead of re-reading the
  * list files: the answer has to describe what the box will actually do, including
  * the case where a set failed to load. This is the one answer raw nft cannot give. */
+/* Адрес или префикс IPv4 в диапазон [lo, hi]. 0 — не адрес. Диапазон «a-b» — тоже: так nft
+ * печатает интервалы, не укладывающиеся в один префикс. */
+static int ipv4_span(const char *t, uint32_t *lo, uint32_t *hi) {
+    char buf[40];
+    size_t n = strlen(t);
+    if (!n || n >= sizeof(buf)) return 0;
+    memcpy(buf, t, n + 1);
+    char *dash = strchr(buf, '-');
+    if (dash) {
+        *dash = '\0';
+        struct in_addr a, b;
+        if (inet_pton(AF_INET, buf, &a) != 1 || inet_pton(AF_INET, dash + 1, &b) != 1) return 0;
+        *lo = ntohl(a.s_addr);
+        *hi = ntohl(b.s_addr);
+        return *lo <= *hi;
+    }
+    char *sl = strchr(buf, '/');
+    int len = 32;
+    if (sl) {
+        *sl = '\0';
+        char *e;
+        long v = strtol(sl + 1, &e, 10);
+        if (*e || v < 0 || v > 32) return 0;
+        len = (int)v;
+    }
+    struct in_addr a;
+    if (inet_pton(AF_INET, buf, &a) != 1) return 0;
+    uint32_t m = len ? 0xffffffffu << (32 - len) : 0;
+    *lo = ntohl(a.s_addr) & m;
+    *hi = *lo | ~m;
+    return 1;
+}
+
+/* Лежит ли адрес (или весь префикс) в наборе — по его дампу, без `nft get element`.
+ *
+ * Нужна ядру 4.9: NFT_MSG_GETSETELEM там отвечает только на дамп, а на запрос одного элемента
+ * — -EOPNOTSUPP (одиночный get появился в 4.15). Без этой ветки explain на телефоне отвечал бы
+ * «ни один канал не забирает» про каждый адрес, в том числе про те, что прямо в списке.
+ *
+ * Разбирается не формат nft целиком, а слова из цифр, точек, дробей и дефисов после
+ * «elements = {»: адрес, префикс, диапазон. Прочее (timeout 1h, expires 59m) адресом не
+ * читается и пропускается само. */
+static int set_scan(const char *set, const char *addr) {
+    for (const char *q = set; *q; q++)
+        if (!((*q >= 'a' && *q <= 'z') || (*q >= 'A' && *q <= 'Z') ||
+              (*q >= '0' && *q <= '9') || *q == '_' || *q == '-'))
+            return 0;
+    uint32_t qlo, qhi;
+    if (!ipv4_span(addr, &qlo, &qhi)) return 0;
+    char cmd[256];
+    snprintf(cmd, sizeof(cmd), "nft list set inet %s %.64s 2>/dev/null", nft_table(), set);
+    FILE *p = popen(cmd, "r");
+    if (!p) return 0;
+    int in = 0, hit = 0, c;
+    char tok[40];
+    size_t tn = 0;
+    const char *key = "elements = {";
+    size_t kpos = 0;
+    while (!hit && (c = fgetc(p)) != EOF) {
+        if (!in) {
+            kpos = (c == key[kpos]) ? kpos + 1 : (c == key[0] ? 1 : 0);
+            if (!key[kpos]) in = 1;
+            continue;
+        }
+        if ((c >= '0' && c <= '9') || c == '.' || c == '/' || c == '-') {
+            if (tn + 1 < sizeof(tok)) tok[tn++] = (char)c;
+            continue;
+        }
+        if (tn) {
+            tok[tn] = '\0';
+            tn = 0;
+            uint32_t lo, hi;
+            if (ipv4_span(tok, &lo, &hi) && lo <= qlo && qhi <= hi) hit = 1;
+        }
+        if (c == '}') in = 0;
+    }
+    pclose(p);
+    return hit;
+}
+
+/* Есть ли адрес в наборе: одиночным `nft get element`, а на старом ядре, где его нет, —
+ * разбором дампа (set_scan). На современном ядре путь прежний, один запуск nft. */
+static int set_lookup(const char *set, const char *elem, const char *addr) {
+    const char *q[] = { "nft", "get", "element", "inet", nft_table(), set, elem, NULL };
+    if (run(q) == 0) return 1;
+    return NFT_LEGACY && set_scan(set, addr);
+}
+
 static int cmd_explain(const char *spec, const char *what) {
     load_spec(spec);
     registry_assign();
     build_groups();
+    g_nftc = nft_compat();
 
     /* Имя сначала превращаем в адрес — и печатаем, во что именно. Без этой строки человек
      * видел бы вердикт по адресу, которого не спрашивал, и не мог бы понять, тот ли это
@@ -3131,8 +3579,12 @@ static int cmd_explain(const char *spec, const char *what) {
                 fprintf(stderr, "checking %.63s\n", g_grp[i].name);
             snprintf(setname, sizeof(setname), "%.63s", g_grp[i].name);
             snprintf(elem, sizeof(elem), "{ %s }", addr);
-            const char *q[] = { "nft", "get", "element", "inet", nft_table(), setname, elem, NULL };
-            hit = run(q) == 0;
+            hit = set_lookup(setname, elem, addr);
+            /* Старая раскладка: у доменной группы вторая половина набора, с префиксами. */
+            if (!hit && legacy_may_have_static(&g_grp[i])) {
+                nft_static_set_name(setname, sizeof(setname), g_grp[i].name);
+                hit = set_lookup(setname, elem, addr);
+            }
         }
         if (!hit) continue;
         struct output *o = out_by_name(g_grp[i].out);

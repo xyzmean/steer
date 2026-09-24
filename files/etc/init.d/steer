@@ -256,6 +256,11 @@ start_service() {
 # firewall — which is the whole reason for not being an fw4 include.
 stop_service() {
     nft delete table inet steer 2>/dev/null
+    # Раскладка для старого ядра (без nat в inet, Linux до 5.2) держит nat в своих таблицах
+    # ip и ip6 — см. nft_compat в src/spec.h. На обычном роутере их нет, и строки ничего не
+    # делают; там, где они есть, без них остались бы заворот DNS и dnat на закрытый порт.
+    nft delete table ip steer 2>/dev/null
+    nft delete table ip6 steer 2>/dev/null
     # Правила обфускаторов живут в СВОЕЙ таблице: ту, что выше, apply пересобирает
     # целиком при каждом сохранении настроек, и правило против RST исчезало бы вместе
     # с ней. Свои цепочки процессы снимают сами при выходе — эта строка на случай, когда

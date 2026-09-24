@@ -1616,6 +1616,49 @@ check "dry-run без строк замены таблицы" "0" \
     "$("$BIN" apply --dry-run --spec "$tmp/spec.json" --state-dir "$tmp/st-fo-drop" 2>/dev/null |
        grep -c '^delete table')"
 
+# ---- раскладка для старого ядра (Linux 4.9) -------------------------------------------------
+# Текстом, без ядра: legacy-min не спрашивает ядро ни о чём, поэтому вывод один и тот же на
+# любой машине и под любым пользователем. Загрузку в ядро проверяет applynft-legacy.sh, а
+# настоящее 4.9 — стенд tools/vm49 в хабе. Здесь — то, без чего 4.9 отвергнет весь файл.
+printf '198.51.100.0/24\n' > "$tmp/lp.lst"
+cat > "$tmp/legacy.json" <<EOF
+{ "schema": 2, "traceroute_hops": true, "from_default": ["192.168.1.0/24"],
+  "outputs": { "vpn": { "kind": "interface", "device": "wg0" },
+               "yt":  { "kind": "zapret" },
+               "tg":  { "kind": "tgws", "domain": "ex.co.uk" } },
+  "channels": [ { "name": "d", "match": { "domains_file": "$tmp/d.lst",
+                                          "prefixes_files": ["$tmp/lp.lst"] }, "out": "vpn" },
+                { "name": "z", "match": { "prefixes_file": "$tmp/a.lst" }, "out": "yt" },
+                { "name": "t", "match": { "prefixes_file": "$tmp/b.lst" }, "out": "tg" } ] }
+EOF
+lout="$(STEER_NFT_COMPAT=legacy-min "$BIN" apply --dry-run --spec "$tmp/legacy.json" \
+        --state-dir "$tmp/st-legacy" 2>"$tmp/legacy.err")"
+check "legacy: спека компилируется" "0" "$?"
+# Всё, что до таблицы ip, — это таблица inet: nat там 4.9 не принимает вовсе.
+check "legacy: в inet нет ни одной цепочки nat" "0" \
+    "$(printf '%s\n' "$lout" | sed '/^table ip /,$d' | grep -c 'type nat')"
+check "legacy: nat — одна цепочка на prerouting в ip" "1" \
+    "$(printf '%s\n' "$lout" | grep -c 'type nat hook prerouting priority dstnat - 1')"
+check "legacy: и пустая на postrouting — для обратной трансляции ответов" "1" \
+    "$(printf '%s\n' "$lout" | grep -c 'type nat hook postrouting priority srcnat + 1')"
+check "legacy: интервального набора со сроками нет" "0" \
+    "$(printf '%s\n' "$lout" | grep -c 'interval,timeout')"
+check "legacy: доменный набор — hash со сроками, префиксы — в _n" "2" \
+    "$(printf '%s\n' "$lout" | grep -c 'set vpn_dom {\|set vpn_dom_n {')"
+check "legacy: notrack без пробы ядра не ставится" "0" "$(printf '%s\n' "$lout" | grep -c notrack)"
+check "legacy: exthdr exists не ставится (4.9 грузит вместо него другое правило)" "0" \
+    "$(printf '%s\n' "$lout" | grep -c 'exthdr')"
+check "legacy: dnat по карте без слова ip" "1" \
+    "$(printf '%s\n' "$lout" | grep -c 'dnat to ip daddr map @fakeip')"
+check "legacy: ip6 без пробы не собирается" "0" "$(printf '%s\n' "$lout" | grep -c '^table ip6 ')"
+check "legacy: сказано, чего не будет (notrack дважды и IPv6)" "3" \
+    "$(grep -c 'не знает notrack\|nat для IPv6' "$tmp/legacy.err")"
+# Современная раскладка той же спеки — прежний текст: ни одной строки старой раскладки.
+mout="$(STEER_NFT_COMPAT=modern "$BIN" apply --dry-run --spec "$tmp/legacy.json" \
+        --state-dir "$tmp/st-legacy" 2>/dev/null)"
+check "modern: одна таблица inet" "1" "$(printf '%s\n' "$mout" | grep -c '^table ')"
+check "modern: exthdr frag exists на месте" "1" "$(printf '%s\n' "$mout" | grep -c 'exthdr frag exists')"
+
 printf '\n%s passed, %s failed\n' "$pass" "$fail"
 [ "$fail" -eq 0 ]
 
