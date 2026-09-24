@@ -20,7 +20,7 @@
 # (ровно то, что умеет ядро телефона) грузится и переключается той же транзакцией; explain
 # работает без `nft get element`; клиент, вошедший через TUN как из LAN, получает от резолвера
 # поддельный адрес через заворот DNS, доходит по dnat из карты и перехватывается мостом — всё
-# одной цепочкой nat. И контроль: две цепочки nat на одном хуке, как в современной раскладке,
+# одной цепочкой nat. down снимает всё, что поставил apply. И контроль: две цепочки nat на одном хуке, как в современной раскладке,
 # на 4.9 не работают (dnat второй цепочки не срабатывает) — ради этого цепочка одна.
 set -u
 pass=0 fail=0
@@ -157,6 +157,25 @@ echo "три цепочки: SYN на $fake:8080 -> $syn"
 nft list table ip three | grep counter
 kill $NC $DP $UP 2>/dev/null
 nft delete table ip three
+
+echo "=== 7. down: выключение снимает всё — таблицы трёх семейств, ip rule, маршруты"
+# Выключение на телефоне (persist.der.steer.enabled=0) гасит резолвер навсегда, и заворот DNS
+# на его порт, оставшись в ядре, лишил бы имён всех, чей DNS заворачивался. Снимать обязано
+# всё, что поставил apply: inet, ip и ip6 старой раскладки и правила маршрутизации выходов.
+steer apply $S >/dev/null 2>&1
+rules_before="$(ip rule show | grep -c 'fwmark')"
+check "перед down: таблицы трёх семейств на месте" "3" "$(nft list tables | grep -c ' steer$')"
+[ "$rules_before" -gt 0 ] && r=yes || r=no
+check "перед down: ip rule выходов на месте" "yes" "$r"
+steer down --state-dir /tmp/st; check "down: код 0" "0" "$?"
+check "после down: таблиц steer нет ни в одном семействе" "0" "$(nft list tables | grep -c steer)"
+check "после down: ip rule выходов сняты" "0" "$(ip rule show | grep -c 'fwmark')"
+left=0
+for t in $(awk '{print $3}' /tmp/st/registry); do
+    left=$((left + $(ip route show table "$t" 2>/dev/null | grep -c .)))
+done
+check "после down: таблицы маршрутизации выходов пусты" "0" "$left"
+check "повторный down ничего не ломает" "0" "$(steer down --state-dir /tmp/st >/dev/null 2>&1; echo $?)"
 
 echo "=== ruleset полной спеки (для сверки с тем же текстом на свежем ядре)"
 echo "---BEGIN---"

@@ -1996,6 +1996,45 @@ static void cleanup_stale_routing(void) {
     }
 }
 
+/* ---- down: снять всё, что поставил движок ------------------------------------
+ *
+ * То же, что stop_service в files/etc/init.d/steer, но командой движка. На роутере снятие —
+ * это десяток строк shell; у init Android shell нет (сервис — один исполняемый файл), а
+ * выдать домену steerd /system/bin/sh значило бы разрешить ему любую команду. Командой
+ * движка оно и точнее: маска метки здесь STEER_MARK_MASK той сборки, что правила ставила
+ * (под STEER_ANDROID она другая, 0x0fc00000), а в shell её пришлось бы повторять литералом.
+ *
+ * Зачем снимать при выключении, если перезапуск нарочно правил не трогает. Перезапуск — это
+ * мгновение, после которого демоны встают снова, и открыть трафик на это мгновение хуже, чем
+ * подержать правила. Выключение — другое: резолвер погашен навсегда, а правило заворота DNS
+ * на его порт осталось бы в ядре, и у всех, чей DNS заворачивался, имена перестали бы
+ * разрешаться вовсе. То же с on_fail=drop: blackhole в таблице выхода пережил бы выключение
+ * и держал трафик закрытым без всякой видимой причины.
+ *
+ * Все таблицы — в каждой раскладке: inet (обычное ядро), ip/ip6 (nat старого ядра, см.
+ * nft_compat) и steer_obfs (правила обфускаторов). Какой таблицы нет — отказ nft молча
+ * значит «нечего снимать». Спека не читается: снимать надо и то, что поставила прежняя
+ * спека, а реестр в состоянии — это и есть список того, что стоит в ядре. */
+static int cmd_down(void) {
+    static const char *const tabs[][2] = {
+        { "inet", NULL }, { "ip", NULL }, { "ip6", NULL }, { "inet", "steer_obfs" },
+    };
+    for (size_t i = 0; i < sizeof tabs / sizeof tabs[0]; i++) {
+        const char *del[] = { "nft", "delete", "table", tabs[i][0],
+                              tabs[i][1] ? tabs[i][1] : nft_table(), NULL };
+        run(del);
+    }
+    registry_snapshot();
+    for (size_t i = 0; i < g_oldreg_n; i++) {
+        char table[16];
+        snprintf(table, sizeof(table), "%d", g_oldreg[i].table);
+        rule_drop(g_oldreg[i].mark, g_oldreg[i].table);
+        const char *flush[] = { "ip", "route", "flush", "table", table, NULL };
+        run(flush);
+    }
+    return 0;
+}
+
 /* Policy routing for interface outputs. Rules are removed before being added so a
  * re-apply cannot stack duplicates — `ip rule add` is happy to add the same rule
  * twice, and the second copy is invisible until someone deletes the first. */
@@ -3615,6 +3654,40 @@ static int cmd_explain(const char *spec, const char *what) {
     return 0;
 }
 
+/* Сторож по кругу: `steer failover --loop СЕК`.
+ *
+ * На роутере круг крутит procd строкой `while :; do steer failover; sleep 60; done`. У init
+ * Android такой строки нет: сервис — это один исполняемый файл, и запускать его через
+ * /system/bin/sh значило бы выдать домену steerd право исполнять shell — то есть любую
+ * команду, которую удастся подсунуть в спеку. Поэтому круг здесь, в движке.
+ *
+ * КАЖДЫЙ ПРОХОД — ОТДЕЛЬНЫЙ ПРОЦЕСС (fork). cmd_failover писан под «один проход и выход»:
+ * спека грузится в глобальные массивы один раз, и повторный load_spec в том же процессе
+ * склеил бы выходы двух чтений. Дочерний процесс получает чистую память и выходит через
+ * exit, так что его atexit (снятие probe-rule) срабатывает, как и при запуске из shell; die()
+ * в нём — это конец одного прохода, а не сторожа: следующий проход перечитает спеку, и
+ * исправленная спека подхватится без перезапуска сервиса — ровно как в круге procd.
+ *
+ * СОН НА CLOCK_MONOTONIC — требование батареи. Этот таймер во сне устройства стоит и не
+ * будит его (будят только *_ALARM и удерживаемый wakelock, которых здесь нет): пока телефон
+ * спит, сторож молчит, а проснувшись, досыпает остаток периода. Проверка по событиям (смена
+ * сети, включение экрана) вместо периода — следующий шаг, см. B4 в брифе Android.
+ *
+ * init гасит сервис сигналом всей группе процессов, поэтому дочерний проход получает свой
+ * SIGTERM и убирает за собой так же, как от kill на роутере. */
+static int failover_loop(const char *spec, int verbose, int period) {
+    for (;;) {
+        pid_t pid = fork();
+        if (pid == 0) exit(cmd_failover(spec, verbose));
+        if (pid > 0)
+            while (waitpid(pid, NULL, 0) < 0 && errno == EINTR) {}
+        else
+            fprintf(stderr, LOG_W "failover: fork: %s\n", strerror(errno));
+        struct timespec left = { period, 0 };
+        while (clock_nanosleep(CLOCK_MONOTONIC, 0, &left, &left) == EINTR) {}
+    }
+}
+
 int main(int argc, char **argv) {
     if (argc < 2) {
         cli_usage_short(stderr);
@@ -3679,7 +3752,9 @@ int main(int argc, char **argv) {
     if (!strcmp(cmd, "apply")) return cmd_apply(spec, a.dry_run);
     if (!strcmp(cmd, "status")) return cmd_status(spec, a.fast);
     if (!strcmp(cmd, "diag")) return cmd_diag(spec);
-    if (!strcmp(cmd, "failover")) return cmd_failover(spec, a.verbose);
+    if (!strcmp(cmd, "down")) return cmd_down();
+    if (!strcmp(cmd, "failover"))
+        return a.loop ? failover_loop(spec, a.verbose, a.loop) : cmd_failover(spec, a.verbose);
     if (!strcmp(cmd, "explain")) {
         /* Адрес ИЛИ имя. Проверка формы обязательна для обоих: аргумент подставляется в
          * вызов nft, и именно здесь однажды была дыра — адрес уходил в system(). */
