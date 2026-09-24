@@ -246,6 +246,11 @@ struct group {
      * чьи списки на месте (I-136). Пустой набор — единственный вариант, при котором
      * пропавший список уносит ровно свои адреса и ничего больше. */
     int emptied;
+    /* Сколько АДРЕСНЫХ строк во всех файлах группы — считает check_address_lists. Ноль при
+     * непустом files_n бывает законно (файл из одних имён, см. там же), и тогда набор
+     * объявляется без строки elements: `elements = {  }` nft не принимает и отвергает весь
+     * набор правил — то есть один такой список снимал бы маршрутизацию целиком. */
+    size_t addrs;
     /* Which channels fed it — reported so a counter still has names behind it. */
     const char *members[MAX_CHANNELS];
     size_t members_n;
@@ -722,6 +727,7 @@ static void check_address_lists(void) {
             size_t total = 0, bad = 0, bad_line = 0;
             char sample[128];
             count_list(g->files[k], &total, &bad, sample, sizeof(sample), &bad_line);
+            g->addrs += total - bad;
             if (!total) {
                 fprintf(stderr, LOG_W "%s: список пуст — канал «%s» ничего не поймает\n",
                         g->files[k], g->members_n ? g->members[0] : g->name);
@@ -751,10 +757,22 @@ static void check_address_lists(void) {
                 else
                     snprintf(who, sizeof(who), "%.60s",
                              g->members_n ? g->members[0] : g->name);
-                fprintf(stderr, LOG_W "%s: адресов нет вовсе, только имена (%zu) — канал "
-                                "«%s» будет работать по именам через резолвер. Первая "
-                                "строка: «%s»\n",
-                        g->files[k], total, who, sample);
+                /* По именам канал работает, только когда у его группы есть доменный набор,
+                 * то есть рядом стоит канал с доменными списками того же выхода, тех же
+                 * клиентов и того же сужения (build_groups; резолвер повторяет это же
+                 * решение в dch_join_domain_group). Без такого соседа имена из файла не
+                 * берёт никто, и обещать «будет работать» значило бы соврать. */
+                if (g->domains)
+                    fprintf(stderr, LOG_W "%s: адресов нет вовсе, только имена (%zu) — канал "
+                                    "«%s» будет работать по именам через резолвер. Первая "
+                                    "строка: «%s»\n",
+                            g->files[k], total, who, sample);
+                else
+                    fprintf(stderr, LOG_W "%s: адресов нет вовсе, только имена (%zu) — канал "
+                                    "«%s» ничего не поймает: имена резолвер берёт у каналов с "
+                                    "доменными списками, а у этого их нет. Подключите файл "
+                                    "доменным списком (domains_files). Первая строка: «%s»\n",
+                            g->files[k], total, who, sample);
                 continue;
             }
             if (bad)
@@ -893,7 +911,7 @@ static void generate(FILE *f) {
              * и позволяет одному правилу быть про сервис, а не про вид списка. */
             fprintf(f, "    set %s {\n        type ipv4_addr\n"
                        "        flags interval,timeout\n        auto-merge\n", g->name);
-            if (g->files_n) {
+            if (g->files_n && g->addrs) {
                 fprintf(f, "        elements = { ");
                 size_t written = 0;
                 for (size_t k = 0; k < g->files_n; k++)
@@ -910,7 +928,7 @@ static void generate(FILE *f) {
             /* Пустой набор объявляется БЕЗ строки elements: `elements = {  }` nft не примет,
              * а объявление без элементов — обычное дело (так же начинают жизнь доменные
              * наборы, которые наполняет резолвер). */
-            if (g->files_n) {
+            if (g->files_n && g->addrs) {
                 fprintf(f, "        elements = { ");
                 size_t written = 0;
                 for (size_t k = 0; k < g->files_n; k++)
