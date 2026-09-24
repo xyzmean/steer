@@ -32,6 +32,7 @@ cc_defaults {
         "src/srs.c",
         "src/puff.c",
         "src/hwid.c",
+        "src/ctl.c",
     ],
     cflags: [
         "-DSTEER_ANDROID",

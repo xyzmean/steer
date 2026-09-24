@@ -37,6 +37,7 @@
 #include "obfs.h"
 #include "cli.h"
 #include "srs.h"
+#include "ctl.h"
 
 /* Уровень в журнале — см. одноимённые макросы в failover.c и obfs.c. Метка подсистемы
  * здесь «apply»: все строки ниже пишутся при компиляции и применении спеки. Отказы
@@ -3958,7 +3959,8 @@ static int cmd_explain(const char *spec, const char *what) {
  * SIGHUP — сверить состав со спекой: ушедшим выходам — SIGTERM, новым — запуск, остальным —
  * ничего, если не изменились их параметры (см. sup_sig): у изменившихся помощник гасится и
  * поднимается сразу, без пятисекундной паузы. SIGTERM — погасить всех и выйти (init шлёт его
- * группе, это на случай kill). SIGHUP шлёт тот, кто сменил спеку.
+ * группе, это на случай kill). SIGHUP шлёт управляющий сокет после каждого удачного apply
+ * (src/ctl.c, reload).
  *
  * zapret здесь нет: его обработчик — отдельная программа (steer-nfqws), а в сборке под
  * Android zapret нет вовсе. В базовой сборке нет и vless, xsteer и tgws — их команды есть только
@@ -4390,6 +4392,7 @@ int main(int argc, char **argv) {
         if (c->passthru) {
             fputs("\nФлаги:\n", stdout);
             if (!strcmp(cmd, "fit")) aggregate_usage_flags(stdout);
+            else if (!strcmp(cmd, "ctl-serve") || !strcmp(cmd, "ctl")) ctl_usage_flags(stdout);
             else dnsd_usage_flags(stdout);
         }
         return 0;
@@ -4399,6 +4402,8 @@ int main(int argc, char **argv) {
      * Такие команды помечены в таблице как passthru и получают argv как есть. */
     if (c->passthru) {
         if (!strcmp(cmd, "fit")) return aggregate_main(argc - 1, argv + 1);
+        if (!strcmp(cmd, "ctl-serve")) return ctl_serve_main(argc - 2, argv + 2);
+        if (!strcmp(cmd, "ctl")) return ctl_client_main(argc - 2, argv + 2);
         return dnsd_main(argc - 2, argv + 2);
     }
 
