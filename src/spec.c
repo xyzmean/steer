@@ -761,8 +761,16 @@ static void parse_outputs(struct js *j) {
                 js_str(j, m, sizeof(m));
                 if (!strcmp(m, "drop")) o.on_fail = FAIL_DROP;
                 else if (!strcmp(m, "direct")) o.on_fail = FAIL_DIRECT;
+#ifdef STEER_ANDROID
+                /* zapret в сборке под Android нет — см. out_skips_zapret в spec.h. */
+                else if (!strcmp(m, "zapret"))
+                    die("outputs.%s: on_fail zapret — в сборке под Android zapret нет "
+                        "(want drop or direct)", o.name);
+                else die("outputs.%s: unknown on_fail (want drop or direct)", o.name);
+#else
                 else if (!strcmp(m, "zapret")) o.on_fail = FAIL_ZAPRET;
                 else die("outputs.%s: unknown on_fail (want drop, direct or zapret)", o.name);
+#endif
             }
             /* Вторая ось сторожа. Значение по умолчанию — `order`, то есть сегодняшнее
              * поведение; см. рассуждение у поля prefer_latency в spec.h. */
@@ -844,6 +852,9 @@ static void parse_outputs(struct js *j) {
                     o.name);
         }
         else if (!strcmp(kind, "zapret")) {
+#ifdef STEER_ANDROID
+            die("outputs.%s: kind zapret — в сборке под Android zapret нет", o.name);
+#endif
             o.kind = OUT_ZAPRET;
             /* Устройства нет и не будет: трафик уходит обычным маршрутом, а выход меняет
              * только то, ЧТО с ним по дороге сделает nfqws. Названное устройство здесь —

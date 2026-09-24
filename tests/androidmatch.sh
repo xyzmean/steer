@@ -11,6 +11,8 @@
 #     следа роутерного поля 0x0ff00000 — в бит 20 и 21 пишет netd.
 #  2. Пути по умолчанию — /data/misc/steer: /etc и /var на телефоне только для чтения.
 #  3. Старая раскладка (legacy-min — ровно ядро телефона) собирается и с этим полем.
+#  4. zapret на телефоне нет: бит пропуска zapret (0x40000000, в битах vendor netd) не ставится,
+#     цепочки failopen, которая существует ради него, нет, а kind/on_fail zapret — отказ спеки.
 set -u
 BIN="${ANDROID:-./build/steer-android}"
 [ -x "$BIN" ] || { echo "not built: $BIN (make test)"; exit 2; }
@@ -38,10 +40,10 @@ S="--spec $tmp/spec.json --state-dir $tmp/state"
 
 out="$(STEER_NFT_COMPAT=modern "$BIN" apply --dry-run $S 2>/dev/null)"
 check "современная раскладка собирается" "0" "$?"
-check "метка пишется в биты 22-27" "1" \
-    "$(printf '%s\n' "$out" | grep -c 'meta mark set mark and 0xf03fffff or 0x40400000')"
-check "набор failopen сверяется маской телефона" "1" \
-    "$(printf '%s\n' "$out" | grep -c 'meta mark and 0x0fc00000 @failopen')"
+check "метка пишется в биты 22-27, без бита zapret" "1" \
+    "$(printf '%s\n' "$out" | grep -c 'meta mark set mark and 0xf03fffff or 0x00400000')"
+check "бита zapret 0x40000000 нет нигде" "0" "$(printf '%s\n' "$out" | grep -ci '0x4[0-9a-f]\{7\}')"
+check "набора и цепочки failopen нет" "0" "$(printf '%s\n' "$out" | grep -c 'failopen')"
 check "роутерного поля нет нигде" "0" "$(printf '%s\n' "$out" | grep -c '0x0ff00000\|0xf00fffff')"
 
 help="$("$BIN" help apply 2>&1)"
@@ -57,7 +59,15 @@ check "старая раскладка: nat в таблице ip" "1" "$(printf 
 # Правил два: адресный и доменный каналы слились в одну группу, и в старой раскладке у неё
 # по правилу на каждую половину набора.
 check "старая раскладка: метка та же" "2" \
-    "$(printf '%s\n' "$lout" | grep -c 'meta mark set mark and 0xf03fffff or 0x40400000')"
+    "$(printf '%s\n' "$lout" | grep -c 'meta mark set mark and 0xf03fffff or 0x00400000')"
+
+sed 's/"kind": "direct" }/"kind": "zapret" }/' "$tmp/spec.json" > "$tmp/z.json"
+"$BIN" apply --dry-run --spec "$tmp/z.json" --state-dir "$tmp/state" >/dev/null 2>"$tmp/z.err"
+check "kind zapret — отказ спеки" "2" "$?"
+check "  и причина названа" "1" "$(grep -c 'в сборке под Android zapret нет' "$tmp/z.err")"
+sed 's/"on_fail": "direct"/"on_fail": "zapret"/' "$tmp/spec.json" > "$tmp/zf.json"
+"$BIN" apply --dry-run --spec "$tmp/zf.json" --state-dir "$tmp/state" >/dev/null 2>"$tmp/zf.err"
+check "on_fail zapret — отказ спеки" "2" "$?"
 
 printf '\nandroidmatch: %s passed, %s failed\n' "$pass" "$fail"
 [ "$fail" -eq 0 ]
