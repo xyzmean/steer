@@ -9,12 +9,15 @@
 #   K=/root/vm49/sysroot/kinc
 #   musl-gcc -static -idirafter $K -O2 -DSTEER_ANDROID -o /tmp/steer <исходники как в Makefile>
 #   musl-gcc -static -idirafter $K -O2 -o /tmp/local49-tool tests/local49-tool.c
-#   tools/vm49/vm49.sh run steer/tests/local49.sh /tmp/steer /tmp/local49-tool
+#   musl-gcc -static -idirafter $K -O2 -o /tmp/dnstool tests/legacy49-dnstool.c
+#   tools/vm49/vm49.sh run steer/tests/local49.sh /tmp/steer /tmp/local49-tool /tmp/dnstool
 #
 # Что проверяется. Приложение из канала по UID уходит в устройство своего выхода, а другое
 # приложение к тому же адресу — обычным путём; канал сторожевого вида для раздачи сам телефон не
 # задевает; «self» берёт всех, кроме root; канал «весь трафик» приложения — всё его IPv4;
-# адрес источника в туннеле — адрес устройства туннеля (masquerade), а не адрес Wi-Fi; down
+# адрес источника в туннеле — адрес устройства туннеля (masquerade), а не адрес Wi-Fi; DNS
+# приложений заворачивается к резолверу движка, а тот переспрашивает сервер, к которому шёл
+# запрос (адрес из conntrack), и соединение к поддельному адресу уходит к настоящему; down
 # снимает цепочки выхода. Устройства — постоянные TUN (local49-tool mk), «сеть» — up0 с
 # маршрутом по умолчанию, туннели — wg9 и wg8.
 set -u
@@ -32,6 +35,7 @@ local49-tool mk wg9 10.77.0.1/24
 local49-tool mk wg8 10.78.0.1/24
 printf '203.0.113.0/24\n' > $W/p.lst
 printf '198.51.100.0/24\n' > $W/q.lst
+printf 'example.com\n' > $W/d.lst
 cat > $W/local.json <<J
 { "schema": 2, "lan_devices": ["rndis0"],
   "outputs": { "vpn": { "kind": "interface", "device": "wg9", "on_fail": "drop" },
@@ -40,8 +44,10 @@ cat > $W/local.json <<J
     { "name": "app", "from": ["uid:10123"], "match": { "prefixes_files": ["$W/p.lst"] }, "out": "vpn" },
     { "name": "all", "from": ["self"], "match": { "prefixes_files": ["$W/q.lst"] }, "out": "vpn2" },
     { "name": "full", "from": ["uid:10500-10510"], "match": { "any": true, "allow_all": true }, "out": "vpn" },
-    { "name": "lan", "match": { "prefixes_files": ["$W/p.lst"] }, "out": "vpn2" } ] }
+    { "name": "lan", "match": { "prefixes_files": ["$W/p.lst"] }, "out": "vpn2" },
+    { "name": "dom", "from": ["uid:10123"], "match": { "domains_files": ["$W/d.lst"] }, "out": "vpn" } ] }
 J
+printf 'example.com\n' > $W/d.lst
 S="--spec $W/local.json --state-dir /tmp/st"
 steer apply $S 2>&1 | grep -v 'masquerade\|not mentioned\|IPv6'
 check "apply с каналами на сам телефон" "0" "$(steer apply $S >/dev/null 2>&1; echo $?)"
@@ -59,6 +65,18 @@ probe() {
     done | head -1
 }
 
+# probe2 UID АДРЕС ПОРТ НАСТОЯЩИЙ — то же, но SYN ищется к НАСТОЯЩЕМУ адресу: соединение к
+# поддельному переводится на выходе (nat output) раньше, чем пакет покинет устройство.
+probe2() {
+    for d in up0 wg9 wg8; do local49-tool watch $d 900 > /tmp/w.$d & done
+    sleep 0.3
+    local49-tool conn "$1" "$2" "$3"
+    wait
+    for d in up0 wg9 wg8; do
+        sed -n "s/^syn \([0-9.]*\) -> $4:$3$/$d \1/p" /tmp/w.$d
+    done | head -1
+}
+
 echo "=== 1. приложение из канала по UID"
 check "uid 10123 к 203.0.113.9 — в туннель wg9 с адресом туннеля" "wg9 10.77.0.1" "$(probe 10123 203.0.113.9 443)"
 echo "=== 2. другое приложение к тому же адресу"
@@ -73,7 +91,29 @@ check "uid 10505 к 192.0.2.7 — в wg9" "wg9 10.77.0.1" "$(probe 10505 192.0.2
 check "uid 10511 к 192.0.2.7 — вне диапазона, обычным путём" "up0 10.66.0.1" "$(probe 10511 192.0.2.7 80)"
 check "первое совпадение сверху: uid 10505 к 198.51.100.9 — канал all выше full" \
     "wg8 10.78.0.1" "$(probe 10505 198.51.100.9 443)"
-echo "=== 5. down"
+echo "=== 5. DNS приложений: к резолверу движка и дальше — к тому серверу, к которому шли"
+# «Сеть» раздаёт DNS с 10.66.0.53 и на любое имя отвечает 203.0.113.77 — настоящим адресом.
+# Резолвер движка поднят в режиме origdst: переспрашивает тот сервер, к которому шёл запрос.
+modprobe nf_conntrack_netlink 2>/dev/null
+ip addr add 10.66.0.53/32 dev up0
+dnstool serve 53 203.0.113.77 10.66.0.53 & UP=$!
+steer dnsd $S --listen-port 5300 --upstream-origdst > /tmp/dnsd.log 2>&1 & DP=$!
+sleep 1
+fake="$(local49-tool dns 10123 10.66.0.53 example.com)"
+check "имя канала у приложения — поддельный адрес" "198.18" "$(echo "$fake" | cut -d. -f1-2)"
+check "чужое имя у другого приложения — ответ того самого сервера сети" "203.0.113.77" \
+    "$(local49-tool dns 10124 10.66.0.53 other.example)"
+check "root не заворачивается — отвечает сервер сети напрямую" "203.0.113.77" \
+    "$(local49-tool dns 0 10.66.0.53 example.com)"
+check "приложение канала к поддельному адресу — в туннель, к настоящему адресу" \
+    "wg9 10.77.0.1" "$(probe2 10123 "$fake" 443 203.0.113.77)"
+check "другое приложение к тому же поддельному — напрямую к настоящему" \
+    "up0 10.66.0.1" "$(probe2 10124 "$fake" 443 203.0.113.77)"
+nft list chain ip steer output_nat 2>&1 | grep -c counter >/dev/null
+kill $DP $UP 2>/dev/null
+grep -v 'realip' /tmp/dnsd.log | head -3
+
+echo "=== 6. down"
 steer down --state-dir /tmp/st
 check "после down цепочек выхода нет" "0" "$(nft list ruleset | grep -c 'output_mark\|output_reroute')"
 check "после down uid 10123 — обычным путём" "up0 10.66.0.1" "$(probe 10123 203.0.113.9 443)"

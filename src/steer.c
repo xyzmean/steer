@@ -561,6 +561,40 @@ static int has_local(void) {
     return 0;
 }
 
+/* Есть ли доменный канал на сам телефон. Тогда DNS приложений заворачивается к резолверу —
+ * см. emit_local_dns. */
+static int has_local_domains(void) {
+    for (size_t i = 0; i < g_grp_n; i++)
+        if (group_is_local(&g_grp[i]) && g_grp[i].domains) return 1;
+    return 0;
+}
+
+/* ---- DNS приложений телефона — к резолверу движка -------------------------------------
+ *
+ * Доменный канал на сам телефон видит только те имена, что спросили через наш резолвер. DNS
+ * приложений делает DnsResolver (netd) — сокетом, который он приписывает UID приложения, — к
+ * серверам текущей сети; правило ниже заворачивает эти запросы к нам, а резолвер переспрашивает
+ * тот же сервер (dnsd --upstream-origdst: адрес берётся из conntrack).
+ *
+ * ВСЕ приложения, а не только приложения каналов. У DnsResolver общий кэш на сеть: заверни мы
+ * только своих, настоящий адрес, полученный чужим приложением первым, достался бы из кэша и
+ * своему — мимо набора канала, то есть мимо туннеля. Кроме root: это сам резолвер (его запрос
+ * наверх иначе завернулся бы по кругу) и прочие демоны.
+ *
+ * И перевод поддельных адресов для соединений самого телефона — тот же, что prerouting_dnat
+ * делает для раздачи: поддельный адрес из кэша DnsResolver получает любое приложение, и у
+ * приложения вне канала соединение должно уйти напрямую к настоящему адресу, а не в никуда.
+ *
+ * Только UDP, как и у раздачи: резолвер движка TCP не слушает (см. prerouting_dns). DNS по
+ * IPv6 на старом ядре без nat в ip6 не заворачивается — там такого правила не поставить. */
+static void emit_local_dns(FILE *f, const char *dnat_kw) {
+    fprintf(f, "        meta skuid != 0 udp dport 53 counter redirect to :%d "
+               "comment \"steer-dns-local\"\n", DNS_PORT);
+    if (has_fakeip())
+        fprintf(f, "        ip daddr 198.18.0.0/15 counter %s to ip daddr map @fakeip "
+                   "comment \"steer-fakeip-local\"\n", dnat_kw);
+}
+
 /* «Кто» у группы на сам телефон: владелец сокета. "self" — все, кроме root (почему — у
  * from_is_local); "uid:N[-M]" — перечисленные приложения. У пакета без сокета (RST и ICMP,
  * которые ядро шлёт само) владельца нет, и skuid не совпадает ни с чем — такие пакеты идут
@@ -1186,6 +1220,12 @@ static void generate_legacy_tail(FILE *f) {
         emit_tgws_rules(f);
         fprintf(f, "    }\n");
 #ifdef STEER_ANDROID
+        if (has_local_domains()) {
+            fprintf(f, "    chain output_nat {\n"
+                       "        type nat hook output priority dstnat - 1; policy accept;\n");
+            emit_local_dns(f, "dnat");
+            fprintf(f, "    }\n");
+        }
         /* Снятие бита перемаршрутизации — см. STEER_REROUTE_BIT в spec.h. mangle + 2: сразу
          * после разметки (output_mark в inet, mangle + 1) и до nat на выходе. */
         if (has_local())
@@ -1725,6 +1765,14 @@ static void generate(FILE *f) {
                        "        ip daddr 198.18.0.0/15 counter dnat ip to ip daddr map @fakeip\n"
                        "    }\n");
         }
+#ifdef STEER_ANDROID
+        if (has_local_domains()) {
+            fprintf(f, "    chain output_dns {\n"
+                       "        type nat hook output priority dstnat; policy accept;\n");
+            emit_local_dns(f, "dnat ip");
+            fprintf(f, "    }\n");
+        }
+#endif
         /* Make traceroute show the REAL intermediate routers while the destination
          * stays the fake address.
          *

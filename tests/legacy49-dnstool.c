@@ -1,6 +1,7 @@
 /* Помощник стенда tests/legacy49.sh (ядро 4.9 в tools/vm49): поддельный вышестоящий DNS и
  * клиент к нему. Python в initramfs стенда нет, поэтому оба — одной статической программой.
- *   dnstool serve PORT A.B.C.D    — отвечает на любой A-запрос этим адресом (TTL 60)
+ *   dnstool serve PORT A.B.C.D [BIND] — отвечает на любой A-запрос этим адресом (TTL 60);
+ *                                  слушает BIND (по умолчанию 127.0.0.1)
  *   dnstool ask SERVER PORT NAME  — печатает первый адрес ответа, «timeout» или «rcodeN» */
 #include <stdio.h>
 #include <stdlib.h>
@@ -10,10 +11,11 @@
 #include <netinet/in.h>
 #include <arpa/inet.h>
 int main(int argc, char **argv) {
-    if (argc == 4 && !strcmp(argv[1], "serve")) {
+    if ((argc == 4 || argc == 5) && !strcmp(argv[1], "serve")) {
         int s = socket(AF_INET, SOCK_DGRAM, 0);
         struct sockaddr_in a = { .sin_family = AF_INET, .sin_port = htons(atoi(argv[2])) };
         a.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+        if (argc == 5) inet_pton(AF_INET, argv[4], &a.sin_addr);
         if (bind(s, (void *)&a, sizeof a)) { perror("bind"); return 1; }
         struct in_addr ip; inet_pton(AF_INET, argv[3], &ip);
         for (;;) {

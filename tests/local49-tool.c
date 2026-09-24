@@ -9,6 +9,8 @@
  *   local49-tool conn UID A.B.C.D PORT   — от имени UID начать TCP-соединение (SYN) и выйти
  *   local49-tool watch NAME MS           — MS миллисекунд читать NAME и печатать TCP SYN:
  *                                          «syn SRC -> DST:PORT» или «none»
+ *   local49-tool dns UID SERVER NAME     — от имени UID спросить A у SERVER:53, напечатать
+ *                                          первый адрес ответа или «timeout»
  *
  * Статически и без libc-зависимостей сверх POSIX: собирается и musl-gcc для стенда vm49, и
  * обычным cc для сетевого пространства на хосте. */
@@ -22,6 +24,7 @@
 #include <poll.h>
 #include <time.h>
 #include <sys/ioctl.h>
+#include <sys/time.h>
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
@@ -99,6 +102,38 @@ int main(int argc, char **argv) {
         if (!seen) printf("none\n");
         return 0;
     }
-    fprintf(stderr, "usage: mk NAME CIDR | conn UID ADDR PORT | watch NAME MS\n");
+    if (argc == 5 && !strcmp(argv[1], "dns")) {
+        unsigned uid = (unsigned)strtoul(argv[2], NULL, 10);
+        if (uid && (setgid(uid) != 0 || setuid(uid) != 0)) { perror("setuid"); return 1; }
+        unsigned char q[300], r[600];
+        int n = 12;
+        memset(q, 0, 12);
+        q[0] = 0x12; q[1] = 0x34; q[2] = 1; q[5] = 1;
+        char name[256];
+        snprintf(name, sizeof name, "%s", argv[4]);
+        for (char *t = strtok(name, "."); t; t = strtok(NULL, ".")) {
+            q[n++] = (unsigned char)strlen(t); memcpy(q + n, t, strlen(t)); n += (int)strlen(t);
+        }
+        q[n++] = 0; q[n++] = 0; q[n++] = 1; q[n++] = 0; q[n++] = 1;
+        int s = socket(AF_INET, SOCK_DGRAM, 0);
+        struct timeval tv = { 2, 0 };
+        setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof tv);
+        struct sockaddr_in a;
+        memset(&a, 0, sizeof a);
+        a.sin_family = AF_INET;
+        a.sin_port = htons(53);
+        inet_pton(AF_INET, argv[3], &a.sin_addr);
+        sendto(s, q, n, 0, (struct sockaddr *)&a, sizeof a);
+        int m = (int)recv(s, r, sizeof r, 0);
+        if (m < n + 16 || !r[7]) { printf("timeout\n"); return 0; }
+        /* Первый ответ: за вопросом — имя-указатель (2), тип, класс, TTL, длина, адрес. */
+        int at = n + 2 + 2 + 2 + 4 + 2;
+        char ip[16];
+        inet_ntop(AF_INET, r + at, ip, sizeof ip);
+        printf("%s\n", ip);
+        return 0;
+    }
+    fprintf(stderr, "usage: mk NAME CIDR | conn UID ADDR PORT | watch NAME MS | "
+                    "dns UID SERVER NAME\n");
     return 2;
 }
