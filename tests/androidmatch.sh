@@ -122,10 +122,18 @@ check "отказ IPv6 у «весь трафик» — с тем же суже�
     "$(c "$m2" 'meta nfproto ipv6 meta l4proto udp th dport 50000-65535 oifname != "lo" ip6 daddr != { fe80::/10, fc00::/7, ff00::/8 } counter reject')"
 check "«весь трафик» — не в свою сеть (RFC 1918, link-local, мультикаст)" "1" \
     "$(c "$m2" 'meta nfproto ipv4 ip daddr != { 10.0.0.0/8, 127.0.0.0/8, 169.254.0.0/16, 172.16.0.0/12, 192.168.0.0/16, 224.0.0.0/4, 255.255.255.255 }')"
-check "DNS телефона — все, кроме запроса самого резолвера (метка движка), только IPv4" "1" \
-    "$(c "$m2" 'meta nfproto ipv4 meta mark and 0x0fc00000 != 0x0fc00000 udp dport 53 counter redirect to :5300')"
-check "  и на старой раскладке — в таблице ip" "1" \
-    "$(c "$l2" 'meta mark and 0x0fc00000 != 0x0fc00000 udp dport 53 counter redirect to :5300')"
+# Метка пакета — в метку соединения (ct mark set mark): по ней резолвер переспрашивает с меткой
+# сети исходного запроса. Оба семейства: в современной раскладке одно правило в inet без
+# nfproto, в старой — по цепочке nat output в ip и ip6.
+dnsrule='meta mark and 0x0fc00000 != 0x0fc00000 udp dport 53 ct mark set mark counter redirect to :5300'
+check "DNS телефона — все, кроме запроса самого резолвера (метка движка), оба семейства" "1" \
+    "$(c "$m2" "$dnsrule")"
+check "  без ограничения семейством" "0" "$(c "$m2" "nfproto ipv4 $dnsrule")"
+# Половину в ip6 (она есть, только если ядро приняло nat в ip6 — это решает проба, а не
+# переменная) проверяет tests/local49.sh на ядре 4.9.
+check "  на старой раскладке — в таблице ip" "1" \
+    "$(printf '%s\n' "$l2" | sed -n '/^table ip steer/,/^}/p' | grep -c -- "$dnsrule")"
+check "  без nat в ip6 таблицы ip6 нет" "0" "$(c "$l2" '^table ip6')"
 check "поддельные адреса для соединений телефона переводятся на output" "1" \
     "$(c "$m2" 'comment "steer-fakeip-local"')"
 check "masquerade — не в nft (его ставит iptables при apply)" "0" "$(c "$m2$l2" 'masquerade')"

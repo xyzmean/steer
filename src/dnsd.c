@@ -1504,6 +1504,16 @@ static void fakeip_route_set(const char *domain, uint64_t want);
 /* proxy state                                                           */
 /* ---------------------------------------------------------------------- */
 
+/* Адрес сервера наверху в режиме origdst — IPv4 или IPv6 (см. g_origdst). Объединение, а не
+ * sockaddr_storage: слотов MAX_PENDING, и 128 байт на слот ради 28 нужных незачем. */
+union dnsd_sa { struct sockaddr sa; struct sockaddr_in v4; struct sockaddr_in6 v6; };
+
+/* Адрес, на который пришёл запрос (режим origdst): по нему ищется запись conntrack, и с него
+ * же уходит ответ клиенту (см. reply_client). af — AF_INET, AF_INET6 или 0 («не узнали»).
+ * IPv4 у двойного стека приходит v4-mapped и хранится здесь как v4: и в conntrack, и в
+ * ответе это IPv4-соединение, а не IPv6. */
+struct dnsd_local { int af; struct in_addr v4; struct in6_addr v6; };
+
 /* sockaddr_storage, not sockaddr_in: the listen socket is dual-stack, so a
  * client can be IPv6. See run_proxy's socket setup for why that matters. */
 struct pending {
@@ -1552,12 +1562,12 @@ struct pending {
     /* Куда ушёл запрос наверх — только в режиме --upstream-origdst (см. g_origdst): ответ
      * принимается лишь от этого адреса. В обычном режиме сокет connect'нут к петле, и
      * сравнивать нечего. */
-    struct sockaddr_in up;
+    union dnsd_sa up;
     /* Режим origdst: сокет пула, которым ушёл запрос, номер транзакции наверх (случайный, см.
      * g_txmap) и адрес, на который пришёл запрос, — с него обязан уйти ответ клиенту. */
     int up_fd;
     uint16_t txid;
-    struct in_addr local;
+    struct dnsd_local local;
     int have_local;
     time_t expire;
 };
@@ -1592,8 +1602,20 @@ static uint8_t g_gen_next;
  * Сокет наверх в этом режиме не connect'нут (серверы разные), и ответ принимается только от
  * того адреса, куда ушёл запрос: иначе подделать ответ мог бы кто угодно, угадав номер
  * транзакции. Записи NAT нет (к нам обратились напрямую, мимо redirect) или назначение —
- * мы сами — запрос уходит на петлю, как в обычном режиме: так петли не бывает. IPv6-клиент
- * тоже уходит на петлю: сокет наверх — IPv4. */
+ * мы сами — запрос уходит на петлю, как в обычном режиме: так петли не бывает.
+ *
+ * IPv6 — ТАК ЖЕ, СВОИМ ПУЛОМ. Запрос приложения к серверу сети по IPv6 заворот на output
+ * переводит на ::1 (redirect на выходе всегда даёт петлю своего семейства), запись conntrack
+ * ищется в семействе AF_INET6, и переспрос уходит к тому же IPv6-серверу сокетом из пула
+ * AF_INET6 (g_up_pool6). Отдельный пул, а не двойной стек на одном: у IPv4-пути остаются ровно
+ * прежние сокеты и прежнее поведение, а ядро без IPv6 просто не откроет второй пул — тогда
+ * IPv6-запрос уходит на петлю, как раньше.
+ *
+ * Сервер по адресу link-local (fe80::…, его раздаёт RDNSS в объявлении маршрутизатора) —
+ * частый случай на Wi-Fi, и зоны (интерфейса) в записи conntrack нет. Переспрос уходит без
+ * sin6_scope_id, и интерфейс выбирает маршрут: на Android — по метке сети (см. g_up_mark ниже),
+ * которая ведёт в таблицу своей сети, где fe80::/64 указывает на её интерфейс. Без метки
+ * решила бы основная таблица. */
 /* Раскладка IPV6_PKTINFO и IP_PKTINFO — своя, а не из netinet/in.h: там их видно только с
  * _GNU_SOURCE, а этот файл включают и стенды со своим порядком заголовков. Поля и размеры —
  * ядра (include/uapi/linux/ipv6.h и in.h), от libc они не зависят. */
@@ -1623,7 +1645,56 @@ static int g_listen_port;
  * запись безвредна — слот сверяется с номером. */
 #define UP_POOL 8
 static int g_up_pool[UP_POOL];
+static int g_up_pool6[UP_POOL];
+static int g_up_pool6_n;              /* открытые сокеты g_up_pool6 — первые g_up_pool6_n */
 static int16_t g_txmap[65536];
+
+#ifdef STEER_ANDROID
+/* ПЕРЕСПРОС С МЕТКОЙ СЕТИ ИСХОДНОГО ЗАПРОСА (только Android, только origdst).
+ *
+ * Зачем. netd метит каждый сокет fwmark'ом (Fwmark.h: номер сети — биты 0-15, explicitly
+ * selected — 16, protectedFromVpn — 17, права — 18-19, uidBillingDone — 20), и маршрут на
+ * телефоне выбирает не адрес, а эта метка: лестница ip rule netd сравнивает её поля масками и
+ * отправляет пакет в таблицу своей сети. Приложение, привязанное к мобильной сети при живом
+ * Wi-Fi, или DnsResolver, спрашивающий «по сети N» (у каждой сети свои серверы и свой кэш),
+ * шлёт запрос с номером той сети. Переспрашивай мы все запросы одной меткой движка, запрос
+ * ушёл бы по сети по умолчанию — к серверу мобильной сети через Wi-Fi (где он недоступен или
+ * отвечает другое), а сервер link-local — вовсе в чужой интерфейс.
+ *
+ * Как метка до нас доходит. SO_RCVMARK появился в 5.19, на 4.9 телефона метку датаграммы
+ * принятым сокетом не узнать. Зато метку знает правило заворота: оно видит пакет с fwmark
+ * приложения и пишет её в метку соединения (`ct mark set mark` в правиле steer-dns-local,
+ * см. emit_local_dns в steer.c). А запись conntrack dnsd и так берёт целиком — ради
+ * исходного назначения (ct_origdst), — и CTA_MARK лежит в том же ответе ядра: ни одного
+ * лишнего системного вызова на запрос.
+ *
+ * Что уходит наверх: метка соединения без поля движка (биты 22-27) и без бита
+ * перемаршрутизации (21), плюс STEER_SELF_MARK в поле движка. Всё прочее — поля netd и биты
+ * vendor/ingress — копируется как есть: это их правила, и решать за них нечего. SELF в поле
+ * обязателен: по нему правило заворота пропускает наш же переспрос (иначе он завернулся бы
+ * к нам по кругу), и по нему же разметка каналов его не трогает. Поэтому канал движка у
+ * исходного запроса (приложение «весь трафик», спрашивающее свой DNS само) на переспрос не
+ * переносится — он уходит сетью netd, как и шёл бы DnsResolver.
+ *
+ * Метка ставится на сокет пула прямо перед sendto. Процесс однопоточный (один цикл epoll,
+ * без потоков), поэтому между setsockopt и sendto на этот сокет никто не вклинится, а
+ * метка у неподключённого UDP-сокета читается ядром на каждой отправке (udp_sendmsg берёт
+ * sk_mark и для поиска маршрута, и для skb->mark) — кэша маршрута, который пришлось бы
+ * сбрасывать, у него нет. Отдельный сокет на каждую сеть не нужен: ответ приходит на порт
+ * сокета независимо от метки. Текущая метка сокета запоминается (g_up_mark), и setsockopt
+ * зовётся только при смене — на телефоне с одной сетью это ноль вызовов сверх прежнего. */
+static unsigned g_up_mark[UP_POOL], g_up_mark6[UP_POOL];
+
+static unsigned up_mark_for(uint32_t ctmark, int have) {
+    if (!have) return STEER_SELF_MARK;
+    return (ctmark & ~(STEER_MARK_MASK | STEER_REROUTE_BIT)) | STEER_SELF_MARK;
+}
+
+static void up_mark_set(int fd, unsigned *cur, unsigned want) {
+    if (*cur == want) return;
+    if (setsockopt(fd, SOL_SOCKET, SO_MARK, &want, sizeof(want)) == 0) *cur = want;
+}
+#endif
 
 static uint16_t rand16(void) {
     uint16_t v = 0;
@@ -1637,7 +1708,7 @@ static uint16_t rand16(void) {
  * узнаёт, обратного перевода нет, и DnsResolver (он connect'ит сокет и сверяет, откуда пришёл
  * ответ) его выбрасывает — DNS приложений не работал бы вовсе. */
 static void reply_client(const void *b, size_t n, const struct sockaddr_storage *cl,
-                         socklen_t cll, const struct in_addr *local, int have_local) {
+                         socklen_t cll, const struct dnsd_local *local, int have_local) {
     if (!g_origdst || !have_local) {
         sendto(g_listen_fd, b, n, 0, (const struct sockaddr *)cl, cll);
         return;
@@ -1652,10 +1723,16 @@ static void reply_client(const void *b, size_t n, const struct sockaddr_storage 
     mh.msg_control = cb.b;
     struct cmsghdr *c = (struct cmsghdr *)cb.b;
     if (cl->ss_family == AF_INET6) {
+        /* Слушающий сокет двойного стека: IPv4-клиенту — v4-mapped адрес приёма, IPv6-клиенту
+         * (запрос по IPv6, заворот на ::1) — сам адрес приёма. */
         struct dnsd_in6_pktinfo pi;
         memset(&pi, 0, sizeof(pi));
-        pi.addr.s6_addr[10] = 0xff; pi.addr.s6_addr[11] = 0xff;
-        memcpy(&pi.addr.s6_addr[12], local, 4);
+        if (local->af == AF_INET6) {
+            pi.addr = local->v6;
+        } else {
+            pi.addr.s6_addr[10] = 0xff; pi.addr.s6_addr[11] = 0xff;
+            memcpy(&pi.addr.s6_addr[12], &local->v4, 4);
+        }
         c->cmsg_level = IPPROTO_IPV6; c->cmsg_type = IPV6_PKTINFO;
         c->cmsg_len = CMSG_LEN(sizeof(pi));
         memcpy(CMSG_DATA(c), &pi, sizeof(pi));
@@ -1663,7 +1740,7 @@ static void reply_client(const void *b, size_t n, const struct sockaddr_storage 
     } else {
         struct dnsd_in_pktinfo pi;
         memset(&pi, 0, sizeof(pi));
-        pi.spec_dst = *local;
+        pi.spec_dst = local->v4;
         c->cmsg_level = IPPROTO_IP; c->cmsg_type = IP_PKTINFO;
         c->cmsg_len = CMSG_LEN(sizeof(pi));
         memcpy(CMSG_DATA(c), &pi, sizeof(pi));
@@ -1672,23 +1749,39 @@ static void reply_client(const void *b, size_t n, const struct sockaddr_storage 
     sendmsg(g_listen_fd, &mh, 0);
 }
 
-/* Исходное назначение запроса из conntrack. 0 — найдено (out заполнен), -1 — нет. */
-static int ct_origdst(const struct sockaddr_storage *cli, const struct in_addr *local,
-                      int lport, struct sockaddr_in *out) {
-    struct in_addr ca;
+/* Исходное назначение запроса из conntrack. 0 — найдено (out заполнен), -1 — нет.
+ *
+ * Семейство — по клиенту: IPv4 (в том числе v4-mapped у двойного стека) ищется в AF_INET,
+ * настоящий IPv6 — в AF_INET6; адрес приёма обязан быть того же семейства, иначе такой
+ * записи не бывает. Попутно — метка соединения (CTA_MARK): *mark и *have_mark, см. g_up_mark.
+ * Атрибута нет (ядро собрано без метки соединений) — *have_mark остаётся 0. */
+static int ct_origdst(const struct sockaddr_storage *cli, const struct dnsd_local *local,
+                      int lport, union dnsd_sa *out, uint32_t *mark, int *have_mark) {
+    int fam;
+    uint8_t caddr[16];
     uint16_t cport;
+    *have_mark = 0;
     if (cli->ss_family == AF_INET) {
         const struct sockaddr_in *c4 = (const struct sockaddr_in *)cli;
-        ca = c4->sin_addr;
+        fam = AF_INET;
+        memcpy(caddr, &c4->sin_addr, 4);
         cport = c4->sin_port;
     } else if (cli->ss_family == AF_INET6) {
         const struct sockaddr_in6 *c6 = (const struct sockaddr_in6 *)cli;
-        if (!IN6_IS_ADDR_V4MAPPED(&c6->sin6_addr)) return -1;
-        memcpy(&ca, &c6->sin6_addr.s6_addr[12], 4);
+        if (IN6_IS_ADDR_V4MAPPED(&c6->sin6_addr)) {
+            fam = AF_INET;
+            memcpy(caddr, &c6->sin6_addr.s6_addr[12], 4);
+        } else {
+            fam = AF_INET6;
+            memcpy(caddr, &c6->sin6_addr, 16);
+        }
         cport = c6->sin6_port;
     } else {
         return -1;
     }
+    if (local->af != fam) return -1;
+    size_t alen = fam == AF_INET ? 4 : 16;
+    const void *laddr = fam == AF_INET ? (const void *)&local->v4 : (const void *)&local->v6;
     if (g_ct_fd < 0) {
         g_ct_fd = socket(AF_NETLINK, SOCK_RAW | SOCK_CLOEXEC, NETLINK_NETFILTER);
         if (g_ct_fd < 0) return -1;
@@ -1703,7 +1796,7 @@ static int ct_origdst(const struct sockaddr_storage *cli, const struct in_addr *
     nh->nlmsg_flags = NLM_F_REQUEST;
     nh->nlmsg_seq = ++seq;
     struct nfgenmsg *nf = (struct nfgenmsg *)NLMSG_DATA(nh);
-    nf->nfgen_family = AF_INET;
+    nf->nfgen_family = (uint8_t)fam;
     nf->version = NFNETLINK_V0;
     size_t pos = NLMSG_LENGTH(sizeof(*nf));
     /* Вложенные атрибуты по-простому: длина вложения дописывается после содержимого. */
@@ -1720,8 +1813,8 @@ static int ct_origdst(const struct sockaddr_storage *cli, const struct in_addr *
     uint16_t lp = htons((uint16_t)lport);
     CT_OPEN(CTA_TUPLE_REPLY, t);
     CT_OPEN(CTA_TUPLE_IP, ip);
-    CT_PUT(CTA_IP_V4_SRC, local, 4);
-    CT_PUT(CTA_IP_V4_DST, &ca, 4);
+    CT_PUT(fam == AF_INET ? CTA_IP_V4_SRC : CTA_IP_V6_SRC, laddr, alen);
+    CT_PUT(fam == AF_INET ? CTA_IP_V4_DST : CTA_IP_V6_DST, caddr, alen);
     CT_CLOSE(ip);
     CT_OPEN(CTA_TUPLE_PROTO, pr);
     CT_PUT(CTA_PROTO_NUM, &proto, 1);
@@ -1737,6 +1830,7 @@ static int ct_origdst(const struct sockaddr_storage *cli, const struct in_addr *
     if (sendto(g_ct_fd, req, pos, 0, (struct sockaddr *)&k, sizeof(k)) < 0) return -1;
 
     uint8_t buf[4096];
+    int dst_attr = fam == AF_INET ? CTA_IP_V4_DST : CTA_IP_V6_DST;
     for (;;) {
         ssize_t n = recv(g_ct_fd, buf, sizeof(buf), 0);
         if (n <= 0) return -1;
@@ -1746,13 +1840,22 @@ static int ct_origdst(const struct sockaddr_storage *cli, const struct in_addr *
             if (h->nlmsg_seq != seq) continue;           /* ответ на прежний, опоздавший */
             if (h->nlmsg_type == NLMSG_ERROR) return -1; /* записи нет — ENOENT */
             if (h->nlmsg_len < NLMSG_LENGTH(sizeof(struct nfgenmsg))) return -1;
-            /* Верхний уровень: ищем CTA_TUPLE_ORIG, в нём IP и порт назначения. */
+            /* Верхний уровень: CTA_TUPLE_ORIG (в нём IP и порт назначения) и CTA_MARK. */
             uint8_t *a = (uint8_t *)NLMSG_DATA(h) + NLMSG_ALIGN(sizeof(struct nfgenmsg));
             uint8_t *end = (uint8_t *)h + h->nlmsg_len;
+            uint8_t oaddr[16];
+            uint16_t oport = 0;
             int got_ip = 0, got_port = 0;
             for (struct nlattr *x = (struct nlattr *)a; (uint8_t *)x + NLA_HDRLEN <= end &&
                  x->nla_len >= NLA_HDRLEN && (uint8_t *)x + x->nla_len <= end;
                  x = (struct nlattr *)((uint8_t *)x + NLA_ALIGN(x->nla_len))) {
+                if ((x->nla_type & NLA_TYPE_MASK) == CTA_MARK && x->nla_len >= NLA_HDRLEN + 4) {
+                    uint32_t m;
+                    memcpy(&m, (uint8_t *)x + NLA_HDRLEN, 4);
+                    *mark = ntohl(m);
+                    *have_mark = 1;
+                    continue;
+                }
                 if ((x->nla_type & NLA_TYPE_MASK) != CTA_TUPLE_ORIG) continue;
                 uint8_t *xe = (uint8_t *)x + x->nla_len;
                 for (struct nlattr *y = (struct nlattr *)((uint8_t *)x + NLA_HDRLEN);
@@ -1768,36 +1871,49 @@ static int ct_origdst(const struct sockaddr_storage *cli, const struct in_addr *
                          z = (struct nlattr *)((uint8_t *)z + NLA_ALIGN(z->nla_len))) {
                         int zt = z->nla_type & NLA_TYPE_MASK;
                         uint8_t *zd = (uint8_t *)z + NLA_HDRLEN;
-                        if (yt == CTA_TUPLE_IP && zt == CTA_IP_V4_DST && z->nla_len >= NLA_HDRLEN + 4) {
-                            memcpy(&out->sin_addr, zd, 4); got_ip = 1;
+                        if (yt == CTA_TUPLE_IP && zt == dst_attr &&
+                            z->nla_len >= NLA_HDRLEN + alen) {
+                            memcpy(oaddr, zd, alen); got_ip = 1;
                         } else if (yt == CTA_TUPLE_PROTO && zt == CTA_PROTO_DST_PORT &&
                                    z->nla_len >= NLA_HDRLEN + 2) {
-                            memcpy(&out->sin_port, zd, 2); got_port = 1;
+                            memcpy(&oport, zd, 2); got_port = 1;
                         }
                     }
                 }
             }
             if (!got_ip || !got_port) return -1;
-            out->sin_family = AF_INET;
             /* Назначение — мы сами: к резолверу обратились напрямую, NAT не было. */
-            if (out->sin_addr.s_addr == local->s_addr && ntohs(out->sin_port) == lport)
-                return -1;
+            if (!memcmp(oaddr, laddr, alen) && ntohs(oport) == lport) return -1;
+            memset(out, 0, sizeof(*out));
+            if (fam == AF_INET) {
+                out->v4.sin_family = AF_INET;
+                memcpy(&out->v4.sin_addr, oaddr, 4);
+                out->v4.sin_port = oport;
+            } else {
+                out->v6.sin6_family = AF_INET6;
+                memcpy(&out->v6.sin6_addr, oaddr, 16);
+                out->v6.sin6_port = oport;
+            }
             return 0;
         }
     }
 }
 
-/* Куда слать запрос наверх: исходное назначение (в режиме origdst), иначе петля. */
-static void upstream_for(const struct sockaddr_storage *cli, const struct in_addr *local,
-                         int have_local, struct sockaddr_in *up) {
+/* Куда слать запрос наверх: исходное назначение (в режиме origdst), иначе петля. *mark — метка
+ * исходного соединения (см. g_up_mark), *have_mark — узнали ли её. */
+static void upstream_for(const struct sockaddr_storage *cli, const struct dnsd_local *local,
+                         int have_local, union dnsd_sa *up, uint32_t *mark, int *have_mark) {
     memset(up, 0, sizeof(*up));
-    up->sin_family = AF_INET;
-    up->sin_port = htons((uint16_t)g_up_port);
-    up->sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    up->v4.sin_family = AF_INET;
+    up->v4.sin_port = htons((uint16_t)g_up_port);
+    up->v4.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    *have_mark = 0;
     if (!g_origdst || !have_local) return;
-    struct sockaddr_in o;
-    memset(&o, 0, sizeof(o));
-    if (ct_origdst(cli, local, g_listen_port, &o) == 0) *up = o;
+    union dnsd_sa o;
+    if (ct_origdst(cli, local, g_listen_port, &o, mark, have_mark) != 0) { *have_mark = 0; return; }
+    /* IPv6-назначение, а пула AF_INET6 нет (ядро без IPv6) — на петлю, как раньше. */
+    if (o.sa.sa_family == AF_INET6 && g_up_pool6_n == 0) { *have_mark = 0; return; }
+    *up = o;
 }
 
 /* Поколение для нового ожидания. Оно ОБЯЗАНО быть усечённым здесь, а не только при
@@ -2047,7 +2163,8 @@ static int handle_client_query(void) {
     ssize_t n;
     /* Адрес, на который пришла датаграмма, нужен только режиму origdst: по нему (вместе с
      * адресом клиента) ищется запись conntrack. В обычном режиме — прежний recvfrom. */
-    struct in_addr local = { 0 };
+    struct dnsd_local local;
+    memset(&local, 0, sizeof(local));
     int have_local = 0;
     if (g_origdst) {
         struct iovec iov = { buf, sizeof(buf) };
@@ -2066,13 +2183,18 @@ static int handle_client_query(void) {
                 struct dnsd_in6_pktinfo pi;
                 memcpy(&pi, CMSG_DATA(c), sizeof(pi));
                 if (IN6_IS_ADDR_V4MAPPED(&pi.addr)) {
-                    memcpy(&local, &pi.addr.s6_addr[12], 4);
-                    have_local = 1;
+                    local.af = AF_INET;
+                    memcpy(&local.v4, &pi.addr.s6_addr[12], 4);
+                } else {
+                    local.af = AF_INET6;
+                    local.v6 = pi.addr;
                 }
+                have_local = 1;
             } else if (c->cmsg_level == IPPROTO_IP && c->cmsg_type == IP_PKTINFO) {
                 struct dnsd_in_pktinfo pi;
                 memcpy(&pi, CMSG_DATA(c), sizeof(pi));
-                local = pi.addr;
+                local.af = AF_INET;
+                local.v4 = pi.addr;
                 have_local = 1;
             }
         }
@@ -2173,20 +2295,38 @@ static int handle_client_query(void) {
     p->gen = pending_next_gen();
     uint16_t tag = pending_tag(p);
     int ufd = g_up_fd;
+    union dnsd_sa up;
+    uint32_t ctmark = 0;
+    int have_mark = 0;
+    upstream_for(&from, &local, have_local, &up, &ctmark, &have_mark);
+    socklen_t uplen = up.sa.sa_family == AF_INET6 ? sizeof(up.v6) : sizeof(up.v4);
     if (g_origdst) {
         tag = rand16();
         g_txmap[tag] = (int16_t)(p - g_pending);
         p->txid = tag;
-        ufd = g_up_pool[rand16() % UP_POOL];
-        if (ufd < 0) ufd = g_up_fd;
+        /* Пул — по семейству сервера: IPv6-назначение upstream_for отдаёт, только если пул
+         * AF_INET6 открыт (g_up_pool6_n > 0). */
+        if (up.sa.sa_family == AF_INET6) {
+            int i = rand16() % g_up_pool6_n;
+            ufd = g_up_pool6[i];
+#ifdef STEER_ANDROID
+            up_mark_set(ufd, &g_up_mark6[i], up_mark_for(ctmark, have_mark));
+#endif
+        } else {
+            int i = rand16() % UP_POOL;
+            ufd = g_up_pool[i];
+            if (ufd < 0) ufd = g_up_fd;
+#ifdef STEER_ANDROID
+            else up_mark_set(ufd, &g_up_mark[i], up_mark_for(ctmark, have_mark));
+#endif
+        }
     }
+    (void)ctmark; (void)have_mark;
     p->up_fd = ufd;
     buf[0] = (uint8_t)(tag >> 8);
     buf[1] = (uint8_t)(tag & 0xFF);
 
-    struct sockaddr_in up;
-    upstream_for(&from, &local, have_local, &up);
-    if ((g_origdst ? sendto(ufd, buf, (size_t)n, 0, (struct sockaddr *)&up, sizeof(up))
+    if ((g_origdst ? sendto(ufd, buf, (size_t)n, 0, &up.sa, uplen)
                    : send(g_up_fd, buf, (size_t)n, 0)) < 0) {
         /* Чаще всего это ECONNREFUSED от петли: резолвер наверху не запущен или
          * перезапускается. Ядро отдаёт такую ошибку отложенно, следующим системным
@@ -2257,15 +2397,26 @@ static size_t build_rewritten_response(const uint8_t *orig, size_t qend,
     return pos;
 }
 
+/* Ответ пришёл оттуда, куда ушёл вопрос: семейство, адрес и порт. Зона (sin6_scope_id) не
+ * сравнивается: вопрос к серверу link-local уходит без неё (см. g_origdst), а ответ приходит
+ * с номером интерфейса. */
+static int up_same(const union dnsd_sa *a, const union dnsd_sa *b) {
+    if (a->sa.sa_family != b->sa.sa_family) return 0;
+    if (a->sa.sa_family == AF_INET6)
+        return !memcmp(&a->v6.sin6_addr, &b->v6.sin6_addr, 16) &&
+               a->v6.sin6_port == b->v6.sin6_port;
+    return a->v4.sin_addr.s_addr == b->v4.sin_addr.s_addr && a->v4.sin_port == b->v4.sin_port;
+}
+
 /* Возвращает 1, если датаграмма была прочитана (есть смысл читать дальше), 0 — если
  * очередь пуста. Ответы всех ожиданий приходят на один сокет, поэтому своё ожидание
  * находится по номеру транзакции, который мы же и проставили при отправке. */
 static int handle_upstream_response(int ufd) {
     uint8_t buf[MAX_PKT];
-    struct sockaddr_in src;
+    union dnsd_sa src;
     socklen_t srclen = sizeof(src);
     memset(&src, 0, sizeof(src));
-    ssize_t n = recvfrom(ufd, buf, sizeof(buf), 0, (struct sockaddr *)&src, &srclen);
+    ssize_t n = recvfrom(ufd, buf, sizeof(buf), 0, &src.sa, &srclen);
     if (n < 0) {
         if (errno == EAGAIN || errno == EWOULDBLOCK) return 0;   /* очередь пуста */
         /* Прочая ошибка — это ОДНА отложенная ошибка сокета (обычно ECONNREFUSED с
@@ -2295,8 +2446,7 @@ static int handle_upstream_response(int ufd) {
         (!g_origdst && p->gen != (uint8_t)((tag >> PENDING_IDX_BITS) & PENDING_GEN_MASK)))
         return 1;
     /* Режим origdst: сокет не connect'нут, и ответ обязан прийти оттуда, куда ушёл вопрос. */
-    if (g_origdst && (src.sin_addr.s_addr != p->up.sin_addr.s_addr ||
-                      src.sin_port != p->up.sin_port)) return 1;
+    if (g_origdst && !up_same(&src, &p->up)) return 1;
     /* И ГЛАВНОЕ: ответ обязан отвечать на НАШ вопрос. Поколение когда-нибудь повторится
      * (шесть бит), и без этой проверки запоздавший ответ уехал бы клиенту как ответ на
      * другой вопрос — чужой адрес вместо нужного, молча и без единой строки в журнале. */
@@ -2651,7 +2801,8 @@ static int run_proxy(int listen_port, int upstream_port) {
     epoll_ctl(g_epfd, EPOLL_CTL_ADD, g_up_fd, &uev);
     /* Пул сокетов наверх на случайных портах — только в режиме origdst (см. g_up_pool).
      * bind на порт 0: ядро выдаёт эфемерный порт случайно. */
-    for (int i = 0; i < UP_POOL; i++) g_up_pool[i] = -1;
+    for (int i = 0; i < UP_POOL; i++) g_up_pool[i] = g_up_pool6[i] = -1;
+    g_up_pool6_n = 0;
     memset(g_txmap, 0xff, sizeof(g_txmap));
     if (g_origdst) {
         for (int i = 0; i < UP_POOL; i++) {
@@ -2662,11 +2813,33 @@ static int run_proxy(int listen_port, int upstream_port) {
 #ifdef STEER_ANDROID
             unsigned mk = STEER_SELF_MARK;
             setsockopt(fd, SOL_SOCKET, SO_MARK, &mk, sizeof(mk));
+            g_up_mark[i] = mk;
 #endif
             g_up_pool[i] = fd;
             struct epoll_event pev = {0};
             pev.events = EPOLLIN;
             pev.data.ptr = &g_up_pool[i];
+            epoll_ctl(g_epfd, EPOLL_CTL_ADD, fd, &pev);
+        }
+        /* Пул AF_INET6 — для запросов по IPv6 (см. g_origdst). Только IPv6 (V6ONLY): IPv4
+         * ходит своим пулом. Не открылся ни один — IPv6-запросы уходят на петлю. */
+        for (int i = 0; i < UP_POOL; i++) {
+            int fd = socket(AF_INET6, SOCK_DGRAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
+            if (fd < 0) break;
+            int on = 1;
+            setsockopt(fd, IPPROTO_IPV6, IPV6_V6ONLY, &on, sizeof(on));
+            struct sockaddr_in6 any6 = { .sin6_family = AF_INET6 };
+            if (bind(fd, (struct sockaddr *)&any6, sizeof(any6)) != 0) { close(fd); break; }
+            int k = g_up_pool6_n++;
+#ifdef STEER_ANDROID
+            unsigned mk = STEER_SELF_MARK;
+            setsockopt(fd, SOL_SOCKET, SO_MARK, &mk, sizeof(mk));
+            g_up_mark6[k] = mk;
+#endif
+            g_up_pool6[k] = fd;
+            struct epoll_event pev = {0};
+            pev.events = EPOLLIN;
+            pev.data.ptr = &g_up_pool6[k];
             epoll_ctl(g_epfd, EPOLL_CTL_ADD, fd, &pev);
         }
     }
