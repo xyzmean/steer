@@ -58,6 +58,8 @@
 static const char *PROBE_TARGETS[] = { "1.1.1.1", "8.8.8.8", NULL };
 
 int run_quiet(const char *const argv[]);   /* из steer.c */
+/* Чтение вывода команды — определено ниже, у сверки состояния; нужно и привязке таблицы. */
+static void ip_show(const char *cmd, char *out, size_t n);
 
 /* Адрес источника устройства: без него правило пробы не к чему привязать, а само
  * отсутствие адреса уже означает, что устройство не готово нести трафик. */
@@ -531,6 +533,227 @@ void rule_drop(unsigned mark, int table) {
     while (run_quiet(dell) == 0) ;
 }
 
+/* ---- таблица и правило выхода БЕЗ МГНОВЕНИЯ ПУСТОТЫ -----------------------------------
+ *
+ * ЧТО БЫЛО. Привязка выхода к устройству (bind_device, apply_routing, отказ drop в
+ * apply_failed) делала `rule_drop` → `rule_add` и `ip route flush table N` → `ip route add
+ * default dev X table N`. Каждая пара — это два запуска ip, то есть миллисекунды, и в эти
+ * миллисекунды у помеченного трафика не было ни правила, ни маршрута в таблице. А нет правила
+ * или пуста таблица — значит «ищи дальше»: пакет с меткой выхода уходит по таблице main, то
+ * есть НАПРЯМУЮ, мимо туннеля. На стенде так утекло рукопожатие WireGuard, а при on_fail=drop
+ * утекает ровно то, что человек запретил пускать мимо туннеля. Перепривязка случается не раз в
+ * жизни: смена устройства пула, каждый apply, каждая починка разъехавшейся маршрутизации,
+ * подъём TUN помощником.
+ *
+ * КАК ТЕПЕРЬ. Маршрут меняется одной командой `ip route replace` — ядро подменяет запись на
+ * месте (и тип тоже: blackhole на устройство и обратно, проверено на 6.8 и 4.9), поэтому
+ * таблица не бывает пустой ни на миг; всё лишнее, что в ней было, снимается ПОСЛЕ. Правило не
+ * снимается вовсе, если оно уже стоит: недостающее добавляется, а лишние копии и прежние формы
+ * (без маски, не на своём приоритете) снимаются после того, как верная копия есть. Одинаковые
+ * правила в ядре ничего не решают друг за друга, так что «сначала добавить, потом снять» —
+ * это и есть «ровно одна копия без мгновения, когда нет ни одной».
+ *
+ * Что нужно прочитать для этого — `ip -4 rule show` и `ip -4 route show table N` — сторож и
+ * так читает на сверке; здесь это одно чтение на привязку, а привязка случается по событию. */
+
+/* Сколько в ядре копий НАШЕГО правила: метка и маска наши, таблица наша (номер или имя, как у
+ * route_facts_of — имя из rt_tables.d разрешить нечем, а метку с нашей маской ставим только
+ * мы), на телефоне — и приоритет наш. pref[] — приоритеты найденных копий, чтобы лишние
+ * снимались точно, по приоритету, а не «первая попавшаяся». wrong[] — наше правило на чужом
+ * приоритете: осталось от сборки, где приоритет выбирало ядро. Чистая функция — стенд
+ * failovermatch. */
+#define RULE_COPIES_MAX 8
+struct rule_copies {
+    int known;                      /* дамп прочитан (пустым он на живой коробке не бывает) */
+    int n;                          /* верных копий */
+    unsigned long pref[RULE_COPIES_MAX];
+    int wrong_n;                    /* копий на чужом приоритете */
+    unsigned long wrong[RULE_COPIES_MAX];
+    int legacy_n;                   /* прежняя форма без маски (см. rule_drop) */
+    unsigned long legacy[RULE_COPIES_MAX];
+};
+
+static struct rule_copies rule_copies_of(const char *rules, uint32_t mark, int table) {
+    struct rule_copies c;
+    memset(&c, 0, sizeof c);
+    c.known = rules && rules[0] != '\0';
+    if (!c.known) return c;
+    char want_tbl[16];
+    snprintf(want_tbl, sizeof(want_tbl), "%d", table);
+    for (const char *ln = rules; ln && *ln; ) {
+        const char *end = strchr(ln, '\n');
+        size_t len = end ? (size_t)(end - ln) : strlen(ln);
+        char line[512];
+        size_t n = len < sizeof(line) - 1 ? len : sizeof(line) - 1;
+        memcpy(line, ln, n);
+        line[n] = '\0';
+        ln = end ? end + 1 : NULL;
+
+        char *stop = NULL;
+        unsigned long pref = strtoul(line, &stop, 10);
+        if (!stop || *stop != ':') continue;
+        const char *fm = strstr(line, "fwmark ");
+        if (!fm) continue;
+        unsigned long got = strtoul(fm + 7, &stop, 16);
+        if (!stop || (uint32_t)got != mark) continue;
+        /* Без маски — прежняя форма (ядро печатает маску 0xffffffff никак). Её снимают, но не
+         * считают верной копией — см. rule_ensure. */
+        int legacy = *stop != '/';
+        if (!legacy && (uint32_t)strtoul(stop + 1, NULL, 16) != STEER_MARK_MASK) continue;
+        const char *lk = strstr(line, "lookup ");
+        if (!lk) continue;
+        const char *t = lk + 7;
+        size_t tl = strcspn(t, " \t");
+        int numeric = tl > 0;
+        for (size_t i = 0; i < tl; i++)
+            if (!isdigit((unsigned char)t[i])) numeric = 0;
+        if (numeric && (tl != strlen(want_tbl) || strncmp(t, want_tbl, tl) != 0)) continue;
+        if (legacy) {
+            if (c.legacy_n < RULE_COPIES_MAX) c.legacy[c.legacy_n++] = pref;
+            continue;
+        }
+        if (STEER_RULE_PREF && pref != (unsigned long)STEER_RULE_PREF) {
+            if (c.wrong_n < RULE_COPIES_MAX) c.wrong[c.wrong_n++] = pref;
+            continue;
+        }
+        if (c.n < RULE_COPIES_MAX) c.pref[c.n] = pref;
+        c.n++;
+    }
+    return c;
+}
+
+/* Снять одну копию правила на данном приоритете. С приоритетом, а не «любую»: без него ядро
+ * сняло бы первую попавшуюся, и это могла бы оказаться как раз та, что должна остаться. */
+static void rule_del_at(unsigned mark, int table, unsigned long pref) {
+    char m[32], t[16], p[24];
+    snprintf(m, sizeof(m), "0x%08x/0x%08x", mark, STEER_MARK_MASK);
+    snprintf(t, sizeof(t), "%d", table);
+    snprintf(p, sizeof(p), "%lu", pref);
+    const char *del[] = { "ip", "rule", "del", "fwmark", m, "table", t, "priority", p, NULL };
+    run_quiet(del);
+}
+
+void rule_ensure(unsigned mark, int table) {
+    /* Статический и с запасом — по той же причине, что в route_facts_read: это ВСЕ правила
+     * коробки, и обрезанный дамп значил бы «нашего нет» и лишнюю копию. */
+    static char rules[16384];
+    ip_show("ip -4 rule show 2>/dev/null", rules, sizeof(rules));
+    struct rule_copies c = rule_copies_of(rules, mark, table);
+    /* Прочитать не вышло (нет ip, отказал popen) — добавляем, ничего не снимая: лишняя копия
+     * того же правила ничего не меняет в маршрутизации, а снятие вслепую могло бы оставить
+     * метку без правила — то есть ту самую утечку, ради которой всё это. */
+    if (!c.known || c.n == 0) rule_add(mark, table);
+    /* Верная копия есть (или только что добавлена) — теперь можно убирать лишнее. */
+    for (int k = 1; k < c.n && k < RULE_COPIES_MAX; k++) rule_del_at(mark, table, c.pref[k]);
+    for (int k = 0; k < c.wrong_n; k++) rule_del_at(mark, table, c.wrong[k]);
+    /* Прежняя форма без маски — см. rule_drop. Снимается после того, как форма с маской есть, и
+     * ТОЛЬКО с явной маской 0xffffffff (так её хранит ядро) и приоритетом. `ip rule del fwmark X
+     * table T` без маски на ядре 4.9 (телефон) снимает ЛЮБОЕ правило с меткой X — и с нашей
+     * маской тоже: маска там сравнивается, только если её назвали. rule_drop это не задевало
+     * (он снимает обе формы по замыслу), а здесь сняло бы только что поставленное верное правило
+     * — то есть метка осталась бы без правила, а трафик ушёл бы напрямую; поймал стенд legacy49
+     * на ядре 4.9. Не прочитав дамп, прежнюю форму не трогаем вовсе. */
+    char legacy[40], t[16], p[24];
+    snprintf(legacy, sizeof(legacy), "0x%08x/0xffffffff", mark);
+    snprintf(t, sizeof(t), "%d", table);
+    for (int k = 0; k < c.legacy_n; k++) {
+        snprintf(p, sizeof(p), "%lu", c.legacy[k]);
+        const char *dell[] = { "ip", "rule", "del", "fwmark", legacy, "table", t,
+                               "priority", p, NULL };
+        run_quiet(dell);
+    }
+}
+
+/* Одна строка `ip -4 route show table N`, разобранная на то, чем её можно снять точно: тип
+ * (пусто — обычный unicast), назначение, устройство, метрика. */
+struct rt_line {
+    char type[16];
+    char dst[64];
+    char dev[32];
+    unsigned long metric;
+};
+
+static int rt_line_parse(const char *line, struct rt_line *r) {
+    static const char *const types[] = { "blackhole", "unreachable", "prohibit", "throw",
+                                         "local", "broadcast", "multicast", "anycast", "nat",
+                                         "unicast", NULL };
+    memset(r, 0, sizeof *r);
+    char buf[512];
+    snprintf(buf, sizeof(buf), "%s", line);
+    char *save = NULL;
+    char *tok = strtok_r(buf, " \t", &save);
+    if (!tok) return 0;
+    for (int i = 0; types[i]; i++)
+        if (!strcmp(tok, types[i])) {
+            snprintf(r->type, sizeof(r->type), "%s", tok);
+            tok = strtok_r(NULL, " \t", &save);
+            break;
+        }
+    if (!tok) return 0;
+    snprintf(r->dst, sizeof(r->dst), "%s", tok);
+    while ((tok = strtok_r(NULL, " \t", &save)) != NULL) {
+        int is_dev = !strcmp(tok, "dev"), is_metric = !strcmp(tok, "metric");
+        if (!is_dev && !is_metric) continue;
+        char *v = strtok_r(NULL, " \t", &save);
+        if (!v) break;
+        if (is_dev) snprintf(r->dev, sizeof(r->dev), "%s", v);
+        else r->metric = strtoul(v, NULL, 10);
+    }
+    return 1;
+}
+
+/* Снять из таблицы всё, кроме одного маршрута по умолчанию — того, что только что поставлен
+ * заменой (в dev, а при dev == NULL — запрет). Снимается каждая запись по её ключу (тип,
+ * назначение, устройство, метрика): «сбросить таблицу и поставить заново» здесь и есть то
+ * окно, от которого эта функция избавляет. */
+static void table_prune(int table, const char *dev) {
+    static char routes[8192];
+    char cmd[64], t[16];
+    snprintf(cmd, sizeof(cmd), "ip -4 route show table %d 2>/dev/null", table);
+    snprintf(t, sizeof(t), "%d", table);
+    ip_show(cmd, routes, sizeof(routes));
+    int kept = 0;
+    for (const char *ln = routes; ln && *ln; ) {
+        const char *end = strchr(ln, '\n');
+        size_t len = end ? (size_t)(end - ln) : strlen(ln);
+        char line[512];
+        size_t n = len < sizeof(line) - 1 ? len : sizeof(line) - 1;
+        memcpy(line, ln, n);
+        line[n] = '\0';
+        ln = end ? end + 1 : NULL;
+
+        struct rt_line r;
+        if (!rt_line_parse(line, &r)) continue;
+        int is_main = !strcmp(r.dst, "default") && r.metric == 0 &&
+                      (dev ? (!r.type[0] || !strcmp(r.type, "unicast")) && !strcmp(r.dev, dev)
+                           : !strcmp(r.type, "blackhole"));
+        if (is_main && !kept) { kept = 1; continue; }
+        char m[24];
+        snprintf(m, sizeof(m), "%lu", r.metric);
+        const char *argv[16];
+        int k = 0;
+        argv[k++] = "ip"; argv[k++] = "route"; argv[k++] = "del";
+        if (r.type[0]) argv[k++] = r.type;
+        argv[k++] = r.dst;
+        if (r.dev[0]) { argv[k++] = "dev"; argv[k++] = r.dev; }
+        if (r.metric) { argv[k++] = "metric"; argv[k++] = m; }
+        argv[k++] = "table"; argv[k++] = t;
+        argv[k] = NULL;
+        run_quiet(argv);
+    }
+}
+
+int table_bind(const struct output *o, const char *dev) {
+    char t[16];
+    snprintf(t, sizeof(t), "%d", o->table);
+    const char *to_dev[] = { "ip", "route", "replace", "default", "dev", dev, "table", t, NULL };
+    const char *to_bh[] = { "ip", "route", "replace", "blackhole", "default", "table", t, NULL };
+    int rc = run_quiet(dev ? to_dev : to_bh);
+    if (rc != 0) return rc;
+    table_prune(o->table, dev);
+    return 0;
+}
+
 /* Пущен ли выход напрямую — отметка в наборе FAILOPEN_SET нашей таблицы. Зачем она и почему
  * так, а не иначе, — у out_failopen_capable в spec.h: пока метка выхода в наборе, цепочка
  * prerouting_failopen снимает с его пакетов бит ZAPRET_SKIP_MARK, и трафик упавшего выхода
@@ -557,23 +780,23 @@ void failopen_mark(const struct output *o, int on) {
 static void apply_failed(struct output *o, int announce) {
     char tbl[16];
     snprintf(tbl, sizeof(tbl), "%d", o->table);
-    const char *flush[] = { "ip", "route", "flush", "table", tbl, NULL };
-    run_quiet(flush);
 
     if (o->on_fail == FAIL_DROP) {
         /* blackhole, а не отсутствие маршрута: без маршрута пакет с меткой
          * провалится в следующую таблицу и уйдёт напрямую — то есть ровно туда,
-         * куда его не пускали. */
-        const char *bh[] = { "ip", "route", "add", "blackhole", "default",
-                             "table", tbl, NULL };
-        run_quiet(bh);
-        /* Правило пересоздаётся и здесь. Без него blackhole лежит в таблице, которую
-         * никто не спрашивает: помеченный пакет провалится дальше и уйдёт напрямую —
-         * то самое, от чего on_fail=drop и защищает. А снять правило было кому:
-         * прежний отказ мог случиться в режиме direct/zapret (ниже), и режим меняют
-         * в интерфейсе, не перезапуская ничего. */
-        rule_drop(o->mark, o->table);
-        rule_add(o->mark, o->table);
+         * куда его не пускали.
+         *
+         * Заменой, а не «сбросить таблицу и добавить запрет»: между сбросом и добавлением
+         * таблица пуста, и помеченный пакет в это мгновение уходил напрямую — ровно то, от
+         * чего запрет и ставится (см. «без мгновения пустоты» у table_bind). */
+        table_bind(o, NULL);
+        /* Правило — и здесь: без него blackhole лежит в таблице, которую никто не
+         * спрашивает, и помеченный пакет провалится дальше и уйдёт напрямую — то самое, от
+         * чего on_fail=drop и защищает. А снять правило было кому: прежний отказ мог
+         * случиться в режиме direct/zapret (ниже), и режим меняют в интерфейсе, не
+         * перезапуская ничего. Стоящее правило не снимается (rule_ensure): снять и поставить
+         * заново значило бы на миг открыть тот же путь напрямую. */
+        rule_ensure(o->mark, o->table);
         /* Режим мог смениться с direct/zapret на drop, пока выход лежал: отметка «пущен
          * напрямую» от прежнего отказа здесь больше не правда. */
         failopen_mark(o, 0);
@@ -590,8 +813,11 @@ static void apply_failed(struct output *o, int announce) {
      * обычным он обязан стать целиком, то есть и для общего обхода DPI: отметка в наборе
      * снимает с него бит «не для zapret» (см. out_failopen_capable в spec.h). Отметка — ДО
      * снятия соединений: следующий пакет каждого из них пройдёт разметку заново и должен
-     * застать её уже на месте. */
+     * застать её уже на месте. Таблица сбрасывается — здесь пустота и есть обещанное: трафик
+     * выхода идёт напрямую, и порядок двух команд этого не меняет. */
     rule_drop(o->mark, o->table);
+    const char *flush[] = { "ip", "route", "flush", "table", tbl, NULL };
+    run_quiet(flush);
     failopen_mark(o, 1);
     conntrack_evict(o->mark);
 
@@ -605,54 +831,53 @@ static void apply_failed(struct output *o, int announce) {
                 o->on_fail == FAIL_ZAPRET ? "zapret" : "direct");
 }
 
-/* Привязать таблицу выхода к устройству. Правило пересоздаётся, потому что режим
- * отказа мог его снять, а `ip rule add` дубликаты не проверяет.
+/* Привязать таблицу выхода к устройству. Правило проверяется и при нужде возвращается,
+ * потому что режим отказа мог его снять.
  *
  * Не static: этим же пользуется клиент VLESS, когда поднял своё устройство. Он —
  * единственный, кто знает момент, когда TUN готов нести трафик, и ждать этого момента
  * снаружи невозможно: procd запускает экземпляр только после того, как init-скрипт
  * закончил работу, то есть уже после apply. Одна функция вместо второй копии тех же
- * трёх команд — иначе привязка «от клиента» и «от сторожа» разъехались бы. */
+ * команд — иначе привязка «от клиента» и «от сторожа» разъехались бы.
+ *
+ * Порядок — сначала маршрут, потом правило, и ни одного снятия до того, как новое стоит (см.
+ * «без мгновения пустоты» у table_bind). Маршрут первым: если правила не было (прежний отказ
+ * в режиме direct), то появившееся правило должно сразу найти в таблице устройство, а не
+ * пустоту. */
 void bind_device(struct output *o, const char *dev) {
     char tbl[16];
     snprintf(tbl, sizeof(tbl), "%d", o->table);
 
-    rule_drop(o->mark, o->table);
-    rule_add(o->mark, o->table);
     /* Выход снова несёт трафик сам — бит «не для zapret» его пакетам опять нужен. Снимается
      * до привязки и до снятия соединений по той же причине, по какой в apply_failed
      * ставится до них. При отказе привязки ниже отметка возвращается. */
     failopen_mark(o, 0);
-    const char *flush[] = { "ip", "route", "flush", "table", tbl, NULL };
-    run_quiet(flush);
-    const char *rt[] = { "ip", "route", "add", "default", "dev", dev, "table", tbl, NULL };
+    int rc = table_bind(o, dev);
+    rule_ensure(o->mark, o->table);
     /* Соединения снимаются ЗДЕСЬ, а не в сторожевом проходе целиком: bind_device зовут,
      * когда маршрут выхода действительно меняется (первая привязка, смена устройства,
      * расхождение состояния), а не каждую минуту. Снимать записи на здоровом тике значило бы
      * рвать людям закачки раз в минуту без всякой причины. */
     conntrack_evict(o->mark);
-    if (run_quiet(rt) != 0) {
-        /* Отказ здесь оставляет таблицу ПУСТОЙ, а пустая таблица — это не «нет
-         * маршрута», а «ищи дальше»: помеченный пакет провалится в следующую таблицу и
-         * уйдёт напрямую, то есть ровно туда, куда его не пускали. Причём flush выше
-         * только что снял blackhole, который apply поставил при on_fail=drop, — молча
-         * исчезает не маршрут, а сама защита. То же решение уже принято в apply_routing
-         * (steer.c) и в apply_failed выше; здесь оно обязано совпадать, иначе один и тот
-         * же порядок команд означает в трёх местах разное.
-         *
-         * Достижимо и после H-081: устройство исчезло между проверкой и привязкой (свой
-         * же процесс туннеля умер), таблица занята чужим маршрутом, нет прав. */
+    if (rc != 0) {
+        /* Замена не прошла: устройство исчезло между проверкой и привязкой (свой же процесс
+         * туннеля умер), нет прав. В таблице осталось то, что было, — прежнее устройство,
+         * запрет или ничего, — и оставлять это на волю случая нельзя: пустая таблица — это не
+         * «нет маршрута», а «ищи дальше», то есть напрямую, куда пакет не пускали. То же
+         * решение принято в apply_routing (steer.c) и в apply_failed выше; здесь оно обязано
+         * совпадать, иначе один и тот же случай означает в трёх местах разное. */
         fprintf(stderr, LOG_W "выход %s: не удалось привязать таблицу %s к %s — "
                         "устройство ещё живо?\n", o->name, tbl, dev);
         if (o->on_fail == FAIL_DROP) {
-            const char *bh[] = { "ip", "route", "add", "blackhole", "default",
-                                 "table", tbl, NULL };
-            run_quiet(bh);
+            table_bind(o, NULL);
             fprintf(stderr, LOG_W "выход %s: трафик остановлен до успешной привязки "
                             "(on_fail=drop)\n", o->name);
         } else {
             /* direct/zapret: пустая таблица уводит пакет в main, то есть напрямую, — пусть
-             * и идёт как обычный, через общий обход. */
+             * и идёт как обычный, через общий обход. Сброс — потому что замена не прошла и в
+             * таблице могло остаться прежнее (мёртвое) устройство. */
+            const char *flush[] = { "ip", "route", "flush", "table", tbl, NULL };
+            run_quiet(flush);
             failopen_mark(o, 1);
         }
     }

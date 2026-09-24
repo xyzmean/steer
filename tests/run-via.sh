@@ -150,7 +150,7 @@ start_vless() {
     done
     inA ip link show vl >/dev/null 2>&1 || return 1
     # И маршрута в таблице vl: клиент привязывает её сам после появления устройства, а до того
-    # помеченное уходит по blackhole (или, в миг между flush и add у bind_device, мимо таблицы).
+    # помеченное уходит по blackhole.
     for _ in $(seq 50); do
         inA ip route show table all | grep -q '^default dev vl ' && return 0
         sleep 0.2

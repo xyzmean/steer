@@ -29,7 +29,7 @@ int rule_deleted = 0;
 static char g_cmd[64][256];
 static int g_cmd_n;
 
-/* Заставить `ip route add default dev ...` отказать: устройство исчезло между
+/* Заставить `ip route replace default dev ...` отказать: устройство исчезло между
  * проверкой и привязкой, таблица занята, нет прав. Подделать это можно только здесь —
  * настоящего ядра у стенда нет. */
 int g_route_add_fails = 0;
@@ -64,7 +64,7 @@ int run_quiet(const char *const argv[]) {
     }
     /* Отказывает только привязка к устройству: blackhole в ту же таблицу обязан
      * пройти, иначе стенд проверял бы не то. */
-    if (g_route_add_fails && strstr(joined, "route add default dev")) return 2;
+    if (g_route_add_fails && strstr(joined, "route replace default dev")) return 2;
     return 0;
 }
 
@@ -72,6 +72,20 @@ static int cmd_seen(const char *needle) {
     for (int i = 0; i < g_cmd_n; i++)
         if (strstr(g_cmd[i], needle)) return 1;
     return 0;
+}
+/* Номер первой команды, содержащей NEEDLE, или -1: для проверок ПОРЯДКА — «новое поставлено
+ * раньше, чем снято старое». */
+static int cmd_at(const char *needle) {
+    for (int i = 0; i < g_cmd_n; i++)
+        if (strstr(g_cmd[i], needle)) return i;
+    return -1;
+}
+/* Сколько команд РОВНО равны LINE. */
+static int cmd_count(const char *line) {
+    int n = 0;
+    for (int i = 0; i < g_cmd_n; i++)
+        if (!strcmp(g_cmd[i], line)) n++;
+    return n;
 }
 
 /* Что «ответит» ядро на запросы состояния. */
@@ -174,6 +188,13 @@ static void check(const char *what, int got, int want) {
     "32767:\tfrom all lookup default\n"
 #define RULES_WITHOUT \
     "0:\tfrom all lookup local\n" \
+    "32766:\tfrom all lookup main\n" \
+    "32767:\tfrom all lookup default\n"
+/* Только прежняя форма — без маски (так ядро печатает маску 0xffffffff): осталась от версии до
+ * R-094. */
+#define RULES_LEGACY \
+    "0:\tfrom all lookup local\n" \
+    "32764:\tfrom all fwmark 0x100000 lookup 300\n" \
     "32766:\tfrom all lookup main\n" \
     "32767:\tfrom all lookup default\n"
 
@@ -415,7 +436,7 @@ int main(void) {
     state_write("active", "vl lo\n");
     tick(RULES_WITH, "blackhole default \n");
     check("blackhole при живом устройстве — маршрут возвращён",
-          cmd_seen("ip route add default dev lo table 300"), 1);
+          cmd_seen("ip route replace default dev lo table 300"), 1);
 
     /* 1a. Смена маршрута обязана СНЯТЬ установленные соединения этого выхода.
      *
@@ -450,20 +471,23 @@ int main(void) {
      *    вернуть его было некому). Устройство живое, имя не менялось. */
     out_set("lo", FAIL_DROP);
     state_write("active", "vl lo\n");
-    tick(RULES_WITHOUT, "default dev lo scope link\n");
+    tick(RULES_LEGACY, "default dev lo scope link\n");
     check("снятое правило fwmark — возвращено",
           cmd_seen("ip rule add fwmark 0x00100000/0x0ff00000 table 300"), 1);
     /* И снимается прежняя форма тоже: иначе после обновления в ядре лежали бы два правила
-     * на одну метку, и порядок между ними определялся бы приоритетом, а не замыслом. */
-    check("прежняя форма без маски снимается",
-          cmd_seen("ip rule del fwmark 0x00100000 table 300"), 1);
+     * на одну метку, и порядок между ними определялся бы приоритетом, а не замыслом. Снимается
+     * она с ЯВНОЙ маской 0xffffffff и приоритетом: `ip rule del fwmark X` без маски на ядре 4.9
+     * снимает любое правило с меткой X, в том числе только что поставленное с маской. */
+    check("прежняя форма без маски снимается — с явной маской",
+          cmd_seen("ip rule del fwmark 0x00100000/0xffffffff table 300 priority 32764"), 1);
+    check("  и никогда без маски", cmd_seen("ip rule del fwmark 0x00100000 table"), 0);
 
     /* 3. Таблица пуста: ядро вычистило маршрут вместе с TUN умершего процесса. */
     out_set("lo", FAIL_DROP);
     state_write("active", "vl lo\n");
     tick(RULES_WITH, "");
     check("пустая таблица — маршрут возвращён",
-          cmd_seen("ip route add default dev lo table 300"), 1);
+          cmd_seen("ip route replace default dev lo table 300"), 1);
 
     /* 4. Состояние в порядке — сторож не трогает НИЧЕГО. Иначе каждая минута означала бы
      *    flush таблицы живого выхода (то есть провал помеченного трафика на время
@@ -472,7 +496,7 @@ int main(void) {
     state_write("active", "vl lo\n");
     tick(RULES_WITH, "default dev lo scope link \n");
     check("целое состояние — маршрут не переписывается",
-          cmd_seen("ip route add default dev lo table 300"), 0);
+          cmd_seen("ip route replace default dev lo table 300"), 0);
     check("целое состояние — правило не переписывается", rule_added, 0);
     check("целое состояние — таблица не сбрасывается",
           cmd_seen("ip route flush table 300"), 0);
@@ -493,7 +517,7 @@ int main(void) {
     }
     tick(RULES_WITH, "default dev nodev0 scope link\n");
     check("мёртвый выход с маршрутом — запрет возвращён",
-          cmd_seen("ip route add blackhole default table 300"), 1);
+          cmd_seen("ip route replace blackhole default table 300"), 1);
 
     /* 6. То же, но состояние уже соответствует on_fail=drop: ни команд, ни строк. */
     out_set("nodev0", FAIL_DROP);
@@ -505,26 +529,24 @@ int main(void) {
     }
     tick(RULES_WITH, "blackhole default\n");
     check("мёртвый выход с запретом — ничего не делается",
-          cmd_seen("ip route add blackhole default table 300"), 0);
+          cmd_seen("ip route replace blackhole default table 300"), 0);
     check("мёртвый выход с запретом — таблица не сбрасывается",
           cmd_seen("ip route flush table 300"), 0);
 
     /* 7. Привязка отказала (I-110). Устройство отвечает, имя сменилось — сторож зовёт
-     *    bind_device, тот делает `ip route flush table 300` и следом `ip route add default
-     *    dev lo table 300`, а он не проходит: устройство исчезло между проверкой и
-     *    привязкой, таблица занята, нет прав. Таблица остаётся ПУСТОЙ, а пустая таблица —
-     *    это не «нет пути», а «ищи дальше»: помеченный пакет проваливается в следующую
-     *    таблицу и уходит НАПРЯМУЮ, то есть ровно туда, куда его не пускали. Хуже того,
-     *    flush снял blackhole, который до этого поставил apply при on_fail=drop.
-     *    Ровно это решение уже принято в apply_routing (steer.c) — здесь оно обязано
-     *    совпадать. */
+     *    bind_device, а `ip route replace default dev lo table 300` не проходит: устройство
+     *    исчезло между проверкой и привязкой, нет прав. В таблице осталось прежнее (здесь —
+     *    ничего), а пустая таблица — это не «нет пути», а «ищи дальше»: помеченный пакет
+     *    проваливается в следующую таблицу и уходит НАПРЯМУЮ, то есть ровно туда, куда его
+     *    не пускали. При on_fail=drop обязан встать запрет. Ровно это решение принято в
+     *    apply_routing (steer.c) — здесь оно обязано совпадать. */
     out_set("lo", FAIL_DROP);
     state_write("active", "vl -\n");
     g_route_add_fails = 1;
     tick(RULES_WITH, "");
     g_route_add_fails = 0;
     check("отказ привязки при on_fail=drop — таблица не остаётся пустой",
-          cmd_seen("ip route add blackhole default table 300"), 1);
+          cmd_seen("ip route replace blackhole default table 300"), 1);
 
     /* 8. Тот же отказ при on_fail=direct: запрет ставить НЕЛЬЗЯ — выход и объявлял, что
      *    при неудаче трафик идёт напрямую. Проверяется, что правка не подменила
@@ -535,7 +557,7 @@ int main(void) {
     tick(RULES_WITH, "");
     g_route_add_fails = 0;
     check("отказ привязки при on_fail=direct — запрет не ставится",
-          cmd_seen("ip route add blackhole default table 300"), 0);
+          cmd_seen("ip route replace blackhole default table 300"), 0);
     /* Пустая таблица при on_fail=direct уводит пакет в main — напрямую. Значит и бит «не
      * для zapret» ему больше не положен: трафик упавшего выхода обязан идти как обычный
      * трафик роутера, через общий обход (см. out_failopen_capable в spec.h). */
@@ -547,9 +569,9 @@ int main(void) {
     state_write("active", "vl -\n");
     tick(RULES_WITH, "");
     check("успешная привязка — запрет не ставится",
-          cmd_seen("ip route add blackhole default table 300"), 0);
+          cmd_seen("ip route replace blackhole default table 300"), 0);
     check("успешная привязка — маршрут поставлен",
-          cmd_seen("ip route add default dev lo table 300"), 1);
+          cmd_seen("ip route replace default dev lo table 300"), 1);
     /* Выход снова несёт трафик сам — отметка «пущен напрямую» снимается, иначе его
      * туннельные пакеты разбирал бы общий обход. */
     check("успешная привязка — отметка «пущен напрямую» снята",
@@ -587,6 +609,90 @@ int main(void) {
     check("мёртвый выход drop — прежняя отметка снимается",
           cmd_seen("nft delete element inet steer failopen { 0x00100000 }"), 1);
 
+    /* 9b. ПЕРЕПРИВЯЗКА БЕЗ ОКНА. Прежде bind_device делал `ip rule del` → `ip rule add` и
+     *     `ip route flush` → `ip route add`: между командами у помеченного трафика не было ни
+     *     правила, ни маршрута, и он уходил по main — напрямую, мимо туннеля (на стенде так
+     *     утекло рукопожатие WireGuard). Теперь: маршрут — одной заменой, прежнее снимается
+     *     ПОСЛЕ неё; стоящее правило не снимается вовсе. Живая проверка того же — стенд
+     *     tests/rebindleak.sh (поток помеченных пакетов во время перепривязок, в WAN — ноль). */
+    out_set("lo", FAIL_DROP);
+    state_write("active", "vl old0\n");
+    tick(RULES_WITH, "default dev old0 scope link \n10.9.0.0/24 dev old0 proto kernel scope link src 10.9.0.1 \n");
+    check("перепривязка: таблица не сбрасывается", cmd_seen("ip route flush table 300"), 0);
+    check("перепривязка: маршрут заменой",
+          cmd_seen("ip route replace default dev lo table 300"), 1);
+    check("перепривязка: прежний default снят",
+          cmd_seen("ip route del default dev old0 table 300"), 1);
+    check("перепривязка: и прочее в таблице снято",
+          cmd_seen("ip route del 10.9.0.0/24 dev old0 table 300"), 1);
+    check("перепривязка: прежнее снято ПОСЛЕ замены",
+          cmd_at("ip route replace default dev lo table 300") <
+          cmd_at("ip route del default dev old0 table 300"), 1);
+    check("перепривязка: новый маршрут не снимается",
+          cmd_seen("ip route del default dev lo"), 0);
+    check("перепривязка: стоящее правило не снимается",
+          cmd_seen("ip rule del fwmark 0x00100000/0x0ff00000"), 0);
+    check("перепривязка: стоящее правило не дублируется", rule_added, 0);
+    /* Правила нет (прежний отказ в режиме direct) — добавляется, и снимается только прежняя
+     * форма без маски, и только после. */
+    out_set("lo", FAIL_DROP);
+    state_write("active", "vl old0\n");
+    tick(RULES_LEGACY, "default dev old0 scope link \n");
+    check("правила нет — добавлено",
+          cmd_seen("ip rule add fwmark 0x00100000/0x0ff00000 table 300"), 1);
+    check("правила нет — форма с маской не снимается",
+          cmd_seen("ip rule del fwmark 0x00100000/0x0ff00000"), 0);
+    check("правила нет — маршрут раньше правила",
+          cmd_at("ip route replace default dev lo table 300") <
+          cmd_at("ip rule add fwmark 0x00100000/0x0ff00000 table 300"), 1);
+    check("прежняя форма без маски снимается после добавления",
+          cmd_at("ip rule add fwmark 0x00100000/0x0ff00000 table 300") <
+          cmd_at("ip rule del fwmark 0x00100000/0xffffffff table 300"), 1);
+    /* Прежней формы в дампе нет — снимать нечего, и вслепую ничего не снимается. */
+    out_set("lo", FAIL_DROP);
+    state_write("active", "vl old0\n");
+    tick(RULES_WITHOUT, "default dev old0 scope link \n");
+    check("прежней формы нет — ни одного снятия правила выхода", cmd_seen("ip rule del fwmark"), 0);
+    /* Две копии правила (ip rule add дубликатов не проверяет) — снимается ровно лишняя, по её
+     * приоритету; первая остаётся, новой не добавляется. */
+    out_set("lo", FAIL_DROP);
+    state_write("active", "vl old0\n");
+    tick("0:\tfrom all lookup local\n"
+         "32763:\tfrom all fwmark 0x100000/0xff00000 lookup 300\n"
+         "32764:\tfrom all fwmark 0x100000/0xff00000 lookup 300\n"
+         "32766:\tfrom all lookup main\n", "default dev old0 scope link \n");
+    check("две копии — снята вторая по приоритету",
+          cmd_count("ip rule del fwmark 0x00100000/0x0ff00000 table 300 priority 32764"), 1);
+    check("две копии — первая остаётся",
+          cmd_seen("priority 32763"), 0);
+    check("две копии — новой не добавлено", rule_added, 0);
+    /* Имя таблицы из rt_tables.d вместо номера — правило всё равно наше (как в сверке). */
+    {
+        struct rule_copies c = rule_copies_of(
+            "32764:\tfrom all fwmark 0x100000/0xff00000 lookup steer_vl\n"
+            "32765:\tfrom all fwmark 0x100000/0xff00000 lookup 305\n"
+            "32766:\tfrom all fwmark 0x100000 lookup 300\n", 0x100000, 300);
+        check("копии: имя таблицы — наше, чужой номер и форма без маски — нет", c.n, 1);
+    }
+    /* Отказ при on_fail=drop: запрет — заменой, а не сбросом и добавлением (между ними
+     * таблица пуста и помеченное уходит напрямую). */
+    out_set("nodev0", FAIL_DROP);
+    state_write("active", "vl nodev0\n");
+    {
+        char stamp[32];
+        snprintf(stamp, sizeof(stamp), "%ld\n", (long)time(NULL));
+        state_write("restart-nodev0", stamp);
+    }
+    tick(RULES_WITH, "default dev nodev0 scope link \n");
+    check("отказ drop: таблица не сбрасывается", cmd_seen("ip route flush table 300"), 0);
+    check("отказ drop: запрет заменой",
+          cmd_seen("ip route replace blackhole default table 300"), 1);
+    check("отказ drop: мёртвый default снят после запрета",
+          cmd_at("ip route replace blackhole default table 300") <
+          cmd_at("ip route del default dev nodev0 table 300"), 1);
+    check("отказ drop: правило не снимается",
+          cmd_seen("ip rule del fwmark 0x00100000/0x0ff00000"), 0);
+
     /* Контроль к проверке 1a: на тике, где состояние целое и менять нечего, соединения
      * трогать НЕЛЬЗЯ. Снятие записи установленного соединения — это разрыв закачки для
      * человека; делать это раз в минуту «на всякий случай» хуже самой болезни. */
@@ -612,9 +718,9 @@ int main(void) {
     check("устройство туннеля в пуле не проверяется пингом", cmd_seen("ping"), 0);
     check("устройство туннеля в пуле не заводит правило пробы", cmd_seen("table 299"), 0);
     check("пул привязан к устройству владельца",
-          cmd_seen("ip route add default dev lo table 301"), 1);
+          cmd_seen("ip route replace default dev lo table 301"), 1);
     check("живой пул не получает запрет",
-          cmd_seen("ip route add blackhole default table 301"), 0);
+          cmd_seen("ip route replace blackhole default table 301"), 0);
 
     /* 11. То же для оживления. Устройство vless и xsteer создаёт наш процесс, netifd про
      *     него не знает, и ifdown/ifup по нему — «Interface … not found» раз в минуту и
@@ -626,7 +732,7 @@ int main(void) {
     check("мёртвое устройство туннеля в пуле не перезапускается через ifdown",
           cmd_seen("ifdown"), 0);
     check("мёртвый пул получает запрет",
-          cmd_seen("ip route add blackhole default table 301"), 1);
+          cmd_seen("ip route replace blackhole default table 301"), 1);
 
     /* 12. Какое устройство выхода считать НЫНЕШНИМ вне процесса сторожа.
      *
@@ -1081,7 +1187,7 @@ int main(void) {
         active_get("in", dev, sizeof(dev));
         check("via: цель жива — внутренний привязан", !strcmp(dev, "vin"), 1);
         check("via: цель жива — маршрут внутреннего в его устройство",
-              cmd_seen("ip route add default dev vin table 300"), 1);
+              cmd_seen("ip route replace default dev vin table 300"), 1);
         /* Цель легла — внутренний нерабочий, хотя его собственное устройство отвечает бы: его
          * on_fail (drop) встаёт в его таблицу, а его устройство даже не пробуется. */
         g_outer_ok = 0;
@@ -1091,7 +1197,7 @@ int main(void) {
         active_get("in", dev, sizeof(dev));
         check("via: цель легла — внутренний нерабочий", !strcmp(dev, "-"), 1);
         check("via: цель легла — on_fail внутреннего (blackhole в его таблице)",
-              cmd_seen("ip route add blackhole default table 300"), 1);
+              cmd_seen("ip route replace blackhole default table 300"), 1);
         check("via: цель легла — внутренний не пробуется", g_in_probes, 0);
         check("via: цель легла — on_fail цели (direct: правило снято)",
               cmd_seen("ip rule del fwmark 0x00200000/0x0ff00000 table 301"), 1);

@@ -2316,9 +2316,9 @@ static int cmd_down(void) {
     return 0;
 }
 
-/* Policy routing for interface outputs. Rules are removed before being added so a
- * re-apply cannot stack duplicates — `ip rule add` is happy to add the same rule
- * twice, and the second copy is invisible until someone deletes the first. */
+/* Policy routing for interface outputs. Дубликаты правил не копятся: rule_ensure считает копии
+ * в ядре и лишние снимает — но только ПОСЛЕ того, как верная стоит, а не «снять всё и
+ * поставить заново» (см. table_bind в failover.c: в том промежутке трафик уходил напрямую). */
 #ifdef STEER_ANDROID
 /* ---- masquerade у выходов-интерфейсов: правилом iptables, а не nft ----------------------
  *
@@ -2410,13 +2410,14 @@ static void apply_routing(void) {
         if (!out_has_device(&g_out[i])) continue;
         char table[16];
         snprintf(table, sizeof(table), "%d", g_out[i].table);
-        rule_drop(g_out[i].mark, g_out[i].table);     /* обе формы, включая копии */
-        rule_add(g_out[i].mark, g_out[i].table);
-        const char *flush[] = { "ip", "route", "flush", "table", table, NULL };
-        run(flush);
-        const char *route[] = { "ip", "route", "add", "default", "dev", g_out[i].device,
-                                "table", table, NULL };
-        if (run(route) != 0) {
+        /* Маршрут — заменой, правило — не снимая стоящего (table_bind и rule_ensure в
+         * failover.c). Прежде здесь были `rule_drop` + `rule_add` и `flush` + `add`, и на
+         * каждом apply помеченный трафик выхода на миг оставался без правила и без маршрута,
+         * то есть уходил напрямую, мимо туннеля, — подробно у table_bind. Маршрут первым: если
+         * правила не было, появившееся должно найти в таблице устройство, а не пустоту. */
+        int rc = table_bind(&g_out[i], g_out[i].device);
+        rule_ensure(g_out[i].mark, g_out[i].table);
+        if (rc != 0) {
             fprintf(stderr, LOG_W "output %s: cannot route via %s — is the device up?\n",
                     g_out[i].name, g_out[i].device);
             /* Пустая таблица — это не «нет маршрута», а «ищи дальше»: помеченный
@@ -2425,15 +2426,16 @@ static void apply_routing(void) {
              * тиком failover обязано быть закрыто, иначе защита работает не всегда,
              * а это хуже, чем не работает вовсе. */
             if (g_out[i].on_fail == FAIL_DROP) {
-                const char *bh[] = { "ip", "route", "add", "blackhole", "default",
-                                     "table", table, NULL };
-                run(bh);
+                table_bind(&g_out[i], NULL);
                 fprintf(stderr, LOG_W "output %s: трафик остановлен до появления "
                                 "рабочего устройства (on_fail=drop)\n", g_out[i].name);
             } else {
                 /* direct/zapret: таблица пуста, пакет уйдёт напрямую — значит и через общий
                  * обход, как обычный (см. out_failopen_capable в spec.h). Таблица правил к
-                 * этому мгновению уже загружена, набор в ней есть. */
+                 * этому мгновению уже загружена, набор в ней есть. Сброс — потому что замена не
+                 * прошла и в таблице могло остаться прежнее устройство. */
+                const char *flush[] = { "ip", "route", "flush", "table", table, NULL };
+                run(flush);
                 failopen_mark(&g_out[i], 1);
             }
         }
