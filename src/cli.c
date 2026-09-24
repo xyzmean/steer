@@ -55,6 +55,7 @@ static const struct cli_flag FLAGS[] = {
     {"--kind",      NULL, "ВИД",        "только выходы этого вида: direct, interface, vless, xsteer, zapret, tgws"},
     {"--obfs",      NULL, NULL,         "только выходы, у которых настроена обфускация"},
     {"--devices",   NULL, NULL,         "печатать имена устройств, а не имена выходов"},
+    {"--via",       NULL, NULL,         "только выходы с via: имя и выход, через который идёт туннель"},
     {"--direct",    NULL, NULL,         "проверять путь НАПРЯМУЮ, минуя обход"},
     {"--fast",      NULL, NULL,         "отдать запомненный ответ немедленно, не пересчитывая"},
     {"--loop",      NULL, "СЕК",        "не завершаться: повторять проход раз в СЕК секунд"},
@@ -175,7 +176,7 @@ static const struct cli_cmd CMDS[] = {
  "Нужен init-скрипту: он спрашивает движок, для каких выходов поднимать процессы.\n"
  "Спрашивать движок надёжнее, чем искать ключ в спеке grep-ом, — переименование поля\n"
  "ломает grep молча, а вместе с ним и запуск.",
- "--spec --state-dir --kind --obfs --devices", 0, 0, 0, 0, 0},
+ "--spec --state-dir --kind --obfs --devices --via", 0, 0, 0, 0, 0},
 
 {"zapret-instances", "Диагностика", "",
  "выходы kind=zapret: имя, очередь и файл ключей",
@@ -787,6 +788,7 @@ void cli_parse(const struct cli_cmd *cmd, int argc, char **argv, int from,
         else if (!strcmp(f->name, "--verbose"))    out->verbose = 1;
         else if (!strcmp(f->name, "--obfs"))       out->obfs = 1;
         else if (!strcmp(f->name, "--devices"))    out->devices = 1;
+        else if (!strcmp(f->name, "--via"))        out->via = 1;
         else if (!strcmp(f->name, "--direct"))     out->direct = 1;
         else if (!strcmp(f->name, "--fast"))      out->fast = 1;
         else if (!strcmp(f->name, "--loop"))       out->loop = cli_int(f->name, val, 1, 86400);

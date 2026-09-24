@@ -124,6 +124,8 @@ int vless_recv_zc(struct vless_conn *c, unsigned char *buf, size_t cap,
 int vless_has_data(const struct vless_conn *c) { (void)c; return 0; }
 void vless_close(struct vless_conn *c) { c->fd = -1; }   /* канал общий — не закрываем */
 const char *vless_strerror(int rc) { (void)rc; return "подмена"; }
+/* Метка сокетов к узлу (via) — у подменённого клиента сокетов нет, метить нечего. */
+void vless_set_sock_mark(uint32_t mark, int required) { (void)mark; (void)required; }
 int vless_probe(const struct vless_node *node, int timeout_s, char *why, size_t why_n) {
     (void)node; (void)timeout_s; (void)why; (void)why_n; return -1;
 }

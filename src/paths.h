@@ -67,11 +67,17 @@
  * system vpn», метка tun_device), а /dev/net/tun там нет вовсе: открытие по роутерному пути
  * кончалось ENOENT, то есть «нет модуля tun» на ядре, где он встроен. Подсказка при отказе
  * тоже своя: kmod-tun — это пакет OpenWrt, на телефоне ставить нечего, TUN даёт ядро прошивки. */
+/* Путь — под #ifndef, как каталоги выше: стенду Android-сборки на обычном Linux (tests/run-via.sh,
+ * хост и vm49) узел нужен по роутерному пути, а подделывать /dev/tun в чужой системе незачем. */
 #ifdef STEER_ANDROID
+#ifndef STEER_TUN_DEV
 #define STEER_TUN_DEV  "/dev/tun"
+#endif
 #define STEER_TUN_HINT "в ядре прошивки нет CONFIG_TUN"
 #else
+#ifndef STEER_TUN_DEV
 #define STEER_TUN_DEV  "/dev/net/tun"
+#endif
 #define STEER_TUN_HINT "не установлен kmod-tun"
 #endif
 

@@ -464,13 +464,50 @@ void obfs_filter_none(int fd) {
     raw_filter(fd, code, 1);
 }
 
+/* ---- метка сокета наверх (via) ----------------------------------------------
+ *
+ * Состояние процесса, а не параметр каждого вызова: помощник обслуживает ровно один выход, и
+ * метку выхода ему называют при старте. Протаскивать её аргументом через obfs_raw_open значило
+ * бы менять сигнатуру у хаба и сервера, которым метка не нужна никогда. Смысл и доводы — в
+ * obfs.h у obfs_set_sock_mark. */
+static uint32_t g_sock_mark;
+static int g_sock_mark_req;
+
+void obfs_set_sock_mark(uint32_t mark, int required) {
+    g_sock_mark = mark;
+    g_sock_mark_req = mark && required;
+}
+
+int obfs_mark_sock(int fd) {
+    if (!g_sock_mark) return 0;
+    if (setsockopt(fd, SOL_SOCKET, SO_MARK, &g_sock_mark, sizeof(g_sock_mark)) == 0) return 0;
+    if (!g_sock_mark_req) return 0;
+    /* Одна строка на процесс: повторы соединения идут с нарастающей паузой, и журнал из
+     * одинаковых строк ничего не прибавил бы к первой. Причина — почти всегда нет
+     * CAP_NET_ADMIN у процесса, то есть чинится запуском, а не повтором. */
+    static int told;
+    int e = errno;
+    if (!told) {
+        told = 1;
+        fprintf(stderr, "steer[warn] via: метка 0x%08x на сокет к серверу не встала (%s) — "
+                        "соединение не открываю: без метки оно ушло бы мимо выхода via\n",
+                g_sock_mark, strerror(e));
+    }
+    errno = e;
+    return -1;
+}
+
 /* ---- сырой сокет ----------------------------------------------------------- */
 /* connect() на сыром сокете ничего не шлёт: он фиксирует получателя и заставляет ядро
  * выбрать маршрут, а с ним и адрес источника — тот самый, который нужен контрольной
  * сумме. Спрашивать адрес у интерфейса нельзя: их несколько, и правильный знает только
  * таблица маршрутизации. */
+static int raw_open(uint32_t daddr, uint32_t saddr_want, uint32_t *saddr_out, int client);
+
+/* Сюда приходят только клиенты (обфускатор и xsteer), поэтому метка via ставится здесь, а не в
+ * obfs_raw_open_from: у хаба и сервера её нет. */
 int obfs_raw_open(uint32_t daddr, uint32_t *saddr_out) {
-    return obfs_raw_open_from(daddr, 0, saddr_out);
+    return raw_open(daddr, 0, saddr_out, 1);
 }
 
 /* saddr_want — адрес, С КОТОРОГО обязаны уходить наши пакеты; 0 означает «выбери сам, ядро».
@@ -482,8 +519,15 @@ int obfs_raw_open(uint32_t daddr, uint32_t *saddr_out) {
  * кода. Найдено стендом переезда в реализации на Go (tests/roam.sh): пир, пришедший к тому же хабу
  * другим путём, получал в ответ тишину. */
 int obfs_raw_open_from(uint32_t daddr, uint32_t saddr_want, uint32_t *saddr_out) {
+    return raw_open(daddr, saddr_want, saddr_out, 0);
+}
+
+static int raw_open(uint32_t daddr, uint32_t saddr_want, uint32_t *saddr_out, int client) {
     int fd = socket(AF_INET, SOCK_RAW, IPPROTO_TCP);
     if (fd < 0) return -1;
+    /* Метка via — до connect(): маршрут, устройство и адрес источника выбираются там, и выбирает
+     * их ядро уже по метке, то есть по таблице выхода-цели. */
+    if (client && obfs_mark_sock(fd) != 0) { close(fd); return -1; }
 
     /* Не ставим DF: путь с меньшим MTU при ошибке в настройке даст фрагментацию, а не
      * тихую пропажу больших пакетов. */

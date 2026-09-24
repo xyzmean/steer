@@ -2798,7 +2798,7 @@ static void status_emit(FILE *out) {
      * нулевой, и это тот же контракт, а не особый случай. */
     fprintf(out, "{\"schema\":1,\"at\":%ld,"
                  "\"features\":[\"lan_devices\",\"nodes\",\"pool\",\"active_device\","
-                 "\"status_cache\",\"xslink\",\"xsteer_state\",\"spec_schema2\"]",
+                 "\"status_cache\",\"xslink\",\"xsteer_state\",\"spec_schema2\",\"via\"]",
             (long)time(NULL));
     /* Локальные устройства — следом: интерфейс показывает, с чего забирается трафик, и
      * без этого поля ему пришлось бы читать спеку вторым источником, то есть однажды
@@ -2821,6 +2821,11 @@ static void status_emit(FILE *out) {
         }
         fprintf(out, "%s\"%s\":{\"kind\":\"%s\"", i ? "," : "", g_out[i].name,
                out_kind_name(g_out[i].kind));
+        /* Через какой выход идёт туннель этого выхода (`via`, см. «вложенные выходы» в
+         * spec.h). Поля нет, когда туннель идёт напрямую, — как в спеке. Живость цели здесь не
+         * повторяется: она видна у самой цели в этом же ответе, а второй источник того же
+         * ответа однажды разошёлся бы с первым. */
+        if (g_out[i].via[0]) fprintf(out, ",\"via\":\"%s\"", g_out[i].via);
         if (out_has_device(&g_out[i])) {
             struct fwcheck c = fw_check(g_out[i].device);
             fprintf(out, ",\"device\":\"%s\",\"up\":%s,\"mark\":\"0x%08x\",\"table\":%d"
@@ -4098,6 +4103,11 @@ static unsigned long long sup_sig(const char *cmd, const struct output *o) {
         sup_fnv(&h, o->obfs.listen, strlen(o->obfs.listen));
         sup_fnv(&h, &o->obfs.listen_port, sizeof(o->obfs.listen_port));
     }
+    /* Цель `via` помощник тоже читает при старте: метку сокета наверх он берёт один раз
+     * (out_underlay_mark), и смена цели без перезапуска оставила бы туннель в прежнем выходе.
+     * Только когда поле задано — подпись выхода без via остаётся прежней, и обновление движка
+     * не перезапускает ни одного помощника. */
+    if (o->via[0]) sup_fnv(&h, o->via, strlen(o->via));
     return h;
 }
 
@@ -4118,18 +4128,25 @@ static int sup_list(const char *spec, struct sup_helper *out, size_t *n) {
         FILE *w = fdopen(pfd[1], "w");
         if (!w) _exit(1);
         load_spec(spec);
-        for (size_t i = 0; i < g_out_n; i++) {
-            const struct output *o = &g_out[i];
+        /* В порядке зависимостей via: цель поднимается раньше того, чей туннель через неё
+         * идёт, — иначе первый подъём внутреннего перебирал бы узлы через ещё не созданное
+         * устройство и уходил в паузу перезапуска. Гарантии готовности это не даёт (цель
+         * поднимается секунды), но у спеки без via порядок прежний, спековый. */
+        for (int depth = 0; depth <= MAX_VIA_DEPTH; depth++) {
+            for (size_t i = 0; i < g_out_n; i++) {
+                const struct output *o = &g_out[i];
+                if (out_via_depth(o) != depth) continue;
 #if defined(STEER_EXTENDED)
-            if (o->kind == OUT_VLESS)
-                fprintf(w, "vless %s %llx\n", o->name, sup_sig("vless", o));
-            if (o->kind == OUT_XSTEER)
-                fprintf(w, "xsteer %s %llx\n", o->name, sup_sig("xsteer", o));
-            if (o->kind == OUT_TGWS)
-                fprintf(w, "tgws %s %llx\n", o->name, sup_sig("tgws", o));
+                if (o->kind == OUT_VLESS)
+                    fprintf(w, "vless %s %llx\n", o->name, sup_sig("vless", o));
+                if (o->kind == OUT_XSTEER)
+                    fprintf(w, "xsteer %s %llx\n", o->name, sup_sig("xsteer", o));
+                if (o->kind == OUT_TGWS)
+                    fprintf(w, "tgws %s %llx\n", o->name, sup_sig("tgws", o));
 #endif
-            if (o->obfs.on)
-                fprintf(w, "obfs %s %llx\n", o->name, sup_sig("obfs", o));
+                if (o->obfs.on)
+                    fprintf(w, "obfs %s %llx\n", o->name, sup_sig("obfs", o));
+            }
         }
         fclose(w);
         _exit(0);
@@ -4528,6 +4545,10 @@ int main(int argc, char **argv) {
             /* --obfs — отдельный признак, а не вид: обфускация есть свойство выхода,
              * и init-скрипту нужен именно список тех, кому поднимать процесс. */
             if (a.obfs && !g_out[i].obfs.on) continue;
+            if (a.via) {
+                if (g_out[i].via[0]) printf("%s\t%s\n", g_out[i].name, g_out[i].via);
+                continue;
+            }
             /* --devices печатает устройство, и выход без устройства (kind=direct) при этом
              * пропускается: пустая строка в списке для настройки фаервола хуже её отсутствия. */
             if (a.devices) {
@@ -4702,6 +4723,12 @@ int main(int argc, char **argv) {
         struct output *o = out_by_name(arg);
         if (!o) die("нет такого выхода: %s", arg);
         if (!o->obfs.on) die("у выхода %s не настроен obfs", arg);
+        /* Метка сокета к серверу обфускации — out_underlay_mark (см. «вложенные выходы» в
+         * spec.h). При via она — метка выхода-цели, а та появляется только в реестре: без
+         * registry_assign функция вернула бы ноль, то есть «напрямую», молча. Без via реестр
+         * не нужен и не трогается — у этого процесса его прежде не было. */
+        if (o->via[0]) registry_assign();
+        obfs_set_sock_mark(out_underlay_mark(o), o->via[0] != 0);
         return obfs_client(o->name, o->obfs.server, o->obfs.server_port,
                            o->obfs.listen, o->obfs.listen_port);
     }

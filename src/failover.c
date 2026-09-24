@@ -1259,9 +1259,38 @@ int cmd_failover(const char *spec, int verbose) {
     registry_assign();
 
     int changed = 0;
-    for (size_t i = 0; i < g_out_n; i++) {
+    /* ПОРЯДОК ОБХОДА — ПО ЗАВИСИМОСТЯМ `via`, а не по спеке.
+     *
+     * Выход, чей туннель идёт через другой выход (см. «вложенные выходы» в spec.h), жив только
+     * пока жива его цель: соединение внутреннего туннеля с сервером едет в устройство цели. Ответ
+     * «цель жива» сторож и так получает в этом же проходе — нужно лишь спросить цель ПЕРВОЙ.
+     * Поэтому сначала выходы без via, затем те, чья цель без via, и так до MAX_VIA_DEPTH: спека
+     * круги и цепочки длиннее не пропускает (via_check в spec.c), так что каждый выход получает
+     * место ровно один раз. Порядок внутри одного слоя — прежний, спековый: у спек без via обход
+     * тот же, что был, до последнего прохода.
+     *
+     * Ни проб, ни таймеров ради этого не заводится — требование батареи на телефоне: зависимость
+     * читается из уже известного ответа, а пробы внутреннего выхода при лежащей цели и вовсе не
+     * делаются (см. via_down ниже). */
+    size_t ord[MAX_OUTPUTS];
+    size_t ord_n = 0;
+    for (int depth = 0; depth <= MAX_VIA_DEPTH; depth++)
+        for (size_t i = 0; i < g_out_n; i++)
+            if (out_via_depth(&g_out[i]) == depth) ord[ord_n++] = i;
+    /* Кто в ЭТОМ проходе нашёл живое устройство. */
+    int alive[MAX_OUTPUTS] = {0};
+    for (size_t oi = 0; oi < ord_n; oi++) {
+        size_t i = ord[oi];
         struct output *o = &g_out[i];
         if (!out_has_device(o)) continue;
+
+        /* Цель via лежит — внутренний выход нерабочий, что бы ни говорила его собственная проба.
+         * Проба тут и соврать может: устройство vless или xsteer остаётся на месте, пока жив
+         * процесс, а до сервера его соединение через мёртвую цель не доедет. И пробовать, и
+         * оживлять его бесполезно — поэтому ни того, ни другого, сразу ветка отказа с ЕГО
+         * on_fail: каналы внутреннего выхода получают то, что человек для них выбрал. */
+        const struct output *via = out_via(o);
+        int via_down = via && !alive[via - g_out];
 
         char was[32];
         active_get(o->name, was, sizeof(was));
@@ -1276,7 +1305,7 @@ int cmd_failover(const char *spec, int verbose) {
          * пробить пробой каждое устройство значило бы платить таймаут за каждый мёртвый
          * запас на каждом тике. Здоровье устройств 0..first_h тем самым известно. */
         int first_h = -1;
-        for (size_t k = 0; k < o->devices_n; k++) {
+        for (size_t k = 0; k < o->devices_n && !via_down; k++) {
             if (health_of(o, o->devices[k])) { first_h = (int)k; break; }
             if (verbose)
                 fprintf(stderr, LOG_W "%s: %s не отвечает\n", o->name, o->devices[k]);
@@ -1381,10 +1410,17 @@ int cmd_failover(const char *spec, int verbose) {
 
         /* Ни одно не ответило — вот теперь можно тратить время на оживление. Порядок
          * тот же, поэтому основной туннель получает попытку первым. */
-        if (!chosen)
+        if (!chosen && !via_down)
             for (size_t k = 0; k < o->devices_n; k++)
                 if (revive(o, o->devices[k], verbose)) { chosen = o->devices[k]; break; }
         g_streak[i] = new_streak;
+        alive[i] = chosen != NULL;
+        /* Причину назвать надо: иначе «живых устройств нет» стоит у выхода, чьё устройство на
+         * месте и чья проба, спроси её, ответила бы «да». Строка — на переходе в отказ (как и
+         * объявление apply_failed) или при -v, а не на каждом проходе. */
+        if (via_down && (verbose || strcmp(was, "-") != 0))
+            fprintf(stderr, LOG_W "выход %s: идёт через %s, а тот не работает — выход "
+                            "считается нерабочим\n", o->name, via->name);
 
         if (chosen) {
             snprintf(o->device, sizeof(o->device), "%s", chosen);

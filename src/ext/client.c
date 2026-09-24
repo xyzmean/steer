@@ -707,11 +707,39 @@ static void sock_ready(int fd, int timeout_s) {
      * дальше». Пределы живут в net.ipv4.tcp_rmem и настраиваются системой, а не нами. */
 }
 
+/* МЕТКА СОКЕТА К УЗЛУ — для `via` (см. «вложенные выходы» в spec.h). Её называет клиенту
+ * tunnel.c при старте: out_underlay_mark выхода. Своя копия того, что в obfs.c делает
+ * obfs_mark_sock, а не вызов: этот файл собирают стенды без obfs.c (xhupmatch), а кода здесь
+ * три строки. required — задан via: тогда отказ SO_MARK — отказ соединения, иначе оно молча
+ * ушло бы мимо выхода-цели напрямую. */
+static uint32_t g_sock_mark;
+static int g_sock_mark_req;
+
+void vless_set_sock_mark(uint32_t mark, int required) {
+    g_sock_mark = mark;
+    g_sock_mark_req = mark && required;
+}
+
 /* Запускает неблокирующий connect. Возвращает fd (соединение уже установлено или в
  * процессе) либо -1. */
 static int attempt_start(struct in_addr ip, uint16_t port, int *done) {
     int fd = socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK, 0);
     if (fd < 0) return -1;
+    /* До connect(): маршрут, а с ним устройство и адрес источника, ядро выбирает там — по
+     * метке, то есть по таблице выхода-цели. */
+    if (g_sock_mark &&
+        setsockopt(fd, SOL_SOCKET, SO_MARK, &g_sock_mark, sizeof(g_sock_mark)) != 0 &&
+        g_sock_mark_req) {
+        static int told;
+        if (!told) {
+            told = 1;
+            fprintf(stderr, "steer[warn] via: метка 0x%08x на сокет к узлу не встала (%s) — "
+                            "соединение не открываю: без метки оно ушло бы мимо выхода via\n",
+                    g_sock_mark, strerror(errno));
+        }
+        close(fd);
+        return -1;
+    }
     struct sockaddr_in sa = { .sin_family = AF_INET, .sin_port = htons(port), .sin_addr = ip };
     *done = 0;
     if (connect(fd, (struct sockaddr *)&sa, sizeof(sa)) == 0) { *done = 1; return fd; }

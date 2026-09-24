@@ -2917,6 +2917,20 @@ static int load_nodes(const char *spec_path, const char *out_name, struct output
     return load_nodes_file(o->sub_file, cnt, st);
 }
 
+/* Метка сокетов к узлам — до первого соединения, то есть и до перебора узлов: проверка узла
+ * при подъёме и `vless-probe` обязаны идти тем же путём, что и сам туннель, иначе при `via`
+ * проба стучалась бы напрямую и объявляла мёртвым узел, который через выход-цель жив (или
+ * наоборот). Смысл метки — «вложенные выходы» в spec.h.
+ *
+ * Реестр — только при via: у цели метка появляется там, а без via этот процесс реестра до
+ * подъёма не трогал, и трогать его ради метки «мимо каналов» незачем. Без выхода (проба
+ * файла подписки) метка — обычная «мимо каналов»: её отдаёт та же функция для выхода без via. */
+static void underlay_setup(const struct output *o) {
+    static const struct output none;
+    if (o && o->via[0]) registry_assign();
+    vless_set_sock_mark(out_underlay_mark(o ? o : &none), o && o->via[0]);
+}
+
 /* Строка JSON с экранированием. Имена узлов приходят из подписки и содержат что угодно —
  * кавычки в них ломали бы весь ответ, а не только своё поле. */
 static void json_str(const char *s) {
@@ -3025,6 +3039,7 @@ int cmd_vless_probe(const char *spec_path, const char *out_name, int node, int t
     int rc = by_file ? load_nodes_file(out_name, &cnt, &st)
                      : load_nodes(spec_path, out_name, &o, &cnt, &st);
     if (rc) return rc;
+    underlay_setup(o);
     if (!cnt) {
         printf("{\"ok\":false,\"error\":\"в подписке нет пригодных узлов\","
                "\"skipped\":%zu,\"foreign\":%zu", st.skipped, st.foreign);
@@ -3085,6 +3100,7 @@ int cmd_vless(const char *spec_path, const char *out_name) {
     struct vless_sub_stats st;
     int rc = load_nodes(spec_path, out_name, &o, &cnt, &st);
     if (rc) return rc;
+    underlay_setup(o);
     struct vless_node *nodes = g_nodes;
     if (!cnt) {
         /* Приговор — не только в журнал. Диагностика без него говорила «устройства нет,

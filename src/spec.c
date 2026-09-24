@@ -734,6 +734,19 @@ static void parse_outputs(struct js *j) {
              * привело бы к попытке поднять туннель по стратегии обхода. */
             else if (!strcmp(key, "opts_file")) js_str(j, o.zp_opts, sizeof(o.zp_opts));
             else if (!strcmp(key, "domain")) js_str(j, o.tg_domain, sizeof(o.tg_domain));
+            /* Через какой выход идёт трафик самого туннеля — см. блок «вложенные выходы» в
+             * spec.h. Состав имени проверяется тем же name_ok, что имя выхода: строка уходит в
+             * status и в подпись помощника, а годное имя выхода по-другому и не выглядит.
+             * Всё остальное (есть ли такой выход, годится ли он, нет ли круга) проверяет
+             * via_check после разбора — цель может стоять в спеке ниже. */
+            else if (!strcmp(key, "via")) {
+                /* Пустая строка — «напрямую», как отсутствие ключа: так поле очищает
+                 * интерфейс, который держит его в форме, и отказ на ней был бы придиркой. */
+                js_str(j, o.via, sizeof(o.via));
+                if (o.via[0] && !name_ok(o.via))
+                    die("outputs.%s: via — имя другого выхода (буквы, цифры, _ - и точка)",
+                        o.name);
+            }
             /* Транспорт выхода xsteer. Полем спеки, а не только ключом командной строки,
              * потому что процесс поднимает procd: ключи ему передать негде, а настройка
              * обязана переживать перезагрузку. */
@@ -1157,6 +1170,124 @@ static void parse_channels(struct js *j) {
     if (js_lit(j, ']') != 0) die("channels: нет закрывающей скобки — спека оборвана?", NULL);
 }
 
+/* ---- вложенные выходы: проверка `via` --------------------------------------------------
+ *
+ * Смысл поля — в блоке «вложенные выходы» в spec.h. Здесь — то, что обязано быть отказом, а не
+ * применённой спекой, и у каждого отказа своя причина:
+ *
+ *   - `via` у выхода без своего соединения с сервером (direct, zapret, tgws, обычный interface)
+ *     ничего бы не сделало: метку ставит тот, кто открывает сокет, а у этих видов его открывает
+ *     не движок. Принять поле молча — сказать «настроено», не настроив;
+ *   - цели нет в спеке или она без устройства — метке некуда вести, и туннель тихо ушёл бы
+ *     напрямую (правила на метку нет — пакет идёт по main);
+ *   - круг (a → b → a, в том числе a → a) — пакет туннеля вечно заворачивался бы сам в себя:
+ *     соединение a идёт в устройство b, соединение b — в устройство a, и не встаёт ни одно;
+ *   - круг ЧЕРЕЗ ПУЛ: цель — выход kind=interface, среди устройств которого устройство самого
+ *     выхода или выхода, который сам зависит от него. Снаружи в спеке круга не видно — он
+ *     проходит через имя устройства, — а по сути это тот же круг, только проявится он лишь в
+ *     тот момент, когда сторож переключит пул на это устройство;
+ *   - цепочка длиннее MAX_VIA_DEPTH переходов — скорее описка, чем замысел (см. spec.h).
+ *
+ * Проверяется ПОСЛЕ разбора всех выходов: цель может стоять ниже того, кто на неё ссылается. */
+static int via_idx(const struct output *o) { return (int)(o - g_out); }
+
+/* Выход, которому принадлежит устройство пула, — тот же ответ, что device_owner в failover.c
+ * (владелец — выход, чей процесс устройство создаёт). Своя копия, а не вызов: specmatch
+ * собирает этот файл без failover.c. Отвечает она на узкий вопрос этой проверки и расходиться
+ * с той функцией ей негде — обе смотрят на out_engine_managed и имя устройства. */
+static const struct output *via_dev_owner(const char *dev, const struct output *not) {
+    for (size_t i = 0; i < g_out_n; i++)
+        if (&g_out[i] != not && out_engine_managed(&g_out[i]) && !strcmp(g_out[i].device, dev))
+            return &g_out[i];
+    return NULL;
+}
+
+static void via_check(void) {
+    static char msg[512];
+    for (size_t i = 0; i < g_out_n; i++) {
+        const struct output *o = &g_out[i];
+        if (!o->via[0]) continue;
+        if (!out_via_capable(o)) {
+            snprintf(msg, sizeof(msg),
+                     "выход %.31s: via есть только у выходов со своим соединением с сервером — "
+                     "vless, xsteer и interface с obfs; у kind=%s соединение открывает не движок, "
+                     "и пустить его через другой выход нечем", o->name,
+                     o->kind == OUT_INTERFACE ? "interface без obfs" : out_kind_name(o->kind));
+            die("%s", msg);
+        }
+        if (!strcmp(o->via, o->name))
+            die("выход %s: via указывает на него самого — туннель не может идти внутри себя",
+                o->name);
+        const struct output *v = out_via(o);
+        if (!v) {
+            snprintf(msg, sizeof(msg), "выход %.31s: via «%.31s» — такого выхода в спеке нет",
+                     o->name, o->via);
+            die("%s", msg);
+        }
+        if (!out_via_target_ok(v)) {
+            snprintf(msg, sizeof(msg),
+                     "выход %.31s: via «%.31s» — это kind=%s, у него нет устройства, в которое "
+                     "можно пустить туннель (нужен выход с устройством: interface, vless, xsteer)",
+                     o->name, v->name, out_kind_name(v->kind));
+            die("%s", msg);
+        }
+
+        /* Цепочка по одним via: круг и глубина. Путь печатается целиком — по одному имени
+         * человек круга не найдёт, если в спеке шестнадцать выходов. */
+        char path[256];
+        int on_path[MAX_OUTPUTS] = {0};
+        size_t pl = (size_t)snprintf(path, sizeof(path), "%s", o->name);
+        on_path[via_idx(o)] = 1;
+        int hops = 0;
+        for (const struct output *t = o, *n; (n = out_via(t)); t = n) {
+            hops++;
+            if (pl < sizeof(path))
+                pl += (size_t)snprintf(path + pl, sizeof(path) - pl, " → %s", n->name);
+            if (on_path[via_idx(n)]) {
+                snprintf(msg, sizeof(msg), "выход %.31s: via замыкается в круг (%s) — туннели "
+                         "заворачивались бы друг в друга, и не встал бы ни один", o->name, path);
+                die("%s", msg);
+            }
+            on_path[via_idx(n)] = 1;
+            if (hops > MAX_VIA_DEPTH) {
+                snprintf(msg, sizeof(msg), "выход %.31s: цепочка via длиннее %d переходов (%s)",
+                         o->name, MAX_VIA_DEPTH, path);
+                die("%s", msg);
+            }
+        }
+
+        /* Круг через пул: обход всего, во что может уйти трафик туннеля o, — цели via и
+         * владельцев устройств в пулах целей. Встретить устройство самого o или сам o — круг. */
+        int seen[MAX_OUTPUTS] = {0};
+        int stack[MAX_OUTPUTS * (MAX_DEVICES + 1)];
+        int sp = 0;
+        stack[sp++] = via_idx(v);
+        while (sp) {
+            const struct output *t = &g_out[stack[--sp]];
+            if (seen[via_idx(t)]) continue;
+            seen[via_idx(t)] = 1;
+            if (t == o) {
+                snprintf(msg, sizeof(msg), "выход %.31s: via замыкается в круг через устройства "
+                         "пула — туннель однажды пошёл бы внутрь себя", o->name);
+                die("%s", msg);
+            }
+            for (size_t d = 0; d < t->devices_n; d++) {
+                for (size_t k = 0; k < o->devices_n; k++)
+                    if (!strcmp(t->devices[d], o->devices[k])) {
+                        snprintf(msg, sizeof(msg), "выход %.31s: via ведёт в %.31s, а среди его "
+                                 "устройств %.31s — устройство самого выхода, туннель пошёл бы "
+                                 "внутрь себя", o->name, t->name, t->devices[d]);
+                        die("%s", msg);
+                    }
+                const struct output *w = via_dev_owner(t->devices[d], t);
+                if (w && !seen[via_idx(w)]) stack[sp++] = via_idx(w);
+            }
+            const struct output *n = out_via(t);
+            if (n && !seen[via_idx(n)]) stack[sp++] = via_idx(n);
+        }
+    }
+}
+
 void load_spec(const char *path) {
     FILE *f = strcmp(path, "-") ? fopen(path, "r") : stdin;
     if (!f) die("%s: cannot open", path);
@@ -1357,6 +1488,8 @@ void load_spec(const char *path) {
                     die("%s", msg);
                 }
     }
+
+    via_check();
 
     /* from_default — это клиенты раздачи; сам телефон называет канал, а не умолчание для всех
      * каналов. Проверка вне цикла по каналам: from_default уходит в правило заворота DNS и

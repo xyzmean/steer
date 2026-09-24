@@ -1409,6 +1409,123 @@ int main(void) {
             "\"match\":{\"domains_file\":\"/tmp/x.lst\"}}]}"));
     }
 
+    /* ---- вложенные выходы: via ---------------------------------------------------------
+     *
+     * Каждый отказ здесь — конфигурация, которая иначе применилась бы и молча повела туннель не
+     * туда: мимо выхода-цели напрямую (цели нет, у цели нет устройства, у выхода нет своего
+     * сокета, чтобы его пометить) или в круг, где не встаёт ни один туннель. Выходы в базовой
+     * сборке — interface с obfs: это единственный вид со своим сокетом наверх, который она знает;
+     * vless и xsteer — в расширенной. OBFS(dev) — описание обфускатора с устройством dev. */
+#define OBFS(dev) "{\"kind\":\"interface\",\"device\":\"" dev "\"," \
+                  "\"obfs\":{\"server\":\"203.0.113.10:4567\",\"listen\":\"127.0.0.1:51820\"}"
+    {
+        check("via: interface с obfs через interface — принята", 0, load_from_str(SPEC(
+            "\"outputs\":{\"a\":" OBFS("wg0") ",\"via\":\"b\"},"
+            "\"b\":{\"kind\":\"interface\",\"device\":\"wg1\"}},\"channels\":[]}")));
+        check_str("via: поле заполнено", "b", g_out_n ? g_out[0].via : "");
+        check("via: out_via находит цель", 1, g_out_n == 2 && out_via(&g_out[0]) == &g_out[1]);
+        check("via: у цели via нет", 1, g_out_n == 2 && out_via(&g_out[1]) == NULL);
+        /* Метка туннеля — метка цели; без via — «мимо каналов» (на роутере ноль). Метки здесь
+         * ставятся руками: registry_assign в этом стенде не зовётся. */
+        g_out[0].mark = 0x00100000;
+        g_out[1].mark = 0x00200000;
+        check("via: метка туннеля — метка цели", 0x00200000, (int)out_underlay_mark(&g_out[0]));
+        check("via: без via — метки нет", 0, (int)out_underlay_mark(&g_out[1]));
+        check("via: глубина 1 и 0", 1, out_via_depth(&g_out[0]) == 1 && out_via_depth(&g_out[1]) == 0);
+    }
+    check("via: цель ниже в спеке — принята", 0, load_from_str(SPEC(
+        "\"outputs\":{\"b\":{\"kind\":\"interface\",\"device\":\"wg1\"},"
+        "\"a\":" OBFS("wg0") ",\"via\":\"b\"}},\"channels\":[]}")));
+    check("via: пустая строка — как без via", 0, load_from_str(SPEC(
+        "\"outputs\":{\"a\":" OBFS("wg0") ",\"via\":\"\"}},\"channels\":[]}")));
+    check("via: пустая строка — поле пустое", 1, g_out_n == 1 && !out_via(&g_out[0]));
+    check("via: негодное имя — отказ", 2, load_from_str(SPEC(
+        "\"outputs\":{\"a\":" OBFS("wg0") ",\"via\":\"b c\"}},\"channels\":[]}")));
+    check("via: несуществующий выход — отказ", 2, load_from_str(SPEC(
+        "\"outputs\":{\"a\":" OBFS("wg0") ",\"via\":\"nope\"}},\"channels\":[]}")));
+    check("via: на самого себя — отказ", 2, load_from_str(SPEC(
+        "\"outputs\":{\"a\":" OBFS("wg0") ",\"via\":\"a\"}},\"channels\":[]}")));
+    check("via: у обычного interface (сокет не наш) — отказ", 2, load_from_str(SPEC(
+        "\"outputs\":{\"a\":{\"kind\":\"interface\",\"device\":\"wg0\",\"via\":\"b\"},"
+        "\"b\":{\"kind\":\"interface\",\"device\":\"wg1\"}},\"channels\":[]}")));
+    check("via: у direct — отказ", 2, load_from_str(SPEC(
+        "\"outputs\":{\"a\":{\"kind\":\"direct\",\"via\":\"b\"},"
+        "\"b\":{\"kind\":\"interface\",\"device\":\"wg1\"}},\"channels\":[]}")));
+    check("via: на direct — отказ", 2, load_from_str(SPEC(
+        "\"outputs\":{\"a\":" OBFS("wg0") ",\"via\":\"d\"},"
+        "\"d\":{\"kind\":\"direct\"}},\"channels\":[]}")));
+    check("via: на zapret — отказ", 2, load_from_str(SPEC(
+        "\"outputs\":{\"a\":" OBFS("wg0") ",\"via\":\"z\"},"
+        "\"z\":{\"kind\":\"zapret\"}},\"channels\":[]}")));
+    check("via: на tgws — отказ", 2, load_from_str(SPEC(
+        "\"outputs\":{\"a\":" OBFS("wg0") ",\"via\":\"t\"},"
+        "\"t\":{\"kind\":\"tgws\",\"domain\":\"example.com\"}},\"channels\":[]}")));
+    check("via: круг a → b → a — отказ", 2, load_from_str(SPEC(
+        "\"outputs\":{\"a\":" OBFS("wg0") ",\"via\":\"b\"},"
+        "\"b\":" OBFS("wg1") ",\"via\":\"a\"}},\"channels\":[]}")));
+    check("via: круг a → b → c → b — отказ", 2, load_from_str(SPEC(
+        "\"outputs\":{\"a\":" OBFS("wg0") ",\"via\":\"b\"},"
+        "\"b\":" OBFS("wg1") ",\"via\":\"c\"},"
+        "\"c\":" OBFS("wg2") ",\"via\":\"b\"}},\"channels\":[]}")));
+    {
+        check("via: цепочка из трёх выходов — принята", 0, load_from_str(SPEC(
+            "\"outputs\":{\"a\":" OBFS("wg0") ",\"via\":\"b\"},"
+            "\"b\":" OBFS("wg1") ",\"via\":\"c\"},"
+            "\"c\":{\"kind\":\"interface\",\"device\":\"wg2\"}},\"channels\":[]}")));
+        check("via: глубина цепочки из трёх — 2", 2, g_out_n == 3 ? out_via_depth(&g_out[0]) : -1);
+        g_out[0].mark = 0x00100000; g_out[1].mark = 0x00200000; g_out[2].mark = 0x00300000;
+        /* Каждый слой метит СВОЙ сокет меткой СВОЕЙ цели — не конца цепочки: пакет a едет в
+         * устройство b, а уже соединение b — в устройство c. */
+        check("via: слой a метится меткой b", 0x00200000, (int)out_underlay_mark(&g_out[0]));
+        check("via: слой b метится меткой c", 0x00300000, (int)out_underlay_mark(&g_out[1]));
+    }
+    check("via: три перехода — принята", 0, load_from_str(SPEC(
+        "\"outputs\":{\"a\":" OBFS("wg0") ",\"via\":\"b\"},"
+        "\"b\":" OBFS("wg1") ",\"via\":\"c\"},"
+        "\"c\":" OBFS("wg2") ",\"via\":\"d\"},"
+        "\"d\":{\"kind\":\"interface\",\"device\":\"wg3\"}},\"channels\":[]}")));
+    check("via: четыре перехода — отказ", 2, load_from_str(SPEC(
+        "\"outputs\":{\"a\":" OBFS("wg0") ",\"via\":\"b\"},"
+        "\"b\":" OBFS("wg1") ",\"via\":\"c\"},"
+        "\"c\":" OBFS("wg2") ",\"via\":\"d\"},"
+        "\"d\":" OBFS("wg3") ",\"via\":\"e\"},"
+        "\"e\":{\"kind\":\"interface\",\"device\":\"wg4\"}},\"channels\":[]}")));
+    /* Круг через пул: цель — interface, среди устройств которого устройство самого выхода.
+     * Пока сторож держит пул на первом устройстве, всё работает; стоит ему переключиться — и
+     * туннель пошёл бы внутрь себя. Отказ — сразу, а не в тот момент. */
+    check("via: пул цели с устройством самого выхода — отказ", 2, load_from_str(SPEC(
+        "\"outputs\":{\"a\":" OBFS("wg0") ",\"via\":\"p\"},"
+        "\"p\":{\"kind\":\"interface\",\"devices\":[\"wg1\",\"wg0\"]}},\"channels\":[]}")));
+    check("via: пул цели без него — принята", 0, load_from_str(SPEC(
+        "\"outputs\":{\"a\":" OBFS("wg0") ",\"via\":\"p\"},"
+        "\"p\":{\"kind\":\"interface\",\"devices\":[\"wg1\",\"wg2\"]}},\"channels\":[]}")));
+#ifdef STEER_EXTENDED
+    {
+        /* Пример владельца наоборот и прямо: VLESS через интерфейс; xsteer через VLESS. */
+        check("via: vless через interface — принята", 0, load_from_str(SPEC(
+            "\"outputs\":{\"v\":{\"kind\":\"vless\",\"sub_file\":\"/tmp/s\",\"via\":\"w\"},"
+            "\"w\":{\"kind\":\"interface\",\"device\":\"wg0\"}},\"channels\":[]}")));
+        check("via: vless через interface — цель найдена", 1,
+              g_out_n == 2 && out_via(&g_out[0]) == &g_out[1]);
+        check("via: xsteer через vless — принята", 0, load_from_str(SPEC(
+            "\"outputs\":{\"x\":{\"kind\":\"xsteer\",\"via\":\"v\"},"
+            "\"v\":{\"kind\":\"vless\",\"sub_file\":\"/tmp/s\"}},\"channels\":[]}")));
+        check("via: vless ↔ xsteer по кругу — отказ", 2, load_from_str(SPEC(
+            "\"outputs\":{\"x\":{\"kind\":\"xsteer\",\"via\":\"v\"},"
+            "\"v\":{\"kind\":\"vless\",\"sub_file\":\"/tmp/s\",\"via\":\"x\"}},\"channels\":[]}")));
+        /* Круг, которого в полях via не видно: v идёт через пул p, в пуле — устройство x, а x
+         * сам идёт через v. Сторож переключит пул на x — и туннели завернутся друг в друга. */
+        check("via: круг через устройство пула — отказ", 2, load_from_str(SPEC(
+            "\"outputs\":{\"v\":{\"kind\":\"vless\",\"sub_file\":\"/tmp/s\",\"via\":\"p\"},"
+            "\"p\":{\"kind\":\"interface\",\"devices\":[\"wg0\",\"x\"]},"
+            "\"x\":{\"kind\":\"xsteer\",\"via\":\"v\"}},\"channels\":[]}")));
+        check("via: пул с чужим туннелем без круга — принята", 0, load_from_str(SPEC(
+            "\"outputs\":{\"v\":{\"kind\":\"vless\",\"sub_file\":\"/tmp/s\",\"via\":\"p\"},"
+            "\"p\":{\"kind\":\"interface\",\"devices\":[\"wg0\",\"x\"]},"
+            "\"x\":{\"kind\":\"xsteer\"}},\"channels\":[]}")));
+    }
+#endif
+#undef OBFS
 
     printf("\n%s\n", fails ? "ЕСТЬ ПРОВАЛЫ" : "все проверки прошли");
     return fails ? 1 : 0;

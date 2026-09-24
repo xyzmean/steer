@@ -101,6 +101,9 @@ struct vless_conn {
     uint16_t pad_from, pad_to;
 };
 
+/* Метка сокетов к узлу (SO_MARK до connect) — для `via`, см. «вложенные выходы» в spec.h.
+ * 0 — не метить. required — метка обязательна: без неё соединение не открывается. */
+void vless_set_sock_mark(uint32_t mark, int required);
 int vless_connect(const struct vless_node *node, struct vless_conn *conn, int timeout_s);
 int vless_probe(const struct vless_node *node, int timeout_s, char *why, size_t why_n);
 

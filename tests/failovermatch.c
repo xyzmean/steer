@@ -318,6 +318,37 @@ static void unlink_lat(void) {
     snprintf(pth, sizeof(pth), "%s/latency", g_state_dir);
     unlink(pth);
 }
+/* ВЛОЖЕННЫЕ ВЫХОДЫ (`via`): туннель выхода «in» идёт через выход «outer». Внутренний стоит в
+ * g_out ПЕРВЫМ нарочно — сторож обязан спросить цель раньше него, а не полагаться на порядок
+ * спеки. Здоровье задаёт стенд; счётчик проб внутреннего ловит пробу, которой быть не должно:
+ * при лежащей цели она не нужна и стоила бы батареи на телефоне. */
+static int g_outer_ok = 1, g_in_probes;
+static int via_health(const struct output *o, const char *dev) {
+    (void)o;
+    if (!strcmp(dev, "vout")) return g_outer_ok;
+    if (!strcmp(dev, "vin")) { g_in_probes++; return 1; }
+    return 0;
+}
+static void out_set_via(void) {
+    memset(g_out, 0, sizeof(g_out));
+    g_out_n = 2;
+    snprintf(g_out[0].name, sizeof(g_out[0].name), "%s", "in");
+    g_out[0].kind = OUT_XSTEER;
+    g_out[0].on_fail = FAIL_DROP;
+    snprintf(g_out[0].via, sizeof(g_out[0].via), "%s", "outer");
+    snprintf(g_out[0].devices[0], sizeof(g_out[0].devices[0]), "%s", "vin");
+    g_out[0].devices_n = 1;
+    g_out[0].mark = 0x100000;
+    g_out[0].table = 300;
+    snprintf(g_out[1].name, sizeof(g_out[1].name), "%s", "outer");
+    g_out[1].kind = OUT_INTERFACE;
+    g_out[1].on_fail = FAIL_DIRECT;
+    snprintf(g_out[1].devices[0], sizeof(g_out[1].devices[0]), "%s", "vout");
+    g_out[1].devices_n = 1;
+    g_out[1].mark = 0x200000;
+    g_out[1].table = 301;
+}
+
 static void out_set_two(void) {
     memset(g_out, 0, sizeof(g_out));
     g_out_n = 1;
@@ -1029,6 +1060,56 @@ int main(void) {
 
         g_latency_probe = NULL;
         g_health_probe = NULL;
+    }
+
+    /* ---- via: отказ цели делает нерабочим и зависящий выход ------------------------------ */
+    {
+        char dev[32];
+        g_health_probe = via_health;
+        snprintf(g_dir, sizeof(g_dir), "/tmp/failovermatch-via-XXXXXX");
+        if (!mkdtemp(g_dir)) { perror("mkdtemp"); return 1; }
+        g_state_dir = g_dir;
+        /* Цель жива — оба выхода привязаны к своим устройствам. */
+        g_outer_ok = 1;
+        out_set_via();
+        state_write("active", "");
+        tick("", "");
+        active_get("in", dev, sizeof(dev));
+        check("via: цель жива — внутренний привязан", !strcmp(dev, "vin"), 1);
+        check("via: цель жива — маршрут внутреннего в его устройство",
+              cmd_seen("ip route add default dev vin table 300"), 1);
+        /* Цель легла — внутренний нерабочий, хотя его собственное устройство отвечает бы: его
+         * on_fail (drop) встаёт в его таблицу, а его устройство даже не пробуется. */
+        g_outer_ok = 0;
+        g_in_probes = 0;
+        out_set_via();
+        tick("", "");
+        active_get("in", dev, sizeof(dev));
+        check("via: цель легла — внутренний нерабочий", !strcmp(dev, "-"), 1);
+        check("via: цель легла — on_fail внутреннего (blackhole в его таблице)",
+              cmd_seen("ip route add blackhole default table 300"), 1);
+        check("via: цель легла — внутренний не пробуется", g_in_probes, 0);
+        check("via: цель легла — on_fail цели (direct: правило снято)",
+              cmd_seen("ip rule del fwmark 0x00200000/0x0ff00000 table 301"), 1);
+        /* Цель ожила — внутренний возвращается тем же проходом, без лишних тиков. */
+        g_outer_ok = 1;
+        out_set_via();
+        tick("", "");
+        active_get("in", dev, sizeof(dev));
+        check("via: цель ожила — внутренний вернулся тем же проходом", !strcmp(dev, "vin"), 1);
+        g_health_probe = NULL;
+        char path[160];
+        const char *names[] = { "active", "restart-vout", "restart-vin", NULL };
+        for (int i = 0; names[i]; i++) {
+            snprintf(path, sizeof(path), "%s/%s", g_dir, names[i]);
+            unlink(path);
+        }
+        rmdir(g_dir);
+        g_state_dir = "/tmp";
+        if (g_fail) {
+            fprintf(stderr, "failovermatch: провалено проверок: %d\n", g_fail);
+            return 1;
+        }
     }
 
     printf("OK\n");
