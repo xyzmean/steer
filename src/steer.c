@@ -37,6 +37,7 @@
 #include "obfs.h"
 #include "cli.h"
 #include "srs.h"
+#include "ctl.h"
 
 /* Уровень в журнале — см. одноимённые макросы в failover.c и obfs.c. Метка подсистемы
  * здесь «apply»: все строки ниже пишутся при компиляции и применении спеки. Отказы
@@ -4036,8 +4037,11 @@ static int cmd_explain(const char *spec, const char *what) {
  * сбрасывается, когда он проработал дольше. Ждёт супервизор в sigtimedwait: таймер монотонный,
  * во сне устройства стоит и не будит его.
  *
- * SIGHUP — сверить состав со спекой: ушедшим выходам — SIGTERM, новым — запуск, остальные не
- * трогаются. SIGTERM — погасить всех и выйти (init шлёт его группе, это на случай kill).
+ * SIGHUP — сверить состав со спекой: ушедшим выходам — SIGTERM, новым — запуск, остальным —
+ * ничего, если не изменились их параметры (см. sup_sig): у изменившихся помощник гасится и
+ * поднимается сразу, без пятисекундной паузы. SIGTERM — погасить всех и выйти (init шлёт его
+ * группе, это на случай kill). SIGHUP шлёт управляющий сокет после каждого удачного apply
+ * (src/ctl.c, reload).
  *
  * zapret здесь нет: его обработчик — отдельная программа (steer-nfqws), а в сборке под
  * Android zapret нет вовсе. В базовой сборке нет и vless, xsteer и tgws — их команды есть только
@@ -4051,7 +4055,47 @@ struct sup_helper {
     long started_ms;
     long delay_ms;      /* пауза следующего перезапуска */
     int gone;           /* выход убран из спеки: не перезапускать */
+    unsigned long long sig;   /* подпись параметров, которые помощник читает при старте */
+    int restart;        /* погашен ради новых параметров: поднять сразу, без паузы */
 };
+
+/* ПОДПИСЬ ПАРАМЕТРОВ ПОМОЩНИКА — то, что он читает из спеки ОДИН РАЗ, при старте.
+ *
+ * Состав («команда выход») SIGHUP сверял и раньше, а смену параметров оставленного выхода — нет:
+ * человек выбирал другой узел подписки или другой сервер обфускации, apply проходил, а помощник
+ * продолжал работать со старым до своего перезапуска, то есть до перезагрузки. Тот же открытый
+ * пункт закрывает на роутере сам splify2 отпечатками vless_fingerprint и obfs_fingerprint
+ * (rpcd/m-spec.sh); здесь поля те же, и по тем же доводам в подпись входит ТОЛЬКО то, что
+ * помощник действительно читает при старте. Правка устройства, on_fail или каналов помощника
+ * не касается, а перезапуск рвёт туннель и меняет выходной адрес — трогать его из-за неё нельзя.
+ *
+ * Поля по видам: vless — файл подписки и выбор узлов; xsteer — файл конфигурации и режим
+ * потока; tgws — домен точек; obfs — сервер и локальный адрес. Содержимое файлов (подписка
+ * обновилась) подписью не ловится, как и на роутере: это отдельный повод со своим путём. */
+static void sup_fnv(unsigned long long *h, const void *p, size_t n) {
+    const unsigned char *b = p;
+    for (size_t i = 0; i < n; i++) { *h ^= b[i]; *h *= 1099511628211ULL; }
+    *h ^= 0xff; *h *= 1099511628211ULL;   /* граница поля: «ab»+«c» не равно «a»+«bc» */
+}
+static unsigned long long sup_sig(const char *cmd, const struct output *o) {
+    unsigned long long h = 14695981039346656037ULL;
+    if (!strcmp(cmd, "vless")) {
+        sup_fnv(&h, o->sub_file, strlen(o->sub_file));
+        for (size_t i = 0; i < o->nodes_n; i++) sup_fnv(&h, &o->nodes[i], sizeof(o->nodes[i]));
+    } else if (!strcmp(cmd, "xsteer")) {
+        sup_fnv(&h, o->xs_conf, strlen(o->xs_conf));
+        sup_fnv(&h, &o->xs_stream, sizeof(o->xs_stream));
+        sup_fnv(&h, &o->xs_stream_port, sizeof(o->xs_stream_port));
+    } else if (!strcmp(cmd, "tgws")) {
+        sup_fnv(&h, o->tg_domain, strlen(o->tg_domain));
+    } else if (!strcmp(cmd, "obfs")) {
+        sup_fnv(&h, o->obfs.server, strlen(o->obfs.server));
+        sup_fnv(&h, &o->obfs.server_port, sizeof(o->obfs.server_port));
+        sup_fnv(&h, o->obfs.listen, strlen(o->obfs.listen));
+        sup_fnv(&h, &o->obfs.listen_port, sizeof(o->obfs.listen_port));
+    }
+    return h;
+}
 
 static long sup_now_ms(void) {
     struct timespec t;
@@ -4059,7 +4103,7 @@ static long sup_now_ms(void) {
     return (long)t.tv_sec * 1000L + t.tv_nsec / 1000000L;
 }
 
-/* Состав помощников по спеке — строками «команда имя». -1 — спека не разобралась. */
+/* Состав помощников по спеке — строками «команда имя подпись». -1 — спека не разобралась. */
 static int sup_list(const char *spec, struct sup_helper *out, size_t *n) {
     int pfd[2];
     if (pipe(pfd) != 0) return -1;
@@ -4073,11 +4117,15 @@ static int sup_list(const char *spec, struct sup_helper *out, size_t *n) {
         for (size_t i = 0; i < g_out_n; i++) {
             const struct output *o = &g_out[i];
 #if defined(STEER_EXTENDED)
-            if (o->kind == OUT_VLESS)  fprintf(w, "vless %s\n", o->name);
-            if (o->kind == OUT_XSTEER) fprintf(w, "xsteer %s\n", o->name);
-            if (o->kind == OUT_TGWS)   fprintf(w, "tgws %s\n", o->name);
+            if (o->kind == OUT_VLESS)
+                fprintf(w, "vless %s %llx\n", o->name, sup_sig("vless", o));
+            if (o->kind == OUT_XSTEER)
+                fprintf(w, "xsteer %s %llx\n", o->name, sup_sig("xsteer", o));
+            if (o->kind == OUT_TGWS)
+                fprintf(w, "tgws %s %llx\n", o->name, sup_sig("tgws", o));
 #endif
-            if (o->obfs.on)            fprintf(w, "obfs %s\n", o->name);
+            if (o->obfs.on)
+                fprintf(w, "obfs %s %llx\n", o->name, sup_sig("obfs", o));
         }
         fclose(w);
         _exit(0);
@@ -4085,13 +4133,15 @@ static int sup_list(const char *spec, struct sup_helper *out, size_t *n) {
     close(pfd[1]);
     FILE *r = fdopen(pfd[0], "r");
     size_t k = 0;
-    char line[96];
+    char line[128];
     while (r && fgets(line, sizeof(line), r) && k < SUP_MAX) {
         char c[8], nm[32];
-        if (sscanf(line, "%7s %31s", c, nm) != 2) continue;
+        unsigned long long sg = 0;
+        if (sscanf(line, "%7s %31s %llx", c, nm, &sg) != 3) continue;
         memset(&out[k], 0, sizeof(out[k]));
         snprintf(out[k].cmd, sizeof(out[k].cmd), "%s", c);
         snprintf(out[k].name, sizeof(out[k].name), "%s", nm);
+        out[k].sig = sg;
         out[k].delay_ms = 5000;
         k++;
     }
@@ -4167,6 +4217,17 @@ static int cmd_supervise(const char *spec) {
                 for (size_t i = 0; i < n; i++) {
                     if (h[i].pid != p) continue;
                     h[i].pid = 0;
+                    /* Погашен нами ради новых параметров — поднять сразу: это не падение,
+                     * и ни пауза, ни её рост к нему не относятся. */
+                    if (h[i].restart) {
+                        h[i].restart = 0;
+                        h[i].delay_ms = 5000;
+                        h[i].next_ms = 0;
+                        if (!h[i].gone)
+                            fprintf(stderr, "steer[info] supervise: %s %s — параметры выхода "
+                                            "изменились, поднимаю заново\n", h[i].cmd, h[i].name);
+                        continue;
+                    }
                     /* Проработал дольше минуты — пауза снова пять секунд. Эта пауза и
                      * ждётся сейчас, а удваивается следующая: первый перезапуск упавшего
                      * всегда через пять секунд, как у procd. */
@@ -4205,6 +4266,22 @@ static int cmd_supervise(const char *spec) {
                     if (h[i].pid) kill(h[i].pid, SIGTERM);
                 }
             }
+            /* Оставленные выходы с новыми параметрами: запомнить подпись и перезапустить
+             * живого помощника. Не запущенный (ждёт паузы после падения) поднимется уже с
+             * новыми — его достаточно запомнить. */
+            for (size_t i = 0; i < n; i++) {
+                if (h[i].gone) continue;
+                for (size_t k = 0; k < fn; k++) {
+                    if (strcmp(h[i].cmd, fresh[k].cmd) || strcmp(h[i].name, fresh[k].name) ||
+                        h[i].sig == fresh[k].sig)
+                        continue;
+                    h[i].sig = fresh[k].sig;
+                    if (h[i].pid && !h[i].restart) {
+                        h[i].restart = 1;
+                        kill(h[i].pid, SIGTERM);
+                    }
+                }
+            }
             for (size_t k = 0; k < fn && n < SUP_MAX; k++) {
                 int have = 0;
                 for (size_t i = 0; i < n; i++) {
@@ -4213,6 +4290,7 @@ static int cmd_supervise(const char *spec) {
                     /* Выход вернули в спеку, пока его прежний помощник ещё гаснет: не второй
                      * экземпляр рядом, а тот же слот — перезапустится, когда прежний выйдет. */
                     h[i].gone = 0;
+                    h[i].sig = fresh[k].sig;
                     have = 1;
                 }
                 if (!have) h[n++] = fresh[k];
@@ -4395,6 +4473,7 @@ int main(int argc, char **argv) {
         if (c->passthru) {
             fputs("\nФлаги:\n", stdout);
             if (!strcmp(cmd, "fit")) aggregate_usage_flags(stdout);
+            else if (!strcmp(cmd, "ctl-serve") || !strcmp(cmd, "ctl")) ctl_usage_flags(stdout);
             else dnsd_usage_flags(stdout);
         }
         return 0;
@@ -4404,6 +4483,8 @@ int main(int argc, char **argv) {
      * Такие команды помечены в таблице как passthru и получают argv как есть. */
     if (c->passthru) {
         if (!strcmp(cmd, "fit")) return aggregate_main(argc - 1, argv + 1);
+        if (!strcmp(cmd, "ctl-serve")) return ctl_serve_main(argc - 2, argv + 2);
+        if (!strcmp(cmd, "ctl")) return ctl_client_main(argc - 2, argv + 2);
         return dnsd_main(argc - 2, argv + 2);
     }
 

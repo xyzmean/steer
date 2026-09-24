@@ -202,5 +202,6 @@ zig cc -target "$TARGET" ${MCPU:+-mcpu=$MCPU} -static $OPT -s \
     -o "$OUT" \
     /src/src/steer.c /src/src/spec.c /src/src/dnsd.c /src/src/failover.c \
     /src/src/aggregate.c /src/src/obfs.c /src/src/cli.c /src/src/srs.c /src/src/puff.c /src/src/hwid.c \
+    /src/src/ctl.c \
     $EXT \
     "$WORK"/*.o
