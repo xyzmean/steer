@@ -21,6 +21,7 @@
 #include <unistd.h>
 #include <sys/stat.h>
 #include <sys/wait.h>
+#include <signal.h>
 #include <fcntl.h>
 #include <sys/socket.h>
 #include <netinet/in.h>
@@ -3846,6 +3847,221 @@ static int cmd_explain(const char *spec, const char *what) {
     return 0;
 }
 
+/* ---- supervise: помощники выходов одним сервисом -------------------------------------
+ *
+ * На роутере init-скрипт поднимает по экземпляру procd на каждый выход, которому нужен свой
+ * процесс (vless, xsteer, obfs, tgws), и procd перезапускает упавший через пять секунд. У init
+ * Android так нельзя: сервисы объявлены в rc статически, а состав выходов известен только из
+ * спеки. Поэтому один сервис — этот — поднимает их сам и держит.
+ *
+ * СОСТАВ считается в ДОЧЕРНЕМ процессе и приезжает строками через трубу: спеку загружают в
+ * глобальные массивы, и второй load_spec в том же процессе склеил бы выходы двух чтений (тот
+ * же довод, что у failover_loop). Спека не разобралась — состав остаётся прежним, а не пустым.
+ *
+ * ПЕРЕЗАПУСК — как у procd: через пять секунд. Но помощник, падающий сразу (сервер туннеля
+ * недоступен, в спеке ошибка), перезапускался бы каждые пять секунд всю ночь, а на телефоне
+ * это батарея. Поэтому пауза удваивается, пока помощник живёт меньше минуты, до пяти минут, и
+ * сбрасывается, когда он проработал дольше. Ждёт супервизор в sigtimedwait: таймер монотонный,
+ * во сне устройства стоит и не будит его.
+ *
+ * SIGHUP — сверить состав со спекой: ушедшим выходам — SIGTERM, новым — запуск, остальные не
+ * трогаются. SIGTERM — погасить всех и выйти (init шлёт его группе, это на случай kill).
+ *
+ * zapret здесь нет: его обработчик — отдельная программа (steer-nfqws), а в сборке под
+ * Android zapret нет вовсе. В базовой сборке нет и vless, xsteer и tgws — их команды есть только
+ * в расширенной, и запускать их значило бы перезапускать отказ по кругу. */
+#define SUP_MAX 32
+struct sup_helper {
+    char cmd[8];
+    char name[32];
+    pid_t pid;
+    long next_ms;       /* когда можно запускать (0 — сразу) */
+    long started_ms;
+    long delay_ms;      /* пауза следующего перезапуска */
+    int gone;           /* выход убран из спеки: не перезапускать */
+};
+
+static long sup_now_ms(void) {
+    struct timespec t;
+    clock_gettime(CLOCK_MONOTONIC, &t);
+    return (long)t.tv_sec * 1000L + t.tv_nsec / 1000000L;
+}
+
+/* Состав помощников по спеке — строками «команда имя». -1 — спека не разобралась. */
+static int sup_list(const char *spec, struct sup_helper *out, size_t *n) {
+    int pfd[2];
+    if (pipe(pfd) != 0) return -1;
+    pid_t pid = fork();
+    if (pid < 0) { close(pfd[0]); close(pfd[1]); return -1; }
+    if (pid == 0) {
+        close(pfd[0]);
+        FILE *w = fdopen(pfd[1], "w");
+        if (!w) _exit(1);
+        load_spec(spec);
+        for (size_t i = 0; i < g_out_n; i++) {
+            const struct output *o = &g_out[i];
+#if defined(STEER_EXTENDED)
+            if (o->kind == OUT_VLESS)  fprintf(w, "vless %s\n", o->name);
+            if (o->kind == OUT_XSTEER) fprintf(w, "xsteer %s\n", o->name);
+            if (o->kind == OUT_TGWS)   fprintf(w, "tgws %s\n", o->name);
+#endif
+            if (o->obfs.on)            fprintf(w, "obfs %s\n", o->name);
+        }
+        fclose(w);
+        _exit(0);
+    }
+    close(pfd[1]);
+    FILE *r = fdopen(pfd[0], "r");
+    size_t k = 0;
+    char line[96];
+    while (r && fgets(line, sizeof(line), r) && k < SUP_MAX) {
+        char c[8], nm[32];
+        if (sscanf(line, "%7s %31s", c, nm) != 2) continue;
+        memset(&out[k], 0, sizeof(out[k]));
+        snprintf(out[k].cmd, sizeof(out[k].cmd), "%s", c);
+        snprintf(out[k].name, sizeof(out[k].name), "%s", nm);
+        out[k].delay_ms = 5000;
+        k++;
+    }
+    if (r) fclose(r); else close(pfd[0]);
+    int st = 0;
+    while (waitpid(pid, &st, 0) < 0 && errno == EINTR) {}
+    if (!WIFEXITED(st) || WEXITSTATUS(st) != 0) return -1;
+    *n = k;
+    return 0;
+}
+
+static void sup_start(struct sup_helper *h, const char *exe, const char *spec,
+                      const sigset_t *blocked) {
+    pid_t pid = fork();
+    if (pid < 0) { h->next_ms = sup_now_ms() + h->delay_ms; return; }
+    if (pid == 0) {
+        sigprocmask(SIG_UNBLOCK, blocked, NULL);
+        const char *argv[] = { exe, h->cmd, h->name, "--spec", spec, NULL };
+        execv(exe, (char *const *)argv);
+        _exit(127);
+    }
+    h->pid = pid;
+    h->started_ms = sup_now_ms();
+    fprintf(stderr, "steer[info] supervise: %s %s запущен (pid %d)\n", h->cmd, h->name, (int)pid);
+}
+
+static int cmd_supervise(const char *spec) {
+    char exe[512];
+    /* Шов стенда: STEER_SUPERVISE_EXE подставляет вместо движка свою программу-помощника
+     * (tests/supervisematch.sh), которая только записывает, с чем её позвали. */
+    const char *seam = getenv("STEER_SUPERVISE_EXE");
+    if (seam && *seam) snprintf(exe, sizeof(exe), "%s", seam);
+    else {
+        ssize_t el = readlink("/proc/self/exe", exe, sizeof(exe) - 1);
+        if (el <= 0) die("supervise: не найти свой исполняемый файл (%s)", strerror(errno));
+        exe[el] = '\0';
+    }
+    if (!spec) spec = STEER_ETC_DIR "/spec.json";
+
+    sigset_t set;
+    sigemptyset(&set);
+    sigaddset(&set, SIGCHLD); sigaddset(&set, SIGHUP);
+    sigaddset(&set, SIGTERM); sigaddset(&set, SIGINT);
+    sigprocmask(SIG_BLOCK, &set, NULL);
+
+    static struct sup_helper h[SUP_MAX];
+    size_t n = 0;
+    if (sup_list(spec, h, &n) != 0)
+        die("supervise: спека %s не разобралась — поднимать нечего", spec);
+    if (!n) fprintf(stderr, "steer[info] supervise: выходов со своим процессом в спеке нет\n");
+
+    for (;;) {
+        long now = sup_now_ms();
+        long wait = -1;
+        for (size_t i = 0; i < n; i++) {
+            if (h[i].pid || h[i].gone) continue;
+            if (h[i].next_ms <= now) sup_start(&h[i], exe, spec, &set);
+            if (!h[i].pid && (wait < 0 || h[i].next_ms - now < wait))
+                wait = h[i].next_ms - now > 0 ? h[i].next_ms - now : 0;
+        }
+        siginfo_t si;
+        int sig;
+        if (wait < 0) sig = sigwaitinfo(&set, &si);
+        else {
+            struct timespec ts = { wait / 1000, (wait % 1000) * 1000000L };
+            sig = sigtimedwait(&set, &si, &ts);
+        }
+        if (sig < 0) continue;                         /* таймаут или EINTR */
+        if (sig == SIGCHLD) {
+            int st;
+            pid_t p;
+            while ((p = waitpid(-1, &st, WNOHANG)) > 0) {
+                for (size_t i = 0; i < n; i++) {
+                    if (h[i].pid != p) continue;
+                    h[i].pid = 0;
+                    /* Проработал дольше минуты — пауза снова пять секунд. Эта пауза и
+                     * ждётся сейчас, а удваивается следующая: первый перезапуск упавшего
+                     * всегда через пять секунд, как у procd. */
+                    long lived = sup_now_ms() - h[i].started_ms;
+                    if (lived >= 60000) h[i].delay_ms = 5000;
+                    h[i].next_ms = sup_now_ms() + h[i].delay_ms;
+                    if (!h[i].gone)
+                        fprintf(stderr, "steer[warn] supervise: %s %s вышел (%s %d) — перезапуск "
+                                        "через %ld с\n", h[i].cmd, h[i].name,
+                                WIFEXITED(st) ? "код" : "сигнал",
+                                WIFEXITED(st) ? WEXITSTATUS(st) : WTERMSIG(st),
+                                h[i].delay_ms / 1000);
+                    if (lived < 60000 && h[i].delay_ms < 300000)
+                        h[i].delay_ms = h[i].delay_ms * 2 > 300000 ? 300000 : h[i].delay_ms * 2;
+                }
+            }
+            /* Убранные из спеки и уже погасшие — вычистить из таблицы. */
+            size_t w = 0;
+            for (size_t i = 0; i < n; i++)
+                if (!(h[i].gone && !h[i].pid)) h[w++] = h[i];
+            n = w;
+        } else if (sig == SIGHUP) {
+            static struct sup_helper fresh[SUP_MAX];
+            size_t fn = 0;
+            if (sup_list(spec, fresh, &fn) != 0) {
+                fprintf(stderr, "steer[warn] supervise: спека не разобралась — состав прежний\n");
+                continue;
+            }
+            for (size_t i = 0; i < n; i++) {
+                int keep = 0;
+                for (size_t k = 0; k < fn; k++)
+                    if (!strcmp(h[i].cmd, fresh[k].cmd) && !strcmp(h[i].name, fresh[k].name))
+                        keep = 1;
+                if (!keep && !h[i].gone) {
+                    h[i].gone = 1;
+                    if (h[i].pid) kill(h[i].pid, SIGTERM);
+                }
+            }
+            for (size_t k = 0; k < fn && n < SUP_MAX; k++) {
+                int have = 0;
+                for (size_t i = 0; i < n; i++)
+                    if (!h[i].gone && !strcmp(h[i].cmd, fresh[k].cmd) &&
+                        !strcmp(h[i].name, fresh[k].name)) have = 1;
+                if (!have) h[n++] = fresh[k];
+            }
+            size_t w = 0;
+            for (size_t i = 0; i < n; i++)
+                if (!(h[i].gone && !h[i].pid)) h[w++] = h[i];
+            n = w;
+        } else {                                       /* SIGTERM, SIGINT */
+            for (size_t i = 0; i < n; i++) if (h[i].pid) kill(h[i].pid, SIGTERM);
+            for (int t = 0; t < 30; t++) {
+                int left = 0;
+                for (size_t i = 0; i < n; i++) {
+                    if (!h[i].pid) continue;
+                    if (waitpid(h[i].pid, NULL, WNOHANG) == h[i].pid) h[i].pid = 0;
+                    else left = 1;
+                }
+                if (!left) break;
+                struct timespec ts = { 0, 100000000L };
+                nanosleep(&ts, NULL);
+            }
+            return 0;
+        }
+    }
+}
+
 /* Сторож по кругу: `steer failover --loop СЕК`.
  *
  * На роутере круг крутит procd строкой `while :; do steer failover; sleep 60; done`. У init
@@ -3874,7 +4090,7 @@ static int failover_loop(const char *spec, int verbose, int period) {
         if (pid > 0)
             while (waitpid(pid, NULL, 0) < 0 && errno == EINTR) {}
         else
-            fprintf(stderr, LOG_W "failover: fork: %s\n", strerror(errno));
+            fprintf(stderr, "steer[warn] failover: fork: %s\n", strerror(errno));
         struct timespec left = { period, 0 };
         while (clock_nanosleep(CLOCK_MONOTONIC, 0, &left, &left) == EINTR) {}
     }
@@ -3945,6 +4161,7 @@ int main(int argc, char **argv) {
     if (!strcmp(cmd, "status")) return cmd_status(spec, a.fast);
     if (!strcmp(cmd, "diag")) return cmd_diag(spec);
     if (!strcmp(cmd, "down")) return cmd_down();
+    if (!strcmp(cmd, "supervise")) return cmd_supervise(spec);
     if (!strcmp(cmd, "failover"))
         return a.loop ? failover_loop(spec, a.verbose, a.loop) : cmd_failover(spec, a.verbose);
     if (!strcmp(cmd, "explain")) {
