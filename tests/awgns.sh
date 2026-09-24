@@ -279,6 +279,15 @@ check "via + Endpoint IPv6: адрес IPv6 на устройство не лё�
       "$(wg show nl endpoints 2>/dev/null | grep -c '2001:db8::9')"
 sed -i 's/^Endpoint = .*/Endpoint = 203.0.113.9:51820/' "$tmp/nl.conf"
 "$BIN" apply $S >/dev/null 2>&1
+# Цель пересоздана под тем же именем с другой меткой (реестр выдал ей другое место): метка сокета
+# туннеля awg — WGDEVICE_A_FWMARK — перенастраивается тем же apply, без перезапуска чего-либо.
+# (У помощников vless/xsteer/obfs то же делает супервизор по подписи — tests/supervisematch.sh.)
+sed -i 's/^ux .*/ux 500000 304/' "$tmp/state/registry"
+[ "${AWG_FWMARK:-off}" != off ] && sed -i 's/^ux .*/ux 1000000 304/' "$tmp/state/registry"
+"$BIN" apply $S >/dev/null 2>&1
+check "via: новая метка цели — на устройстве тем же apply" \
+      "$(printf '0x%x' "$(($(omark ux) | tunbit))")" "$(wg show nl fwmark 2>/dev/null)"
+check "  и она не прежняя" "1" "$([ "$(omark ux)" != "$uxmark" ] && echo 1 || echo 0)"
 
 # ---- 7. down снимает туннель -------------------------------------------------------------
 "$BIN" down --state-dir "$tmp/state" >/dev/null 2>&1

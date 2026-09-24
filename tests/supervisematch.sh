@@ -9,7 +9,9 @@
 # после удаления выхода из спеки гасит его помощника и не трогает остальных; SIGHUP с
 # новым выходом поднимает его; SIGHUP со сменой параметров выхода (сервер обфускации)
 # перезапускает его помощника сразу и не трогает соседей, а SIGHUP без изменений не трогает
-# никого; SIGTERM гасит всех и завершает супервизор.
+# никого; SIGTERM гасит всех и завершает супервизор; смена МЕТКИ цели via (цель пересоздана с тем
+# же именем) перезапускает помощника выхода через неё, а помощник получает каталог состояния
+# супервизора.
 set -u
 BIN="${STEER:-./build/steer}"
 [ -x "$BIN" ] || { echo "not built: $BIN (make test)"; exit 2; }
@@ -130,6 +132,39 @@ sleep 5
 check "  третий — через 10 с после второго" "3" "$(grep -c '^obfs d ' "$tmp/crash.log")"
 check "  и пауза растёт в журнале: 5, затем 10 с" "1 1" \
     "$(grep -c 'через 5 с' "$tmp/crash.err") $(grep -c 'через 10 с' "$tmp/crash.err")"
+kill -TERM $SUP; wait $SUP 2>/dev/null
+
+# Метка цели via — в подписи помощника, а не только её имя. Цель убрали из спеки и вернули под тем
+# же именем — реестр выдал ей другое место, то есть другую метку; помощник, прочитавший метку при
+# старте, метил бы сокет старой (теперь чужой или ничьей — то есть мимо цели) до своего
+# перезапуска. Здесь «пересоздание» — правка реестра в каталоге состояния супервизора.
+st="$tmp/st"
+mkdir -p "$st"
+cat > "$tmp/via.json" <<EOF
+{"schema":2,"from_default":["192.168.1.0/24"],"outputs":{
+ "t":{"kind":"interface","device":"wgt"},
+ "a":{"kind":"interface","device":"wga","via":"t",
+      "obfs":{"mode":"wg-over-tcp","server":"10.99.0.3:4443","listen":"127.0.0.1:5101"}}},
+ "channels":[]}
+EOF
+: > "$tmp/log"
+STEER_SUPERVISE_EXE="$tmp/helper" "$BIN" supervise --spec "$tmp/via.json" --state-dir "$st" \
+    2>"$tmp/via.err" &
+SUP=$!
+wait_for '[ "$(running a)" = 1 ]' 5
+check "via: помощник выхода a поднят" "1" "$(running a)"
+check "via: метки — из реестра каталога состояния супервизора" "1" "$(grep -c '^t ' "$st/registry" 2>/dev/null)"
+p="$(grep '^obfs a ' "$tmp/log" | tail -1 | cut -d' ' -f3)"
+check "via: помощник получил тот же каталог состояния" "1" \
+    "$(tr '\0' ' ' < "/proc/$p/cmdline" 2>/dev/null | grep -c -- "--state-dir $st")"
+kill -HUP $SUP
+sleep 2
+check "via: SIGHUP без изменений — помощник не перезапущен" "1 yes" "$(running a) $(alive a)"
+sed -i 's/^t .*/t 500000 304/' "$st/registry"
+kill -HUP $SUP
+wait_for '[ "$(running a)" = 2 ] && [ "$(alive a)" = yes ]' 8
+check "via: у цели другая метка — помощник перезапущен" "2 yes" "$(running a) $(alive a)"
+check "  и о причине сказано" "1" "$(grep -c 'supervise: obfs a — параметры выхода изменились' "$tmp/via.err")"
 kill -TERM $SUP; wait $SUP 2>/dev/null
 
 rm -rf "$tmp"
