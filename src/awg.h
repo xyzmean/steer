@@ -192,6 +192,15 @@ int awg_healthy(const struct output *o, const char *dev);
 /* Починка молчащего туннеля: заново разрешить Endpoint и перенастроить (создать, если
  * устройства нет). Возврат — как у awg_healthy после починки. */
 int awg_revive(const struct output *o, const char *dev);
+/* ПАМЯТЬ СТОРОЖА: замеры счётчиков между проходами (см. «здоровье» в awg.c) — в памяти, а не в
+ * файле <state>/awg-<устройство>.hs. Зовёт `failover --loop` (steer.c): on=1 — проход берёт и
+ * кладёт замеры в память процесса; дочерний проход получает её копией при fork, а свои новые
+ * замеры отдаёт родителю через трубу — awg_hs_send в дочернем, awg_hs_recv в родителе (свою
+ * память он заменяет, только если сообщение пришло целиком). Без круга (один проход, круг
+ * shell на роутере) — как прежде, файлом. */
+void awg_hs_memory(int on);
+void awg_hs_send(int fd);
+void awg_hs_recv(int fd);
 /* Поле "awg" у выхода в `steer status`: начинается с запятой. */
 void awg_status_json(FILE *out, const struct output *o);
 

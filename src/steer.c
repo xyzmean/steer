@@ -4461,18 +4461,36 @@ static int failover_events_drain(int fd) {
 static int failover_loop(const char *spec, int verbose, int period) {
     int ev = failover_events_open();
     for (;;) {
+        /* ПАМЯТЬ МЕЖДУ ПРОХОДАМИ — у родителя, а не в файлах каталога состояния: на телефоне это
+         * /data, флеш, и запись на каждом проходе (раз в минуту и по каждому событию сети) шла бы
+         * круглые сутки. Замеры счётчиков туннелей awg дочерний проход получает копией памяти при
+         * fork, а свои новые отдаёт по трубе (awg_hs_send / awg_hs_recv, src/awg.c). Остальное, что
+         * проход пишет, — выбор устройств (active), реестр меток, подпись awg — пишется только
+         * при изменении. Нет трубы — этот проход работает по-старому, файлом: без памяти
+         * приговор «туннель молчит» не вынести вовсе. O_CLOEXEC — чтобы команды, которые проход
+         * запускает (ip, nft), не держали конец записи и родитель не ждал их, читая трубу. */
+        int pfd[2];
+        int piped = pipe2(pfd, O_CLOEXEC) == 0;
+        awg_hs_memory(piped);
         pid_t pid = fork();
         if (pid == 0) {
+            if (piped) close(pfd[0]);
             int rc = cmd_failover(spec, verbose);
 #ifdef STEER_ANDROID
             android_masq_ensure();      /* спека уже загружена проходом */
 #endif
+            if (piped) awg_hs_send(pfd[1]);
             exit(rc);
         }
-        if (pid > 0)
+        if (piped) close(pfd[1]);
+        if (pid > 0) {
+            /* Сначала дочитать трубу (до конца файла — проход вышел), потом ждать: сообщение
+             * короче буфера трубы, так что проход не встанет на записи, но порядок и так верный. */
+            if (piped) awg_hs_recv(pfd[0]);
             while (waitpid(pid, NULL, 0) < 0 && errno == EINTR) {}
-        else
+        } else
             fprintf(stderr, "steer[warn] failover: fork: %s\n", strerror(errno));
+        if (piped) close(pfd[0]);
 #ifndef STEER_ANDROID
         /* На роутере проход сам делает ifdown/ifup мёртвому интерфейсу, и события за время
          * прохода — его же следы: реагировать на них значило бы будить себя по кругу. На

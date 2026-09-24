@@ -1147,7 +1147,15 @@ static int sig_read(const char *dev, struct awg_sig *g) {
     return ok ? 0 : -1;
 }
 
+/* Только при изменении: подпись пишется при каждой настройке устройства, в том числе при
+ * починке сторожем (раз в пять минут у молчащего туннеля), а содержимое у неё меняется лишь с
+ * файлом туннеля. Переписывать то же самое во флеш телефона незачем. */
 static void sig_write(const char *dev, const struct awg_sig *g) {
+    struct awg_sig old;
+    if (sig_read(dev, &old) == 0 && old.u16_has == g->u16_has && old.h_has == g->h_has &&
+        old.i_has == g->i_has && old.r16_has == g->r16_has && old.u8_has == g->u8_has &&
+        old.hpk == g->hpk)
+        return;
     char p[512];
     sig_path(dev, p, sizeof p);
     FILE *f = fopen(p, "w");
@@ -1165,6 +1173,121 @@ static int sig_lost(const struct awg_sig *old, const struct awg_sig *now) {
 
 static int is_our_kind(const char *k) {
     return !strcmp(k, AWG_GENL_NAME) || !strcmp(k, WG_GENL_NAME_);
+}
+
+/* ---- замеры счётчиков для сторожа: в памяти круга или в файле ------------------------------
+ *
+ * ЗАЧЕМ ПАМЯТЬ. Приговор «туннель молчит» (см. «здоровье» ниже) сравнивает счётчики пира с
+ * прошлым проходом сторожа, и прошлый замер надо где-то хранить между проходами. Раньше это был
+ * файл <state>/awg-<устройство>.hs, и писался он КАЖДЫЙ проход — счётчики и время меняются
+ * всегда. На телефоне каталог состояния — /data, то есть флеш, а проход — раз в минуту и по
+ * каждому событию сети: это постоянные записи во флеш круглые сутки, против требования
+ * владельца о батарее и сне (на роутере state — tmpfs, там это ничего не стоило).
+ *
+ * На телефоне сторож — `failover --loop`: один долгоживущий родитель и проход в дочернем
+ * процессе (fork; почему так — у failover_loop в steer.c). Память родителя дочерний видит
+ * копией, так что прошлые замеры он получает даром; новые отдаёт родителю через трубу одной
+ * короткой записью (строк не больше, чем устройств). Проход, умерший на полпути (die() в
+ * разборе спеки, SIGKILL), ничего не отдаёт — и родитель держит прежние замеры, а не пустые:
+ * пустые означали бы «прошлого замера нет», и приговор отложился бы ещё на проход. Замеров в
+ * файл круг не пишет вовсе; файл остаётся для одиночного прохода (круг procd на роутере), где
+ * памяти между проходами нет. Сна это не касается: во сне проходов нет вовсе. */
+struct hs_sample {
+    char dev[IFNAMSIZ];
+    unsigned long long tx, rx;
+    long t;
+    int v;
+};
+static struct hs_sample g_hs[REG_MAX];
+static size_t g_hs_n;
+static int g_hs_mem;
+
+void awg_hs_memory(int on) { g_hs_mem = on; }
+
+static int hs_get(const char *dev, struct hs_sample *out) {
+    if (g_hs_mem) {
+        for (size_t i = 0; i < g_hs_n; i++)
+            if (!strcmp(g_hs[i].dev, dev)) { *out = g_hs[i]; return 0; }
+        return -1;
+    }
+    char p[512];
+    snprintf(p, sizeof p, "%s/awg-%s.hs", g_state_dir, dev);
+    FILE *f = fopen(p, "r");
+    if (!f) return -1;
+    int ok = fscanf(f, "%llu %llu %ld %d", &out->tx, &out->rx, &out->t, &out->v) == 4;
+    fclose(f);
+    return ok ? 0 : -1;
+}
+
+static void hs_put(const char *dev, const struct hs_sample *s) {
+    if (g_hs_mem) {
+        size_t i = 0;
+        while (i < g_hs_n && strcmp(g_hs[i].dev, dev)) i++;
+        if (i == g_hs_n) {
+            if (g_hs_n >= REG_MAX) return;
+            g_hs_n++;
+        }
+        g_hs[i] = *s;
+        snprintf(g_hs[i].dev, sizeof g_hs[i].dev, "%s", dev);
+        return;
+    }
+    char p[512];
+    snprintf(p, sizeof p, "%s/awg-%s.hs", g_state_dir, dev);
+    FILE *f = fopen(p, "w");
+    if (!f) return;
+    fprintf(f, "%llu %llu %ld %d\n", s->tx, s->rx, s->t, s->v);
+    fclose(f);
+}
+
+/* Сообщение в трубу: строка на замер и «end» в конце — по нему родитель узнаёт, что прочёл всё.
+ * Одной записью: при нескольких десятках строк это меньше PIPE_BUF, и родитель не увидит
+ * половину. */
+void awg_hs_send(int fd) {
+    char buf[REG_MAX * 96 + 8];
+    size_t n = 0;
+    for (size_t i = 0; i < g_hs_n; i++) {
+        int w = snprintf(buf + n, sizeof buf - n, "%s %llu %llu %ld %d\n", g_hs[i].dev,
+                         g_hs[i].tx, g_hs[i].rx, g_hs[i].t, g_hs[i].v);
+        if (w < 0 || (size_t)w >= sizeof buf - n) return;
+        n += (size_t)w;
+    }
+    if (n + 4 >= sizeof buf) return;
+    memcpy(buf + n, "end\n", 4);
+    n += 4;
+    for (size_t off = 0; off < n; ) {
+        ssize_t w = write(fd, buf + off, n - off);
+        if (w < 0 && errno == EINTR) continue;
+        if (w <= 0) return;
+        off += (size_t)w;
+    }
+}
+
+void awg_hs_recv(int fd) {
+    char buf[REG_MAX * 96 + 8];
+    size_t n = 0;
+    for (;;) {
+        if (n >= sizeof buf - 1) break;
+        ssize_t r = read(fd, buf + n, sizeof buf - 1 - n);
+        if (r < 0 && errno == EINTR) continue;
+        if (r <= 0) break;
+        n += (size_t)r;
+    }
+    buf[n] = '\0';
+    if (n < 4 || strcmp(buf + n - 4, "end\n") != 0) return;   /* проход не договорил */
+    struct hs_sample got[REG_MAX];
+    size_t k = 0;
+    for (char *save = NULL, *ln = strtok_r(buf, "\n", &save); ln; ln = strtok_r(NULL, "\n", &save)) {
+        if (!strcmp(ln, "end") || k >= REG_MAX) break;
+        struct hs_sample s;
+        memset(&s, 0, sizeof s);
+        char dev[64];
+        if (sscanf(ln, "%63s %llu %llu %ld %d", dev, &s.tx, &s.rx, &s.t, &s.v) != 5) continue;
+        if (strlen(dev) >= IFNAMSIZ) continue;
+        snprintf(s.dev, sizeof s.dev, "%s", dev);
+        got[k++] = s;
+    }
+    memcpy(g_hs, got, k * sizeof got[0]);
+    g_hs_n = k;
 }
 
 static void dev_state_drop(const char *dev) {
@@ -1498,27 +1621,20 @@ int awg_healthy(const struct output *o, const char *dev) {
         tx += L.peer[i].tx;
     }
     long now = boot_now();
-    char p[512];
-    snprintf(p, sizeof p, "%s/awg-%s.hs", g_state_dir, dev);
+    /* Прошлый замер — из памяти круга или из файла (см. «замеры счётчиков для сторожа»). */
+    struct hs_sample prev;
     unsigned long long ptx = 0, prx = 0;
     long pt = 0;
     int pv = -1;
-    FILE *f = fopen(p, "r");
-    if (f) {
-        if (fscanf(f, "%llu %llu %ld %d", &ptx, &prx, &pt, &pv) != 4) pv = -1;
-        fclose(f);
-    }
+    if (hs_get(dev, &prev) == 0) { ptx = prev.tx; prx = prev.rx; pt = prev.t; pv = prev.v; }
     int verdict;
     int64_t age = newest ? (int64_t)time(NULL) - newest : -1;
     if (newest && age >= 0 && age <= fresh_s) verdict = 1;
     else if (pv < 0 || tx < ptx || rx < prx) verdict = 1;          /* нет замера или счётчики сброшены */
     else if (now - pt < AWG_SAMPLE_MIN) return pv;                  /* рано судить — прежний приговор */
     else verdict = !(tx > ptx && rx == prx);
-    f = fopen(p, "w");
-    if (f) {
-        fprintf(f, "%llu %llu %ld %d\n", (unsigned long long)tx, (unsigned long long)rx, now, verdict);
-        fclose(f);
-    }
+    struct hs_sample cur = { .tx = tx, .rx = rx, .t = now, .v = verdict };
+    hs_put(dev, &cur);
     return verdict;
 }
 

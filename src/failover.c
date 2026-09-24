@@ -1296,16 +1296,41 @@ static void active_get(const char *out, char *dev, size_t n) {
     fclose(f);
 }
 
+/* Записать выбор прохода — ТОЛЬКО если он отличается от записанного.
+ *
+ * Файл пишется в конце каждого прохода, а проход на телефоне — раз в минуту и по каждому
+ * событию сети. Каталог состояния там — /data, то есть флеш, и безусловная запись означала бы
+ * запись во флеш каждую минуту круглые сутки ради одного и того же текста: выбор устройства
+ * меняется редко (переключение, отказ, счётчик гистерезиса при возврате). Требование владельца —
+ * батарея и сон — это исключает. Сравнивается будущий текст целиком, как у реестра меток
+ * (registry_assign в spec.c): чтение не пишет ничего.
+ *
+ * Через временный файл и rename: status и apply читают этот файл в любой момент, и половина
+ * строк означала бы для них «сторож не проходил» у половины выходов. */
 static void active_save(void) {
-    char path[256];
+    char want[MAX_OUTPUTS * 80 + 1];
+    size_t wn = 0;
+    for (size_t i = 0; i < g_out_n; i++) {
+        if (!out_has_device(&g_out[i])) continue;
+        int w = snprintf(want + wn, sizeof(want) - wn, "%s %s %d\n", g_out[i].name,
+                         g_out[i].device[0] ? g_out[i].device : "-", g_streak[i]);
+        if (w < 0 || (size_t)w >= sizeof(want) - wn) break;
+        wn += (size_t)w;
+    }
+    char path[256], tmp[288];
     active_path(path, sizeof(path));
-    FILE *f = fopen(path, "w");
+    FILE *f = fopen(path, "r");
+    if (f) {
+        char have[sizeof(want) + 1];
+        size_t hn = fread(have, 1, sizeof(have), f);
+        fclose(f);
+        if (hn == wn && memcmp(have, want, wn) == 0) return;
+    }
+    snprintf(tmp, sizeof(tmp), "%s.tmp", path);
+    f = fopen(tmp, "w");
     if (!f) return;
-    for (size_t i = 0; i < g_out_n; i++)
-        if (out_has_device(&g_out[i]))
-            fprintf(f, "%s %s %d\n", g_out[i].name,
-                    g_out[i].device[0] ? g_out[i].device : "-", g_streak[i]);
-    fclose(f);
+    fwrite(want, 1, wn, f);
+    if (fclose(f) != 0 || rename(tmp, path) != 0) unlink(tmp);
 }
 
 /* Взять устройство, которое НЕСЁТ ТРАФИК СЕЙЧАС, а не первое по списку кандидатов.

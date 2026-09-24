@@ -289,6 +289,50 @@ check "via: новая метка цели — на устройстве тем 
       "$(printf '0x%x' "$(($(omark ux) | tunbit))")" "$(wg show nl fwmark 2>/dev/null)"
 check "  и она не прежняя" "1" "$([ "$(omark ux)" != "$uxmark" ] && echo 1 || echo 0)"
 
+# ---- 6b. сторож по кругу: замеры в памяти, во флеш — только перемены ---------------------
+# На телефоне сторож — `failover --loop`, каталог состояния — /data (флеш), проход — раз в минуту
+# и по событиям сети. Замер счётчиков туннеля (для приговора «молчит») раньше писался в
+# <state>/awg-<dev>.hs каждый проход, выбор устройств (active) — тоже каждый проход, подпись awg —
+# при каждой починке. Теперь замеры живут в памяти родителя круга (проход — fork, новые замеры
+# приходят по трубе), остальное пишется только при изменении. Проверяется и то, что память
+# действительно переходит между проходами: мёртвый туннель dd (пир на этом порту не слушает)
+# объявляется мёртвым только сравнением с замером прошлого прохода не моложе 15 с.
+sed -i 's/^Endpoint = .*/Endpoint = 192.0.2.2:51820/' "$tmp/nl.conf"
+sed -e 's/^Endpoint = .*/Endpoint = 192.0.2.2:51821/' -e 's|^Address = .*|Address = 10.77.9.2/24|' \
+    "$tmp/nl.conf" > "$tmp/dd.conf"
+cat > "$tmp/spec.json" <<SPEC
+{ "schema": 2, "from_default": ["192.168.1.0/24"],
+  "outputs": { "nl": { "kind": "awg", "conf": "$tmp/nl.conf", "device": "nl", "on_fail": "drop" },
+               "dd": { "kind": "awg", "conf": "$tmp/dd.conf", "device": "dd", "on_fail": "drop" } },
+  "channels": [ { "name": "a", "match": { "prefixes_file": "$tmp/a.lst" }, "out": "nl" } ] }
+SPEC
+"$BIN" apply $S >/dev/null 2>&1
+check "круг: apply двух туннелей" "0" "$?"
+rm -f "$tmp/state"/awg-*.hs
+ddmark="$(omark dd)"; ddtable="$(st | grep -o '"dd":{[^}]*' | grep -o '"table":[0-9]*' | cut -d: -f2)"
+sig0="$(stat -c %y "$tmp/state/awg-dd.sig" 2>/dev/null)"
+"$BIN" failover $S --loop 3 >"$tmp/loop.out" 2>&1 &
+loop=$!
+# Трафик в dd всё время круга: попытки рукопожатия растят tx, а ответа нет — rx стоит.
+ping -q -i 0.5 -c 50 -W 1 -m "$((ddmark))" -I 10.77.9.2 198.51.100.1 >/dev/null 2>&1 &
+pinger=$!
+sleep 2
+act1="$(stat -c %y "$tmp/state/active" 2>/dev/null)"
+sleep 10
+act2="$(stat -c %y "$tmp/state/active" 2>/dev/null)"
+sleep 13
+kill "$loop" 2>/dev/null; wait "$loop" 2>/dev/null
+kill "$pinger" 2>/dev/null; wait "$pinger" 2>/dev/null
+check "круг: замеры счётчиков не пишутся в файлы" "0" "$(ls "$tmp/state" | grep -c '^awg-.*\.hs$')"
+check "круг: выбор устройств без перемен не переписывается" "$act1" "$act2"
+check "круг: мёртвый dd объявлен по замеру прошлого прохода (память между проходами)" "1" \
+      "$(grep -c 'выход dd: живых устройств нет, трафик остановлен' "$tmp/loop.out")"
+check "круг: у dd запрет" "1" "$(ip route show table "$ddtable" | nobs | grep -c 'blackhole default')"
+check "круг: живой nl не тронут" "1" "$(ip route show table all | grep -c '^default dev nl table')"
+check "круг: подпись dd при починке не переписана (та же)" "$sig0" \
+      "$(stat -c %y "$tmp/state/awg-dd.sig" 2>/dev/null)"
+check "круг: починка dd была" "1" "$([ "$(grep -c 'dd: туннель молчит' "$tmp/loop.out")" -ge 1 ] && echo 1 || echo 0)"
+
 # ---- 7. down снимает туннель -------------------------------------------------------------
 "$BIN" down --state-dir "$tmp/state" >/dev/null 2>&1
 check "down: устройство снято" "0" "$(ip link show "$dev" 2>/dev/null | grep -c "$dev")"
