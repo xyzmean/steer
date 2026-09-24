@@ -8,8 +8,8 @@
 //
 // Both are compiled with -DSTEER_ANDROID (mark field above netd's bits, ip rule priorities
 // below netd's ladder, directories under /data/misc/steer, /dev/tun — see src/spec.h and
-// src/paths.h). The engine calls `nft -f` and `ip` as external programs, so it is installed
-// next to `nft` (external/nftables) and gets both through the PATH its init service sets.
+// src/paths.h). The engine calls `nft -f`, `ip` and `iptables` as external programs and finds
+// them through init's default PATH, which includes /system_ext/bin (nft) and /system/bin.
 //
 // Installed in system_ext/bin/der/ rather than system_ext/bin/: every domain may list
 // /system_ext/bin (system_file:dir r_dir_perms), and the directory der/ carries its own SELinux
@@ -45,9 +45,13 @@ cc_defaults {
     },
 }
 
+// Not installable: both modules would be /system_ext/bin/der/steer, and Kati rejects two
+// install rules for one path ("overriding commands for target") for EVERY declared module,
+// not only for those in PRODUCT_PACKAGES. Still buildable by name (m steer_base).
 cc_binary {
     name: "steer_base",
     defaults: ["steer_defaults"],
+    installable: false,
 }
 
 // mbedtls with the engine's own configuration (src/ext/steer_mbedtls_config.h): the sources
@@ -97,6 +101,10 @@ cc_binary {
     cflags: [
         "-DSTEER_EXTENDED",
         "-DMBEDTLS_CONFIG_FILE=\"steer_mbedtls_config.h\"",
+        // Soong builds this project with -Werror, and a comment in src/ext/certverify.c
+        // contains "*val/*val_n" (-Wcomment). That file is protected from edits, so the
+        // warning is turned off here instead of being fixed there.
+        "-Wno-comment",
     ],
     static_libs: ["libsteer_mbedtls"],
 }

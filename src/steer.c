@@ -53,6 +53,11 @@ int dnsd_main(int argc, char **argv);
  * снимок живёт ниже, рядом с тем, что его пишет. */
 static void status_snap_path(char *buf, size_t n);
 int cmd_failover(const char *spec, int verbose);
+void probe_rule_cleanup(void);   /* failover.c */
+#ifdef STEER_ANDROID
+static void android_masq_drop_all(void);   /* ниже, у apply_routing */
+static void android_masq_ensure(void);
+#endif
 /* Свои флаги эти двое печатают сами — см. комментарии у объявлений. Справка по ним
  * склеивается из таблицы (что команда делает) и этих строк (чем ей управляют). */
 void dnsd_usage_flags(FILE *out);
@@ -591,20 +596,31 @@ static int has_local_domains(void) {
  *
  * Только UDP, как и у раздачи: резолвер движка TCP не слушает (см. prerouting_dns). DNS по
  * IPv6 на старом ядре без nat в ip6 не заворачивается — там такого правила не поставить. */
-static void emit_local_dns(FILE *f, const char *dnat_kw) {
-    fprintf(f, "        meta skuid != 0 udp dport 53 counter redirect to :%d "
-               "comment \"steer-dns-local\"\n", DNS_PORT);
+static void emit_local_dns(FILE *f, const char *dnat_kw, int inet) {
+    /* Всех, кроме собственного запроса резолвера наверх (STEER_SELF_MARK): DnsResolver шлёт
+     * запросы приложений от root. Только IPv4: запрос по IPv6 резолвер переспросить не может
+     * (исходное назначение он ищет только для IPv4), и заворачивать его — значит потерять. */
+    fprintf(f, "        %smeta mark and 0x%08x != 0x%08x udp dport 53 counter redirect to :%d "
+               "comment \"steer-dns-local\"\n", inet ? "meta nfproto ipv4 " : "",
+            STEER_MARK_MASK, STEER_SELF_MARK, DNS_PORT);
     if (has_fakeip())
         fprintf(f, "        ip daddr 198.18.0.0/15 counter %s to ip daddr map @fakeip "
                    "comment \"steer-fakeip-local\"\n", dnat_kw);
 }
 
-/* «Кто» у группы на сам телефон: владелец сокета. "self" — все, кроме root (почему — у
- * from_is_local); "uid:N[-M]" — перечисленные приложения. У пакета без сокета (RST и ICMP,
- * которые ядро шлёт само) владельца нет, и skuid не совпадает ни с чем — такие пакеты идут
- * обычным путём. */
+/* «Кто» у группы на сам телефон: владелец сокета. "self" — все приложения (UID от
+ * STEER_APP_UID_MIN; почему не демоны — у from_is_local); "uid:N[-M]" — перечисленные. У
+ * пакета без сокета (RST и ICMP, которые ядро шлёт само) владельца нет, и skuid не совпадает
+ * ни с чем — такие пакеты идут обычным путём.
+ *
+ * `ct direction original` — только соединения, которые приложение ОТКРЫЛО само. Ответы на
+ * входящие (беспроводной adb, сервер в приложении) обязаны уйти тем же путём, каким пришёл
+ * запрос, а не в туннель. */
 static void emit_local_who(FILE *f, const struct group *g) {
-    if (!strcmp(g->from[0], "self")) { fprintf(f, "meta skuid != 0 "); return; }
+    if (!strcmp(g->from[0], "self")) {
+        fprintf(f, "meta skuid >= %u ct direction original ", STEER_APP_UID_MIN);
+        return;
+    }
     int one = g->from_n == 1 && !strchr(g->from[0], '-');
     fprintf(f, one ? "meta skuid " : "meta skuid { ");
     for (size_t i = 0; i < g->from_n; i++) {
@@ -614,7 +630,7 @@ static void emit_local_who(FILE *f, const struct group *g) {
         if (lo == hi) fprintf(f, "%s%u", i ? ", " : "", lo);
         else fprintf(f, "%s%u-%u", i ? ", " : "", lo, hi);
     }
-    fprintf(f, one ? " " : " } ");
+    fprintf(f, one ? " ct direction original " : " } ct direction original ");
 }
 
 #endif
@@ -1096,11 +1112,15 @@ static void emit_output_mark(FILE *f) {
         struct output *o = out_by_name(g->out);
         if (!o) die("channel group %s points at a missing output", g->name);
         if (g->all && out_needs_mark(o)) {
+            /* С тем же сужением по протоколу и портам, что и канал: канал «UDP 50000-65535»
+             * не вправе отнимать у приложения весь IPv6. Своя сеть (петля, link-local, ULA,
+             * мультикаст) — не наружу и не мимо туннеля, её не трогаем. */
             fprintf(f, "        ");
             emit_local_who(f, g);
-            /* Петля ::1 — не наружу и не мимо туннеля; её приложение трогать не должно. */
-            fprintf(f, "meta nfproto ipv6 oifname != \"lo\" counter reject "
-                       "comment \"steer-v6:%s\"\n", g->name);
+            fprintf(f, "meta nfproto ipv6 ");
+            emit_l4(f, g->l4, 0);
+            fprintf(f, "oifname != \"lo\" ip6 daddr != { fe80::/10, fc00::/7, ff00::/8 } "
+                       "counter reject comment \"steer-v6:%s\"\n", g->name);
         }
         int halves = legacy_has_static(g) ? 2 : 1;
         for (int h = 0; h < halves; h++) {
@@ -1109,13 +1129,23 @@ static void emit_output_mark(FILE *f) {
             if (halves == 2 && h == 0) { nft_static_set_name(sn, sizeof(sn), g->name); set = sn; }
             fprintf(f, "        ");
             emit_local_who(f, g);
+            /* «Весь трафик» — это интернет, а не своя сеть: принтер, NAS и Chromecast в Wi-Fi
+             * через туннель не видны. Только IPv4 — IPv6 такой группы отвергнут строкой выше. */
+            if (g->all)
+                fprintf(f, "meta nfproto ipv4 ip daddr != { 10.0.0.0/8, 127.0.0.0/8, "
+                           "169.254.0.0/16, 172.16.0.0/12, 192.168.0.0/16, 224.0.0.0/4, "
+                           "255.255.255.255 } ");
             emit_l4(f, g->l4, 0);
             if (g->files_n || g->domains || g->emptied) fprintf(f, "ip daddr @%s ", set);
+            /* Бит перемаршрутизации ставится ПОСЛЕ метки соединения: в conntrack ему не место,
+             * он живёт на пакете до цепочки route в таблице ip. */
             if (out_needs_mark(o))
+            {
                 fprintf(f, "meta mark set mark and 0x%08x or 0x%08x %s",
-                        ~STEER_MARK_MASK,
-                        o->mark | (NFT_LEGACY ? STEER_REROUTE_BIT : 0),
+                        ~STEER_MARK_MASK, o->mark,
                         out_needs_ctmark(o) ? "ct mark set mark " : "");
+                if (NFT_LEGACY) fprintf(f, "meta mark set mark or 0x%08x ", STEER_REROUTE_BIT);
+            }
             if (h == 0) emit_counter(f, g->name, 0);
             else fprintf(f, "counter ");
             fprintf(f, "return comment \"steer:%s\"\n", g->name);
@@ -1124,32 +1154,6 @@ static void emit_output_mark(FILE *f) {
     fprintf(f, "    }\n");
 }
 
-/* ---- masquerade у выходов-интерфейсов ------------------------------------------------
- *
- * На роутере адрес источника у пакетов в туннель подменяет firewall (зона выхода с masq), и
- * движок его настройку не трогает. На телефоне такого firewall нет вовсе: netd делает NAT
- * только для раздачи на её восходящий интерфейс. Пакет раздачи или приложения, уведённый
- * меткой в туннель, уходил бы с адресом Wi-Fi или сотовой сети — сервер туннеля такой пакет
- * не примет, а ответ на него пришёл бы не туда.
- *
- * Только НАШ помеченный трафик и только на устройствах выхода: `mark and маска == метка`
- * вместе с oifname. Выходы vless и xsteer не нуждаются в этом (их устройство обслуживает наш
- * процесс, и адреса он переводит сам, см. out_self_natting). */
-static void emit_masquerade_rules(FILE *f) {
-    for (size_t i = 0; i < g_out_n; i++) {
-        struct output *o = &g_out[i];
-        if (o->kind != OUT_INTERFACE || !o->devices_n) continue;
-        fprintf(f, "        meta mark and 0x%08x == 0x%08x oifname ", STEER_MARK_MASK, o->mark);
-        if (o->devices_n == 1) fprintf(f, "\"%s\" ", o->devices[0]);
-        else {
-            fprintf(f, "{ ");
-            for (size_t k = 0; k < o->devices_n; k++)
-                fprintf(f, "%s\"%s\"", k ? ", " : "", o->devices[k]);
-            fprintf(f, " } ");
-        }
-        fprintf(f, "counter masquerade comment \"steer-masq:%s\"\n", o->name);
-    }
-}
 #endif
 
 /* ХВОСТ НАБОРА ПРАВИЛ В СТАРОЙ РАСКЛАДКЕ: закрыть inet и собрать nat в ip/ip6.
@@ -1227,7 +1231,7 @@ static void generate_legacy_tail(FILE *f) {
         if (has_local_domains()) {
             fprintf(f, "    chain output_nat {\n"
                        "        type nat hook output priority dstnat - 1; policy accept;\n");
-            emit_local_dns(f, "dnat");
+            emit_local_dns(f, "dnat", 0);
             fprintf(f, "    }\n");
         }
         /* Снятие бита перемаршрутизации — см. STEER_REROUTE_BIT в spec.h. mangle + 2: сразу
@@ -1240,11 +1244,8 @@ static void generate_legacy_tail(FILE *f) {
                        "    }\n", STEER_REROUTE_BIT, STEER_REROUTE_BIT, ~STEER_REROUTE_BIT);
 #endif
         fprintf(f, "    chain postrouting_nat {\n"
-                   "        type nat hook postrouting priority srcnat + 1; policy accept;\n");
-#ifdef STEER_ANDROID
-        emit_masquerade_rules(f);
-#endif
-        fprintf(f, "    }\n}\n");
+                   "        type nat hook postrouting priority srcnat + 1; policy accept;\n"
+                   "    }\n}\n");
     }
     if (legacy_has_ip6()) {
         fprintf(f, "table ip6 %s {\n"
@@ -1773,7 +1774,7 @@ static void generate(FILE *f) {
         if (has_local_domains()) {
             fprintf(f, "    chain output_dns {\n"
                        "        type nat hook output priority dstnat; policy accept;\n");
-            emit_local_dns(f, "dnat ip");
+            emit_local_dns(f, "dnat ip", 1);
             fprintf(f, "    }\n");
         }
 #endif
@@ -1798,13 +1799,6 @@ static void generate(FILE *f) {
          * redirecting TCP would break the truncated-answer retry.
          */
     }
-#ifdef STEER_ANDROID
-    /* masquerade у выходов-интерфейсов — см. emit_masquerade_rules. */
-    fprintf(f, "\n    chain postrouting_masq {\n"
-               "        type nat hook postrouting priority srcnat + 1; policy accept;\n");
-    emit_masquerade_rules(f);
-    fprintf(f, "    }\n");
-#endif
     fprintf(f, "}\n");
 }
 
@@ -2228,12 +2222,103 @@ static int cmd_down(void) {
         const char *flush[] = { "ip", "route", "flush", "table", table, NULL };
         run(flush);
     }
+    /* Правило и таблица пробы сторожа. Сторож снимает их сам при выходе, но init Android гасит
+     * сервис SIGKILL (без gentle_kill — сразу, с ним — через 200 мс), и уборка при выходе может
+     * не успеть. */
+    probe_rule_cleanup();
+#ifdef STEER_ANDROID
+    android_masq_drop_all();
+#endif
     return 0;
 }
 
 /* Policy routing for interface outputs. Rules are removed before being added so a
  * re-apply cannot stack duplicates — `ip rule add` is happy to add the same rule
  * twice, and the second copy is invisible until someone deletes the first. */
+#ifdef STEER_ANDROID
+/* ---- masquerade у выходов-интерфейсов: правилом iptables, а не nft ----------------------
+ *
+ * ЗАЧЕМ. На роутере адрес источника у пакетов в туннель подменяет firewall (зона выхода с
+ * masq). На телефоне такого firewall нет: netd делает NAT только для раздачи на её восходящий
+ * интерфейс. Пакет раздачи или приложения, уведённый меткой в туннель, уходил бы с адресом
+ * Wi-Fi или сотовой сети — сервер туннеля такой пакет не примет.
+ *
+ * ПОЧЕМУ iptables. На ядре 4.9 каждая регистрация nat (цепочка nat nft, таблица nat iptables)
+ * решает судьбу нового соединения сама: первая сработавшая, не найдя правила, ставит «пустую»
+ * привязку, и следующие для этого соединения уже не вычисляются (nf_nat_ipv4_fn в
+ * nf_nat_l3proto_ipv4.c). netd держит nat в iptables на srcnat (100). Цепочка nft после неё
+ * не срабатывает никогда, а до неё — отнимает у netd раздачу целиком. Правило в той же таблице
+ * nat iptables, первым в POSTROUTING, живёт с правилами netd в одном проходе.
+ *
+ * Только наш помеченный трафик и только на устройствах выхода. Правила узнаются по маске
+ * поля метки в тексте `iptables -S` — чужих с нашей маской не бывает. Выходы vless и xsteer
+ * здесь не нужны: их устройство обслуживает наш процесс, адреса он переводит сам. */
+static void android_masq_drop_all(void) {
+    char mask[24];
+    snprintf(mask, sizeof(mask), "/0x%x ", STEER_MARK_MASK);
+    FILE *p = popen("iptables -w -t nat -S POSTROUTING 2>/dev/null", "r");
+    if (!p) return;
+    char line[512], lines[64][512];
+    int n = 0;
+    while (n < 64 && fgets(line, sizeof(line), p)) {
+        if (strncmp(line, "-A POSTROUTING ", 15) || !strstr(line, mask) ||
+            !strstr(line, "-j MASQUERADE")) continue;
+        snprintf(lines[n++], sizeof(lines[0]), "%s", line + 15);
+    }
+    pclose(p);
+    for (int i = 0; i < n; i++) {
+        const char *argv[32] = { "iptables", "-w", "-t", "nat", "-D", "POSTROUTING" };
+        int k = 6;
+        for (char *t = strtok(lines[i], " \n"); t && k < 31; t = strtok(NULL, " \n"))
+            argv[k++] = t;
+        argv[k] = NULL;
+        run(argv);
+    }
+}
+
+/* Вернуть недостающие правила masquerade, не трогая стоящие. Зовёт сторож после каждого
+ * прохода: netd при (пере)запуске перестраивает iptables и наши правила пропадают, а apply
+ * после этого случится, только если его позовёт init (см. steerd.rc). */
+static void android_masq_ensure(void) {
+    for (size_t i = 0; i < g_out_n; i++) {
+        const struct output *o = &g_out[i];
+        if (o->kind != OUT_INTERFACE) continue;
+        char mk[32];
+        snprintf(mk, sizeof(mk), "0x%x/0x%x", o->mark, STEER_MARK_MASK);
+        for (size_t k = 0; k < o->devices_n; k++) {
+            const char *chk[] = { "iptables", "-w", "-t", "nat", "-C", "POSTROUTING",
+                                  "-o", o->devices[k], "-m", "mark", "--mark", mk,
+                                  "-j", "MASQUERADE", NULL };
+            if (run(chk) == 0) continue;
+            const char *add[] = { "iptables", "-w", "-t", "nat", "-I", "POSTROUTING", "1",
+                                  "-o", o->devices[k], "-m", "mark", "--mark", mk,
+                                  "-j", "MASQUERADE", NULL };
+            if (run(add) == 0)
+                fprintf(stderr, "steer[info] failover: masquerade на %s возвращён\n",
+                        o->devices[k]);
+        }
+    }
+}
+
+static void android_masq_sync(void) {
+    android_masq_drop_all();
+    for (size_t i = 0; i < g_out_n; i++) {
+        const struct output *o = &g_out[i];
+        if (o->kind != OUT_INTERFACE) continue;
+        char mk[32];
+        snprintf(mk, sizeof(mk), "0x%x/0x%x", o->mark, STEER_MARK_MASK);
+        for (size_t k = 0; k < o->devices_n; k++) {
+            const char *add[] = { "iptables", "-w", "-t", "nat", "-I", "POSTROUTING", "1",
+                                  "-o", o->devices[k], "-m", "mark", "--mark", mk,
+                                  "-j", "MASQUERADE", NULL };
+            if (run(add) != 0)
+                fprintf(stderr, LOG_W "output %s: masquerade на %s не встал (iptables)\n",
+                        o->name, o->devices[k]);
+        }
+    }
+}
+#endif
+
 static void apply_routing(void) {
     for (size_t i = 0; i < g_out_n; i++) {
         if (!out_has_device(&g_out[i])) continue;
@@ -2506,6 +2591,9 @@ static int cmd_apply(const char *spec, int dry) {
     }
     unlink(tmp);
     apply_routing();
+#ifdef STEER_ANDROID
+    android_masq_sync();
+#endif
     cleanup_stale_routing();
     /* Снимок состояния СНИМАЕТСЯ: он описывает то, что было применено до этой транзакции, и
      * `status --fast` отдавал бы его как нынешнее — то есть прежние выходы и прежние каналы
@@ -4038,18 +4126,30 @@ static int cmd_supervise(const char *spec) {
             }
             for (size_t k = 0; k < fn && n < SUP_MAX; k++) {
                 int have = 0;
-                for (size_t i = 0; i < n; i++)
-                    if (!h[i].gone && !strcmp(h[i].cmd, fresh[k].cmd) &&
-                        !strcmp(h[i].name, fresh[k].name)) have = 1;
+                for (size_t i = 0; i < n; i++) {
+                    if (strcmp(h[i].cmd, fresh[k].cmd) || strcmp(h[i].name, fresh[k].name))
+                        continue;
+                    /* Выход вернули в спеку, пока его прежний помощник ещё гаснет: не второй
+                     * экземпляр рядом, а тот же слот — перезапустится, когда прежний выйдет. */
+                    h[i].gone = 0;
+                    have = 1;
+                }
                 if (!have) h[n++] = fresh[k];
             }
+            /* Спеку исправили — упавшему незачем досиживать растущую паузу до пяти минут. */
+            for (size_t i = 0; i < n; i++)
+                if (!h[i].pid) { h[i].delay_ms = 5000; h[i].next_ms = 0; }
             size_t w = 0;
             for (size_t i = 0; i < n; i++)
                 if (!(h[i].gone && !h[i].pid)) h[w++] = h[i];
             n = w;
         } else {                                       /* SIGTERM, SIGINT */
             for (size_t i = 0; i < n; i++) if (h[i].pid) kill(h[i].pid, SIGTERM);
-            for (int t = 0; t < 30; t++) {
+            for (int t = 0; t < 31; t++) {
+                /* Три секунды на уборку, дальше — SIGKILL: супервизор не выходит, оставив
+                 * помощника жить без присмотра. */
+                if (t == 30)
+                    for (size_t i = 0; i < n; i++) if (h[i].pid) kill(h[i].pid, SIGKILL);
                 int left = 0;
                 for (size_t i = 0; i < n; i++) {
                     if (!h[i].pid) continue;
@@ -4084,7 +4184,7 @@ static int cmd_supervise(const char *spec) {
  * спит, сторож молчит, а проснувшись, досыпает остаток периода.
  *
  * ПО СОБЫТИЯМ, А НЕ ТОЛЬКО ПО ПЕРИОДУ: смена интерфейса или адреса (сеть сменилась, TUN выхода
- * поднялся или упал) — внеочередной проход через секунду после события, см.
+ * поднялся или упал) — внеочередной проход через пять секунд после события, см.
  * failover_events_open. Период остаётся для того, чего событием не увидеть: туннель поднят,
  * а трафик через него не идёт.
  *
@@ -4112,7 +4212,9 @@ static int failover_events_open(void) {
 static int failover_events_drain(int fd) {
     char buf[8192];
     int any = 0;
-    while (recv(fd, buf, sizeof(buf), 0) > 0) any = 1;
+    ssize_t r;
+    while ((r = recv(fd, buf, sizeof(buf), 0)) > 0 || (r < 0 && errno == ENOBUFS))
+        any = 1;   /* ENOBUFS — события потеряны переполнением: это тоже «что-то сменилось» */
     return any;
 }
 
@@ -4120,7 +4222,13 @@ static int failover_loop(const char *spec, int verbose, int period) {
     int ev = failover_events_open();
     for (;;) {
         pid_t pid = fork();
-        if (pid == 0) exit(cmd_failover(spec, verbose));
+        if (pid == 0) {
+            int rc = cmd_failover(spec, verbose);
+#ifdef STEER_ANDROID
+            android_masq_ensure();      /* спека уже загружена проходом */
+#endif
+            exit(rc);
+        }
         if (pid > 0)
             while (waitpid(pid, NULL, 0) < 0 && errno == EINTR) {}
         else
@@ -4135,8 +4243,9 @@ static int failover_loop(const char *spec, int verbose, int period) {
 
         /* Ждать период ИЛИ событие. poll на монотонном времени: во сне устройства ожидание
          * стоит и не будит его. Событие — не повод бежать сразу: смена сети приходит пачкой
-         * (адрес ушёл, интерфейс лёг, поднялся, адрес пришёл), и за секунду она успевает
-         * закончиться; проход на середине увидел бы полусобранную сеть. */
+         * (адрес ушёл, интерфейс лёг, поднялся, адрес пришёл), и проход на середине увидел бы
+         * полусобранную сеть. Пять секунд — и чтобы она закончилась, и чтобы мигающий
+         * интерфейс не гонял проходы подряд. */
         long left = (long)period * 1000;
         struct timespec t0;
         clock_gettime(CLOCK_MONOTONIC, &t0);
@@ -4145,7 +4254,7 @@ static int failover_loop(const char *spec, int verbose, int period) {
             int r = ev >= 0 ? poll(&p, 1, (int)(left > 0x7fffffff ? 0x7fffffff : left))
                             : poll(NULL, 0, (int)(left > 0x7fffffff ? 0x7fffffff : left));
             if (r > 0 && failover_events_drain(ev)) {
-                struct timespec q = { 1, 0 };
+                struct timespec q = { 5, 0 };
                 while (nanosleep(&q, &q) != 0 && errno == EINTR) {}
                 failover_events_drain(ev);
                 if (verbose)

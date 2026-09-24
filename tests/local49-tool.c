@@ -123,7 +123,10 @@ int main(int argc, char **argv) {
         a.sin_family = AF_INET;
         a.sin_port = htons(53);
         inet_pton(AF_INET, argv[3], &a.sin_addr);
-        sendto(s, q, n, 0, (struct sockaddr *)&a, sizeof a);
+        /* connect, как DnsResolver: ответ с чужого адреса (например, с адреса Wi-Fi вместо
+         * того, к которому шёл запрос) ядро такому сокету не отдаст — стенд увидит timeout. */
+        if (connect(s, (struct sockaddr *)&a, sizeof a) != 0) { printf("connect\n"); return 0; }
+        send(s, q, n, 0);
         int m = (int)recv(s, r, sizeof r, 0);
         if (m < n + 16 || !r[7]) { printf("timeout\n"); return 0; }
         /* Первый ответ: за вопросом — имя-указатель (2), тип, класс, TTL, длина, адрес. */

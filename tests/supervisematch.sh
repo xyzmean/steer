@@ -21,7 +21,9 @@ check() {
 cat > "$tmp/helper" <<H
 #!/bin/sh
 echo "\$1 \$2 \$\$" >> "$tmp/log"
-trap 'echo "stop \$2 \$\$" >> "$tmp/log"; exit 0' TERM
+# Гаснет не сразу — как настоящий помощник, убирающий за собой: так видно, что супервизор не
+# поднимает второй экземпляр рядом с ещё живым прежним.
+trap 'echo "stop \$2 \$\$" >> "$tmp/log"; sleep 2; exit 0' TERM
 while :; do sleep 1; done
 H
 chmod +x "$tmp/helper"
@@ -36,6 +38,13 @@ spec() {   # spec ВЫХОД... — выходы с obfs
     printf '},"channels":[]}\n' >> "$tmp/spec.json"
 }
 running() { grep -c "^obfs $1 " "$tmp/log" 2>/dev/null; }
+# wait_for УСЛОВИЕ СЕК — ждать, пока shell-условие не станет истинным (вместо sleep на глаз:
+# под нагрузкой помощник гасится позже, чем через секунду).
+wait_for() {
+    i=0
+    while [ $i -lt $(($2 * 10)) ]; do eval "$1" && return 0; sleep 0.1; i=$((i + 1)); done
+    return 1
+}
 alive() {  # alive ВЫХОД — жив ли его последний помощник
     p="$(grep "^obfs $1 " "$tmp/log" | tail -1 | cut -d' ' -f3)"
     [ -n "$p" ] && kill -0 "$p" 2>/dev/null && echo yes || echo no
@@ -48,22 +57,39 @@ sleep 1
 check "поднят помощник выхода a" "1" "$(running a)"
 check "поднят помощник выхода bb" "1" "$(running bb)"
 
-kill "$(grep '^obfs a ' "$tmp/log" | tail -1 | cut -d' ' -f3)"
-sleep 6.5
+kill -KILL "$(grep '^obfs a ' "$tmp/log" | tail -1 | cut -d' ' -f3)"
+sleep 4
+check "убитый помощник: за 4 с ещё не перезапущен (пауза 5 с)" "1" "$(running a)"
+wait_for '[ "$(running a)" = 2 ]' 4
 check "убитый помощник перезапущен через 5 с" "2" "$(running a)"
 check "  и о перезапуске сказано" "1" "$(grep -c 'supervise: obfs a вышел' "$tmp/sup.err")"
 
 spec bb ccc
 kill -HUP $SUP
-sleep 1
+wait_for '[ "$(alive a)" = no ] && [ "$(running ccc)" = 1 ]' 8
 check "SIGHUP: выход a убран из спеки — его помощник остановлен" "no" "$(alive a)"
-check "SIGHUP: bb не тронут" "1" "$(running bb)"
+check "SIGHUP: bb не тронут — жив" "yes" "$(alive bb)"
 check "SIGHUP: новый выход ccc поднят" "1" "$(running ccc)"
 sleep 6
 check "убранный выход не перезапускается" "2" "$(running a)"
+check "bb и через 6 с — тот же процесс, не перезапущен" "1 yes" "$(running bb) $(alive bb)"
+
+# Выход убрали и тут же вернули, пока его помощник ещё гаснет: второй экземпляр рядом с живым
+# старым не поднимается — слот тот же, запуск после выхода прежнего.
+spec bb
+kill -HUP $SUP
+sleep 0.3          # супервизор дочитал спеку; помощник ccc ещё гаснет (trap после sleep 1)
+spec bb ccc
+kill -HUP $SUP
+sleep 0.3
+live=0
+for pid in $(grep '^obfs ccc ' "$tmp/log" | cut -d' ' -f3); do kill -0 "$pid" 2>/dev/null && live=$((live + 1)); done
+check "возвращённый выход, пока прежний гаснет, — не второй экземпляр рядом" "1" "$live"
+wait_for '[ "$(running ccc)" = 2 ] && [ "$(alive ccc)" = yes ]' 10
+check "  и после выхода прежнего поднят заново" "2 yes" "$(running ccc) $(alive ccc)"
 
 kill -TERM $SUP
-sleep 1
+wait_for '! kill -0 $SUP 2>/dev/null' 5
 check "SIGTERM: супервизор вышел" "no" "$(kill -0 $SUP 2>/dev/null && echo yes || echo no)"
 check "SIGTERM: помощники погашены" "no no" "$(alive bb) $(alive ccc)"
 

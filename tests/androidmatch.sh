@@ -80,22 +80,74 @@ cat > "$tmp/local.json" <<EOF2
 EOF2
 lo="$(STEER_NFT_COMPAT=legacy-min "$BIN" apply --dry-run --spec "$tmp/local.json" --state-dir "$tmp/state" 2>/dev/null)"
 check "канал по UID: правило на output со skuid" "1" \
-    "$(printf '%s\n' "$lo" | grep -c 'meta skuid 10123 ip daddr @vpn_ip_c0 meta mark set')"
+    "$(printf '%s\n' "$lo" | grep -c 'meta skuid 10123 ct direction original ip daddr @vpn_ip_c0 meta mark set')"
 check "канал по UID: на prerouting его нет" "0" \
     "$(printf '%s\n' "$lo" | sed -n '/chain prerouting_mark/,/}/p' | grep -c skuid)"
 check "старая раскладка: бит перемаршрутизации снимает цепочка route в ip" "1" \
     "$(printf '%s\n' "$lo" | grep -c 'type route hook output priority mangle + 2')"
-check "masquerade у выхода-интерфейса" "1" "$(printf '%s\n' "$lo" | grep -c 'oifname "wg0" counter masquerade')"
-bad() {   # bad ИМЯ FROM — спека с таким «кому» отвергается кодом 2
+bad() {   # bad ИМЯ FROM ТЕКСТ — спека с таким «кому» отвергается кодом 2 и называет причину
     sed "s|\"from\": \[\"uid:10123\"\]|\"from\": $2|" "$tmp/local.json" > "$tmp/bad.json"
-    "$BIN" apply --dry-run --spec "$tmp/bad.json" --state-dir "$tmp/state" >/dev/null 2>&1
+    "$BIN" apply --dry-run --spec "$tmp/bad.json" --state-dir "$tmp/state" >/dev/null 2>"$tmp/bad.err"
     check "$1" "2" "$?"
+    check "  причина: $3" "1" "$(grep -c "$3" "$tmp/bad.err")"
 }
-bad "смешаны телефон и клиенты — отказ" '["self", "192.168.43.5"]'
-bad "self вместе с uid — отказ" '["self", "uid:10123"]'
-bad "uid:0 (root) — отказ" '["uid:0"]'
-bad "не UID — отказ" '["uid:abc"]'
-bad "обратный диапазон — отказ" '["uid:10200-10100"]'
+bad "смешаны телефон и клиенты — отказ" '["self", "192.168.43.5"]' 'смешаны сам телефон и клиенты'
+bad "self вместе с uid — отказ" '["self", "uid:10123"]' 'уже включает все приложения'
+bad "uid:0 (root) — отказ" '["uid:0"]' 'это root'
+bad "не UID — отказ" '["uid:abc"]' 'не UID приложения'
+bad "обратный диапазон — отказ" '["uid:10200-10100"]' 'не UID приложения'
+
+# Вид правил на output. Спека с «self» + весь трафик и сужением, с приложениями списком и
+# диапазоном, с доменным каналом телефона.
+cat > "$tmp/loc2.json" <<EOF2
+{ "schema": 2, "lan_devices": ["rndis0"],
+  "outputs": { "vpn": { "kind": "interface", "device": "wg0" } },
+  "channels": [
+    { "name": "s", "from": ["self"], "match": { "any": true, "allow_all": true, "proto": "udp", "ports": ["50000-65535"] }, "out": "vpn" },
+    { "name": "u", "from": ["uid:10123", "uid:1010200-1010300"], "match": { "prefixes_file": "$tmp/a.lst" }, "out": "vpn" },
+    { "name": "d", "from": ["uid:10124"], "match": { "domains_files": ["$tmp/d.lst"] }, "out": "vpn" } ] }
+EOF2
+m2="$(STEER_NFT_COMPAT=modern "$BIN" apply --dry-run --spec "$tmp/loc2.json" --state-dir "$tmp/state" 2>/dev/null)"
+l2="$(STEER_NFT_COMPAT=legacy-min "$BIN" apply --dry-run --spec "$tmp/loc2.json" --state-dir "$tmp/state" 2>/dev/null)"
+c() { printf '%s\n' "$1" | grep -c -- "$2"; }
+check "self — приложения (UID от 10000), только исходящие соединения" "2" \
+    "$(c "$m2" 'meta skuid >= 10000 ct direction original')"
+check "приложения списком и диапазоном — в фигурных скобках" "1" \
+    "$(c "$m2" 'meta skuid { 10123, 1010200-1010300 } ct direction original')"
+check "современная раскладка: output_mark — цепочка route прямо в inet" "1" \
+    "$(c "$m2" 'type route hook output priority mangle + 1')"
+check "старая раскладка: бит 21 ставится после метки соединения — у всех трёх групп" "3" \
+    "$(c "$l2" 'ct mark set mark meta mark set mark or 0x00200000')"
+check "отказ IPv6 у «весь трафик» — с тем же сужением, мимо своей сети" "1" \
+    "$(c "$m2" 'meta nfproto ipv6 meta l4proto udp th dport 50000-65535 oifname != "lo" ip6 daddr != { fe80::/10, fc00::/7, ff00::/8 } counter reject')"
+check "«весь трафик» — не в свою сеть (RFC 1918, link-local, мультикаст)" "1" \
+    "$(c "$m2" 'meta nfproto ipv4 ip daddr != { 10.0.0.0/8, 127.0.0.0/8, 169.254.0.0/16, 172.16.0.0/12, 192.168.0.0/16, 224.0.0.0/4, 255.255.255.255 }')"
+check "DNS телефона — все, кроме запроса самого резолвера (метка движка), только IPv4" "1" \
+    "$(c "$m2" 'meta nfproto ipv4 meta mark and 0x0fc00000 != 0x0fc00000 udp dport 53 counter redirect to :5300')"
+check "  и на старой раскладке — в таблице ip" "1" \
+    "$(c "$l2" 'meta mark and 0x0fc00000 != 0x0fc00000 udp dport 53 counter redirect to :5300')"
+check "поддельные адреса для соединений телефона переводятся на output" "1" \
+    "$(c "$m2" 'comment "steer-fakeip-local"')"
+check "masquerade — не в nft (его ставит iptables при apply)" "0" "$(c "$m2$l2" 'masquerade')"
+
+spec_bad() {   # spec_bad ИМЯ ТЕКСТ — спека из stdin отвергается и называет причину
+    cat > "$tmp/sb.json"
+    "$BIN" apply --dry-run --spec "$tmp/sb.json" --state-dir "$tmp/state" >/dev/null 2>"$tmp/sb.err"
+    check "$1" "2" "$?"
+    check "  причина: $2" "1" "$(grep -c "$2" "$tmp/sb.err")"
+}
+spec_bad "канал телефона с выходом tgws — отказ" 'только для клиентов раздачи' <<EOF2
+{ "schema": 2, "outputs": { "tg": { "kind": "tgws", "domain": "ex.co.uk" } },
+  "channels": [ { "name": "t", "from": ["uid:10123"], "match": { "prefixes_file": "$tmp/a.lst" }, "out": "tg" } ] }
+EOF2
+spec_bad "self в from_default — отказ, даже если у каналов свой from" 'сам телефон, а не клиенты' <<EOF2
+{ "schema": 2, "from_default": ["self"], "outputs": { "vpn": { "kind": "interface", "device": "wg0" } },
+  "channels": [ { "name": "a", "from": ["uid:10123"], "match": { "prefixes_file": "$tmp/a.lst" }, "out": "vpn" } ] }
+EOF2
+spec_bad "диапазон UID в правиле на устройство — отказ" 'одно приложение' <<EOF2
+{ "schema": 2, "outputs": { "vpn": { "kind": "interface", "device": "wg0" } },
+  "channels": [ { "name": "a", "scope": "device", "from": ["uid:10100-10200"], "match": { "prefixes_file": "$tmp/a.lst" }, "out": "vpn" } ] }
+EOF2
 ROUTER="${ROUTER:-./build/steer}"
 if [ -x "$ROUTER" ]; then
     "$ROUTER" apply --dry-run --spec "$tmp/local.json" --state-dir "$tmp/state" >/dev/null 2>"$tmp/r.err"

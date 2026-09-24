@@ -1217,6 +1217,18 @@ static void cleanup_probe_rule(void) {
     run_quiet(del);
 }
 
+/* То же для `steer down`: правило пробы — все копии, и таблица пробы. Проход, убитый SIGKILL
+ * (init Android гасит сервис так), не успевает ни того, ни другого. */
+void probe_rule_cleanup(void) {
+    char prio[16], tbl[16];
+    snprintf(prio, sizeof(prio), "%d", PROBE_PRIO);
+    snprintf(tbl, sizeof(tbl), "%d", PROBE_TABLE);
+    const char *del[] = { "ip", "-4", "rule", "del", "priority", prio, NULL };
+    for (int i = 0; i < 16 && run_quiet(del) == 0; i++) {}
+    const char *flush[] = { "ip", "route", "flush", "table", tbl, NULL };
+    run_quiet(flush);
+}
+
 static void sig_cleanup(int sig) {
     cleanup_probe_rule();
     _exit(128 + sig);

@@ -391,44 +391,60 @@ static pthread_once_t g_android_roots_once = PTHREAD_ONCE_INIT;
 #define STEER_ANDROID_CA_DIRS "/apex/com.android.conscrypt/cacerts", "/system/etc/security/cacerts"
 #endif
 
+extern const char *g_state_dir;   /* spec.c: каталог состояния с учётом --state-dir */
+
+/* Склеить каталог dir в файл final. 0 — готово; -1 — каталога нет, он пуст или записать не
+ * вышло (тогда времянки не остаётся). Ошибка записи — не повод отдавать certverify обрубок:
+ * корней в нём меньше, чем в системе, и часть узлов security=tls отказала бы без причины. */
+static int android_roots_glue(const char *dir, const char *final) {
+    DIR *d = opendir(dir);
+    if (!d) return -1;
+    char tmp[600];
+    snprintf(tmp, sizeof tmp, "%s.XXXXXX", final);
+    int fd = mkstemp(tmp);
+    FILE *out = fd >= 0 ? fdopen(fd, "w") : NULL;
+    if (!out) {
+        if (fd >= 0) { close(fd); unlink(tmp); }
+        closedir(d);
+        return -1;
+    }
+    int n = 0, bad = 0;
+    struct dirent *e;
+    while ((e = readdir(d)) != NULL) {
+        if (e->d_name[0] == '.') continue;
+        char p[512];
+        snprintf(p, sizeof p, "%s/%s", dir, e->d_name);
+        FILE *in = fopen(p, "rb");
+        if (!in) continue;
+        char buf[4096];
+        size_t got;
+        while ((got = fread(buf, 1, sizeof buf, in)) > 0)
+            if (fwrite(buf, 1, got, out) != got) bad = 1;
+        fputc('\n', out);
+        fclose(in);
+        n++;
+    }
+    closedir(d);
+    if (ferror(out)) bad = 1;
+    if (fclose(out) != 0) bad = 1;
+    if (bad || n == 0 || rename(tmp, final) != 0) { unlink(tmp); return -1; }
+    return 0;
+}
+
 static void android_roots_build(void) {
     static const char *const dirs[] = { STEER_ANDROID_CA_DIRS };
-    char final[400], tmp[420];
-    snprintf(final, sizeof final, "%s/ca-roots.pem", STEER_STATE_DIR);
-    snprintf(tmp, sizeof tmp, "%s.XXXXXX", final);
-    for (size_t k = 0; k < sizeof dirs / sizeof dirs[0]; k++) {
-        DIR *d = opendir(dirs[k]);
-        if (!d) continue;
-        int fd = mkstemp(tmp);
-        FILE *out = fd >= 0 ? fdopen(fd, "w") : NULL;
-        if (!out) {
-            if (fd >= 0) { close(fd); unlink(tmp); }
-            closedir(d);
-            return;
-        }
-        int n = 0;
-        struct dirent *e;
-        while ((e = readdir(d)) != NULL) {
-            if (e->d_name[0] == '.') continue;
-            char p[512];
-            snprintf(p, sizeof p, "%s/%s", dirs[k], e->d_name);
-            FILE *in = fopen(p, "rb");
-            if (!in) continue;
-            char buf[4096];
-            size_t got;
-            while ((got = fread(buf, 1, sizeof buf, in)) > 0) fwrite(buf, 1, got, out);
-            fputc('\n', out);
-            fclose(in);
-            n++;
-        }
-        closedir(d);
-        if (fclose(out) != 0 || n == 0 || rename(tmp, final) != 0) {
-            unlink(tmp);
-            snprintf(tmp, sizeof tmp, "%s.XXXXXX", final);   /* mkstemp съел шаблон */
-            continue;
-        }
-        snprintf(g_android_roots, sizeof g_android_roots, "%s", final);
-        return;
+    /* Куда класть: каталог состояния (с --state-dir, как у всего движка), а если туда не
+     * пишется — каталог времянок. Без запасного места отказ mkstemp оставлял бы процесс без
+     * корней до перезапуска: склейка делается один раз (pthread_once). */
+    const char *places[] = { g_state_dir ? g_state_dir : STEER_STATE_DIR, STEER_TMP_DIR };
+    for (size_t w = 0; w < sizeof places / sizeof places[0]; w++) {
+        char final[512];
+        snprintf(final, sizeof final, "%s/ca-roots.pem", places[w]);
+        for (size_t k = 0; k < sizeof dirs / sizeof dirs[0]; k++)
+            if (android_roots_glue(dirs[k], final) == 0) {
+                snprintf(g_android_roots, sizeof g_android_roots, "%s", final);
+                return;
+            }
     }
 }
 

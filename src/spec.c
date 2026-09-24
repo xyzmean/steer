@@ -1358,6 +1358,14 @@ void load_spec(const char *path) {
                 }
     }
 
+    /* from_default — это клиенты раздачи; сам телефон называет канал, а не умолчание для всех
+     * каналов. Проверка вне цикла по каналам: from_default уходит в правило заворота DNS и
+     * тогда, когда у каждого канала свой from, — и «ip saddr self» nft отверг бы синтаксической
+     * ошибкой вместо слова о спеке. */
+    for (size_t k = 0; k < g_from_default_n; k++)
+        if (from_is_local(g_from_default[k]))
+            die("from_default: «%s» — сам телефон, а не клиенты; укажите его в from канала",
+                g_from_default[k]);
     for (size_t i = 0; i < g_ch_n; i++) {
         struct channel *c = &g_ch[i];
         /* Выключенное правило не проверяем: оно не действует, а отказ применить спеку из-за
@@ -1392,16 +1400,10 @@ void load_spec(const char *path) {
                         c->name);
             }
         } else {
-            for (size_t k = 0; k < g_from_default_n; k++) {
+            for (size_t k = 0; k < g_from_default_n; k++)
                 if (!g_from_default[k][0])
                     die("канал %s берёт «кому» из from_default, а в нём пустая строка — "
                         "уберите её", c->name);
-                /* from_default — это клиенты раздачи; сам телефон называет канал, а не
-                 * умолчание для всех каналов. */
-                if (from_is_local(g_from_default[k]))
-                    die("from_default: «%s» — сам телефон, а не клиенты; укажите его в from "
-                        "канала", g_from_default[k]);
-            }
         }
 
         /* Адреса и MAC-и в одном «кому» — нельзя. nft не умеет «или» внутри правила, и
@@ -1498,6 +1500,12 @@ void load_spec(const char *path) {
                 "добавьте \"allow_all\": true — иначе выберите список", c->name);
 
         struct output *o = out_by_name(c->out);
+        /* Мост Telegram перехватывает соединения только в prerouting (раздача): у трафика самого
+         * телефона такого заворота нет, и канал «приложение → tgws» стоял бы применённым, не
+         * делая ничего. */
+        if (local && o && o->kind == OUT_TGWS)
+            die("канал %s: выход kind=tgws работает только для клиентов раздачи — у трафика "
+                "самого телефона моста нет", c->name);
         /* Дальше — проверки, которым нужен выход С УСТРОЙСТВОМ. Через out_has_device, а не
          * сравнением с OUT_INTERFACE: у выхода kind=vless последствие ровно то же — весь
          * трафик клиента, включая доступ к роутеру и его DNS, уходит в туннель. Проверка,

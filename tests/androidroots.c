@@ -7,7 +7,7 @@
  * молча не работает, проверка security=tls на телефоне отвергает КАЖДЫЙ узел как «хранилище
  * корней не прочиталось», а на роутере этого не видно никогда — там путь другой.
  *
- * ЧТО ПРОВЕРЯЕТСЯ. Первый каталог списка отсутствует — берётся второй; в нём файлы в формате
+ * ЧТО ПРОВЕРЯЕТСЯ. Первый каталог списка отсутствует, второй пуст — берётся третий; в нём файлы в формате
  * Android (текст перед PEM), и из склейки mbedtls разбирает ровно столько сертификатов,
  * сколько файлов; скрытые файлы пропускаются; повторный вызов отдаёт тот же путь, не
  * пересобирая; в каталоге состояния не остаётся времянок; заданный шов стенда (g_cert_roots)
@@ -29,7 +29,8 @@
 /* Каталог состояния и каталоги корней — свои, во временном месте: стенд не трогает ни /data,
  * ни /apex. */
 #define STEER_STATE_DIR "/tmp/steer-androidroots/state"
-#define STEER_ANDROID_CA_DIRS "/tmp/steer-androidroots/nope", "/tmp/steer-androidroots/cacerts"
+#define STEER_ANDROID_CA_DIRS "/tmp/steer-androidroots/nope", "/tmp/steer-androidroots/empty", \
+                              "/tmp/steer-androidroots/cacerts"
 #include "../src/ext/client.c"
 
 #include "mbedtls/x509_crt.h"
@@ -87,6 +88,7 @@ int main(void) {
     mkdir("/tmp/steer-androidroots", 0700);
     mkdir("/tmp/steer-androidroots/state", 0700);
     mkdir("/tmp/steer-androidroots/cacerts", 0700);
+    mkdir("/tmp/steer-androidroots/empty", 0700);      /* есть, но пуст — пропустить */
 
     /* Три корня в формате Android: текст перед PEM и хвостовая строка SHA1, как в
      * system/ca-certificates/files. Плюс скрытый файл, который читать нельзя. */
@@ -106,9 +108,11 @@ int main(void) {
     fputs("-----BEGIN CERTIFICATE-----\nбрак\n-----END CERTIFICATE-----\n", h);
     fclose(h);
 
+    /* Каталог состояния — как его задаёт --state-dir (g_state_dir, spec.c). */
+    g_state_dir = "/tmp/steer-androidroots/state";
     const char *p = cert_roots();
     check("склейка: путь выдан", 1, p != NULL);
-    check("склейка: из второго каталога (первого нет), в каталоге состояния", 0,
+    check("склейка: из третьего каталога (первого нет, второй пуст), в каталоге состояния", 0,
           p ? strcmp(p, "/tmp/steer-androidroots/state/ca-roots.pem") : -1);
 
     mbedtls_x509_crt roots;

@@ -10,7 +10,8 @@
 #   musl-gcc -static -idirafter $K -O2 -DSTEER_ANDROID -o /tmp/steer <исходники как в Makefile>
 #   musl-gcc -static -idirafter $K -O2 -o /tmp/local49-tool tests/local49-tool.c
 #   musl-gcc -static -idirafter $K -O2 -o /tmp/dnstool tests/legacy49-dnstool.c
-#   tools/vm49/vm49.sh run steer/tests/local49.sh /tmp/steer /tmp/local49-tool /tmp/dnstool
+#   iptables-legacy статически (musl), под именем iptables — см. ANDROID_AGENT_TASK.md §4
+#   tools/vm49/vm49.sh run steer/tests/local49.sh /tmp/steer /tmp/local49-tool /tmp/dnstool /tmp/iptables
 #
 # Что проверяется. Приложение из канала по UID уходит в устройство своего выхода, а другое
 # приложение к тому же адресу — обычным путём; канал сторожевого вида для раздачи сам телефон не
@@ -33,6 +34,10 @@ mkdir -p /data/misc/steer/state /data/misc/steer/tmp /tmp/st
 local49-tool mk up0 10.66.0.1/24 && ip route add default dev up0
 local49-tool mk wg9 10.77.0.1/24
 local49-tool mk wg8 10.78.0.1/24
+# Как netd: NAT раздачи в iptables на восходящий интерфейс. На ядре 4.9 первая сработавшая
+# регистрация nat решает судьбу соединения, поэтому masquerade движка обязан жить в той же
+# таблице iptables, а не цепочкой nft рядом (см. android_masq_sync в steer.c).
+iptables -t nat -A POSTROUTING -o up0 -j MASQUERADE
 printf '203.0.113.0/24\n' > $W/p.lst
 printf '198.51.100.0/24\n' > $W/q.lst
 printf 'example.com\n' > $W/d.lst
@@ -84,11 +89,13 @@ check "uid 10124 к 203.0.113.9 — обычным путём (канал раз
     "up0 10.66.0.1" "$(probe 10124 203.0.113.9 443)"
 echo "=== 3. self — все, кроме root"
 check "uid 10124 к 198.51.100.9 — в wg8" "wg8 10.78.0.1" "$(probe 10124 198.51.100.9 443)"
-check "uid 1000 (system) к 198.51.100.9 — в wg8" "wg8 10.78.0.1" "$(probe 1000 198.51.100.9 443)"
+check "uid 1000 (system) к 198.51.100.9 — обычным путём: self — это приложения" \
+    "up0 10.66.0.1" "$(probe 1000 198.51.100.9 443)"
 check "root к 198.51.100.9 — обычным путём" "up0 10.66.0.1" "$(probe 0 198.51.100.9 443)"
 echo "=== 4. весь трафик приложения (диапазон UID)"
 check "uid 10505 к 192.0.2.7 — в wg9" "wg9 10.77.0.1" "$(probe 10505 192.0.2.7 80)"
 check "uid 10511 к 192.0.2.7 — вне диапазона, обычным путём" "up0 10.66.0.1" "$(probe 10511 192.0.2.7 80)"
+check "uid 10505 к своей сети 192.168.5.5 — не в туннель" "up0 10.66.0.1" "$(probe 10505 192.168.5.5 80)"
 check "первое совпадение сверху: uid 10505 к 198.51.100.9 — канал all выше full" \
     "wg8 10.78.0.1" "$(probe 10505 198.51.100.9 443)"
 echo "=== 5. DNS приложений: к резолверу движка и дальше — к тому серверу, к которому шли"
@@ -101,15 +108,16 @@ steer dnsd $S --listen-port 5300 --upstream-origdst > /tmp/dnsd.log 2>&1 & DP=$!
 sleep 1
 fake="$(local49-tool dns 10123 10.66.0.53 example.com)"
 check "имя канала у приложения — поддельный адрес" "198.18" "$(echo "$fake" | cut -d. -f1-2)"
-check "чужое имя у другого приложения — ответ того самого сервера сети" "203.0.113.77" \
-    "$(local49-tool dns 10124 10.66.0.53 other.example)"
-check "root не заворачивается — отвечает сервер сети напрямую" "203.0.113.77" \
-    "$(local49-tool dns 0 10.66.0.53 example.com)"
+check "чужое имя у другого приложения — ответ того самого сервера сети (с его адреса)" \
+    "203.0.113.77" "$(local49-tool dns 10124 10.66.0.53 other.example)"
+check "имя канала у ДРУГОГО приложения — тоже поддельный (общий кэш DnsResolver)" "198.18" \
+    "$(local49-tool dns 10124 10.66.0.53 example.com | cut -d. -f1-2)"
+check "запрос root (так шлёт DnsResolver) заворачивается тоже" "198.18" \
+    "$(local49-tool dns 0 10.66.0.53 example.com | cut -d. -f1-2)"
 check "приложение канала к поддельному адресу — в туннель, к настоящему адресу" \
     "wg9 10.77.0.1" "$(probe2 10123 "$fake" 443 203.0.113.77)"
 check "другое приложение к тому же поддельному — напрямую к настоящему" \
     "up0 10.66.0.1" "$(probe2 10124 "$fake" 443 203.0.113.77)"
-nft list chain ip steer output_nat 2>&1 | grep -c counter >/dev/null
 kill $DP $UP 2>/dev/null
 grep -v 'realip' /tmp/dnsd.log | head -3
 
@@ -117,6 +125,8 @@ echo "=== 6. down"
 steer down --state-dir /tmp/st
 check "после down цепочек выхода нет" "0" "$(nft list ruleset | grep -c 'output_mark\|output_reroute')"
 check "после down uid 10123 — обычным путём" "up0 10.66.0.1" "$(probe 10123 203.0.113.9 443)"
+check "после down masquerade движка в iptables снят, правило netd на месте" "1" \
+    "$(iptables -t nat -S POSTROUTING | grep -c MASQUERADE)"
 
 printf '\nlocal49: %s passed, %s failed\n' "$pass" "$fail"
 [ "$fail" -eq 0 ]

@@ -67,6 +67,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/epoll.h>
+#include <sys/random.h>
 #include <sys/socket.h>
 #include <sys/types.h>
 #include <sys/wait.h>
@@ -1552,6 +1553,12 @@ struct pending {
      * принимается лишь от этого адреса. В обычном режиме сокет connect'нут к петле, и
      * сравнивать нечего. */
     struct sockaddr_in up;
+    /* Режим origdst: сокет пула, которым ушёл запрос, номер транзакции наверх (случайный, см.
+     * g_txmap) и адрес, на который пришёл запрос, — с него обязан уйти ответ клиенту. */
+    int up_fd;
+    uint16_t txid;
+    struct in_addr local;
+    int have_local;
     time_t expire;
 };
 
@@ -1587,10 +1594,6 @@ static uint8_t g_gen_next;
  * транзакции. Записи NAT нет (к нам обратились напрямую, мимо redirect) или назначение —
  * мы сами — запрос уходит на петлю, как в обычном режиме: так петли не бывает. IPv6-клиент
  * тоже уходит на петлю: сокет наверх — IPv4. */
-static int g_origdst;
-static int g_ct_fd = -1;
-static int g_listen_port;
-
 /* Раскладка IPV6_PKTINFO и IP_PKTINFO — своя, а не из netinet/in.h: там их видно только с
  * _GNU_SOURCE, а этот файл включают и стенды со своим порядком заголовков. Поля и размеры —
  * ядра (include/uapi/linux/ipv6.h и in.h), от libc они не зависят. */
@@ -1605,6 +1608,69 @@ struct dnsd_in_pktinfo { int ifindex; struct in_addr spec_dst; struct in_addr ad
 #ifndef IP_PKTINFO
 #define IP_PKTINFO 8
 #endif
+
+static int g_origdst;
+static int g_ct_fd = -1;
+static int g_listen_port;
+
+/* ЗАЩИТА ОТ ПОДДЕЛАННОГО ОТВЕТА В РЕЖИМЕ origdst. Пока наверху была петля, подделать ответ
+ * мог только тот, кто уже на ней. Теперь наверху сервер Wi-Fi или оператора, по UDP, и
+ * отравить ответ может любой в той же сети, подделав адрес сервера, — а ответ ляжет в общий
+ * кэш DnsResolver на всё устройство. Проверка адреса источника от этого не спасает. Спасают
+ * две вещи, те же, что у любого резолвера: случайный номер транзакции (вместо слота с
+ * поколением — угадывался за десятки попыток) и случайный порт — пул сокетов на случайных
+ * портах, запрос уходит случайным из них. Номер к слоту ведёт таблица g_txmap; устаревшая
+ * запись безвредна — слот сверяется с номером. */
+#define UP_POOL 8
+static int g_up_pool[UP_POOL];
+static int16_t g_txmap[65536];
+
+static uint16_t rand16(void) {
+    uint16_t v = 0;
+    if (getrandom(&v, sizeof(v), 0) != (ssize_t)sizeof(v)) v = (uint16_t)(rand() ^ time(NULL));
+    return v;
+}
+
+/* Ответ клиенту. В режиме origdst — с того адреса, на который пришёл запрос: заворот на
+ * output переводит запрос приложения на 127.0.0.1, а сокет слушает любой адрес, и без
+ * явного адреса источника ядро выбрало бы адрес Wi-Fi. Ответ с чужого адреса conntrack не
+ * узнаёт, обратного перевода нет, и DnsResolver (он connect'ит сокет и сверяет, откуда пришёл
+ * ответ) его выбрасывает — DNS приложений не работал бы вовсе. */
+static void reply_client(const void *b, size_t n, const struct sockaddr_storage *cl,
+                         socklen_t cll, const struct in_addr *local, int have_local) {
+    if (!g_origdst || !have_local) {
+        sendto(g_listen_fd, b, n, 0, (const struct sockaddr *)cl, cll);
+        return;
+    }
+    struct iovec iov = { (void *)b, n };
+    union { struct cmsghdr h; char b[CMSG_SPACE(sizeof(struct dnsd_in6_pktinfo))]; } cb;
+    memset(&cb, 0, sizeof(cb));
+    struct msghdr mh;
+    memset(&mh, 0, sizeof(mh));
+    mh.msg_name = (void *)cl; mh.msg_namelen = cll;
+    mh.msg_iov = &iov; mh.msg_iovlen = 1;
+    mh.msg_control = cb.b;
+    struct cmsghdr *c = (struct cmsghdr *)cb.b;
+    if (cl->ss_family == AF_INET6) {
+        struct dnsd_in6_pktinfo pi;
+        memset(&pi, 0, sizeof(pi));
+        pi.addr.s6_addr[10] = 0xff; pi.addr.s6_addr[11] = 0xff;
+        memcpy(&pi.addr.s6_addr[12], local, 4);
+        c->cmsg_level = IPPROTO_IPV6; c->cmsg_type = IPV6_PKTINFO;
+        c->cmsg_len = CMSG_LEN(sizeof(pi));
+        memcpy(CMSG_DATA(c), &pi, sizeof(pi));
+        mh.msg_controllen = CMSG_SPACE(sizeof(pi));
+    } else {
+        struct dnsd_in_pktinfo pi;
+        memset(&pi, 0, sizeof(pi));
+        pi.spec_dst = *local;
+        c->cmsg_level = IPPROTO_IP; c->cmsg_type = IP_PKTINFO;
+        c->cmsg_len = CMSG_LEN(sizeof(pi));
+        memcpy(CMSG_DATA(c), &pi, sizeof(pi));
+        mh.msg_controllen = CMSG_SPACE(sizeof(pi));
+    }
+    sendmsg(g_listen_fd, &mh, 0);
+}
 
 /* Исходное назначение запроса из conntrack. 0 — найдено (out заполнен), -1 — нет. */
 static int ct_origdst(const struct sockaddr_storage *cli, const struct in_addr *local,
@@ -1674,8 +1740,9 @@ static int ct_origdst(const struct sockaddr_storage *cli, const struct in_addr *
     for (;;) {
         ssize_t n = recv(g_ct_fd, buf, sizeof(buf), 0);
         if (n <= 0) return -1;
-        for (struct nlmsghdr *h = (struct nlmsghdr *)buf; NLMSG_OK(h, (size_t)n);
-             h = NLMSG_NEXT(h, n)) {
+        int len = (int)n;
+        for (struct nlmsghdr *h = (struct nlmsghdr *)buf; len > 0 && NLMSG_OK(h, (unsigned)len);
+             h = NLMSG_NEXT(h, len)) {
             if (h->nlmsg_seq != seq) continue;           /* ответ на прежний, опоздавший */
             if (h->nlmsg_type == NLMSG_ERROR) return -1; /* записи нет — ENOENT */
             if (h->nlmsg_len < NLMSG_LENGTH(sizeof(struct nfgenmsg))) return -1;
@@ -2040,8 +2107,7 @@ static int handle_client_query(void) {
                 size_t len = build_rewritten_response(buf, qend, out, sizeof(out), 0, 0);
                 if (len) {
                     make_response_flags(out);
-                    sendto(g_listen_fd, out, len, 0,
-                           (struct sockaddr *)&from, fromlen);
+                    reply_client(out, len, &from, fromlen, &local, have_local);
                     return 1;
                 }
             } else if (qtype == DNS_TYPE_A) {
@@ -2063,8 +2129,7 @@ static int handle_client_query(void) {
                                                           1, g_fakeip.entries[at].addr);
                     if (len) {
                         make_response_flags(out);
-                        sendto(g_listen_fd, out, len, 0,
-                               (struct sockaddr *)&from, fromlen);
+                        reply_client(out, len, &from, fromlen, &local, have_local);
                         /* Маршрут переутверждается идемпотентно (fw4 reload
                          * смывает элементы наборов); дроссель внутри. */
                         fakeip_route_set(lname, dch_fakeip_only(sets));
@@ -2107,12 +2172,21 @@ static int handle_client_query(void) {
     p->cli_id = (uint16_t)((buf[0] << 8) | buf[1]);
     p->gen = pending_next_gen();
     uint16_t tag = pending_tag(p);
+    int ufd = g_up_fd;
+    if (g_origdst) {
+        tag = rand16();
+        g_txmap[tag] = (int16_t)(p - g_pending);
+        p->txid = tag;
+        ufd = g_up_pool[rand16() % UP_POOL];
+        if (ufd < 0) ufd = g_up_fd;
+    }
+    p->up_fd = ufd;
     buf[0] = (uint8_t)(tag >> 8);
     buf[1] = (uint8_t)(tag & 0xFF);
 
     struct sockaddr_in up;
     upstream_for(&from, &local, have_local, &up);
-    if ((g_origdst ? sendto(g_up_fd, buf, (size_t)n, 0, (struct sockaddr *)&up, sizeof(up))
+    if ((g_origdst ? sendto(ufd, buf, (size_t)n, 0, (struct sockaddr *)&up, sizeof(up))
                    : send(g_up_fd, buf, (size_t)n, 0)) < 0) {
         /* Чаще всего это ECONNREFUSED от петли: резолвер наверху не запущен или
          * перезапускается. Ядро отдаёт такую ошибку отложенно, следующим системным
@@ -2140,6 +2214,8 @@ static int handle_client_query(void) {
     p->client = from;
     p->client_len = fromlen;
     p->up = up;
+    p->local = local;
+    p->have_local = have_local;
     p->expire = time(NULL) + PENDING_TTL_SEC;
     return 1;
 }
@@ -2184,12 +2260,12 @@ static size_t build_rewritten_response(const uint8_t *orig, size_t qend,
 /* Возвращает 1, если датаграмма была прочитана (есть смысл читать дальше), 0 — если
  * очередь пуста. Ответы всех ожиданий приходят на один сокет, поэтому своё ожидание
  * находится по номеру транзакции, который мы же и проставили при отправке. */
-static int handle_upstream_response(void) {
+static int handle_upstream_response(int ufd) {
     uint8_t buf[MAX_PKT];
     struct sockaddr_in src;
     socklen_t srclen = sizeof(src);
     memset(&src, 0, sizeof(src));
-    ssize_t n = recvfrom(g_up_fd, buf, sizeof(buf), 0, (struct sockaddr *)&src, &srclen);
+    ssize_t n = recvfrom(ufd, buf, sizeof(buf), 0, (struct sockaddr *)&src, &srclen);
     if (n < 0) {
         if (errno == EAGAIN || errno == EWOULDBLOCK) return 0;   /* очередь пуста */
         /* Прочая ошибка — это ОДНА отложенная ошибка сокета (обычно ECONNREFUSED с
@@ -2206,10 +2282,18 @@ static int handle_upstream_response(void) {
 
     uint16_t tag = (uint16_t)((buf[0] << 8) | buf[1]);
     struct pending *p = &g_pending[tag & PENDING_IDX_MASK];
+    if (g_origdst) {
+        /* Случайный номер: слот — по таблице, и сверяется всё — номер, сокет, источник. */
+        int slot = g_txmap[tag];
+        if (slot < 0) return 1;
+        p = &g_pending[slot];
+        if (!p->in_use || p->txid != tag || p->up_fd != ufd) return 1;
+    }
     /* Слот занят и поколение совпадает. Иначе датаграмма — запоздавший ответ на давно
      * закрытое ожидание или чужая подделка, и применять её к живому слоту нельзя. */
     if (!p->in_use ||
-        p->gen != (uint8_t)((tag >> PENDING_IDX_BITS) & PENDING_GEN_MASK)) return 1;
+        (!g_origdst && p->gen != (uint8_t)((tag >> PENDING_IDX_BITS) & PENDING_GEN_MASK)))
+        return 1;
     /* Режим origdst: сокет не connect'нут, и ответ обязан прийти оттуда, куда ушёл вопрос. */
     if (g_origdst && (src.sin_addr.s_addr != p->up.sin_addr.s_addr ||
                       src.sin_port != p->up.sin_port)) return 1;
@@ -2235,8 +2319,7 @@ static int handle_upstream_response(void) {
      * вывода, который уже известен: реле как есть. */
     if (p->hit == -1 && p->rules_gen == g_rules_gen) {
         if (!quiet)
-            sendto(g_listen_fd, buf, (size_t)n, 0,
-                   (struct sockaddr *)&p->client, p->client_len);
+            reply_client(buf, (size_t)n, &p->client, p->client_len, &p->local, p->have_local);
         return 1;
     }
 
@@ -2272,8 +2355,7 @@ static int handle_upstream_response(void) {
     }
     if (nips < 0 || hit < 0) {
         if (!quiet)
-            sendto(g_listen_fd, buf, (size_t)n, 0,
-                   (struct sockaddr *)&p->client, p->client_len);
+            reply_client(buf, (size_t)n, &p->client, p->client_len, &p->local, p->have_local);
         return 1;
     }
 
@@ -2289,8 +2371,7 @@ static int handle_upstream_response(void) {
         if (!quiet) {
             uint8_t out[512];
             size_t len = build_rewritten_response(buf, qend, out, sizeof(out), 0, 0);
-            sendto(g_listen_fd, len ? out : buf, len ? len : (size_t)n, 0,
-                   (struct sockaddr *)&p->client, p->client_len);
+            reply_client(len ? out : buf, len ? len : (size_t)n, &p->client, p->client_len, &p->local, p->have_local);
         }
         return 1;
     }
@@ -2314,8 +2395,7 @@ static int handle_upstream_response(void) {
                     nft_add_element(g_dch[c].set, ntohl(ips[k].addr), set_ttl_clamp(ips[k].ttl));
             }
         if (!quiet)
-            sendto(g_listen_fd, buf, (size_t)n, 0,
-                   (struct sockaddr *)&p->client, p->client_len);
+            reply_client(buf, (size_t)n, &p->client, p->client_len, &p->local, p->have_local);
         return 1;
     }
 
@@ -2372,7 +2452,7 @@ static int handle_upstream_response(void) {
                 uint8_t out[512];
                 size_t len = build_rewritten_response(buf, qend, out, sizeof(out), 1, fake_addr);
                 if (len > 0) {
-                    sendto(g_listen_fd, out, len, 0, (struct sockaddr *)&p->client, p->client_len);
+                    reply_client(out, len, &p->client, p->client_len, &p->local, p->have_local);
                     return 1;
                 }
             } else if (g_nlk_fd >= 0 && map_refusal_is_window(maprc, time(NULL))) {
@@ -2397,8 +2477,7 @@ static int handle_upstream_response(void) {
                     if (len) {
                         make_response_flags(out);
                         out[3] = (uint8_t)((out[3] & 0xf0) | 0x02);   /* RCODE 2 — SERVFAIL */
-                        sendto(g_listen_fd, out, len, 0,
-                               (struct sockaddr *)&p->client, p->client_len);
+                        reply_client(out, len, &p->client, p->client_len, &p->local, p->have_local);
                     }
                 }
                 static time_t warned;
@@ -2428,7 +2507,7 @@ static int handle_upstream_response(void) {
      * is exhausted). Relay the real answer unchanged — fail open, never block the
      * DNS transaction. */
     if (!quiet)
-        sendto(g_listen_fd, buf, (size_t)n, 0, (struct sockaddr *)&p->client, p->client_len);
+        reply_client(buf, (size_t)n, &p->client, p->client_len, &p->local, p->have_local);
     return 1;
 }
 
@@ -2549,6 +2628,17 @@ static int run_proxy(int listen_port, int upstream_port) {
     g_up_port = upstream_port;
     up.sin_port = htons((uint16_t)upstream_port);
     up.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+#ifdef STEER_ANDROID
+    /* Собственный запрос наверх помечен значением «сам движок» (STEER_SELF_MARK в spec.h):
+     * заворот DNS на output берёт всех, включая root, — DnsResolver шлёт запросы приложений от
+     * root, — и без метки наш же запрос к серверу сети завернулся бы обратно к нам. */
+    {
+        unsigned mk = STEER_SELF_MARK;
+        if (setsockopt(g_up_fd, SOL_SOCKET, SO_MARK, &mk, sizeof(mk)) != 0)
+            fprintf(stderr, "steer[warn] dnsd: SO_MARK на сокете наверх не встал (%s) — "
+                            "запросы наверх завернутся к резолверу по кругу\n", strerror(errno));
+    }
+#endif
     /* В режиме origdst серверы наверху разные — сокет не connect'нут (см. g_origdst). */
     if (!g_origdst && connect(g_up_fd, (struct sockaddr *)&up, sizeof(up)) != 0) {
         perror("upstream connect");
@@ -2559,6 +2649,27 @@ static int run_proxy(int listen_port, int upstream_port) {
     uev.events = EPOLLIN;
     uev.data.ptr = &g_up_fd;            /* не NULL — значит это ответ сверху */
     epoll_ctl(g_epfd, EPOLL_CTL_ADD, g_up_fd, &uev);
+    /* Пул сокетов наверх на случайных портах — только в режиме origdst (см. g_up_pool).
+     * bind на порт 0: ядро выдаёт эфемерный порт случайно. */
+    for (int i = 0; i < UP_POOL; i++) g_up_pool[i] = -1;
+    memset(g_txmap, 0xff, sizeof(g_txmap));
+    if (g_origdst) {
+        for (int i = 0; i < UP_POOL; i++) {
+            int fd = socket(AF_INET, SOCK_DGRAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
+            if (fd < 0) continue;
+            struct sockaddr_in any = { .sin_family = AF_INET };
+            if (bind(fd, (struct sockaddr *)&any, sizeof(any)) != 0) { close(fd); continue; }
+#ifdef STEER_ANDROID
+            unsigned mk = STEER_SELF_MARK;
+            setsockopt(fd, SOL_SOCKET, SO_MARK, &mk, sizeof(mk));
+#endif
+            g_up_pool[i] = fd;
+            struct epoll_event pev = {0};
+            pev.events = EPOLLIN;
+            pev.data.ptr = &g_up_pool[i];
+            epoll_ctl(g_epfd, EPOLL_CTL_ADD, fd, &pev);
+        }
+    }
 
     signal(SIGHUP, on_sighup);
     signal(SIGTERM, on_sigterm);
@@ -2639,8 +2750,9 @@ static int run_proxy(int listen_port, int upstream_port) {
                 /* Ответы всех ожиданий приходят на один сокет, поэтому очередь тоже
                  * дочитывается до конца пачкой — иначе на всплеске за один виток цикла
                  * забирался бы ровно один ответ. */
+                int ufd = *(int *)events[i].data.ptr;
                 for (int k = 0; k < 64; k++)
-                    if (!handle_upstream_response()) break;
+                    if (!handle_upstream_response(ufd)) break;
             }
         }
     }
