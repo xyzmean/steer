@@ -69,7 +69,9 @@
 #include <sys/epoll.h>
 #include <sys/random.h>
 #include <sys/socket.h>
+#include <sys/stat.h>
 #include <sys/types.h>
+#include <sys/un.h>
 #include <sys/wait.h>
 #include <time.h>
 #include <unistd.h>
@@ -2037,21 +2039,36 @@ static int ctnl_delete(int fd, uint8_t family, uint32_t seq, const struct nlattr
     }
 }
 
-/* Дамп одного семейства с удалением совпавшего. Возврат — как у ctnl_evict_mark. */
-static int ctnl_evict_family(int dfd, int xfd, uint8_t family, uint32_t val, uint32_t mask,
-                             uint32_t *seq, uint8_t *buf) {
+/* ДАМП CONNTRACK ОДНОГО СЕМЕЙСТВА — общий для двух читателей: снятия записей выхода (ниже,
+ * ctnl_evict_mark) и списка соединений для приложения (ctnl_conns_print). Каждая запись дампа
+ * отдаётся обработчику fn атрибутами [a, end); что с ней делать, решает он.
+ *
+ * С filter — дамп с фильтром ядра по метке (CTA_MARK/CTA_MARK_MASK, см. довод у снятия выше):
+ * ядро пришлёт только совпавшее, если фильтр понимает. Полагаться на это обработчик всё равно
+ * не должен — метку он сверяет сам. Без filter — все записи семейства: список соединений
+ * отбирает записи по ПОЛЮ метки движка (любое ненулевое значение поля), а такое условие одной
+ * парой «значение и маска» ядру не выразить.
+ *
+ * Возврат: 0 — дамп пройден до конца; 1 — ядро отвергло фильтр по метке (EOPNOTSUPP: ядро
+ * собрано без CONFIG_NF_CONNTRACK_MARK, записей с меткой у него нет вовсе); -1 — разговор не
+ * состоялся (или обработчик попросил прервать, вернув не 0). */
+typedef int (*ctnl_rec_fn)(const uint8_t *a, const uint8_t *end, uint8_t family, void *ctx);
+
+static int ctnl_dump(int dfd, uint8_t family, int filter, uint32_t val, uint32_t mask,
+                     uint32_t *seq, uint8_t *buf, ctnl_rec_fn fn, void *ctx) {
     uint8_t req[128];
     struct nlbuf b;
     uint32_t dseq = ++*seq;
     struct nlmsghdr *nh = ctnl_msg(&b, req, sizeof(req), IPCTNL_MSG_CT_GET,
                                    NLM_F_REQUEST | NLM_F_DUMP, dseq, family);
-    nlbuf_put_be32(&b, CTA_MARK, val);
-    nlbuf_put_be32(&b, CTA_MARK_MASK, mask);
+    if (filter) {
+        nlbuf_put_be32(&b, CTA_MARK, val);
+        nlbuf_put_be32(&b, CTA_MARK_MASK, mask);
+    }
     nh->nlmsg_len = (uint32_t)(b.p - b.base);
     struct sockaddr_nl k = { .nl_family = AF_NETLINK };
     if (sendto(dfd, req, nh->nlmsg_len, 0, (struct sockaddr *)&k, sizeof(k)) < 0) return -1;
 
-    int evicted = 0;
     for (;;) {
         /* MSG_TRUNC: recv возвращает настоящую длину части. Больше буфера — значит часть
          * обрезана, и разбирать её остаток нельзя; при CTNL_RCVBUF этого не бывает. */
@@ -2061,32 +2078,52 @@ static int ctnl_evict_family(int dfd, int xfd, uint8_t family, uint32_t val, uin
         for (struct nlmsghdr *h = (struct nlmsghdr *)buf; len > 0 && NLMSG_OK(h, (unsigned)len);
              h = NLMSG_NEXT(h, len)) {
             if (h->nlmsg_seq != dseq) continue;
-            if (h->nlmsg_type == NLMSG_DONE) return evicted;
+            if (h->nlmsg_type == NLMSG_DONE) return 0;
             if (h->nlmsg_type == NLMSG_ERROR) {
                 if (h->nlmsg_len < NLMSG_LENGTH(sizeof(struct nlmsgerr))) return -1;
                 int err = ((struct nlmsgerr *)NLMSG_DATA(h))->error;
                 /* EOPNOTSUPP на фильтре — ядро собрано без CONFIG_NF_CONNTRACK_MARK. Метки
-                 * соединения у такого ядра нет вовсе, а значит и записей с меткой выхода: снимать
-                 * нечего, и внешний инструмент здесь не нужен. */
-                if (err == -EOPNOTSUPP) return 0;
-                return err == 0 ? evicted : -1;
+                 * соединения у такого ядра нет вовсе, а значит и записей с меткой выхода. */
+                if (filter && err == -EOPNOTSUPP) return 1;
+                return err == 0 ? 0 : -1;
             }
             if ((h->nlmsg_type >> 8) != NFNL_SUBSYS_CTNETLINK ||
                 h->nlmsg_len < NLMSG_LENGTH(sizeof(struct nfgenmsg)))
                 continue;
             const uint8_t *a = (const uint8_t *)NLMSG_DATA(h) + NLMSG_ALIGN(sizeof(struct nfgenmsg));
             const uint8_t *end = (const uint8_t *)h + h->nlmsg_len;
-            const struct nlattr *m = ct_attr(a, end, CTA_MARK);
-            if (!m || m->nla_len < NLA_HDRLEN + 4) continue;
-            uint32_t mv;
-            memcpy(&mv, (const uint8_t *)m + NLA_HDRLEN, 4);
-            if ((ntohl(mv) & mask) != val) continue;
-            const struct nlattr *tuple = ct_attr(a, end, CTA_TUPLE_ORIG);
-            if (!tuple) continue;
-            evicted += ctnl_delete(xfd, family, ++*seq, tuple, ct_attr(a, end, CTA_ID),
-                                   ct_attr(a, end, CTA_ZONE));
+            if (fn(a, end, family, ctx) != 0) return -1;
         }
     }
+}
+
+/* Метка записи (CTA_MARK); 0 — атрибута нет (ядро без метки соединений или запись без метки:
+ * ноль ядро не шлёт вовсе). */
+static uint32_t ct_mark_of(const uint8_t *a, const uint8_t *end) {
+    const struct nlattr *m = ct_attr(a, end, CTA_MARK);
+    if (!m || m->nla_len < NLA_HDRLEN + 4) return 0;
+    uint32_t mv;
+    memcpy(&mv, (const uint8_t *)m + NLA_HDRLEN, 4);
+    return ntohl(mv);
+}
+
+struct ctnl_evict_ctx {
+    int xfd;
+    uint32_t val, mask;
+    uint32_t *seq;
+    int evicted;
+};
+
+/* Запись дампа при снятии: совпала по метке — снять отдельно, по исходному кортежу и CTA_ID. */
+static int ctnl_evict_rec(const uint8_t *a, const uint8_t *end, uint8_t family, void *ctx) {
+    struct ctnl_evict_ctx *x = ctx;
+    uint32_t mv = ct_mark_of(a, end);
+    if (!mv || (mv & x->mask) != x->val) return 0;
+    const struct nlattr *tuple = ct_attr(a, end, CTA_TUPLE_ORIG);
+    if (!tuple) return 0;
+    x->evicted += ctnl_delete(x->xfd, family, ++*x->seq, tuple, ct_attr(a, end, CTA_ID),
+                              ct_attr(a, end, CTA_ZONE));
+    return 0;
 }
 
 int ctnl_evict_mark(uint32_t val, uint32_t mask) {
@@ -2099,17 +2136,252 @@ int ctnl_evict_mark(uint32_t val, uint32_t mask) {
     if (dfd >= 0 && xfd >= 0 && buf) {
         static const uint8_t fam[] = { AF_INET, AF_INET6 };
         uint32_t seq = (uint32_t)time(NULL);
+        struct ctnl_evict_ctx x = { xfd, val, mask, &seq, 0 };
         total = 0;
         for (size_t i = 0; i < sizeof(fam); i++) {
-            int n = ctnl_evict_family(dfd, xfd, fam[i], val, mask, &seq, buf);
-            if (n < 0) { total = -1; break; }
-            total += n;
+            /* 1 (фильтр отвергнут: меток у ядра нет) — снимать в этом семействе нечего, и
+             * внешний инструмент здесь не нужен: это не «разговор не состоялся». */
+            if (ctnl_dump(dfd, fam[i], 1, val, mask, &seq, buf, ctnl_evict_rec, &x) < 0) {
+                total = -1;
+                break;
+            }
         }
+        if (total == 0) total = x.evicted;
     }
     free(buf);
     if (dfd >= 0) close(dfd);
     if (xfd >= 0) close(xfd);
     return total;
+}
+
+/* ---- соединения движка: `steer conns` (команда conns управляющего сокета) --------------
+ *
+ * ЗАЧЕМ. Экран «Соединения» приложения (план C1): какие соединения сейчас идут через каналы
+ * движка и в какой выход. Источник правды — conntrack: метку выхода соединению ставят правила
+ * движка (ct mark), и она же решает маршрут каждого следующего пакета, то есть запись
+ * conntrack с меткой — это ровно «соединение, которое движок куда-то повёл». Инструмента
+ * conntrack в образе Android нет, /proc/net/nf_conntrack у ядра телефона нет тоже
+ * (CONFIG_NF_CONNTRACK_PROCFS выключен), поэтому — тот же дамп ctnetlink, что у снятия.
+ *
+ * ЧТО ПОПАДАЕТ. Записи, у которых ПОЛЕ метки движка (STEER_MARK_MASK) не ноль. Чужие биты вне
+ * поля (netd на телефоне кладёт в метку номер сети и права) не мешают и не показываются.
+ * Значение «все биты поля» на телефоне — не выход, а собственный трафик движка
+ * (STEER_SELF_MARK: запросы резолвера наверх), и в список оно не идёт: человеку в «Соединениях»
+ * нужны его приложения, а не служебные запросы DNS самого движка.
+ *
+ * ВЫХОД — по метке из реестра меток каталога состояния (<state>/registry, «имя метка таблица»),
+ * а не из спеки. В ядре стоят метки ПРИМЕНЁННОЙ спеки, и реестр — их запись; сохранённая, но
+ * не применённая спека (движок выключен, apply отвергнут ядром) меток в пакетах не меняла.
+ * Метки нет в реестре (выход убран, а его соединения ещё доживают) — "out":null.
+ *
+ * UID ПРИЛОЖЕНИЯ здесь нет и не выдумывается: conntrack его не хранит (метка сокета и skuid
+ * живут в сокете, а не в записи соединения), и угадывать его по порту значило бы показывать
+ * человеку неправду.
+ *
+ * СЧЁТЧИКИ (packets/bytes, reply_packets/reply_bytes) — только если ядро их ведёт: у 4.9 и у
+ * свежих ядер это sysctl net.netfilter.nf_conntrack_acct, по умолчанию выключенный, и запись,
+ * заведённая без него, счётчиков не получает и потом. Нет атрибута — нет поля: ноль означал бы
+ * «ничего не передано», а это неправда.
+ *
+ * ПРЕДЕЛ — CONNS_MAX записей в ответе; остальные считаются (total), но не печатаются, и ответ
+ * несёт "truncated":true. Запись — до ~350 байт JSON (два адреса IPv6), 2000 записей — ~700 КиБ,
+ * с запасом внутри предела вывода управляющего сокета (1 МиБ, CTL_OUT_MAX в ctl.c): ответ
+ * через сокет обрезаться посреди JSON не должен никогда. На телефоне живых соединений сотни.
+ *
+ * БАТАРЕЯ. Одна команда — два дампа (IPv4 и IPv6) по запросу экрана; ничего не остаётся жить. */
+#define CONNS_MAX 2000
+
+struct conns_reg { char name[32]; uint32_t mark; };
+static void dlog_json_str(FILE *f, const char *s);   /* строка JSON — у журнала имён ниже */
+
+struct ctnl_conns_ctx {
+    FILE *out;
+    int shown, total;
+    struct conns_reg reg[STEER_MARK_SLOTS * 2];
+    size_t reg_n;
+};
+
+static const char *ct_proto_name(uint8_t p) {
+    switch (p) {
+    case IPPROTO_TCP: return "tcp";
+    case IPPROTO_UDP: return "udp";
+    case IPPROTO_ICMP: return "icmp";
+    case IPPROTO_ICMPV6: return "icmpv6";
+    case IPPROTO_SCTP: return "sctp";
+    case IPPROTO_UDPLITE: return "udplite";
+    case IPPROTO_DCCP: return "dccp";
+    case IPPROTO_GRE: return "gre";
+    default: return NULL;
+    }
+}
+
+/* Состояние TCP из conntrack — те же имена, что печатает инструмент conntrack, строчными.
+ * Номера — enum tcp_conntrack ядра; они не менялись с 2.6 (SYN_SENT2 = 9, прежний LISTEN). */
+static const char *ct_tcp_state(uint8_t st) {
+    static const char *const N[] = { "none", "syn_sent", "syn_recv", "established", "fin_wait",
+                                     "close_wait", "last_ack", "time_wait", "close", "syn_sent2" };
+    return st < sizeof(N) / sizeof(N[0]) ? N[st] : NULL;
+}
+
+/* Число из атрибута счётчика: be64 у свежих ядер и у 4.9, be32 у очень старых (CTA_COUNTERS32_*).
+ * Атрибут be64 в сообщении выровнен только на 4 байта — поэтому чтение по байтам, а не
+ * разыменование. */
+static int ct_counter(const struct nlattr *nest, int t64, int t32, unsigned long long *v) {
+    const struct nlattr *x = ct_attr_in(nest, t64);
+    if (x && x->nla_len >= NLA_HDRLEN + 8) {
+        /* По байтам, старший первым: так одинаково верно и на little-endian телефоне, и на
+         * big-endian роутере (MIPS), без be64toh, которого нет в каждой libc. */
+        const uint8_t *q = (const uint8_t *)x + NLA_HDRLEN;
+        unsigned long long r = 0;
+        for (int i = 0; i < 8; i++) r = (r << 8) | q[i];
+        *v = r;
+        return 1;
+    }
+    x = ct_attr_in(nest, t32);
+    if (x && x->nla_len >= NLA_HDRLEN + 4) {
+        uint32_t b;
+        memcpy(&b, (const uint8_t *)x + NLA_HDRLEN, 4);
+        *v = ntohl(b);
+        return 1;
+    }
+    return 0;
+}
+
+static void ct_print_counters(FILE *out, const struct nlattr *nest, const char *pfx) {
+    unsigned long long v;
+    if (!nest) return;
+    if (ct_counter(nest, CTA_COUNTERS_PACKETS, CTA_COUNTERS32_PACKETS, &v))
+        fprintf(out, ",\"%spackets\":%llu", pfx, v);
+    if (ct_counter(nest, CTA_COUNTERS_BYTES, CTA_COUNTERS32_BYTES, &v))
+        fprintf(out, ",\"%sbytes\":%llu", pfx, v);
+}
+
+static int ctnl_conns_rec(const uint8_t *a, const uint8_t *end, uint8_t family, void *vctx) {
+    struct ctnl_conns_ctx *x = vctx;
+    uint32_t field = ct_mark_of(a, end) & STEER_MARK_MASK;
+    if (!field) return 0;
+#ifdef STEER_SELF_MARK
+    if (field == (STEER_SELF_MARK & STEER_MARK_MASK)) return 0;
+#endif
+    const struct nlattr *orig = ct_attr(a, end, CTA_TUPLE_ORIG);
+    const struct nlattr *tip = ct_attr_in(orig, CTA_TUPLE_IP);
+    const struct nlattr *tpr = ct_attr_in(orig, CTA_TUPLE_PROTO);
+    int v6 = family == AF_INET6;
+    size_t alen = v6 ? 16 : 4;
+    const struct nlattr *sa = ct_attr_in(tip, v6 ? CTA_IP_V6_SRC : CTA_IP_V4_SRC);
+    const struct nlattr *da = ct_attr_in(tip, v6 ? CTA_IP_V6_DST : CTA_IP_V4_DST);
+    const struct nlattr *pn = ct_attr_in(tpr, CTA_PROTO_NUM);
+    if (!sa || !da || !pn || sa->nla_len < NLA_HDRLEN + alen || da->nla_len < NLA_HDRLEN + alen ||
+        pn->nla_len < NLA_HDRLEN + 1)
+        return 0;                              /* запись без кортежа — показывать нечего */
+    x->total++;
+    if (x->shown >= CONNS_MAX) return 0;
+    char s[INET6_ADDRSTRLEN], d[INET6_ADDRSTRLEN];
+    inet_ntop(family, (const uint8_t *)sa + NLA_HDRLEN, s, sizeof(s));
+    inet_ntop(family, (const uint8_t *)da + NLA_HDRLEN, d, sizeof(d));
+    uint8_t proto = *((const uint8_t *)pn + NLA_HDRLEN);
+    FILE *out = x->out;
+    fprintf(out, "%s{\"family\":\"%s\",\"proto\":", x->shown ? "," : "", v6 ? "ipv6" : "ipv4");
+    const char *pnm = ct_proto_name(proto);
+    if (pnm) fprintf(out, "\"%s\"", pnm);
+    else fprintf(out, "\"%u\"", proto);
+    fprintf(out, ",\"src\":\"%s\"", s);
+    /* Порты — только у протоколов с портами: у ICMP в кортеже вместо них тип, код и номер. */
+    const struct nlattr *sp = ct_attr_in(tpr, CTA_PROTO_SRC_PORT);
+    const struct nlattr *dp = ct_attr_in(tpr, CTA_PROTO_DST_PORT);
+    uint16_t pv;
+    if (sp && sp->nla_len >= NLA_HDRLEN + 2) {
+        memcpy(&pv, (const uint8_t *)sp + NLA_HDRLEN, 2);
+        fprintf(out, ",\"sport\":%u", ntohs(pv));
+    }
+    fprintf(out, ",\"dst\":\"%s\"", d);
+    if (dp && dp->nla_len >= NLA_HDRLEN + 2) {
+        memcpy(&pv, (const uint8_t *)dp + NLA_HDRLEN, 2);
+        fprintf(out, ",\"dport\":%u", ntohs(pv));
+    }
+    fprintf(out, ",\"mark\":\"0x%08x\",\"out\":", field);
+    const char *on = NULL;
+    for (size_t i = 0; i < x->reg_n; i++)
+        if (x->reg[i].mark == field) { on = x->reg[i].name; break; }
+    /* Имя выхода из спеки проверено name_ok, но реестр — файл на диске, и строку JSON из него
+     * собирает тот же экранирующий писатель, что у журнала имён. */
+    if (on) dlog_json_str(out, on);
+    else fputs("null", out);
+    if (proto == IPPROTO_TCP) {
+        const struct nlattr *pi = ct_attr(a, end, CTA_PROTOINFO);
+        const struct nlattr *st = ct_attr_in(ct_attr_in(pi, CTA_PROTOINFO_TCP),
+                                             CTA_PROTOINFO_TCP_STATE);
+        const char *sn = st && st->nla_len >= NLA_HDRLEN + 1
+                             ? ct_tcp_state(*((const uint8_t *)st + NLA_HDRLEN)) : NULL;
+        if (sn) fprintf(out, ",\"state\":\"%s\"", sn);
+    }
+    ct_print_counters(out, ct_attr(a, end, CTA_COUNTERS_ORIG), "");
+    ct_print_counters(out, ct_attr(a, end, CTA_COUNTERS_REPLY), "reply_");
+    fputc('}', out);
+    x->shown++;
+    return 0;
+}
+
+/* Реестр меток: «имя метка таблица» построчно — тот же разбор, что у registry_assign (spec.c),
+ * и то же отсечение меток вне поля: такая запись осталась от сборки с другим полем и
+ * сопоставлять её с записями conntrack нельзя. Только читается: conns ничего не раздаёт. */
+static void conns_registry(struct ctnl_conns_ctx *x) {
+    char path[PATH_MAX];
+    snprintf(path, sizeof(path), "%s/registry", g_state_dir);
+    FILE *f = fopen(path, "r");
+    if (!f) return;
+    char name[32];
+    unsigned mark;
+    int table;
+    while (x->reg_n < sizeof(x->reg) / sizeof(x->reg[0]) &&
+           fscanf(f, "%31s %x %d\n", name, &mark, &table) == 3) {
+        if (!mark || (mark & ~STEER_MARK_MASK)) continue;
+        snprintf(x->reg[x->reg_n].name, sizeof(x->reg[0].name), "%s", name);
+        x->reg[x->reg_n++].mark = mark;
+    }
+    fclose(f);
+}
+
+/* Печать ответа `steer conns`. 0 — готово; 1 — conntrack недоступен (нет сокета
+ * NETLINK_NETFILTER, модуля nf_conntrack_netlink или прав), причина — в stderr, stdout пуст. */
+int ctnl_conns_print(FILE *out) {
+    static struct ctnl_conns_ctx x;
+    memset(&x, 0, sizeof(x));
+    x.out = out;
+    conns_registry(&x);
+    int dfd = ctnl_socket();
+    uint8_t *buf = malloc(CTNL_RCVBUF);
+    if (dfd < 0 || !buf) {
+        fprintf(stderr, "steer[warn] conns: нет сокета ctnetlink (%s)\n", strerror(errno));
+        if (dfd >= 0) close(dfd);
+        free(buf);
+        return 1;
+    }
+    /* Ответ копится в памяти, а не пишется по ходу: разговор с ядром может оборваться на
+     * втором семействе, и тогда в stdout не должно остаться половины JSON. */
+    char *mem = NULL;
+    size_t memn = 0;
+    FILE *m = open_memstream(&mem, &memn);
+    if (!m) { close(dfd); free(buf); return 1; }
+    x.out = m;
+    static const uint8_t fam[] = { AF_INET, AF_INET6 };
+    uint32_t seq = (uint32_t)time(NULL);
+    int rc = 0;
+    for (size_t i = 0; i < sizeof(fam) && rc == 0; i++)
+        rc = ctnl_dump(dfd, fam[i], 0, 0, 0, &seq, buf, ctnl_conns_rec, &x);
+    fclose(m);
+    close(dfd);
+    free(buf);
+    if (rc != 0) {
+        fprintf(stderr, "steer[warn] conns: conntrack не ответил на дамп — нет модуля "
+                        "nf_conntrack_netlink или прав\n");
+        free(mem);
+        return 1;
+    }
+    fprintf(out, "{\"schema\":1,\"conns\":[%s],\"shown\":%d,\"total\":%d,\"truncated\":%s}\n",
+            mem ? mem : "", x.shown, x.total, x.total > x.shown ? "true" : "false");
+    free(mem);
+    return 0;
 }
 
 /* Куда слать запрос наверх: исходное назначение (в режиме origdst), иначе петля. *mark — метка
@@ -2174,6 +2446,17 @@ struct dchan {
     size_t rules_n;
     struct ruleset rules;
     int realip;                 /* put the real answers in the set, do not fake */
+    /* Правило спеки, от имени которого набор показывается в журнале имён (dns-log), и его
+     * выход: человеку нужно имя правила с экрана, а не имя набора nft. Набор бывает общим у
+     * нескольких правил (тот же выход, те же клиенты и режим, см. dch_build), и тогда
+     * называется первое ДОМЕННОЕ из них (с domains_files) — старшее по порядку, то есть то,
+     * что человек видит выше. Адресное правило попадает в группу только ради гибридных
+     * списков (dch_join_domain_group), и назвать его — значило бы приписать имя из доменного
+     * списка соседа правилу «подсети Discord»; оно называется, лишь пока доменного в группе
+     * нет. Выход у всех правил группы один — он входит в имя набора. */
+    char chan[32];
+    char out[32];
+    int chan_dom;               /* chan — правило с domains_files */
 };
 static struct dchan g_dch[MAX_CHANNELS];
 static size_t g_dch_n;
@@ -2257,6 +2540,297 @@ static uint64_t dch_fakeip_only(uint64_t mask) {
     for (size_t i = 0; i < g_dch_n && i < 64; i++)
         if ((mask & (1ULL << i)) && g_dch[i].realip) mask &= ~(1ULL << i);
     return mask;
+}
+
+/* ---- журнал имён: `steer dns-log` (команда dns-log управляющего сокета) ----------------
+ *
+ * ЗАЧЕМ. Экран «Соединения и DNS» приложения (план C1): какие имена недавно спрашивали, в какой
+ * канал каждое попало (или мимо всех), сколько раз и когда последний раз. Это ответ на вопрос
+ * «почему сайт не идёт в туннель» с другой стороны, чем explain: explain говорит, куда ПОПАЛО
+ * БЫ имя, журнал — что на самом деле спрашивали приложения и что им досталось.
+ *
+ * ЧТО ХРАНИТСЯ. По записи на имя: имя (нижним регистром), доменный канал, в который оно попало
+ * при последнем запросе, счётчик запросов и время последнего. Ни адреса клиента, ни типа
+ * запроса, ни ответа: «без персональных данных сверх имени» — журнал показывает, КУДА ушло
+ * имя, а не КТО и что спросил. Записей — DLOG_N (256): это «недавние», а не история; самая
+ * давняя запись уступает место новому имени.
+ *
+ * ГДЕ. Только в памяти резолвера. Никаких периодических записей на диск — флеш телефона и сон
+ * устройства дороже истории, которая после перезапуска резолвера никому не нужна. Журнал
+ * отдаётся по запросу, и ради запроса резолвер ничего не пишет на диск тоже.
+ *
+ * КАК ОТДАЁТСЯ — свой маленький unix-сокет резолвера, <каталог состояния>/dnsd.sock: клиент
+ * (`steer dns-log`, её зовёт сервер управляющего сокета) подключается, резолвер сразу пишет
+ * журнал одним объектом JSON и закрывает соединение. Запроса нет вовсе — резолвер ничего не
+ * читает от собеседника, поэтому медленный или молчащий клиент ему не страшен.
+ *
+ * Почему сокет, а не «SIGUSR1 — сбросить журнал в файл, который прочтёт ctl». (1) Файл — это
+ * запись на флеш на каждое открытие экрана: каталог состояния на телефоне — /data, tmpfs для
+ * движка там нет. (2) Сигнал асинхронен: читающему пришлось бы ждать появления файла опросом
+ * со сроком — то есть гадать, дописан ли файл и не от прошлого ли он запроса. Сокет отвечает
+ * синхронно, ровно тем, что лежит в памяти в эту секунду. (3) Найти резолвер для сигнала —
+ * обход /proc (ctl_find); сокет находится по имени.
+ *
+ * ДОСТУП. Каталог состояния — 0700 и тип steerd_data_file, приложениям не листается; сам сокет
+ * создаётся с правами 0600, и резолвер ещё сверяет собеседника (SO_PEERCRED): root или тот же
+ * uid, что у него. Сокет в каталоге состояния получает тип каталога (steerd_data_file), своего
+ * типа ему не нужно: подключается к нему только домен движка (steerd), в котором живёт и
+ * сервер управляющего сокета. Приложение журнал получает только через управляющий сокет.
+ *
+ * СТОИМОСТЬ НА ЗАПРОС. Поиск имени — проход по 256 записям со сравнением 32-битного отпечатка
+ * (FNV-1a, sidx_hash) и строки только при совпадении отпечатка; вытеснение — ещё один проход,
+ * только для нового имени. Против системных вызовов, которых стоит каждый запрос DNS, это
+ * незаметно и на роутерном MIPS. */
+#define DLOG_N 256
+
+struct dlog_ent {
+    char name[MAX_HOSTNAME];
+    uint32_t hash;
+    uint32_t count;
+    time_t last;                /* CLOCK_MONOTONIC, секунды: часы телефона после загрузки
+                                 * переводит NTP, и «когда» по стенным часам прыгало бы */
+    int16_t hit;                /* индекс в g_dch; -1 — мимо всех доменных каналов */
+};
+static struct dlog_ent g_dlog[DLOG_N];
+static size_t g_dlog_n;
+static int g_dlog_fd = -1;
+static char g_dlog_path[PATH_MAX];
+static ino_t g_dlog_ino;
+
+static time_t dlog_mono(void) {
+    struct timespec t;
+    clock_gettime(CLOCK_MONOTONIC, &t);
+    return t.tv_sec;
+}
+
+/* Отметить запрос имени qname, попавшего в канал hit (-1 — мимо). */
+static void dlog_note(const char *qname, int hit) {
+    char lname[MAX_HOSTNAME];
+    snprintf(lname, sizeof(lname), "%s", qname);
+    str_lower(lname);
+    uint32_t h = sidx_hash(lname);
+    time_t now = dlog_mono();
+    struct dlog_ent *e = NULL;
+    for (size_t i = 0; i < g_dlog_n; i++)
+        if (g_dlog[i].hash == h && !strcmp(g_dlog[i].name, lname)) { e = &g_dlog[i]; break; }
+    if (!e) {
+        if (g_dlog_n < DLOG_N) {
+            e = &g_dlog[g_dlog_n++];
+        } else {
+            e = &g_dlog[0];
+            for (size_t i = 1; i < DLOG_N; i++)
+                if (g_dlog[i].last < e->last) e = &g_dlog[i];
+        }
+        snprintf(e->name, sizeof(e->name), "%s", lname);
+        e->hash = h;
+        e->count = 0;
+    }
+    e->count++;
+    e->last = now;
+    e->hit = (int16_t)hit;
+}
+
+static void dlog_json_str(FILE *f, const char *s) {
+    fputc('"', f);
+    for (; *s; s++) {
+        unsigned char c = (unsigned char)*s;
+        /* Метка имени DNS — любые байты (parse_name_adv копирует их как есть): всё, что не
+         * печатный ASCII, идёт \u00XX, иначе один странный запрос сломал бы весь ответ. */
+        if (c == '"' || c == '\\') fprintf(f, "\\%c", c);
+        else if (c < 0x20 || c >= 0x7f) fprintf(f, "\\u%04x", c);
+        else fputc(c, f);
+    }
+    fputc('"', f);
+}
+
+static int dlog_cmp(const void *a, const void *b) {
+    const struct dlog_ent *x = *(const struct dlog_ent *const *)a;
+    const struct dlog_ent *y = *(const struct dlog_ent *const *)b;
+    if (x->last != y->last) return x->last < y->last ? 1 : -1;
+    return x->count < y->count ? 1 : x->count > y->count ? -1 : 0;
+}
+
+/* Журнал одним объектом JSON — свежие имена первыми. */
+static char *dlog_render(size_t *len) {
+    char *mem = NULL;
+    size_t n = 0;
+    FILE *f = open_memstream(&mem, &n);
+    if (!f) return NULL;
+    struct dlog_ent *ord[DLOG_N];
+    for (size_t i = 0; i < g_dlog_n; i++) ord[i] = &g_dlog[i];
+    qsort(ord, g_dlog_n, sizeof(ord[0]), dlog_cmp);
+    time_t mono = dlog_mono(), wall = time(NULL);
+    fprintf(f, "{\"schema\":1,\"running\":true,\"size\":%d,\"names\":[", DLOG_N);
+    for (size_t i = 0; i < g_dlog_n; i++) {
+        const struct dlog_ent *e = ord[i];
+        long ago = (long)(mono - e->last);
+        fputs(i ? ",{\"name\":" : "{\"name\":", f);
+        dlog_json_str(f, e->name);
+        fputs(",\"channel\":", f);
+        /* Индекс вне таблицы быть не может (таблица каналов не пересобирается до выхода
+         * резолвера — см. dch_signature), но граница сверяется всё равно. */
+        if (e->hit >= 0 && (size_t)e->hit < g_dch_n) {
+            dlog_json_str(f, g_dch[e->hit].chan);
+            fputs(",\"out\":", f);
+            dlog_json_str(f, g_dch[e->hit].out);
+        } else {
+            fputs("null,\"out\":null", f);
+        }
+        fprintf(f, ",\"count\":%u,\"last\":%lld,\"ago\":%ld}", e->count,
+                (long long)(wall - ago), ago);
+    }
+    fputs("]}\n", f);
+    if (fclose(f) != 0) { free(mem); return NULL; }
+    *len = n;
+    return mem;
+}
+
+/* Слушающий сокет журнала. Не вышло — резолвер работает дальше без журнала (строка в stderr):
+ * журнал — окно для человека, а не часть разрешения имён. */
+static void dlog_listen(void) {
+    struct sockaddr_un a;
+    memset(&a, 0, sizeof(a));
+    a.sun_family = AF_UNIX;
+    if ((size_t)snprintf(g_dlog_path, sizeof(g_dlog_path), "%s/dnsd.sock", g_state_dir) >=
+            sizeof(a.sun_path)) {
+        fprintf(stderr, "steer[warn] dnsd: путь сокета журнала слишком длинный — журнала не будет\n");
+        g_dlog_path[0] = '\0';
+        return;
+    }
+    memcpy(a.sun_path, g_dlog_path, strlen(g_dlog_path) + 1);   /* длина сверена выше */
+    int fd = socket(AF_UNIX, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
+    if (fd < 0) return;
+    /* Прежний файл — от упавшего резолвера: второй резолвер на том же каталоге состояния
+     * делил бы с первым и dnsd.sig, так что проверять «жив ли сосед» здесь незачем. */
+    unlink(g_dlog_path);
+    mode_t old = umask(0177);                  /* 0600 с рождения, как у ctl-serve (ctl_listen) */
+    int rc = bind(fd, (struct sockaddr *)&a, sizeof(a));
+    umask(old);
+    if (rc != 0 || listen(fd, 4) != 0) {
+        fprintf(stderr, "steer[warn] dnsd: сокет журнала %s: %s — журнала не будет\n",
+                g_dlog_path, strerror(errno));
+        close(fd);
+        g_dlog_path[0] = '\0';
+        return;
+    }
+    struct stat sb;
+    g_dlog_ino = stat(g_dlog_path, &sb) == 0 ? sb.st_ino : 0;
+    struct epoll_event ev = {0};
+    ev.events = EPOLLIN;
+    ev.data.ptr = &g_dlog_fd;
+    g_dlog_fd = fd;
+    if (epoll_ctl(g_epfd, EPOLL_CTL_ADD, fd, &ev) != 0) {
+        close(fd);
+        g_dlog_fd = -1;
+        unlink(g_dlog_path);
+        g_dlog_path[0] = '\0';
+    }
+}
+
+static void dlog_close(void) {
+    if (g_dlog_fd < 0) return;
+    close(g_dlog_fd);
+    g_dlog_fd = -1;
+    struct stat sb;
+    if (g_dlog_path[0] && g_dlog_ino && stat(g_dlog_path, &sb) == 0 && sb.st_ino == g_dlog_ino)
+        unlink(g_dlog_path);
+}
+
+/* Подключились к сокету журнала: отдать журнал и закрыть. Запись — со сроком 200 мс на всё:
+ * ответ (до ~80 КиБ) обычно целиком ложится в буфер сокета за один вызов, а собеседник,
+ * который не читает, не должен держать разрешение имён дольше этого. */
+/* Раскладка ответа SO_PEERCRED — своя, по той же причине, что dnsd_in6_pktinfo: struct ucred
+ * libc показывает только с _GNU_SOURCE, а этот файл включают стенды со своим порядком
+ * заголовков. Поля — ядра (include/linux/socket.h), от libc не зависят. По той же причине
+ * accept, а не accept4. */
+struct dnsd_ucred { pid_t pid; uid_t uid; gid_t gid; };
+
+static void dlog_serve(void) {
+    for (int k = 0; k < 4; k++) {
+        int c = accept(g_dlog_fd, NULL, NULL);
+        if (c < 0) return;
+        fcntl(c, F_SETFD, FD_CLOEXEC);
+        /* Принятый сокет наследует O_NONBLOCK слушающего только в BSD; в Linux — нет, но
+         * полагаться на это незачем: запись ниже идёт со сроком, а не с неблокирующим. */
+        fcntl(c, F_SETFL, fcntl(c, F_GETFL) & ~O_NONBLOCK);
+        struct dnsd_ucred uc;
+        socklen_t l = sizeof(uc);
+        if (getsockopt(c, SOL_SOCKET, SO_PEERCRED, &uc, &l) != 0 ||
+            (uc.uid != 0 && uc.uid != geteuid())) {
+            close(c);
+            continue;
+        }
+        size_t n = 0;
+        char *js = dlog_render(&n);
+        if (js) {
+            struct timeval tv = { 0, 200000 };
+            setsockopt(c, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+            size_t off = 0;
+            while (off < n) {
+                ssize_t w = send(c, js + off, n - off, MSG_NOSIGNAL);
+                if (w <= 0) break;
+                off += (size_t)w;
+            }
+            free(js);
+        }
+        close(c);
+    }
+}
+
+/* Клиент: `steer dns-log` — журнал работающего резолвера как есть. Резолвер не запущен (сокета
+ * нет или никто не слушает) — это состояние, а не ошибка: "running":false и код 0, экран
+ * покажет «резолвер не запущен». 1 — сокет есть, но ответа нет (права, срок). */
+int dlog_print(FILE *out) {
+    char path[PATH_MAX];
+    struct sockaddr_un a;
+    memset(&a, 0, sizeof(a));
+    a.sun_family = AF_UNIX;
+    if ((size_t)snprintf(path, sizeof(path), "%s/dnsd.sock", g_state_dir) >= sizeof(a.sun_path)) {
+        fprintf(stderr, "steer[warn] dns-log: путь сокета журнала слишком длинный\n");
+        return 1;
+    }
+    memcpy(a.sun_path, path, strlen(path) + 1);                 /* длина сверена выше */
+    int fd = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
+    if (fd < 0) return 1;
+    if (connect(fd, (struct sockaddr *)&a, sizeof(a)) != 0) {
+        int e = errno;
+        close(fd);
+        if (e == ENOENT || e == ECONNREFUSED) {
+            fprintf(out, "{\"schema\":1,\"running\":false,\"size\":%d,\"names\":[]}\n", DLOG_N);
+            return 0;
+        }
+        fprintf(stderr, "steer[warn] dns-log: %s: %s\n", path, strerror(e));
+        return 1;
+    }
+    struct timeval tv = { 3, 0 };
+    setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+    char *buf = NULL;
+    size_t n = 0, cap = 0;
+    for (;;) {
+        if (n + 16384 > cap) {
+            size_t nc = cap ? cap * 2 : 65536;
+            char *q = realloc(buf, nc);
+            if (!q) break;
+            buf = q;
+            cap = nc;
+        }
+        ssize_t m = recv(fd, buf + n, cap - n, 0);
+        if (m < 0 && errno == EINTR) continue;
+        if (m <= 0) {
+            if (m < 0) n = 0;                  /* срок или обрыв: половина JSON хуже, чем ничего */
+            break;
+        }
+        n += (size_t)m;
+    }
+    close(fd);
+    if (!n || buf[n - 1] != '\n') {
+        free(buf);
+        fprintf(stderr, "steer[warn] dns-log: резолвер не отдал журнал\n");
+        return 1;
+    }
+    fwrite(buf, 1, n, out);
+    free(buf);
+    return 0;
 }
 
 /* Сколько секунд подряд отказ ядра ещё считается окном пересборки таблицы.
@@ -2443,6 +3017,9 @@ static int dns_query(uint8_t *buf, ssize_t n, struct sockaddr_storage from, sock
          * порядку правил, а ответ клиенту всё равно один. */
         sets = dch_match_mask(qname);
         hit = dch_first(sets);
+        /* В журнал — каждый разобранный вопрос, до быстрого пути: ответ из быстрого пути —
+         * тоже запрос приложения. Сюда приходят и UDP, и TCP (tcpc_read зовёт эту же функцию). */
+        dlog_note(qname, hit);
         if (hit >= 0 && !g_dch[hit].realip) {
             if (qtype == DNS_TYPE_AAAA || qtype == DNS_TYPE_HTTPS ||
                 qtype == DNS_TYPE_SVCB) {
@@ -3597,6 +4174,8 @@ static int run_proxy(int listen_port, int upstream_port) {
     epoll_ctl(g_epfd, EPOLL_CTL_ADD, g_listen_fd, &ev);
     /* И TCP на том же порту — см. «DNS по TCP» выше. */
     tcp_listen_open(listen_port);
+    /* Сокет журнала имён — см. «журнал имён» выше. */
+    dlog_listen();
 
     /* Один сокет наверх на весь процесс — см. комментарий у struct pending. Открывается
      * здесь, а не при первом запросе, чтобы отказ был виден сразу, а не превращался в
@@ -3751,6 +4330,8 @@ static int run_proxy(int listen_port, int upstream_port) {
                  * upstream, которые ждут в этом же массиве событий. */
                 for (int k = 0; k < 64; k++)
                     if (!handle_client_query()) break;
+            } else if (events[i].data.ptr == &g_dlog_fd) {
+                dlog_serve();
             } else if (tcp_event(events[i].data.ptr, events[i].events)) {
                 /* соединение TCP — клиента или наверх; всё сделано внутри */
             } else {
@@ -3765,6 +4346,7 @@ static int run_proxy(int listen_port, int upstream_port) {
     }
 
     tcp_close_all();
+    dlog_close();
     if (g_nlk_fd >= 0) close(g_nlk_fd);
     if (g_up_fd >= 0) close(g_up_fd);
     close(g_listen_fd);
@@ -4079,8 +4661,13 @@ static void dch_build(void) {
             if (g_dch_n >= MAX_CHANNELS) break;
             memset(&g_dch[g_dch_n], 0, sizeof(g_dch[g_dch_n]));
             snprintf(g_dch[g_dch_n].set, sizeof(g_dch[g_dch_n].set), "%s", set);
+            snprintf(g_dch[g_dch_n].out, sizeof(g_dch[g_dch_n].out), "%.31s", g_ch[i].out);
             g_dch[g_dch_n].realip = realip;
             k = g_dch_n++;
+        }
+        if (!g_dch[k].chan[0] || (!g_dch[k].chan_dom && g_ch[i].domains_n)) {
+            snprintf(g_dch[k].chan, sizeof(g_dch[k].chan), "%.31s", g_ch[i].name);
+            g_dch[k].chan_dom = g_ch[i].domains_n > 0;
         }
         for (size_t f = 0; f < g_ch[i].domains_n && g_dch[k].rules_n < MAX_FILES; f++)
             g_dch[k].rules_path[g_dch[k].rules_n++] = g_ch[i].domains_files[f];

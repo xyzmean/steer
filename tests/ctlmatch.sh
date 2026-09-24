@@ -16,11 +16,22 @@
 #  5. apply: негодная спека не трогает spec.json и не оставляет временных файлов; годная при
 #     выключенном движке сохраняется и не применяется; check ничего не сохраняет.
 #  6. reload: супервизор помощников получает SIGHUP и поднимает выход, добавленный в спеку.
-#  7. Под root в своём сетевом пространстве с настоящим nft: apply при включённом движке
+#  7. Файлы списков: put-file кладёт файл переименованием (прежний файл, на который держат
+#     ссылку, не переписан на месте), тело больше 1 МиБ (предела спеки) принимается, больше
+#     16 МиБ — too-large без чтения тела; имена с «..», «/», точкой или «-» в начале — отказ;
+#     тело короче объявленного не оставляет ни файла, ни временного; пределы каталога (256
+#     файлов) — отказ новому имени и замена старого; list-files — по имени, без скрытых;
+#     rm-file — removed true/false, отказ in-use для файла из сохранённой спеки; брошенный
+#     временный файл сервер убирает при старте.
+#  8. Под root в своём сетевом пространстве с настоящим nft: apply при включённом движке
 #     ставит таблицу; резолвер после apply получает HUP, если состав доменных каналов тот же, и
-#     TERM, если он изменился; отказ ядра (nft -f не прошёл) возвращает прежнюю спеку.
+#     TERM, если он изменился; отказ ядра (nft -f не прошёл) возвращает прежнюю спеку. conns:
+#     из записей conntrack с разными метками в ответе только те, у которых поле метки движка не
+#     ноль, с выходом по реестру (или null), с состоянием TCP и счётчиками, если их вело ядро.
+#     dns-log: имена, спрошенные у резолвера по UDP и по TCP, — с каналом, выходом и счётчиком;
+#     без резолвера — "running":false; сокет журнала резолвер убирает при выходе.
 #
-# Без root пункты 4 и 7 пропускаются, без python3 — весь стенд (им шлются сырые запросы).
+# Без root пункты 4 и 8 пропускаются, без python3 — весь стенд (им шлются сырые запросы).
 set -u
 BIN="${STEER:-./build/steer}"
 BIN="$(cd "$(dirname "$BIN")" && pwd)/$(basename "$BIN")"
@@ -138,7 +149,8 @@ self_uid=""
 serve() {   # serve ВКЛЮЧЁН — поднять сервер заново
     [ -n "$SRV" ] && { kill "$SRV" 2>/dev/null; wait "$SRV" 2>/dev/null; }
     STEER_CTL_ENABLED="$1" "$BIN" ctl-serve --socket "$tmp/s.sock" --spec "$tmp/spec.json" \
-        --state-dir "$tmp/state" --allow-uid 65533 $self_uid 2>>"$tmp/serve.err" &
+        --state-dir "$tmp/state" --lists-dir "$tmp/lists" --allow-uid 65533 $self_uid \
+        2>>"$tmp/serve.err" &
     SRV=$!
     wait_for '[ -S "$tmp/s.sock" ]' 5
 }
@@ -170,6 +182,22 @@ check "explain: тот же ответ, что у подкоманды" \
 r="$(ctl vless-nodes vpn)"
 check "vless-nodes в базовой сборке: отказ подкоманды (код 2), не сервера" "2 -" \
     "$(printf '%s' "$r" | j code) $(printf '%s' "$r" | j error)"
+# sub-check: разбор подписки подкомандой vless-nodes по временному файлу. В базовой сборке
+# VLESS нет — честный отказ подкоманды (код 2), не сервера; временный файл убран в любом случае.
+printf 'vless://11111111-2222-3333-4444-555555555555@1.2.3.4:443?security=none#n\n' > "$tmp/sub.txt"
+r="$(ctl sub-check < "$tmp/sub.txt")"
+if "$BIN" version | grep -q 'расширенная'; then
+    check "sub-check: код 0, пригодных узлов 1" "0 1" \
+        "$(printf '%s' "$r" | j code) $(printf '%s' "$r" | j stdout | j usable)"
+else
+    check "sub-check в базовой сборке: отказ подкоманды (код 2), не сервера" "2 -" \
+        "$(printf '%s' "$r" | j code) $(printf '%s' "$r" | j error)"
+fi
+check "  временный файл подписки убран" "0" "$(ls /tmp | grep -c "^sub-check\.ctl-")"
+check "sub-check без длины тела — bad-request" "bad-request" "$(printf 'sub-check\n' | raw | j error)"
+r="$(ctl dns-log)"
+check "dns-log без резолвера: код 0, running=false, имён нет" "0 false" \
+    "$(printf '%s' "$r" | j code) $(printf '%s' "$r" | j stdout | j running)"
 
 # ---- 2. слова запроса -------------------------------------------------------------------
 check "explain с флагом вместо адреса — bad-request" "bad-request" "$(ctl explain --spec | j error)"
@@ -178,6 +206,7 @@ check "vless-probe: срок вне 1..30 — bad-request" "bad-request" "$(ctl 
 check "vless-probe: номер не число — bad-request" "bad-request" "$(ctl vless-probe vpn abc | j error)"
 check "status с лишним словом — bad-request" "bad-request" "$(ctl status slow | j error)"
 check "неизвестная команда — unknown-command" "unknown-command" "$(ctl conns-all | j error)"
+check "conns со словом — bad-request" "bad-request" "$(ctl conns all | j error)"
 check "два пробела подряд — bad-request" "bad-request" "$(printf 'explain  1.1.1.1\n' | raw | j error)"
 
 # ---- 3. пределы -------------------------------------------------------------------------
@@ -260,7 +289,79 @@ check "  и он поднял выход, добавленный в спеку" 
 check "  а прежний не тронул" "1" "$(grep -c '^obfs a ' "$tmp/helper.log")"
 kill "$SUP"; wait "$SUP" 2>/dev/null; SUP=""
 
-# ---- 7. настоящий apply, резолвер и откат -----------------------------------------------
+# ---- 7. файлы списков -------------------------------------------------------------------
+L="$tmp/lists"
+check "list-files до первого put: пусто, каталога нет" "0 0 no" \
+    "$(ctl list-files | j code) $(ctl list-files | python3 -c 'import json,sys; print(len(json.load(sys.stdin)["files"]))') \
+$([ -e "$L" ] && echo yes || echo no)"
+printf 'one\n' > "$tmp/f1"
+r="$(ctl put-file yt.lst "$tmp/f1")"
+check "put-file: код 0, имя, размер и путь" "0 yt.lst 4 $L/yt.lst" \
+    "$(printf '%s' "$r" | j code) $(printf '%s' "$r" | j name) $(printf '%s' "$r" | j size) $(printf '%s' "$r" | j path)"
+check "  файл на месте с присланным содержимым" "one" "$(cat "$L/yt.lst")"
+check "  каталог создан с правами 0700" "700" "$(stat -c %a "$L")"
+# Атомарность: замена идёт переименованием нового файла, а не записью в прежний. Жёсткая
+# ссылка на прежний файл держит его inode: запись на месте переписала бы и её.
+ln "$L/yt.lst" "$tmp/old-link"
+printf 'two\n' | ctl put-file yt.lst - >/dev/null
+check "put-file поверх: новое содержимое под именем" "two" "$(cat "$L/yt.lst")"
+check "  прежний файл не переписан на месте (замена переименованием)" "one" "$(cat "$tmp/old-link")"
+check "  временных файлов не осталось" "0" "$(ls -A "$L" | grep -c '^\.')"
+head -c 2000000 /dev/zero | tr '\0' a > "$tmp/big"
+check "put-file больше 1 МиБ (предела спеки): принят" "0 2000000" \
+    "$(ctl put-file big.lst "$tmp/big" | j code) $(stat -c %s "$L/big.lst")"
+check "put-file больше 16 МиБ — too-large до чтения тела" "too-large" \
+    "$(printf 'put-file huge.lst 16777217\n' | raw | j error)"
+check "  и файла нет" "no" "$([ -e "$L/huge.lst" ] && echo yes || echo no)"
+check "put-file: тело короче объявленного — bad-request" "bad-request" \
+    "$(printf 'put-file short.lst 100\nabc' | raw | j error)"
+check "  ни файла, ни временного" "no 0" \
+    "$([ -e "$L/short.lst" ] && echo yes || echo no) $(ls -A "$L" | grep -c '^\.')"
+for bad in ../x a..b .hidden -x 'a/b' 'a;b' \
+           "$(head -c 65 /dev/zero | tr '\0' n)"; do
+    check "put-file с именем «$bad» — bad-request" "bad-request" \
+        "$(printf 'x' | ctl put-file "$bad" - | j error)"
+done
+check "put-file без тела (нет длины) — bad-request" "bad-request" "$(printf 'put-file a.lst\n' | raw | j error)"
+check "  плохие имена не создали ничего вне каталога" "no no" \
+    "$([ -e "$tmp/x" ] && echo yes || echo no) $([ -e "$L/a" ] && echo yes || echo no)"
+touch "$L/.stray"
+r="$(ctl list-files)"
+check "list-files: по имени, без скрытых" "big.lst:2000000 yt.lst:4" \
+    "$(printf '%s' "$r" | python3 -c 'import json,sys; print(" ".join("%s:%d" % (f["name"], f["size"]) for f in json.load(sys.stdin)["files"]))')"
+check "  mtime — секунды Unix, свежие" "yes" \
+    "$(printf '%s' "$r" | python3 -c 'import json,sys,time; print("yes" if all(abs(f["mtime"]-time.time())<120 for f in json.load(sys.stdin)["files"]) else "no")')"
+check "  dir — каталог списков" "$L" "$(printf '%s' "$r" | j dir)"
+rm -f "$L/.stray"
+# Пределы каталога: 256 файлов уже лежат — новому имени отказ, замене старого — нет.
+i=0; while [ $i -lt 254 ]; do : > "$L/n$i"; i=$((i + 1)); done
+check "257-й файл — too-large" "too-large" "$(printf 'x' | ctl put-file new.lst - | j error)"
+check "замена при полном каталоге — принята" "0" "$(printf 'x' | ctl put-file n0 - | j code)"
+i=0; while [ $i -lt 254 ]; do rm -f "$L/n$i"; i=$((i + 1)); done
+r="$(ctl rm-file big.lst)"
+check "rm-file: removed=true, файла нет" "0 true no" \
+    "$(printf '%s' "$r" | j code) $(printf '%s' "$r" | j removed) $([ -e "$L/big.lst" ] && echo yes || echo no)"
+r="$(ctl rm-file big.lst)"
+check "rm-file повторно: код 0, removed=false" "0 false" \
+    "$(printf '%s' "$r" | j code) $(printf '%s' "$r" | j removed)"
+check "rm-file с именем «../spec.json» — bad-request" "bad-request" "$(ctl rm-file ../spec.json | j error)"
+check "  спека на месте" "yes" "$([ -e "$tmp/spec.json" ] && echo yes || echo no)"
+# Файл, на который ссылается сохранённая спека, не удаляется.
+spec L.json "$L/yt.lst"
+cp "$tmp/spec.json" "$tmp/spec.keep"
+cp "$tmp/L.json" "$tmp/spec.json"
+r="$(ctl rm-file yt.lst)"
+check "rm-file файла из сохранённой спеки — in-use, файл на месте" "in-use yes" \
+    "$(printf '%s' "$r" | j error) $([ -e "$L/yt.lst" ] && echo yes || echo no)"
+cp "$tmp/spec.keep" "$tmp/spec.json"
+check "rm-file после смены спеки — удалён" "true" "$(ctl rm-file yt.lst | j removed)"
+# Временный файл, брошенный убитым обработчиком, сервер убирает при старте.
+: > "$L/.put-stale1"
+serve 0
+check "брошенный временный файл убран при старте сервера" "no" \
+    "$([ -e "$L/.put-stale1" ] && echo yes || echo no)"
+
+# ---- 8. настоящий apply, резолвер и откат -----------------------------------------------
 if [ "${CTLMATCH_INNER:-}" = 1 ] && [ -n "$real_nft" ] && ip link set lo up 2>/dev/null &&
    "$real_nft" add table inet ctlmatch_probe 2>/dev/null; then
     "$real_nft" delete table inet ctlmatch_probe
@@ -273,10 +374,104 @@ if [ "${CTLMATCH_INNER:-}" = 1 ] && [ -n "$real_nft" ] && ip link set lo up 2>/d
     check "explain после apply: адрес ушёл в выход vpn" "1" \
         "$(ctl explain 10.1.2.3 | j stdout | grep -c 'output "vpn"')"
 
+    # conns: записи conntrack с метками — своими правилами nft в своей таблице, как в
+    # tests/ctnl49.sh (метку выхода берём из реестра, раскладку поля не повторяем).
+    M=$((0x$(awk '$1 == "vpn" { print $2 }' "$tmp/state/registry")))
+    MASK=$(( M | (M << 1) | (M << 2) | (M << 3) | (M << 4) | (M << 5) | (M << 6) | (M << 7) ))
+    M2=$(( M * 2 ))                          # другое значение поля — выхода с ним в реестре нет
+    X=$(( 0x1234 ))                          # чужие биты вне поля (как у netd на телефоне)
+    hex() { printf '0x%08x' "$1"; }
+    "$real_nft" -f - <<N
+table inet ctt {
+    chain o {
+        type filter hook output priority 0;
+        udp dport { 41001, 41006 } ct mark set $(hex $M)
+        udp dport 41002 ct mark set $(hex $((M | X)))
+        udp dport 41003 ct mark set $(hex $M2)
+        udp dport 41004 ct mark set $(hex $X)
+        tcp dport 41010 ct mark set $(hex $M)
+    }
+}
+N
+    # 41006 — до включения счётчиков: у такой записи их нет и потом.
+    echo 0 > /proc/sys/net/netfilter/nf_conntrack_acct
+    python3 -c 'import socket; socket.socket(socket.AF_INET, socket.SOCK_DGRAM).sendto(b"x", ("127.0.0.1", 41006))'
+    echo 1 > /proc/sys/net/netfilter/nf_conntrack_acct
+    python3 - <<'PY' &
+import socket, time
+for p in (41001, 41002, 41003, 41004, 41005):
+    socket.socket(socket.AF_INET, socket.SOCK_DGRAM).sendto(b"x", ("127.0.0.1", p))
+socket.socket(socket.AF_INET6, socket.SOCK_DGRAM).sendto(b"x", ("::1", 41001))
+l = socket.socket(); l.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+l.bind(("127.0.0.1", 41010)); l.listen(1)
+c = socket.create_connection(("127.0.0.1", 41010)); a, _ = l.accept(); a.send(b"hello")
+time.sleep(5)
+PY
+    CPY=$!
+    sleep 0.5
+    cat > "$tmp/conns.py" <<'PY'
+import json, sys
+r = json.loads(sys.stdin.read())
+d = json.loads(r["stdout"])
+for c in sorted(d["conns"], key=lambda c: (c["family"], c["proto"], c.get("dport", 0))):
+    if c.get("dport", 0) < 41000 or c.get("dport", 0) > 41100: continue
+    f = [c["family"], c["proto"], str(c.get("dport")), c["out"] or "null", c.get("state", "-"),
+         "cnt" if "packets" in c and "reply_bytes" in c else "nocnt"]
+    print(" ".join(f))
+print("total=%d shown=%d truncated=%s" % (d["total"], d["shown"], d["truncated"]))
+PY
+    r="$(ctl conns)"
+    check "conns: код 0" "0" "$(printf '%s' "$r" | j code)"
+    out="$(printf '%s' "$r" | python3 "$tmp/conns.py")"
+    check "conns: только записи с полем метки движка, выход по реестру" \
+"ipv4 tcp 41010 vpn established cnt
+ipv4 udp 41001 vpn - cnt
+ipv4 udp 41002 vpn - cnt
+ipv4 udp 41003 null - cnt
+ipv4 udp 41006 vpn - nocnt
+ipv6 udp 41001 vpn - cnt" "$(printf '%s\n' "$out" | grep -v '^total')"
+    check "  без обрезки" "False" "$(printf '%s\n' "$out" | sed -n 's/.*truncated=//p')"
+    check "  адреса и порты исходного направления" "127.0.0.1 41001" \
+        "$(printf '%s' "$r" | j stdout | python3 -c 'import json,sys; c=[c for c in json.load(sys.stdin)["conns"] if c.get("dport")==41001 and c["family"]=="ipv4"][0]; print(c["dst"], c["dport"]) if c["src"]=="127.0.0.1" and c["sport"]>0 else print("-")')"
+    kill $CPY 2>/dev/null; wait $CPY 2>/dev/null
+    "$real_nft" delete table inet ctt
+
     "$BIN" dnsd --spec "$tmp/spec.json" --state-dir "$tmp/state" \
         --fakeip-state "$tmp/state/fakeip" 2>"$tmp/dnsd.err" &
     DNSD=$!
     wait_for '[ -s "$tmp/state/dnsd.sig" ]' 5
+    # dns-log: запросы по UDP и по TCP, регистр имени не важен; имя мимо каналов — channel null.
+    wait_for '[ -S "$tmp/state/dnsd.sock" ]' 5
+    cat > "$tmp/q.py" <<'PY'
+import socket, struct, sys, time
+def q(name, tcp):
+    m = struct.pack(">HHHHHH", 0x1234, 0x0100, 1, 0, 0, 0)
+    m += b"".join(bytes([len(p)]) + p.encode() for p in name.split(".")) + b"\0"
+    m += struct.pack(">HH", 1, 1)
+    if tcp:
+        s = socket.create_connection(("127.0.0.1", 5300), timeout=2)
+        s.sendall(struct.pack(">H", len(m)) + m)
+        time.sleep(0.3)
+        s.close()
+    else:
+        socket.socket(socket.AF_INET, socket.SOCK_DGRAM).sendto(m, ("127.0.0.1", 5300))
+for a in sys.argv[1:]:
+    t, n = a.split(":")
+    q(n, t == "tcp")
+PY
+    python3 "$tmp/q.py" udp:example.com udp:Example.COM tcp:example.com tcp:only-tcp.test udp:nomatch.test
+    sleep 0.3
+    r="$(ctl dns-log)"
+    check "dns-log: код 0, резолвер работает" "0 true" \
+        "$(printf '%s' "$r" | j code) $(printf '%s' "$r" | j stdout | j running)"
+    check "  имена с каналом, выходом и счётчиком (UDP и TCP вместе)" \
+"example.com d vpn 3
+nomatch.test null null 1
+only-tcp.test null null 1" \
+        "$(printf '%s' "$r" | j stdout | python3 -c 'import json,sys; [print(n["name"], n["channel"] or "null", n["out"] or "null", n["count"]) for n in sorted(json.load(sys.stdin)["names"], key=lambda n: n["name"])]')"
+    check "  last — секунды Unix, ago — возраст" "yes" \
+        "$(printf '%s' "$r" | j stdout | python3 -c 'import json,sys,time; print("yes" if all(abs(n["last"]-time.time())<60 and 0<=n["ago"]<60 for n in json.load(sys.stdin)["names"]) else "no")')"
+    check "  сокет журнала — только владельцу" "600" "$(stat -c %a "$tmp/state/dnsd.sock")"
     # Обновился только СОСТАВ списка (как после ночного обновления) — подпись та же: HUP.
     # Путь файла подсетей в подписи тоже есть (список может нести и домены, и подсети), поэтому
     # меняется содержимое, а не имя.
@@ -294,6 +489,7 @@ if [ "${CTLMATCH_INNER:-}" = 1 ] && [ -n "$real_nft" ] && ip link set lo up 2>/d
     wait_for '! kill -0 $DNSD 2>/dev/null' 5
     check "  резолвер получил TERM и вышел (поднимет init)" "no" \
         "$(kill -0 $DNSD 2>/dev/null && echo yes || echo no)"
+    check "  и убрал за собой сокет журнала" "no" "$([ -e "$tmp/state/dnsd.sock" ] && echo yes || echo no)"
     DNSD=""
 
     touch "$tmp/failnft"

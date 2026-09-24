@@ -31,6 +31,13 @@
 #      метка ДРУГОГО выхода (соседнее значение поля); только чужие биты; без метки. После
 #      отказа выхода сторожем обязаны исчезнуть первые две в каждом семействе и только они,
 #      а внешний conntrack — не зваться вовсе.
+#   3. Список соединений движка (`steer conns`, команда conns управляющего сокета) по тем же
+#      записям, до отказа выхода: в ответе записи с полем метки движка (метка выхода — с
+#      именем выхода, другое значение поля — с "out":null), без записей только с чужими
+#      битами и без метки; в сборке под Android — без собственного трафика движка (значение
+#      «все биты поля», STEER_SELF_MARK). Счётчики — только у записей, заведённых при
+#      включённом nf_conntrack_acct. Формат дампа у 4.9 свой (вложенные атрибуты без флага
+#      NLA_F_NESTED, счётчики с выравниванием на 4 байта) — ради этого пункт и идёт на 4.9.
 # Отказ выхода — настоящий: устройство выхода удаляется, и `steer failover` уводит выход в
 # on_fail=direct, где и снимаются его соединения (apply_failed в src/failover.c).
 set -u
@@ -109,13 +116,20 @@ nft -f - <<N
 table inet ctt {
     chain o {
         type filter hook output priority 0;
-        udp dport { 41001, 42001 } ct mark set $(hex $M)
+        udp dport { 41001, 42001, 41006 } ct mark set $(hex $M)
         udp dport { 41002, 42002 } ct mark set $(hex $((M | X)))
         udp dport { 41003, 42003 } ct mark set $(hex $M2)
         udp dport { 41004, 42004 } ct mark set $(hex $X)
+        udp dport 41007 ct mark set $(hex $MASK)
     }
 }
 N
+# 41006 заводится при выключенных счётчиках — у такой записи их нет и потом; остальные при
+# включённых (пункт 3).
+echo 0 > /proc/sys/net/netfilter/nf_conntrack_acct
+ctnl49-tool udp 127.0.0.1 41006
+echo 1 > /proc/sys/net/netfilter/nf_conntrack_acct
+ctnl49-tool udp 127.0.0.1 41007
 for p in 1 2 3 4 5; do
     ctnl49-tool udp 127.0.0.1 4100$p
     ctnl49-tool udp ::1 4200$p
@@ -133,6 +147,37 @@ check "до: v6 метка выхода + netd" "$(hex $((M | X)))" "$(mark_of v
 check "до: v6 другой выход"        "$(hex $M2)"         "$(mark_of v6 42003)"
 check "до: v6 только netd"         "$(hex $X)"          "$(mark_of v6 42004)"
 check "до: v6 без метки"           "0x00000000"         "$(mark_of v6 42005)"
+
+# --- 3. список соединений движка -------------------------------------------------------------
+# conn_of СЕМЕЙСТВО ПОРТ — «выход счётчики» записи из ответа `steer conns` или «нет». Объекты
+# в ответе плоские, поэтому разбор — по «}», без разборщика JSON (его в ВМ нет).
+steer conns $S > "$T/conns.json" 2>"$T/conns.err"
+check "conns: код 0" "0" "$?"
+conn_of() {
+    tr '}' '\n' < "$T/conns.json" | grep "\"family\":\"$1\"" | grep "\"dport\":$2," | head -1 |
+        sed -n 's/.*"out":\([^,]*\).*/\1/p; ' | tr -d '"' | grep . || { echo нет; return; }
+}
+cnt_of() {
+    tr '}' '\n' < "$T/conns.json" | grep "\"family\":\"$1\"" | grep "\"dport\":$2," | head -1 |
+        grep -q '"packets":1,"bytes":[0-9]*,"reply_packets":0' && echo есть || echo нет
+}
+check "conns: v4 метка выхода — выход vpn"         "vpn"  "$(conn_of ipv4 41001)"
+check "conns: v4 метка выхода + netd — выход vpn"  "vpn"  "$(conn_of ipv4 41002)"
+check "conns: v4 другое значение поля — out null"  "null" "$(conn_of ipv4 41003)"
+check "conns: v4 только чужие биты — нет"          "нет"  "$(conn_of ipv4 41004)"
+check "conns: v4 без метки — нет"                  "нет"  "$(conn_of ipv4 41005)"
+check "conns: v6 метка выхода — выход vpn"         "vpn"  "$(conn_of ipv6 42001)"
+check "conns: v6 другое значение поля — out null"  "null" "$(conn_of ipv6 42003)"
+check "conns: v6 без метки — нет"                  "нет"  "$(conn_of ipv6 42005)"
+check "conns: счётчики у записи при включённом acct" "есть" "$(cnt_of ipv4 41001)"
+check "conns: без acct — поля счётчиков нет"       "нет"  "$(cnt_of ipv4 41006)"
+check "conns: запись без счётчиков всё же в ответе" "vpn" "$(conn_of ipv4 41006)"
+if [ -n "${VM49:-}" ]; then
+    check "conns: собственный трафик движка (все биты поля) — нет" "нет" "$(conn_of ipv4 41007)"
+fi
+check "conns: адреса исходного направления" "1" \
+    "$(tr '}' '\n' < "$T/conns.json" | grep -c '"src":"127.0.0.1","sport":[0-9]*,"dst":"127.0.0.1","dport":41001,')"
+check "conns: без обрезки" "1" "$(grep -c '"truncated":false' "$T/conns.json")"
 
 ip link del wg9
 steer failover $S >"$T/fo2.log" 2>&1
