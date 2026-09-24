@@ -155,7 +155,12 @@ check "пир видит рукопожатие (сторона wg)" "1" "$($P w
 # ---- 3. сторож: здоровье по рукопожатию, без проб ---------------------------------------
 "$BIN" failover $S >/dev/null 2>&1
 check "сторож: выход жив, маршрут на месте" "1" "$(ip route show table all | grep -c '^default dev nl table')"
-check "сторож: без blackhole" "0" "$(ip route show table all | grep -c 'blackhole default')"
+# Запасной запрет (blackhole с метрикой STEER_BACKSTOP_METRIC) лежит у выхода с drop всегда и
+# запретом в таблице не считается — проверки ниже смотрят на основной, без метрики.
+nobs() { grep -v ' metric 65535'; }
+check "сторож: без blackhole" "0" "$(ip route show table all | nobs | grep -c 'blackhole default')"
+check "запасной запрет у выхода с drop на месте" "1" \
+      "$(ip route show table all | grep -c 'blackhole default.* metric 65535')"
 
 # ---- 4. смена файла — перенастройка без пересоздания ------------------------------------
 idx="$(cat /sys/class/net/nl/ifindex)"
@@ -193,7 +198,7 @@ check "отказ назван" "1" "$(printf '%s\n' "$err" | grep -c 'нет м
 check "устройство nl2 не создано" "0" "$(ip link show nl2 2>/dev/null | grep -c nl2)"
 check "устройство выхода, убранного из спеки, снято" "0" "$(ip link show nl 2>/dev/null | grep -c 'nl:')"
 check "таблица выхода без устройства — blackhole (on_fail=drop)" "1" \
-      "$(ip route show table all | grep -c 'blackhole default')"
+      "$(ip route show table all | nobs | grep -c 'blackhole default')"
 
 # ---- 6. имя, выдающее туннель, заменяется ------------------------------------------------
 mkconf ""
@@ -253,7 +258,7 @@ check "via: ux жив — nl в работе" "1" "$(ip route show table "$nltab
 ip link set ux0 down
 "$BIN" failover $S >"$tmp/fo.out" 2>&1
 check "via: ux лёг — nl объявлен нерабочим" "1" "$(grep -c 'выход nl: идёт через ux' "$tmp/fo.out")"
-check "via: у nl blackhole" "1" "$(ip route show table "$nltable" | grep -c blackhole)"
+check "via: у nl blackhole" "1" "$(ip route show table "$nltable" | nobs | grep -c blackhole)"
 ip link set ux0 up
 "$BIN" failover $S >"$tmp/fo.out" 2>&1
 check "via: ux ожил — nl вернулся" "1" "$(ip route show table "$nltable" | grep -c 'default dev nl')"

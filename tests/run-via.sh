@@ -218,7 +218,8 @@ inA "$BIN" failover --spec "$WORK/spec.json" --state-dir "$WORK/state" > "$WORK/
 if grep -q 'выход vl: идёт через vx, а тот не работает' "$WORK/fo2.log"; then
     ok "сторож: vx лёг — vl объявлен нерабочим"; else bad "сторож не связал отказ vl с vx"; sed 's/^/    /' "$WORK/fo2.log"; fi
 tbl=$(awk '$1=="vl"{print $3}' "$WORK/state/registry")
-if inA ip route show table "$tbl" | grep -q blackhole; then
+# Основной запрет, а не запасной (blackhole с метрикой 65535 у выхода с drop лежит всегда).
+if inA ip route show table "$tbl" | grep -v ' metric 65535' | grep -q blackhole; then
     ok "on_fail=drop у vl: blackhole в его таблице"; else bad "у vl нет blackhole"; fi
 inA ip link set vx0 up
 inA "$BIN" failover --spec "$WORK/spec.json" --state-dir "$WORK/state" > "$WORK/fo3.log" 2>&1 || true

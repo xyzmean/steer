@@ -254,6 +254,22 @@ static void facts_cases(void) {
                        "default dev vl\n", 0x100000, 300);
     check("прежняя форма без маски не своя", f.rule, 0);
 
+    /* Запасной запрет (STEER_BACKSTOP_METRIC) лежит у живого выхода с drop всегда — это не
+     * «запрет в таблице». Один он остаётся, когда ядро вычистило маршрут исчезнувшего
+     * устройства: живому выходу это не годится (надо привязать заново), отказу drop — годится
+     * (трафик и так стоит). */
+    f = route_facts_of(RULES_WITH, "default dev vl scope link \nblackhole default metric 65535 \n",
+                       0x100000, 300);
+    check("запасной запрет рядом с устройством — таблица на устройстве", f.table == TBL_DEV, 1);
+    check("запасной запрет замечен", f.backstop, 1);
+    check("запасной запрет не мешает живому выходу", routing_live_ok(&f, "vl"), 1);
+    f = route_facts_of(RULES_WITH, "blackhole default metric 65535 \n", 0x100000, 300);
+    check("один запасной запрет — маршрута в устройство нет", f.table == TBL_EMPTY, 1);
+    check("один запасной запрет не годится живому выходу", routing_live_ok(&f, "vl"), 0);
+    check("один запасной запрет годится отказу drop", routing_failed_ok(&f, FAIL_DROP), 1);
+    f = route_facts_of(RULES_WITH, "blackhole default metric 655350 \n", 0x100000, 300);
+    check("метрика по префиксу — не запасной запрет", f.backstop, 0);
+
     /* Своя метка, но правило смотрит в другую таблицу — правило пересоздать. */
     f = route_facts_of("32764:\tfrom all fwmark 0x100000 lookup 305\n",
                        "default dev vl\n", 0x100000, 300);
@@ -692,6 +708,49 @@ int main(void) {
           cmd_at("ip route del default dev nodev0 table 300"), 1);
     check("отказ drop: правило не снимается",
           cmd_seen("ip rule del fwmark 0x00100000/0x0ff00000"), 0);
+
+    /* 9c. ЗАПАСНОЙ ЗАПРЕТ у выхода с on_fail=drop: ставится ПЕРВЫМ при привязке и не
+     *     снимается прополкой таблицы; у direct — снимается. Исчезни устройство (помощник
+     *     умер, awg пересоздаётся) — ядро вычистит маршрут в него, а запрет останется, и
+     *     помеченное не утечёт в main. Живая проверка — сценарий 5 tests/rebindleak.sh. */
+    out_set("lo", FAIL_DROP);
+    state_write("active", "vl old0\n");
+    tick(RULES_WITH, "default dev old0 scope link \nblackhole default metric 65535 \n");
+    check("drop: запасной запрет ставится",
+          cmd_seen("ip route replace blackhole default metric 65535 table 300"), 1);
+    check("drop: запасной запрет — раньше маршрута",
+          cmd_at("ip route replace blackhole default metric 65535 table 300") <
+          cmd_at("ip route replace default dev lo table 300"), 1);
+    check("drop: прополка запасной запрет не снимает",
+          cmd_seen("ip route del blackhole default metric 65535"), 0);
+    out_set("lo", FAIL_DIRECT);
+    state_write("active", "vl old0\n");
+    tick(RULES_WITH, "default dev old0 scope link \nblackhole default metric 65535 \n");
+    check("direct: запасной запрет не ставится",
+          cmd_seen("ip route replace blackhole default metric"), 0);
+    check("direct: оставшийся от drop запасной запрет снят",
+          cmd_seen("ip route del blackhole default metric 65535 table 300"), 1);
+    /* Маршрутизация цела, а запасного запрета нет (таблицу ставил движок до него) — он
+     * возвращается одной командой, без перепривязки и без снятия соединений. */
+    out_set("lo", FAIL_DROP);
+    state_write("active", "vl lo\n");
+    tick(RULES_WITH, "default dev lo scope link \n");
+    check("целая таблица без запасного запрета — запрет возвращён",
+          cmd_seen("ip route replace blackhole default metric 65535 table 300"), 1);
+    check("  без перепривязки", cmd_seen("ip route replace default dev"), 0);
+    check("  и без снятия соединений", cmd_seen("ctnl evict"), 0);
+    /* Отказ drop, в таблице один запасной запрет (устройство исчезло, ядро вычистило маршрут) —
+     * трафик и так стоит, сторож ничего не переписывает. */
+    out_set("nodev0", FAIL_DROP);
+    state_write("active", "vl -\n");
+    {
+        char stamp[32];
+        snprintf(stamp, sizeof(stamp), "%ld\n", (long)time(NULL));
+        state_write("restart-nodev0", stamp);
+    }
+    tick(RULES_WITH, "blackhole default metric 65535 \n");
+    check("отказ drop на запасном запрете — таблица не трогается",
+          cmd_seen("ip route replace"), 0);
 
     /* Контроль к проверке 1a: на тике, где состояние целое и менять нечего, соединения
      * трогать НЕЛЬЗЯ. Снятие записи установленного соединения — это разрыв закачки для

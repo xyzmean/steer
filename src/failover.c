@@ -703,10 +703,11 @@ static int rt_line_parse(const char *line, struct rt_line *r) {
 }
 
 /* Снять из таблицы всё, кроме одного маршрута по умолчанию — того, что только что поставлен
- * заменой (в dev, а при dev == NULL — запрет). Снимается каждая запись по её ключу (тип,
+ * заменой (в dev, а при dev == NULL — запрет), — и запасного запрета, если он положен
+ * (backstop; см. STEER_BACKSTOP_METRIC в spec.h). Снимается каждая запись по её ключу (тип,
  * назначение, устройство, метрика): «сбросить таблицу и поставить заново» здесь и есть то
  * окно, от которого эта функция избавляет. */
-static void table_prune(int table, const char *dev) {
+static void table_prune(int table, const char *dev, int backstop) {
     static char routes[8192];
     char cmd[64], t[16];
     snprintf(cmd, sizeof(cmd), "ip -4 route show table %d 2>/dev/null", table);
@@ -728,6 +729,9 @@ static void table_prune(int table, const char *dev) {
                       (dev ? (!r.type[0] || !strcmp(r.type, "unicast")) && !strcmp(r.dev, dev)
                            : !strcmp(r.type, "blackhole"));
         if (is_main && !kept) { kept = 1; continue; }
+        int is_backstop = !strcmp(r.dst, "default") && !strcmp(r.type, "blackhole") &&
+                          r.metric == STEER_BACKSTOP_METRIC;
+        if (is_backstop && backstop) { backstop = 0; continue; }
         char m[24];
         snprintf(m, sizeof(m), "%lu", r.metric);
         const char *argv[16];
@@ -743,14 +747,31 @@ static void table_prune(int table, const char *dev) {
     }
 }
 
+/* Поставить запасной запрет (см. STEER_BACKSTOP_METRIC в spec.h). Заменой: стоящий такой же
+ * она не дублирует. */
+static void backstop_set(int table) {
+    char t[16], m[16];
+    snprintf(t, sizeof(t), "%d", table);
+    snprintf(m, sizeof(m), "%d", STEER_BACKSTOP_METRIC);
+    const char *bs[] = { "ip", "route", "replace", "blackhole", "default", "metric", m,
+                         "table", t, NULL };
+    run_quiet(bs);
+}
+
 int table_bind(const struct output *o, const char *dev) {
     char t[16];
     snprintf(t, sizeof(t), "%d", o->table);
+    /* Запасной запрет — ПЕРВЫМ: с этого мгновения исчезновение устройства (помощник умер, awg
+     * пересоздаётся) оставляет в таблице запрет, а не пустоту. */
+    int backstop = o->on_fail == FAIL_DROP;
+    if (backstop) backstop_set(o->table);
     const char *to_dev[] = { "ip", "route", "replace", "default", "dev", dev, "table", t, NULL };
     const char *to_bh[] = { "ip", "route", "replace", "blackhole", "default", "table", t, NULL };
     int rc = run_quiet(dev ? to_dev : to_bh);
     if (rc != 0) return rc;
-    table_prune(o->table, dev);
+    /* Без on_fail=drop запасной запрет снимается здесь же: режим мог смениться с drop, а
+     * пустая таблица у direct/zapret — обещанное «напрямую», а не утечка. */
+    table_prune(o->table, dev, backstop);
     return 0;
 }
 
@@ -956,6 +977,7 @@ struct route_facts {
     int rule;             /* правило `fwmark <метка> table <таблица>` в ядре есть */
     enum tbl_state table;
     char dev[32];         /* устройство из default, когда table == TBL_DEV */
+    int backstop;         /* запасной запрет (STEER_BACKSTOP_METRIC) на месте */
 };
 
 /* Разбор дословного вывода `ip rule show` и `ip route show table N`.
@@ -971,6 +993,7 @@ static struct route_facts route_facts_of(const char *rules, const char *routes,
     f.rule = 0;
     f.table = TBL_EMPTY;
     f.dev[0] = '\0';
+    f.backstop = 0;
     if (!f.known) return f;
 
     char want_tbl[16];
@@ -1042,6 +1065,19 @@ static struct route_facts route_facts_of(const char *rules, const char *routes,
                       !strncmp(p, "prohibit ", 9);
         if (blocked) {
             if (!strstr(p, "default")) continue;
+            /* Запасной запрет — не «запрет в таблице»: он лежит у живого выхода всегда (см.
+             * STEER_BACKSTOP_METRIC в spec.h), и счесть его запретом значило бы объявлять
+             * разъехавшейся каждую исправную таблицу. */
+            {
+                char bm[32];
+                snprintf(bm, sizeof(bm), " metric %d", STEER_BACKSTOP_METRIC);
+                const char *mp = strstr(p, bm);
+                if (mp && (mp[strlen(bm)] == '\0' || mp[strlen(bm)] == ' ' ||
+                           mp[strlen(bm)] == '\t')) {
+                    f.backstop = 1;
+                    continue;
+                }
+            }
             f.table = TBL_BLACKHOLE;
             f.dev[0] = '\0';
             continue;
@@ -1068,7 +1104,10 @@ static int routing_live_ok(const struct route_facts *f, const char *dev) {
  * drop требует и правила, и запрета в таблице: запрет без правила — это утечка напрямую
  * (таблицу никто не спрашивает), правило без запрета — трафик в мёртвый туннель. */
 static int routing_failed_ok(const struct route_facts *f, enum on_fail of) {
-    if (of == FAIL_DROP) return f->rule && f->table == TBL_BLACKHOLE;
+    /* Запрет — основной или только запасной: второе остаётся, когда ядро вычистило маршрут
+     * исчезнувшего устройства, и трафик при нём стоит ровно так же. */
+    if (of == FAIL_DROP)
+        return f->rule && (f->table == TBL_BLACKHOLE || (f->table == TBL_EMPTY && f->backstop));
     return !f->rule;
 }
 
@@ -1093,7 +1132,8 @@ static const char *facts_why(const struct route_facts *f, const char *dev) {
     if (!f->rule) return "правила fwmark нет";
     switch (f->table) {
     case TBL_EMPTY:
-        return "таблица пуста — помеченный трафик уходил напрямую";
+        return f->backstop ? "маршрута в устройство нет — трафик стоял на запасном запрете"
+                           : "таблица пуста — помеченный трафик уходил напрямую";
     case TBL_BLACKHOLE:
         return "в таблице остался запрет (blackhole)";
     case TBL_OTHER:
@@ -1687,8 +1727,12 @@ int cmd_failover(const char *spec, int verbose) {
                             o->name, chosen, facts_why(&f, chosen));
                     bind_device(o, chosen);
                     changed = 1;
-                } else if (verbose) {
-                    fprintf(stderr, LOG_I "%s: %s работает\n", o->name, chosen);
+                } else {
+                    /* Маршрутизация цела, но у выхода с drop пропал запасной запрет (его снял
+                     * кто-то снаружи, или таблицу ставил движок до этой версии). Возвращается
+                     * одной командой, без перепривязки: соединения рвать не из-за чего. */
+                    if (o->on_fail == FAIL_DROP && !f.backstop) backstop_set(o->table);
+                    if (verbose) fprintf(stderr, LOG_I "%s: %s работает\n", o->name, chosen);
                 }
             }
         } else {

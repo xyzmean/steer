@@ -147,7 +147,10 @@ check "status: endpoint" "192.0.2.2:51820" "$(field endpoint)"
 # ---- 3. сторож -------------------------------------------------------------------------
 steer failover $S >$T/fo.out 2>&1
 check "сторож: маршрут выхода на месте" "1" "$(ip route show table all | grep -c '^default dev nl table')"
-check "сторож: без blackhole" "0" "$(ip route show table all | grep -c 'blackhole')"
+# Запасной запрет (blackhole с метрикой STEER_BACKSTOP_METRIC) у выхода с drop лежит всегда и
+# запретом в таблице не считается — проверки смотрят на основной, без метрики.
+nobs() { grep -v ' metric 65535'; }
+check "сторож: без blackhole" "0" "$(ip route show table all | nobs | grep -c 'blackhole')"
 
 # ---- 4. смена файла поверх --------------------------------------------------------------
 idx="$(cat /sys/class/net/nl/ifindex)"
@@ -209,7 +212,7 @@ check "via: ux жив — nl в работе" "1" "$(ip route show table "$nlt" 
 ip link set ux0 down
 steer failover $S >$T/fo5.out 2>&1
 check "via: ux лёг — nl объявлен нерабочим" "1" "$(grep -c 'выход nl: идёт через ux' $T/fo5.out)"
-check "via: у nl blackhole" "1" "$(ip route show table "$nlt" | grep -c blackhole)"
+check "via: у nl blackhole" "1" "$(ip route show table "$nlt" | nobs | grep -c blackhole)"
 ip link set ux0 up
 steer failover $S >$T/fo5.out 2>&1
 check "via: ux ожил — nl вернулся" "1" "$(ip route show table "$nlt" | grep -c 'default dev nl')"
