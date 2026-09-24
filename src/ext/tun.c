@@ -36,6 +36,7 @@
 #include <sys/uio.h>
 
 #include "tun.h"
+#include "../paths.h"
 
 /* Заголовок разгрузки virtio, тот самый, который принимает IFF_VNET_HDR.
  *
@@ -72,12 +73,12 @@ typedef char vnet_hdr_size_check[sizeof(struct vnet_hdr) == VNET_HDR_LEN ? 1 : -
  * а причина нужна именно от ПЕРВОЙ — она отвечает на вопрос «почему устройства нет вовсе»,
  * тогда как последняя расскажет лишь про отказ от последнего украшения. */
 static int g_open_errno;
-static int g_open_stage;      /* 1 — не открылся /dev/net/tun, 2 — отказал TUNSETIFF,
+static int g_open_stage;      /* 1 — не открылся узел TUN, 2 — отказал TUNSETIFF,
                                  3 — ядро создало устройство с другим именем */
 static char g_open_got[IFNAMSIZ];   /* имя, которое вернуло ядро при stage 3 */
 
 static int queue_open(const char *name, short flags) {
-    int fd = open("/dev/net/tun", O_RDWR);
+    int fd = open(STEER_TUN_DEV, O_RDWR);
     if (fd < 0) {
         if (!g_open_errno) { g_open_errno = errno; g_open_stage = 1; }
         return -1;
@@ -210,7 +211,7 @@ int tun_open(struct tun_dev *d, int max_queues, const char *name) {
      * ни строки, и «туннель не поднялся» выглядело как «туннель просто не работает». */
     if (g_open_stage == 1 && (g_open_errno == ENOENT || g_open_errno == ENXIO ||
                               g_open_errno == ENODEV)) {
-        fprintf(stderr, "steer[warn] tunnel: нет /dev/net/tun (%s) — не установлен kmod-tun\n",
+        fprintf(stderr, "steer[warn] tunnel: нет " STEER_TUN_DEV " (%s) — " STEER_TUN_HINT "\n",
                 strerror(g_open_errno));
         return TUN_ENODEV;
     }
@@ -223,7 +224,7 @@ int tun_open(struct tun_dev *d, int max_queues, const char *name) {
     }
     fprintf(stderr, "steer[warn] tunnel: устройство %s не создалось: %s (%s)\n", name,
             strerror(g_open_errno ? g_open_errno : EINVAL),
-            g_open_stage == 1 ? "не открылся /dev/net/tun" : "отказал TUNSETIFF");
+            g_open_stage == 1 ? "не открылся " STEER_TUN_DEV : "отказал TUNSETIFF");
     return TUN_ESETUP;
 }
 

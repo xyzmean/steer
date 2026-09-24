@@ -47,4 +47,18 @@
 #endif
 #endif
 
+/* ---- узел TUN ---------------------------------------------------------------------------
+ *
+ * На Android ueventd создаёт его как /dev/tun (system/core/rootdir/ueventd.rc: «/dev/tun 0660
+ * system vpn», метка tun_device), а /dev/net/tun там нет вовсе: открытие по роутерному пути
+ * кончалось ENOENT, то есть «нет модуля tun» на ядре, где он встроен. Подсказка при отказе
+ * тоже своя: kmod-tun — это пакет OpenWrt, на телефоне ставить нечего, TUN даёт ядро прошивки. */
+#ifdef STEER_ANDROID
+#define STEER_TUN_DEV  "/dev/tun"
+#define STEER_TUN_HINT "в ядре прошивки нет CONFIG_TUN"
+#else
+#define STEER_TUN_DEV  "/dev/net/tun"
+#define STEER_TUN_HINT "не установлен kmod-tun"
+#endif
+
 #endif

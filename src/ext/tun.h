@@ -6,7 +6,7 @@
 #include <stddef.h>
 #include <sys/types.h>
 
-#define TUN_ENODEV (-40)   /* нет /dev/net/tun — не установлен kmod-tun */
+#define TUN_ENODEV (-40)   /* нет узла TUN (STEER_TUN_DEV в paths.h) */
 #define TUN_ESETUP (-41)
 
 struct flow_key {

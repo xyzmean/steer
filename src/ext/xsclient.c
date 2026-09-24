@@ -306,7 +306,7 @@ static int tun_up_queues(struct spoke *s, struct tun_dev *q, int want, const cha
                          int managed) {
     int n = tun_open(q, want, dev);
     if (n < 0) {
-        fprintf(stderr, LOG_W "нет /dev/net/tun — установите kmod-tun\n");
+        fprintf(stderr, LOG_W "нет " STEER_TUN_DEV " — " STEER_TUN_HINT "\n");
         return -1;
     }
     s->tun = q[0];

@@ -362,6 +362,85 @@ static int dial(const char *host, uint16_t port, int timeout_s) {
  * проверяемый. Стенду же нужна ровно подмена на время процесса, и она здесь (R-118). */
 static const char *g_cert_roots;
 
+/* КОРНИ НА ТЕЛЕФОНЕ. certverify.c читает хранилище ОДНИМ файлом PEM — так его кладёт пакет
+ * ca-bundle на роутере. У Android такого файла нет: корни лежат каталогом, по сертификату на
+ * файл (текст `openssl x509 -text` и PEM за ним), и с Android 14 основная копия — в APEX
+ * conscrypt, который обновляется через mainline отдельно от прошивки; /system/etc/security/
+ * cacerts остаётся запасной. Без склейки проверка security=tls на телефоне кончалась бы
+ * «хранилище корней не прочиталось» у каждого узла.
+ *
+ * Склеивается при первом TLS-соединении процесса, в файл состояния, и отдаётся certverify
+ * тем же швом, что и стенду (auth.roots): так сам certverify.c (защищённый путь) не меняется
+ * вовсе. Каталог читается живым, а не снимком на сборке, — иначе обновление корней через
+ * mainline до движка не доходило бы. Текст между сертификатами разбору не мешает:
+ * mbedtls_x509_crt_parse ищет в буфере границы BEGIN/END и всё вне их пропускает.
+ *
+ * Корни, выключенные человеком в настройках Android (cacerts-removed), здесь не учитываются:
+ * движок доверяет системному набору, а не выбору пользователя в Java-хранилище. */
+#ifdef STEER_ANDROID
+#include <dirent.h>
+#include <pthread.h>
+#include "../paths.h"
+
+static char g_android_roots[512];
+static pthread_once_t g_android_roots_once = PTHREAD_ONCE_INIT;
+
+/* Каталоги по порядку предпочтения: первый, где нашёлся хоть один файл, и есть хранилище.
+ * Макросом — чтобы стенд (tests/androidroots.c) подставил свои. */
+#ifndef STEER_ANDROID_CA_DIRS
+#define STEER_ANDROID_CA_DIRS "/apex/com.android.conscrypt/cacerts", "/system/etc/security/cacerts"
+#endif
+
+static void android_roots_build(void) {
+    static const char *const dirs[] = { STEER_ANDROID_CA_DIRS };
+    char final[400], tmp[420];
+    snprintf(final, sizeof final, "%s/ca-roots.pem", STEER_STATE_DIR);
+    snprintf(tmp, sizeof tmp, "%s.XXXXXX", final);
+    for (size_t k = 0; k < sizeof dirs / sizeof dirs[0]; k++) {
+        DIR *d = opendir(dirs[k]);
+        if (!d) continue;
+        int fd = mkstemp(tmp);
+        FILE *out = fd >= 0 ? fdopen(fd, "w") : NULL;
+        if (!out) {
+            if (fd >= 0) { close(fd); unlink(tmp); }
+            closedir(d);
+            return;
+        }
+        int n = 0;
+        struct dirent *e;
+        while ((e = readdir(d)) != NULL) {
+            if (e->d_name[0] == '.') continue;
+            char p[512];
+            snprintf(p, sizeof p, "%s/%s", dirs[k], e->d_name);
+            FILE *in = fopen(p, "rb");
+            if (!in) continue;
+            char buf[4096];
+            size_t got;
+            while ((got = fread(buf, 1, sizeof buf, in)) > 0) fwrite(buf, 1, got, out);
+            fputc('\n', out);
+            fclose(in);
+            n++;
+        }
+        closedir(d);
+        if (fclose(out) != 0 || n == 0 || rename(tmp, final) != 0) {
+            unlink(tmp);
+            snprintf(tmp, sizeof tmp, "%s.XXXXXX", final);   /* mkstemp съел шаблон */
+            continue;
+        }
+        snprintf(g_android_roots, sizeof g_android_roots, "%s", final);
+        return;
+    }
+}
+
+static const char *cert_roots(void) {
+    if (g_cert_roots) return g_cert_roots;
+    pthread_once(&g_android_roots_once, android_roots_build);
+    return g_android_roots[0] ? g_android_roots : NULL;
+}
+#else
+static const char *cert_roots(void) { return g_cert_roots; }
+#endif
+
 /* Поднять вторую связь — под выгрузку. Тот же путь установления, что и у первой: TCP, и
  * дальше либо ничего (security=none), либо Reality, либо обычный TLS с проверкой. */
 static int up_connect(struct vless_conn *c, const struct vless_node *n, int timeout_s) {
@@ -401,7 +480,7 @@ static int up_connect(struct vless_conn *c, const struct vless_node *n, int time
     }
 
     struct tls13_auth auth = { 0 };
-    if (is_tls) { auth.host = verify_host; auth.roots = g_cert_roots; }
+    if (is_tls) { auth.host = verify_host; auth.roots = cert_roots(); }
     else        auth.reality_key = rst.authkey;
 
     rc = tls13_handshake_auth(&u->tls, fd, hello, hello_n, rst.priv, &auth);
@@ -806,7 +885,7 @@ int vless_connect(const struct vless_node *node, struct vless_conn *conn, int ti
      * У обычного TLS это цепочка и имя, у Reality — HMAC в поле подписи временного
      * сертификата на ключе, который есть только у владельца постоянной пары. */
     struct tls13_auth auth = { 0 };
-    if (is_tls) { auth.host = verify_host; auth.roots = g_cert_roots; }
+    if (is_tls) { auth.host = verify_host; auth.roots = cert_roots(); }
     else        auth.reality_key = conn->rst.authkey;
 
     rc = tls13_handshake_auth(&conn->tls, fd, hello, hello_n, conn->rst.priv, &auth);
