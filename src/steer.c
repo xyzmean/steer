@@ -843,8 +843,13 @@ static void counters_load(void) {
     /* Обе цепочки за один вызов: раздельные popen дали бы счётчики, снятые в разные моменты,
      * и «отдано больше, чем скачано» на глазах у человека объяснялось бы не маршрутизацией,
      * а нашей ленью. */
-    FILE *nft = popen("nft -a list chain inet steer prerouting_mark 2>/dev/null; "
-                      "nft -a list chain inet steer postrouting_down 2>/dev/null", "r");
+    /* Таблица — своя у каждой сборки (nft_table): у мини-сборки моста это inet stgws, и с
+     * жёстким «inet steer» её счётчики через apply не переносились. */
+    char cmd[256];
+    snprintf(cmd, sizeof(cmd),
+             "nft -a list chain inet %s prerouting_mark 2>/dev/null; "
+             "nft -a list chain inet %s postrouting_down 2>/dev/null", nft_table(), nft_table());
+    FILE *nft = popen(cmd, "r");
     if (!nft) return;
     char line[1024];
     while (fgets(line, sizeof(line), nft)) {
