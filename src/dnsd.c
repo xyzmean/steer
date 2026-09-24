@@ -1749,6 +1749,29 @@ static void reply_client(const void *b, size_t n, const struct sockaddr_storage 
     sendmsg(g_listen_fd, &mh, 0);
 }
 
+/* Атрибут ctnetlink по типу — среди атрибутов [p, end) или внутри вложенного `in`.
+ *
+ * Общий разбор для двух разговоров с conntrack: исходного назначения (ниже) и снятия записей
+ * выхода (ctnl_evict_mark). Каждая граница сверяется ДО чтения: ответ ядра — это чужие байты,
+ * и атрибут с длиной больше остатка сообщения (или меньше заголовка) — конец разбора, а не
+ * чтение за край буфера. Тип сравнивается без флагов: есть ли у вложенного атрибута флаг
+ * NLA_F_NESTED, зависит от версии ядра, а смысл у атрибута один. NULL на входе даёт NULL: так
+ * цепочка «кортеж → IP → адрес» пишется подряд, без проверки на каждом шаге. */
+static const struct nlattr *ct_attr(const uint8_t *p, const uint8_t *end, int type) {
+    if (!p) return NULL;
+    while (p + NLA_HDRLEN <= end) {
+        const struct nlattr *x = (const struct nlattr *)p;
+        if (x->nla_len < NLA_HDRLEN || p + x->nla_len > end) return NULL;
+        if ((x->nla_type & NLA_TYPE_MASK) == type) return x;
+        p += NLA_ALIGN(x->nla_len);
+    }
+    return NULL;
+}
+static const struct nlattr *ct_attr_in(const struct nlattr *in, int type) {
+    if (!in) return NULL;
+    return ct_attr((const uint8_t *)in + NLA_HDRLEN, (const uint8_t *)in + in->nla_len, type);
+}
+
 /* Исходное назначение запроса из conntrack. 0 — найдено (out заполнен), -1 — нет.
  *
  * Семейство — по клиенту: IPv4 (в том числе v4-mapped у двойного стека) ищется в AF_INET,
@@ -1841,45 +1864,28 @@ static int ct_origdst(const struct sockaddr_storage *cli, const struct dnsd_loca
             if (h->nlmsg_type == NLMSG_ERROR) return -1; /* записи нет — ENOENT */
             if (h->nlmsg_len < NLMSG_LENGTH(sizeof(struct nfgenmsg))) return -1;
             /* Верхний уровень: CTA_TUPLE_ORIG (в нём IP и порт назначения) и CTA_MARK. */
-            uint8_t *a = (uint8_t *)NLMSG_DATA(h) + NLMSG_ALIGN(sizeof(struct nfgenmsg));
-            uint8_t *end = (uint8_t *)h + h->nlmsg_len;
+            const uint8_t *a = (const uint8_t *)NLMSG_DATA(h) + NLMSG_ALIGN(sizeof(struct nfgenmsg));
+            const uint8_t *end = (const uint8_t *)h + h->nlmsg_len;
+            const struct nlattr *cm = ct_attr(a, end, CTA_MARK);
+            if (cm && cm->nla_len >= NLA_HDRLEN + 4) {
+                uint32_t m;
+                memcpy(&m, (const uint8_t *)cm + NLA_HDRLEN, 4);
+                *mark = ntohl(m);
+                *have_mark = 1;
+            }
+            const struct nlattr *orig = ct_attr(a, end, CTA_TUPLE_ORIG);
+            const struct nlattr *tip = ct_attr_in(orig, CTA_TUPLE_IP);
+            const struct nlattr *tpr = ct_attr_in(orig, CTA_TUPLE_PROTO);
+            const struct nlattr *dst = ct_attr_in(tip, dst_attr);
+            const struct nlattr *dpt = ct_attr_in(tpr, CTA_PROTO_DST_PORT);
             uint8_t oaddr[16];
             uint16_t oport = 0;
             int got_ip = 0, got_port = 0;
-            for (struct nlattr *x = (struct nlattr *)a; (uint8_t *)x + NLA_HDRLEN <= end &&
-                 x->nla_len >= NLA_HDRLEN && (uint8_t *)x + x->nla_len <= end;
-                 x = (struct nlattr *)((uint8_t *)x + NLA_ALIGN(x->nla_len))) {
-                if ((x->nla_type & NLA_TYPE_MASK) == CTA_MARK && x->nla_len >= NLA_HDRLEN + 4) {
-                    uint32_t m;
-                    memcpy(&m, (uint8_t *)x + NLA_HDRLEN, 4);
-                    *mark = ntohl(m);
-                    *have_mark = 1;
-                    continue;
-                }
-                if ((x->nla_type & NLA_TYPE_MASK) != CTA_TUPLE_ORIG) continue;
-                uint8_t *xe = (uint8_t *)x + x->nla_len;
-                for (struct nlattr *y = (struct nlattr *)((uint8_t *)x + NLA_HDRLEN);
-                     (uint8_t *)y + NLA_HDRLEN <= xe && y->nla_len >= NLA_HDRLEN &&
-                     (uint8_t *)y + y->nla_len <= xe;
-                     y = (struct nlattr *)((uint8_t *)y + NLA_ALIGN(y->nla_len))) {
-                    int yt = y->nla_type & NLA_TYPE_MASK;
-                    if (yt != CTA_TUPLE_IP && yt != CTA_TUPLE_PROTO) continue;
-                    uint8_t *ye = (uint8_t *)y + y->nla_len;
-                    for (struct nlattr *z = (struct nlattr *)((uint8_t *)y + NLA_HDRLEN);
-                         (uint8_t *)z + NLA_HDRLEN <= ye && z->nla_len >= NLA_HDRLEN &&
-                         (uint8_t *)z + z->nla_len <= ye;
-                         z = (struct nlattr *)((uint8_t *)z + NLA_ALIGN(z->nla_len))) {
-                        int zt = z->nla_type & NLA_TYPE_MASK;
-                        uint8_t *zd = (uint8_t *)z + NLA_HDRLEN;
-                        if (yt == CTA_TUPLE_IP && zt == dst_attr &&
-                            z->nla_len >= NLA_HDRLEN + alen) {
-                            memcpy(oaddr, zd, alen); got_ip = 1;
-                        } else if (yt == CTA_TUPLE_PROTO && zt == CTA_PROTO_DST_PORT &&
-                                   z->nla_len >= NLA_HDRLEN + 2) {
-                            memcpy(&oport, zd, 2); got_port = 1;
-                        }
-                    }
-                }
+            if (dst && dst->nla_len >= NLA_HDRLEN + alen) {
+                memcpy(oaddr, (const uint8_t *)dst + NLA_HDRLEN, alen); got_ip = 1;
+            }
+            if (dpt && dpt->nla_len >= NLA_HDRLEN + 2) {
+                memcpy(&oport, (const uint8_t *)dpt + NLA_HDRLEN, 2); got_port = 1;
             }
             if (!got_ip || !got_port) return -1;
             /* Назначение — мы сами: к резолверу обратились напрямую, NAT не было. */
@@ -1897,6 +1903,196 @@ static int ct_origdst(const struct sockaddr_storage *cli, const struct dnsd_loca
             return 0;
         }
     }
+}
+
+/* ---- снятие записей conntrack выхода: ctnetlink без инструмента conntrack -------------
+ *
+ * ЗАЧЕМ ЗДЕСЬ. Снимать соединения выхода при смене его маршрута нужно сторожу
+ * (conntrack_evict в failover.c, там же — почему снимать вообще). До сих пор это делал
+ * внешний `conntrack -D --mark`, а его нет в образе Android: на телефоне смена выхода
+ * оставляла уже установленные соединения на прежнем, возможно мёртвом, выходе до их
+ * естественной смерти — то есть долгие соединения мессенджеров висели минутами. Разговор с
+ * conntrack по netlink в движке уже был — вот он, выше, у исходного назначения резолвера, —
+ * поэтому код лежит рядом с ним и берёт тот же разбор атрибутов (ct_attr) и тот же
+ * построитель сообщений (nlbuf), а не заводит свой файл: новый файл означал бы правку пяти
+ * списков сборки (Makefile, Android.bp, build.sh, стенды) ради одной функции.
+ *
+ * КАК, И ПОЧЕМУ НЕ ОДНИМ СООБЩЕНИЕМ. У ctnetlink есть «снять всё» — IPCTNL_MSG_CT_DELETE без
+ * кортежа, — и с атрибутами CTA_MARK/CTA_MARK_MASK оно снимает только совпавшее. В 4.9
+ * телефона этот фильтр есть (ctnetlink_flush_conntrack), но опора на него хрупкая с двух
+ * сторон: ядро старше фильтра атрибуты молча пропустит, а 4.9 без ОБОИХ атрибутов (скажем,
+ * маска потерялась при правке этого же кода) фильтра не заводит вовсе — и в обоих случаях
+ * сбрасывается ВСЯ таблица: у телефона — все соединения всех приложений, у роутера — вся
+ * сеть за ним. Ошибка такой цены не стоит одного сэкономленного сообщения, поэтому путь тот
+ * же, что у самого `conntrack -D --mark`: дамп (с фильтром по
+ * метке — его 4.9 уже знает, ctnetlink_dump_table проверено по дереву ядра телефона), и
+ * каждая совпавшая запись снимается ОТДЕЛЬНО по своему исходному кортежу. Метка сверяется
+ * ещё раз здесь, по CTA_MARK самой записи: если ядро фильтр дампа не поняло и прислало всё,
+ * чужое всё равно не будет тронуто. Запись без CTA_MARK (метка 0) не наша никогда — ноль
+ * метку выхода не несёт.
+ *
+ * Снимается строго запись с тем же CTA_ID: между дампом и удалением соединение могло умереть,
+ * а на его кортеже родиться новое — чужое, — и удаление по одному кортежу сняло бы его. С
+ * CTA_ID ядро отвечает ENOENT, и это не ошибка. CTA_ZONE копируется, если есть: без него
+ * поиск идёт в нулевой зоне, и запись другой зоны не нашлась бы.
+ *
+ * Семейства — по одному дампу на каждое: запрос с AF_UNSPEC в 4.9 отдаёт оба, но в свежих
+ * ядрах фильтр дампа переписан, и полагаться на смысл нуля в двух реализациях незачем, когда
+ * два дампа стоят один лишний системный вызов.
+ *
+ * Два сокета: дамп идёт частями — следующая часть готовится ядром на каждом recv, — и
+ * удаление на том же сокете смешало бы свои подтверждения с частями дампа. На втором сокете
+ * удаление идёт между частями, как у conntrack -D, и памяти под список найденного не нужно:
+ * запись, которую ядро держит как точку продолжения дампа, userspace ещё не видел и снять
+ * не мог, остальные из корзины уже отданы.
+ *
+ * БАТАРЕЯ. Один проход, без таймеров и повторов: ядро отвечает на каждый запрос сразу,
+ * внутри того же системного вызова. SO_RCVTIMEO — только страховка от вечного recv при
+ * невозможном «ядро не ответило», как у ct_origdst; в обычной работе он не срабатывает.
+ *
+ * Возврат: сколько записей снято (0 и больше) или -1 — «разговор с ctnetlink не состоялся»:
+ * нет сокета NETLINK_NETFILTER (на роутере нет nfnetlink), ядро не знает подсистемы
+ * conntrack (нет модуля nf_conntrack_netlink), нет прав. Тогда вызывающий пробует внешний
+ * инструмент. */
+#define CTNL_RCVBUF 32768   /* больше части дампа ядро не шлёт: netlink_dump режет по 32 КиБ */
+
+static int ctnl_socket(void) {
+    int fd = socket(AF_NETLINK, SOCK_RAW | SOCK_CLOEXEC, NETLINK_NETFILTER);
+    if (fd < 0) return -1;
+    struct sockaddr_nl sa = { .nl_family = AF_NETLINK };
+    if (bind(fd, (struct sockaddr *)&sa, sizeof(sa)) != 0) { close(fd); return -1; }
+    struct timeval tv = { 1, 0 };
+    setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+    return fd;
+}
+
+/* Заголовки сообщения ctnetlink в начале буфера; атрибуты дописываются за ними. */
+static struct nlmsghdr *ctnl_msg(struct nlbuf *b, void *mem, size_t cap, int type,
+                                 int flags, uint32_t seq, uint8_t family) {
+    size_t hl = NLMSG_ALIGN(sizeof(struct nlmsghdr)) + NLMSG_ALIGN(sizeof(struct nfgenmsg));
+    memset(mem, 0, hl);
+    nlbuf_init(b, mem, cap);
+    struct nlmsghdr *nh = (struct nlmsghdr *)b->p;
+    nh->nlmsg_type = (uint16_t)((NFNL_SUBSYS_CTNETLINK << 8) | type);
+    nh->nlmsg_flags = (uint16_t)flags;
+    nh->nlmsg_seq = seq;
+    struct nfgenmsg *nf = (struct nfgenmsg *)(b->p + NLMSG_ALIGN(sizeof(*nh)));
+    nf->nfgen_family = family;
+    nf->version = NFNETLINK_V0;
+    b->p += hl;
+    return nh;
+}
+
+/* Атрибут из ответа ядра — в запрос как есть, вместе с вложенным содержимым. */
+static int ctnl_copy_attr(struct nlbuf *b, const struct nlattr *x) {
+    if (!x) return 0;
+    size_t n = NLA_ALIGN(x->nla_len);
+    if (b->p + n > b->end) return -1;
+    memset(b->p, 0, n);
+    memcpy(b->p, x, x->nla_len);
+    b->p += n;
+    return 0;
+}
+
+/* Снять одну запись; 1 — снята, 0 — нет (уже умерла или ядро отказало). */
+static int ctnl_delete(int fd, uint8_t family, uint32_t seq, const struct nlattr *tuple,
+                       const struct nlattr *id, const struct nlattr *zone) {
+    uint8_t req[512];
+    struct nlbuf b;
+    struct nlmsghdr *nh = ctnl_msg(&b, req, sizeof(req), IPCTNL_MSG_CT_DELETE,
+                                   NLM_F_REQUEST | NLM_F_ACK, seq, family);
+    if (ctnl_copy_attr(&b, tuple) || ctnl_copy_attr(&b, id) || ctnl_copy_attr(&b, zone))
+        return 0;
+    nh->nlmsg_len = (uint32_t)(b.p - b.base);
+    struct sockaddr_nl k = { .nl_family = AF_NETLINK };
+    if (sendto(fd, req, nh->nlmsg_len, 0, (struct sockaddr *)&k, sizeof(k)) < 0) return 0;
+    uint8_t ack[512];
+    for (;;) {
+        ssize_t n = recv(fd, ack, sizeof(ack), 0);
+        if (n <= 0) return 0;
+        int len = (int)n;
+        for (struct nlmsghdr *h = (struct nlmsghdr *)ack; len > 0 && NLMSG_OK(h, (unsigned)len);
+             h = NLMSG_NEXT(h, len)) {
+            if (h->nlmsg_seq != seq || h->nlmsg_type != NLMSG_ERROR) continue;
+            if (h->nlmsg_len < NLMSG_LENGTH(sizeof(struct nlmsgerr))) return 0;
+            return ((struct nlmsgerr *)NLMSG_DATA(h))->error == 0;
+        }
+    }
+}
+
+/* Дамп одного семейства с удалением совпавшего. Возврат — как у ctnl_evict_mark. */
+static int ctnl_evict_family(int dfd, int xfd, uint8_t family, uint32_t val, uint32_t mask,
+                             uint32_t *seq, uint8_t *buf) {
+    uint8_t req[128];
+    struct nlbuf b;
+    uint32_t dseq = ++*seq;
+    struct nlmsghdr *nh = ctnl_msg(&b, req, sizeof(req), IPCTNL_MSG_CT_GET,
+                                   NLM_F_REQUEST | NLM_F_DUMP, dseq, family);
+    nlbuf_put_be32(&b, CTA_MARK, val);
+    nlbuf_put_be32(&b, CTA_MARK_MASK, mask);
+    nh->nlmsg_len = (uint32_t)(b.p - b.base);
+    struct sockaddr_nl k = { .nl_family = AF_NETLINK };
+    if (sendto(dfd, req, nh->nlmsg_len, 0, (struct sockaddr *)&k, sizeof(k)) < 0) return -1;
+
+    int evicted = 0;
+    for (;;) {
+        /* MSG_TRUNC: recv возвращает настоящую длину части. Больше буфера — значит часть
+         * обрезана, и разбирать её остаток нельзя; при CTNL_RCVBUF этого не бывает. */
+        ssize_t n = recv(dfd, buf, CTNL_RCVBUF, MSG_TRUNC);
+        if (n <= 0 || n > CTNL_RCVBUF) return -1;
+        int len = (int)n;
+        for (struct nlmsghdr *h = (struct nlmsghdr *)buf; len > 0 && NLMSG_OK(h, (unsigned)len);
+             h = NLMSG_NEXT(h, len)) {
+            if (h->nlmsg_seq != dseq) continue;
+            if (h->nlmsg_type == NLMSG_DONE) return evicted;
+            if (h->nlmsg_type == NLMSG_ERROR) {
+                if (h->nlmsg_len < NLMSG_LENGTH(sizeof(struct nlmsgerr))) return -1;
+                int err = ((struct nlmsgerr *)NLMSG_DATA(h))->error;
+                /* EOPNOTSUPP на фильтре — ядро собрано без CONFIG_NF_CONNTRACK_MARK. Метки
+                 * соединения у такого ядра нет вовсе, а значит и записей с меткой выхода: снимать
+                 * нечего, и внешний инструмент здесь не нужен. */
+                if (err == -EOPNOTSUPP) return 0;
+                return err == 0 ? evicted : -1;
+            }
+            if ((h->nlmsg_type >> 8) != NFNL_SUBSYS_CTNETLINK ||
+                h->nlmsg_len < NLMSG_LENGTH(sizeof(struct nfgenmsg)))
+                continue;
+            const uint8_t *a = (const uint8_t *)NLMSG_DATA(h) + NLMSG_ALIGN(sizeof(struct nfgenmsg));
+            const uint8_t *end = (const uint8_t *)h + h->nlmsg_len;
+            const struct nlattr *m = ct_attr(a, end, CTA_MARK);
+            if (!m || m->nla_len < NLA_HDRLEN + 4) continue;
+            uint32_t mv;
+            memcpy(&mv, (const uint8_t *)m + NLA_HDRLEN, 4);
+            if ((ntohl(mv) & mask) != val) continue;
+            const struct nlattr *tuple = ct_attr(a, end, CTA_TUPLE_ORIG);
+            if (!tuple) continue;
+            evicted += ctnl_delete(xfd, family, ++*seq, tuple, ct_attr(a, end, CTA_ID),
+                                   ct_attr(a, end, CTA_ZONE));
+        }
+    }
+}
+
+int ctnl_evict_mark(uint32_t val, uint32_t mask) {
+    /* Нулевое значение совпало бы с каждой записью без метки — то есть со всем чужим. Метка
+     * выхода нулём не бывает; защита от ошибки вызывающего, а не от ядра. */
+    if (!val || (val & ~mask)) return 0;
+    int dfd = ctnl_socket(), xfd = ctnl_socket();
+    uint8_t *buf = malloc(CTNL_RCVBUF);
+    int total = -1;
+    if (dfd >= 0 && xfd >= 0 && buf) {
+        static const uint8_t fam[] = { AF_INET, AF_INET6 };
+        uint32_t seq = (uint32_t)time(NULL);
+        total = 0;
+        for (size_t i = 0; i < sizeof(fam); i++) {
+            int n = ctnl_evict_family(dfd, xfd, fam[i], val, mask, &seq, buf);
+            if (n < 0) { total = -1; break; }
+            total += n;
+        }
+    }
+    free(buf);
+    if (dfd >= 0) close(dfd);
+    if (xfd >= 0) close(xfd);
+    return total;
 }
 
 /* Куда слать запрос наверх: исходное назначение (в режиме origdst), иначе петля. *mark — метка

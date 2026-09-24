@@ -110,6 +110,18 @@ void registry_assign(void) {}
 struct probe_status g_probe_stub;
 struct probe_status probe_read(const char *out_name) { (void)out_name; return g_probe_stub; }
 
+/* Снятие соединений самим движком (ctnl_evict_mark, dnsd.c) подменено записью в тот же
+ * журнал команд: настоящее полезло бы в conntrack машины, на которой идёт make test, и сняло
+ * бы там записи с меткой из стенда. Ответ задаётся стендом: -1 — «ctnetlink недоступен»,
+ * тогда сторож обязан взять внешний conntrack; 0 и больше — «снято», и внешний не нужен. По
+ * умолчанию -1, чтобы проверки внешнего пути ниже видели ровно то, что видели до нативного. */
+static int g_ctnl_ret = -1;
+int ctnl_evict_mark(uint32_t val, uint32_t mask) {
+    if (g_cmd_n < (int)(sizeof(g_cmd) / sizeof(*g_cmd)))
+        snprintf(g_cmd[g_cmd_n++], sizeof(g_cmd[0]), "ctnl evict %u/%u", val, mask);
+    return g_ctnl_ret;
+}
+
 #include "../src/failover.c"
 
 #undef popen
@@ -384,6 +396,20 @@ int main(void) {
      * выход не знала ничего (mark=0), и снять «соединения этого выхода» было нельзя. */
     check("смена маршрута снимает соединения выхода",
           cmd_seen("conntrack -D --mark 1048576/267386880"), 1);
+    check("внешнему conntrack предшествует попытка через ctnetlink",
+          cmd_seen("ctnl evict 1048576/267386880"), 1);
+
+    /* 1b. Тот же проход, но ctnetlink ответил. Снимает сам движок — строго по метке выхода с
+     *     маской движка, — а внешний conntrack не зовётся вовсе: в образе Android его нет, и
+     *     попытка запуска была бы лишним fork на каждой смене выхода. */
+    g_ctnl_ret = 0;
+    out_set("lo", FAIL_DROP);
+    state_write("active", "vl lo\n");
+    tick(RULES_WITH, "blackhole default \n");
+    check("ctnetlink ответил — соединения сняты самим движком",
+          cmd_seen("ctnl evict 1048576/267386880"), 1);
+    check("ctnetlink ответил — внешний conntrack не зовётся", cmd_seen("conntrack"), 0);
+    g_ctnl_ret = -1;
 
     /* 2. Правило fwmark снято (так поступает apply_failed при on_fail=direct/zapret, и
      *    вернуть его было некому). Устройство живое, имя не менялось. */
@@ -534,6 +560,7 @@ int main(void) {
     tick(RULES_WITH, "default dev lo scope link\n");
     check("целое состояние — соединения не снимаются",
           cmd_seen("conntrack -D"), 0);
+    check("целое состояние — и через ctnetlink тоже", cmd_seen("ctnl evict"), 0);
 
     /* 10. Мера здоровья принадлежит УСТРОЙСТВУ, а не виду выхода, который его назвал.
      *
