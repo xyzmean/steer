@@ -713,69 +713,13 @@ static void nftlk_split_table(const char *fam_tbl, const char **out_fam, const c
  * semantics: NLA_HEADER(2B len incl header, 2B type) + payload padded to 4B.
  * Nested attrs use NLA_F_NESTED in the type. We only ever build one
  * NEWSETELEM transaction at a time, so a single reentrant builder suffices. */
-/* NLA_F_NESTED, NLA_HDRLEN, NLA_ALIGN come from <linux/netlink.h>. */
 #define NFTLK_MSG_CAP     512   /* biggest msg we build: hdrs + ~3 nested attrs */
 #define ACK_TIMEOUT_MS    100   /* recv() wait for the kernel's NLM_F_ACK reply */
 
-struct nlbuf {
-    uint8_t *base;    /* start of nlmsghdr */
-    uint8_t *p;       /* next write position */
-    uint8_t *end;     /* one past last writable byte */
-};
-
-static void nlbuf_init(struct nlbuf *b, void *mem, size_t cap) {
-    b->base = mem; b->p = mem; b->end = (uint8_t *)mem + cap;
-}
-
-static struct nlattr *nlbuf_reserve(struct nlbuf *b, uint16_t type, size_t pay_len) {
-    size_t aligned = (NLA_HDRLEN + pay_len + 3) & ~(size_t)3;
-    if (b->p + aligned > b->end) return NULL;
-    struct nlattr *a = (struct nlattr *)b->p;
-    a->nla_len = (uint16_t)(NLA_HDRLEN + pay_len);
-    a->nla_type = type;
-    b->p += aligned;
-    return a; /* caller writes payload into (a+1) immediately */
-}
-/* Scalar nf_tables attributes are BIG-ENDIAN on the wire: the kernel parses
- * NFTA_SET_ELEM_TIMEOUT with nla_get_be64(). Writing host order on a
- * little-endian box turned a 60000ms timeout into an astronomically large value,
- * and nf_msecs_to_jiffies64() rejected it with -ERANGE — which is exactly why
- * inserts into the timeout-flagged VPN/direct sets failed while the map (which
- * carries no timeout) succeeded. Confirmed on the test router: ack error=-34 for
- * the set, error=0 for the map, same code path otherwise. */
-static void nlbuf_put_be32(struct nlbuf *b, uint16_t type, uint32_t v) {
-    struct nlattr *a = nlbuf_reserve(b, type, 4);
-    if (!a) return;
-    uint32_t be = htonl(v);
-    memcpy(a + 1, &be, 4);
-}
-
-static void nlbuf_put_be64(struct nlbuf *b, uint16_t type, uint64_t v) {
-    struct nlattr *a = nlbuf_reserve(b, type, 8);
-    if (!a) return;
-    uint8_t be[8];
-    for (int i = 0; i < 8; i++) be[i] = (uint8_t)(v >> (56 - 8 * i));
-    memcpy(a + 1, be, 8);
-}
-static void nlbuf_put_str(struct nlbuf *b, uint16_t type, const char *s) {
-    size_t n = strlen(s) + 1;
-    struct nlattr *a = nlbuf_reserve(b, type, n);
-    if (a) memcpy(a + 1, s, n);
-}
-/* Fixed binary blob (e.g. a 4-byte IPv4 key). */
-static void nlbuf_put_data(struct nlbuf *b, uint16_t type, const void *d, size_t n) {
-    struct nlattr *a = nlbuf_reserve(b, type, n);
-    if (a) memcpy(a + 1, d, n);
-}
-/* Begin a nested attribute; returns an opaque cookie (the nlattr*) to pass to
- * nlbuf_end_nested(), which backpatches nla_len with the filled size. */
-static struct nlattr *nlbuf_begin_nested(struct nlbuf *b, uint16_t type) {
-    struct nlattr *a = nlbuf_reserve(b, type | NLA_F_NESTED, 0);
-    return a; /* nla_len currently == NLA_HDRLEN; end_nested fixes it */
-}
-static void nlbuf_end_nested(struct nlbuf *b, struct nlattr *outer) {
-    outer->nla_len = (uint16_t)((b->p) - (uint8_t *)outer);
-}
+/* Сам построитель живёт в nlbuf.h: им же собирает сообщения rtnetlink и generic netlink
+ * выход kind=awg (src/awg.c), и две копии разметки атрибутов разошлись бы молча — см. шапку
+ * заголовка. */
+#include "nlbuf.h"
 
 /* ---- netlink socket --------------------------------------------------- */
 static int g_nlk_fd = -1;

@@ -122,6 +122,10 @@ int ctnl_evict_mark(uint32_t val, uint32_t mask) {
     return g_ctnl_ret;
 }
 
+/* Выход kind=awg спрашивает ядро по netlink (src/awg.c); стенду сторожа ядро не нужно —
+ * здоровье устройств он задаёт своим швом g_health_probe, и до этих функций дело не доходит. */
+int awg_healthy(const struct output *o, const char *dev) { (void)o; (void)dev; return 1; }
+int awg_revive(const struct output *o, const char *dev) { (void)o; (void)dev; return 0; }
 #include "../src/failover.c"
 
 #undef popen

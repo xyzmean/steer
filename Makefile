@@ -21,24 +21,24 @@ DEFS    := -DSTEER_VERSION='"$(VERSION)"' $(if $(REV),-DSTEER_REV='"$(REV)"',)
 all: $(BUILD)/steer
 
 $(BUILD)/steer: src/steer.c src/spec.c src/dnsd.c src/failover.c src/aggregate.c \
-                src/obfs.c src/cli.c src/srs.c src/puff.c src/hwid.c src/ctl.c src/ctl.h src/spec.h src/obfs.h \
+                src/obfs.c src/cli.c src/srs.c src/puff.c src/hwid.c src/ctl.c src/awg.c src/ctl.h src/awg.h src/nlbuf.h src/spec.h src/obfs.h \
                 src/cli.h src/srs.h src/puff.h src/hwid.h src/paths.h VERSION
 	@mkdir -p $(BUILD)
 	$(CC) $(CFLAGS) $(DEFS) -o $@ src/steer.c src/spec.c src/dnsd.c src/failover.c \
-	      src/aggregate.c src/obfs.c src/cli.c src/srs.c src/puff.c src/hwid.c src/ctl.c
+	      src/aggregate.c src/obfs.c src/cli.c src/srs.c src/puff.c src/hwid.c src/ctl.c src/awg.c
 
 # Сборка под Android — тот же движок с -DSTEER_ANDROID: своё поле метки (биты 22-27, в 0-21
 # пишет netd), свои каталоги (/data/misc/steer) и приоритет ip rule ниже лестницы netd. Здесь
 # она собирается хостовым компилятором ради стенда androidmatch: он проверяет, что сборка
 # вообще компилируется и что поле и пути у неё свои. Настоящая сборка под телефон — не здесь.
 $(BUILD)/steer-android: src/steer.c src/spec.c src/dnsd.c src/failover.c src/aggregate.c \
-                        src/obfs.c src/cli.c src/srs.c src/puff.c src/hwid.c src/ctl.c src/ctl.h src/spec.h \
+                        src/obfs.c src/cli.c src/srs.c src/puff.c src/hwid.c src/ctl.c src/awg.c src/ctl.h src/awg.h src/nlbuf.h src/spec.h \
                         src/obfs.h src/cli.h src/srs.h src/puff.h src/hwid.h src/paths.h VERSION
 	@mkdir -p $(BUILD)
 	$(CC) $(CFLAGS) $(DEFS) -DSTEER_ANDROID -o $@ src/steer.c src/spec.c src/dnsd.c \
-	      src/failover.c src/aggregate.c src/obfs.c src/cli.c src/srs.c src/puff.c src/hwid.c src/ctl.c
+	      src/failover.c src/aggregate.c src/obfs.c src/cli.c src/srs.c src/puff.c src/hwid.c src/ctl.c src/awg.c
 
-test: all ext-syntax $(BUILD)/steer-android $(BUILD)/tgwssim $(BUILD)/dnsmatch $(BUILD)/specmatch $(BUILD)/specmatch-ext $(BUILD)/xswirematch $(BUILD)/xsconnmatch $(BUILD)/xsstreammatch $(BUILD)/tungromatch $(BUILD)/tunnelmatch $(BUILD)/tunnamematch $(BUILD)/xsconfmatch $(BUILD)/xslinkmatch $(BUILD)/xsroutematch $(BUILD)/chellomatch $(BUILD)/failovermatch $(BUILD)/dcmatch $(BUILD)/msgsplitmatch $(BUILD)/warmmatch $(BUILD)/upmatch $(BUILD)/tgwsfailmatch $(BUILD)/h2match $(BUILD)/xhupmatch $(BUILD)/submatch $(BUILD)/subfetchmatch $(BUILD)/fwmatch $(BUILD)/obfsmatch $(BUILD)/visionmatch $(BUILD)/tlsprobematch $(BUILD)/diagsim $(BUILD)/hwidsum
+test: all ext-syntax $(BUILD)/steer-android $(BUILD)/tgwssim $(BUILD)/dnsmatch $(BUILD)/specmatch $(BUILD)/specmatch-ext $(BUILD)/xswirematch $(BUILD)/xsconnmatch $(BUILD)/xsstreammatch $(BUILD)/tungromatch $(BUILD)/tunnelmatch $(BUILD)/tunnamematch $(BUILD)/xsconfmatch $(BUILD)/xslinkmatch $(BUILD)/xsroutematch $(BUILD)/chellomatch $(BUILD)/failovermatch $(BUILD)/dcmatch $(BUILD)/msgsplitmatch $(BUILD)/warmmatch $(BUILD)/upmatch $(BUILD)/tgwsfailmatch $(BUILD)/h2match $(BUILD)/xhupmatch $(BUILD)/submatch $(BUILD)/subfetchmatch $(BUILD)/fwmatch $(BUILD)/obfsmatch $(BUILD)/visionmatch $(BUILD)/tlsprobematch $(BUILD)/diagsim $(BUILD)/hwidsum $(BUILD)/awgmatch $(BUILD)/awgmatch-android
 	@sh tests/run.sh
 	@sh tests/gen.sh
 	@sh tests/tgwsmark.sh
@@ -83,17 +83,20 @@ test: all ext-syntax $(BUILD)/steer-android $(BUILD)/tgwssim $(BUILD)/dnsmatch $
 	@$(BUILD)/xsroutematch
 	@$(BUILD)/chellomatch
 	@sh tests/hwidmatch.sh
+	@$(BUILD)/awgmatch
+	@$(BUILD)/awgmatch-android
+	@sh tests/awgns.sh
 
 # Мини-сборка микропакета tgws на хосте — для стенда tgwsmark: ядро движка с -DSTEER_TGWS,
 # мост заменён заглушкой (tests/tgws-stub.c), потому что настоящий тянет TLS и docker.
 # Проверяется не мост, а ruleset рядом с полным движком: свой бит метки, свой порт, свой ряд
 # таблиц, чужой реестр.
 $(BUILD)/tgwssim: src/steer.c src/spec.c src/dnsd.c src/failover.c src/aggregate.c \
-                  src/obfs.c src/cli.c src/srs.c src/puff.c src/hwid.c src/ctl.c src/ctl.h src/spec.h src/cli.h \
+                  src/obfs.c src/cli.c src/srs.c src/puff.c src/hwid.c src/ctl.c src/awg.c src/ctl.h src/awg.h src/nlbuf.h src/spec.h src/cli.h \
                   src/paths.h tests/tgws-stub.c VERSION
 	@mkdir -p $(BUILD)
 	$(CC) $(CFLAGS) $(DEFS) -DSTEER_TGWS -o $@ src/steer.c src/spec.c src/dnsd.c \
-	      src/failover.c src/aggregate.c src/obfs.c src/cli.c src/srs.c src/puff.c src/hwid.c src/ctl.c \
+	      src/failover.c src/aggregate.c src/obfs.c src/cli.c src/srs.c src/puff.c src/hwid.c src/ctl.c src/awg.c \
 	      tests/tgws-stub.c
 
 # Движок, собранный как расширенный, но без самой расширенной части: нужен стенду
@@ -101,11 +104,11 @@ $(BUILD)/tgwssim: src/steer.c src/spec.c src/dnsd.c src/failover.c src/aggregate
 # проверять диагностику интереснее всего именно на VLESS-выходе. Три подкоманды
 # расширенной сборки заменены заглушками — см. tests/vless-stub.c.
 $(BUILD)/diagsim: src/steer.c src/spec.c src/dnsd.c src/failover.c src/aggregate.c \
-                  src/obfs.c src/cli.c src/srs.c src/puff.c src/hwid.c src/ctl.c src/ctl.h src/spec.h src/cli.h \
+                  src/obfs.c src/cli.c src/srs.c src/puff.c src/hwid.c src/ctl.c src/awg.c src/ctl.h src/awg.h src/nlbuf.h src/spec.h src/cli.h \
                   src/srs.h src/puff.h src/hwid.h src/paths.h tests/vless-stub.c
 	@mkdir -p $(BUILD)
 	$(CC) $(CFLAGS) $(DEFS) -DSTEER_EXTENDED -o $@ src/steer.c src/spec.c src/dnsd.c \
-	      src/failover.c src/aggregate.c src/obfs.c src/cli.c src/srs.c src/puff.c src/hwid.c src/ctl.c \
+	      src/failover.c src/aggregate.c src/obfs.c src/cli.c src/srs.c src/puff.c src/hwid.c src/ctl.c src/awg.c \
 	      tests/vless-stub.c
 
 # SHA-256 движка против sha256sum оболочки. Отдельная цель, потому что стенду нужен ПОЛНЫЙ
@@ -207,6 +210,17 @@ $(BUILD)/obfsmatch: tests/obfsmatch.c src/obfs.c src/obfs.h src/spec.c src/spec.
 	@mkdir -p $(BUILD)
 	$(CC) $(CFLAGS) -o $@ tests/obfsmatch.c src/spec.c
 
+# Выход kind=awg без ядра: разбор файла awg-quick, спека, побайтная сборка сообщений netlink
+# (tests/awgmatch.c включает spec.c и awg.c). Дважды — роутерная и Android-сборка: у них разная
+# метка сокета туннеля без via (0 против STEER_SELF_MARK). С ядром — tests/awgns.sh.
+$(BUILD)/awgmatch: tests/awgmatch.c src/awg.c src/awg.h src/nlbuf.h src/spec.c src/spec.h
+	@mkdir -p $(BUILD)
+	$(CC) $(CFLAGS) -o $@ tests/awgmatch.c
+
+$(BUILD)/awgmatch-android: tests/awgmatch.c src/awg.c src/awg.h src/nlbuf.h src/spec.c src/spec.h
+	@mkdir -p $(BUILD)
+	$(CC) $(CFLAGS) -DSTEER_ANDROID -o $@ tests/awgmatch.c
+
 $(BUILD)/failovermatch: tests/failovermatch.c src/failover.c
 	@mkdir -p $(BUILD)
 	$(CC) $(CFLAGS) -o $@ tests/failovermatch.c
@@ -215,11 +229,11 @@ $(BUILD)/failovermatch: tests/failovermatch.c src/failover.c
 # nft, и проверить эвристику можно только примерами. Стенд включает исходник движка и
 # подменяет popen на чтение из памяти — см. tests/fwmatch.c.
 $(BUILD)/fwmatch: tests/fwmatch.c src/steer.c src/spec.c src/dnsd.c src/failover.c \
-                  src/aggregate.c src/obfs.c src/cli.c src/srs.c src/puff.c src/hwid.c src/ctl.c \
+                  src/aggregate.c src/obfs.c src/cli.c src/srs.c src/puff.c src/hwid.c src/ctl.c src/awg.c \
                   src/spec.h src/cli.h src/srs.h
 	@mkdir -p $(BUILD)
 	$(CC) $(CFLAGS) -o $@ tests/fwmatch.c src/spec.c src/dnsd.c src/failover.c \
-	      src/aggregate.c src/obfs.c src/cli.c src/srs.c src/puff.c src/hwid.c src/ctl.c
+	      src/aggregate.c src/obfs.c src/cli.c src/srs.c src/puff.c src/hwid.c src/ctl.c src/awg.c
 
 # Управление потоком HTTP/2 проверяется в памяти: h2.c общается с сетью только через
 # struct h2_io, поэтому стенд подменяет его целиком. -Itests/stub нужен, чтобы не тянуть
