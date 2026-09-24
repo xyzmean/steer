@@ -11,6 +11,7 @@
 #     следа роутерного поля 0x0ff00000 — в бит 20 и 21 пишет netd.
 #  2. Пути по умолчанию — /data/misc/steer: /etc и /var на телефоне только для чтения.
 #  3. Старая раскладка (legacy-min — ровно ядро телефона) собирается и с этим полем.
+#  5. Каналы на сам телефон (from: self / uid:N): правило на output, отказы разбора.
 #  4. zapret на телефоне нет: бит пропуска zapret (0x40000000, в битах vendor netd) не ставится,
 #     цепочки failopen, которая существует ради него, нет, а kind/on_fail zapret — отказ спеки.
 set -u
@@ -68,6 +69,38 @@ check "  и причина названа" "1" "$(grep -c 'в сборке по�
 sed 's/"on_fail": "direct"/"on_fail": "zapret"/' "$tmp/spec.json" > "$tmp/zf.json"
 "$BIN" apply --dry-run --spec "$tmp/zf.json" --state-dir "$tmp/state" >/dev/null 2>"$tmp/zf.err"
 check "on_fail zapret — отказ спеки" "2" "$?"
+
+# Каналы на сам телефон (from: self / uid:N) — разбор спеки. Поведение в ядре проверяет
+# tests/local49.sh на стенде vm49; здесь — что генератор ставит их на output, а спека
+# отвергает то, чего быть не может.
+cat > "$tmp/local.json" <<EOF2
+{ "schema": 2, "lan_devices": ["rndis0"],
+  "outputs": { "vpn": { "kind": "interface", "device": "wg0" } },
+  "channels": [ { "name": "a", "from": ["uid:10123"], "match": { "prefixes_file": "$tmp/a.lst" }, "out": "vpn" } ] }
+EOF2
+lo="$(STEER_NFT_COMPAT=legacy-min "$BIN" apply --dry-run --spec "$tmp/local.json" --state-dir "$tmp/state" 2>/dev/null)"
+check "канал по UID: правило на output со skuid" "1" \
+    "$(printf '%s\n' "$lo" | grep -c 'meta skuid 10123 ip daddr @vpn_ip_c0 meta mark set')"
+check "канал по UID: на prerouting его нет" "0" \
+    "$(printf '%s\n' "$lo" | sed -n '/chain prerouting_mark/,/}/p' | grep -c skuid)"
+check "старая раскладка: бит перемаршрутизации снимает цепочка route в ip" "1" \
+    "$(printf '%s\n' "$lo" | grep -c 'type route hook output priority mangle + 2')"
+check "masquerade у выхода-интерфейса" "1" "$(printf '%s\n' "$lo" | grep -c 'oifname "wg0" counter masquerade')"
+bad() {   # bad ИМЯ FROM — спека с таким «кому» отвергается кодом 2
+    sed "s|\"from\": \[\"uid:10123\"\]|\"from\": $2|" "$tmp/local.json" > "$tmp/bad.json"
+    "$BIN" apply --dry-run --spec "$tmp/bad.json" --state-dir "$tmp/state" >/dev/null 2>&1
+    check "$1" "2" "$?"
+}
+bad "смешаны телефон и клиенты — отказ" '["self", "192.168.43.5"]'
+bad "self вместе с uid — отказ" '["self", "uid:10123"]'
+bad "uid:0 (root) — отказ" '["uid:0"]'
+bad "не UID — отказ" '["uid:abc"]'
+bad "обратный диапазон — отказ" '["uid:10200-10100"]'
+ROUTER="${ROUTER:-./build/steer}"
+if [ -x "$ROUTER" ]; then
+    "$ROUTER" apply --dry-run --spec "$tmp/local.json" --state-dir "$tmp/state" >/dev/null 2>"$tmp/r.err"
+    check "роутерная сборка: каналы на себя — отказ" "2" "$?"
+fi
 
 printf '\nandroidmatch: %s passed, %s failed\n' "$pass" "$fail"
 [ "$fail" -eq 0 ]

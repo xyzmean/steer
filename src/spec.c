@@ -1392,10 +1392,16 @@ void load_spec(const char *path) {
                         c->name);
             }
         } else {
-            for (size_t k = 0; k < g_from_default_n; k++)
+            for (size_t k = 0; k < g_from_default_n; k++) {
                 if (!g_from_default[k][0])
                     die("канал %s берёт «кому» из from_default, а в нём пустая строка — "
                         "уберите её", c->name);
+                /* from_default — это клиенты раздачи; сам телефон называет канал, а не
+                 * умолчание для всех каналов. */
+                if (from_is_local(g_from_default[k]))
+                    die("from_default: «%s» — сам телефон, а не клиенты; укажите его в from "
+                        "канала", g_from_default[k]);
+            }
         }
 
         /* Адреса и MAC-и в одном «кому» — нельзя. nft не умеет «или» внутри правила, и
@@ -1408,7 +1414,44 @@ void load_spec(const char *path) {
          * и получила бы тихо: снаружи такое правило выглядит точно так же. Пустой `from`
          * означал бы правило «на устройство», действующее на всех, то есть глобальное с
          * приоритетом глобальных — самое опасное из возможных недоразумений. */
-        if (c->dev_scope) {
+        /* «Кто» на самом устройстве — см. from_is_local в spec.h. */
+        size_t local = 0;
+        for (size_t k = 0; k < c->from_n; k++) if (from_is_local(c->from[k])) local++;
+        if (local) {
+#ifndef STEER_ANDROID
+            die("канал %s: «self» и «uid:» в from — только в сборке под Android", c->name);
+#endif
+            if (local != c->from_n)
+                die("канал %s: в «кому» смешаны сам телефон и клиенты раздачи — это разные "
+                    "пути пакета, разделите на два канала", c->name);
+            for (size_t k = 0; k < c->from_n; k++) {
+                unsigned lo, hi;
+                if (!strcmp(c->from[k], "self")) {
+                    if (c->from_n > 1)
+                        die("канал %s: «self» уже включает все приложения — уберите из "
+                            "«кому» остальное", c->name);
+                    continue;
+                }
+                static char msg[300];
+                if (from_uid_range(c->from[k], &lo, &hi) != 0) {
+                    snprintf(msg, sizeof(msg), "канал %.40s: «%.40s» — не UID приложения "
+                             "(want uid:N or uid:N-M)", c->name, c->from[k]);
+                    die("%s", msg);
+                }
+                if (lo == 0)
+                    die("канал %s: uid:0 — это root, то есть сам движок и системные демоны; "
+                        "их трафик каналом не маршрутизируется", c->name);
+                /* Правило на устройство — на ОДНО приложение, диапазон тут был бы тем же
+                 * «приоритет получила половина сети», что и подсеть у адресов. */
+                if (c->dev_scope && lo != hi) {
+                    snprintf(msg, sizeof(msg), "канал %.40s: правило на устройство принимает "
+                             "одно приложение, а «%.40s» — диапазон", c->name, c->from[k]);
+                    die("%s", msg);
+                }
+            }
+        }
+
+        if (c->dev_scope && !local) {
             if (!c->from_n)
                 die("канал %s объявлен правилом на устройство, но в нём нет ни одного "
                     "хозяина: добавьте адрес или MAC в \"from\"", c->name);
@@ -1424,7 +1467,7 @@ void load_spec(const char *path) {
                 }
         }
 
-        if (c->from_n > 1) {
+        if (c->from_n > 1 && !local) {
             int macs = 0;
             for (size_t k = 0; k < c->from_n; k++) if (strchr(c->from[k], ':')) macs++;
             if (macs && macs != (int)c->from_n)
@@ -1803,6 +1846,31 @@ int spec_one_host(const char *s) {
     memcpy(buf, s, n);
     buf[n] = '\0';
     return spec_line_is_addr(buf) && !strchr(buf, '-');
+}
+
+int from_is_local(const char *s) {
+    return s && (!strcmp(s, "self") || !strncmp(s, "uid:", 4));
+}
+
+int from_uid_range(const char *s, unsigned *lo, unsigned *hi) {
+    if (!s || strncmp(s, "uid:", 4)) return -1;
+    const char *p = s + 4;
+    unsigned long a, b;
+    char *end;
+    if (*p < '0' || *p > '9') return -1;
+    a = strtoul(p, &end, 10);
+    if (*end == '-') {
+        p = end + 1;
+        if (*p < '0' || *p > '9') return -1;
+        b = strtoul(p, &end, 10);
+    } else {
+        b = a;
+    }
+    /* UID ядра — 32 бита, но (uid_t)-1 означает «нет» и в правило попадать не должен. */
+    if (*end || a > 0x7fffffffUL || b > 0x7fffffffUL || a > b) return -1;
+    *lo = (unsigned)a;
+    *hi = (unsigned)b;
+    return 0;
 }
 
 int spec_line_is_addr(const char *s) {

@@ -549,6 +549,38 @@ static void emit_to(FILE *f, const struct group *g) {
     if (g->from_n) emit_who(f, g, 1); else emit_ifs(f, 1);
 }
 
+/* Группа каналов на сам телефон, а не на клиентов раздачи (см. from_is_local в spec.h).
+ * Смешанных групп не бывает: спека отвергает «кому» из себя и клиентов сразу. */
+static int group_is_local(const struct group *g) {
+    return g->from_n && from_is_local(g->from[0]);
+}
+
+#ifdef STEER_ANDROID
+static int has_local(void) {
+    for (size_t i = 0; i < g_grp_n; i++) if (group_is_local(&g_grp[i])) return 1;
+    return 0;
+}
+
+/* «Кто» у группы на сам телефон: владелец сокета. "self" — все, кроме root (почему — у
+ * from_is_local); "uid:N[-M]" — перечисленные приложения. У пакета без сокета (RST и ICMP,
+ * которые ядро шлёт само) владельца нет, и skuid не совпадает ни с чем — такие пакеты идут
+ * обычным путём. */
+static void emit_local_who(FILE *f, const struct group *g) {
+    if (!strcmp(g->from[0], "self")) { fprintf(f, "meta skuid != 0 "); return; }
+    int one = g->from_n == 1 && !strchr(g->from[0], '-');
+    fprintf(f, one ? "meta skuid " : "meta skuid { ");
+    for (size_t i = 0; i < g->from_n; i++) {
+        unsigned lo, hi;
+        if (from_uid_range(g->from[i], &lo, &hi) != 0)
+            die("группа %s: негодный UID", g->name);   /* спека это уже отвергла */
+        if (lo == hi) fprintf(f, "%s%u", i ? ", " : "", lo);
+        else fprintf(f, "%s%u-%u", i ? ", " : "", lo, hi);
+    }
+    fprintf(f, one ? " " : " } ");
+}
+
+#endif
+
 /* «Чем и куда именно»: сужение канала по протоколу и портам назначения (схема 2).
  *
  * ПОЧЕМУ `meta l4proto` ПЛЮС `th dport`, А НЕ `tcp dport`/`udp dport`. Две причины, и
@@ -999,6 +1031,89 @@ static int legacy_has_ip6(void) {
 #endif
 }
 
+#ifdef STEER_ANDROID
+/* ---- каналы на сам телефон: разметка на выходе ------------------------------------
+ *
+ * Тот же приём, что prerouting_mark для раздачи, но на хуке output: «первое совпадение
+ * решает», одно правило на группу (два — на две половины доменного набора старой раскладки),
+ * метка — наши биты с маской, метка соединения — как там.
+ *
+ * Тип цепочки зависит от раскладки. В современной (ядро с nat в inet) это route прямо в
+ * inet, где и наборы: смена метки в ней сама заставляет ядро искать маршрут заново. В старой
+ * route в inet нет, поэтому здесь filter, а к метке добавляется STEER_REROUTE_BIT — его
+ * снимает цепочка route в таблице ip (generate_legacy_tail), и маршрут пересматривается там
+ * (подробно — у STEER_REROUTE_BIT в spec.h).
+ *
+ * IPv6. Наборы каналов — IPv4, и правило с набором IPv6 не касается. Но у группы «весь
+ * трафик» набора нет, и её IPv6 ушёл бы мимо туннеля: маршруты выхода движок ставит только
+ * для IPv4. Поэтому такой группе IPv6 отвечается отказом — приложения переходят на IPv4 (так
+ * устроен выбор адреса у любого клиента с двумя стеками), и ничего не утекает напрямую. */
+static void emit_output_mark(FILE *f) {
+    fprintf(f, "\n    chain output_mark {\n"
+               "        type %s hook output priority mangle + 1; policy accept;\n",
+            NFT_LEGACY ? "filter" : "route");
+    for (size_t i = 0; i < g_grp_n; i++) {
+        struct group *g = &g_grp[i];
+        if (!group_is_local(g)) continue;
+        struct output *o = out_by_name(g->out);
+        if (!o) die("channel group %s points at a missing output", g->name);
+        if (g->all && out_needs_mark(o)) {
+            fprintf(f, "        ");
+            emit_local_who(f, g);
+            /* Петля ::1 — не наружу и не мимо туннеля; её приложение трогать не должно. */
+            fprintf(f, "meta nfproto ipv6 oifname != \"lo\" counter reject "
+                       "comment \"steer-v6:%s\"\n", g->name);
+        }
+        int halves = legacy_has_static(g) ? 2 : 1;
+        for (int h = 0; h < halves; h++) {
+            char sn[80];
+            const char *set = g->name;
+            if (halves == 2 && h == 0) { nft_static_set_name(sn, sizeof(sn), g->name); set = sn; }
+            fprintf(f, "        ");
+            emit_local_who(f, g);
+            emit_l4(f, g->l4, 0);
+            if (g->files_n || g->domains || g->emptied) fprintf(f, "ip daddr @%s ", set);
+            if (out_needs_mark(o))
+                fprintf(f, "meta mark set mark and 0x%08x or 0x%08x %s",
+                        ~STEER_MARK_MASK,
+                        o->mark | (NFT_LEGACY ? STEER_REROUTE_BIT : 0),
+                        out_needs_ctmark(o) ? "ct mark set mark " : "");
+            if (h == 0) emit_counter(f, g->name, 0);
+            else fprintf(f, "counter ");
+            fprintf(f, "return comment \"steer:%s\"\n", g->name);
+        }
+    }
+    fprintf(f, "    }\n");
+}
+
+/* ---- masquerade у выходов-интерфейсов ------------------------------------------------
+ *
+ * На роутере адрес источника у пакетов в туннель подменяет firewall (зона выхода с masq), и
+ * движок его настройку не трогает. На телефоне такого firewall нет вовсе: netd делает NAT
+ * только для раздачи на её восходящий интерфейс. Пакет раздачи или приложения, уведённый
+ * меткой в туннель, уходил бы с адресом Wi-Fi или сотовой сети — сервер туннеля такой пакет
+ * не примет, а ответ на него пришёл бы не туда.
+ *
+ * Только НАШ помеченный трафик и только на устройствах выхода: `mark and маска == метка`
+ * вместе с oifname. Выходы vless и xsteer не нуждаются в этом (их устройство обслуживает наш
+ * процесс, и адреса он переводит сам, см. out_self_natting). */
+static void emit_masquerade_rules(FILE *f) {
+    for (size_t i = 0; i < g_out_n; i++) {
+        struct output *o = &g_out[i];
+        if (o->kind != OUT_INTERFACE || !o->devices_n) continue;
+        fprintf(f, "        meta mark and 0x%08x == 0x%08x oifname ", STEER_MARK_MASK, o->mark);
+        if (o->devices_n == 1) fprintf(f, "\"%s\" ", o->devices[0]);
+        else {
+            fprintf(f, "{ ");
+            for (size_t k = 0; k < o->devices_n; k++)
+                fprintf(f, "%s\"%s\"", k ? ", " : "", o->devices[k]);
+            fprintf(f, " } ");
+        }
+        fprintf(f, "counter masquerade comment \"steer-masq:%s\"\n", o->name);
+    }
+}
+#endif
+
 /* ХВОСТ НАБОРА ПРАВИЛ В СТАРОЙ РАСКЛАДКЕ: закрыть inet и собрать nat в ip/ip6.
  *
  * ПОЧЕМУ ОДНА ЦЕПОЧКА NAT, а не три, как в современной раскладке (prerouting_dns,
@@ -1069,10 +1184,23 @@ static void generate_legacy_tail(FILE *f) {
         if (fakeip)
             fprintf(f, "        ip daddr 198.18.0.0/15 counter dnat to ip daddr map @fakeip\n");
         emit_tgws_rules(f);
-        fprintf(f, "    }\n"
-                   "    chain postrouting_nat {\n"
-                   "        type nat hook postrouting priority srcnat + 1; policy accept;\n"
-                   "    }\n}\n");
+        fprintf(f, "    }\n");
+#ifdef STEER_ANDROID
+        /* Снятие бита перемаршрутизации — см. STEER_REROUTE_BIT в spec.h. mangle + 2: сразу
+         * после разметки (output_mark в inet, mangle + 1) и до nat на выходе. */
+        if (has_local())
+            fprintf(f, "    chain output_reroute {\n"
+                       "        type route hook output priority mangle + 2; policy accept;\n"
+                       "        meta mark and 0x%08x == 0x%08x meta mark set mark and 0x%08x "
+                       "counter comment \"steer-reroute\"\n"
+                       "    }\n", STEER_REROUTE_BIT, STEER_REROUTE_BIT, ~STEER_REROUTE_BIT);
+#endif
+        fprintf(f, "    chain postrouting_nat {\n"
+                   "        type nat hook postrouting priority srcnat + 1; policy accept;\n");
+#ifdef STEER_ANDROID
+        emit_masquerade_rules(f);
+#endif
+        fprintf(f, "    }\n}\n");
     }
     if (legacy_has_ip6()) {
         fprintf(f, "table ip6 %s {\n"
@@ -1162,6 +1290,8 @@ static void generate(FILE *f) {
         struct group *g = &g_grp[i];
         struct output *o = out_by_name(g->out);
         if (!o) die("channel group %s points at a missing output", g->name);
+        /* Каналы на сам телефон — на хуке output, см. emit_output_mark. */
+        if (group_is_local(g)) continue;
         /* ПРАВИЛ У ГРУППЫ ОБЫЧНО ОДНО, в старой раскладке у доменной группы с префиксами — два:
          * по правилу на каждую половину набора (см. generate выше). nft не умеет «или» внутри
          * правила, а объединить интервальный набор с hash-набором нечем. Оба правила
@@ -1224,6 +1354,10 @@ static void generate(FILE *f) {
     }
     fprintf(f, "    }\n");
 
+#ifdef STEER_ANDROID
+    if (has_local()) emit_output_mark(f);
+#endif
+
     /* ВЫХОД УПАЛ И ПУЩЕН НАПРЯМУЮ — бит «не для zapret» снимается. Правило разметки выше
      * ставит его безусловно, а при on_fail=direct/zapret упавший выход отдаёт трафик
      * таблице main, то есть открытому пути; там пакет обязан быть обычным трафиком роутера
@@ -1273,6 +1407,9 @@ static void generate(FILE *f) {
                "        type filter hook postrouting priority srcnat + 10; policy accept;\n");
     for (size_t i = 0; i < g_grp_n; i++) {
         struct group *g = &g_grp[i];
+        /* Скачанное каналом на сам телефон этой цепочкой не считается: получатель у него —
+         * сокет телефона, и пакет идёт через input, а не через postrouting. */
+        if (group_is_local(g)) continue;
         /* Две половины доменного набора в старой раскладке — два правила с одним
          * комментарием, как в prerouting_mark и по той же причине. */
         int halves = legacy_has_static(g) ? 2 : 1;
@@ -1609,6 +1746,13 @@ static void generate(FILE *f) {
          * redirecting TCP would break the truncated-answer retry.
          */
     }
+#ifdef STEER_ANDROID
+    /* masquerade у выходов-интерфейсов — см. emit_masquerade_rules. */
+    fprintf(f, "\n    chain postrouting_masq {\n"
+               "        type nat hook postrouting priority srcnat + 1; policy accept;\n");
+    emit_masquerade_rules(f);
+    fprintf(f, "    }\n");
+#endif
     fprintf(f, "}\n");
 }
 
