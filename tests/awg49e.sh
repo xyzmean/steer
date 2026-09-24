@@ -174,6 +174,54 @@ check "I1 на устройстве больше нет" "0" "$(awg showconf nl 
 cping 3
 check "трафик после пересоздания" "0" "$?"
 
+# ---- 5a. via: UDP туннеля — через выход-интерфейс ---------------------------------------
+# Второй путь к пиру — ux0, устройство выхода kind=interface. Endpoint — адрес на петле пира,
+# до которого без метки маршрута нет: дойти туда UDP туннеля может только меткой выхода ux,
+# через его таблицу и ux0 (см. «вложенные выходы» в spec.h). На ядре 4.9 это проверяет, что
+# WireGuard ставит метку устройства на свои датаграммы и ip rule движка их уводит.
+awg49-veth ux0 ux1 || echo "не создалась пара veth ux"
+ip link set ux1 netns p
+ip addr add 10.78.0.1/24 dev ux0; ip link set ux0 up
+ip -n p addr add 10.78.0.2/24 dev ux1; ip -n p link set ux1 up
+ip -n p addr add 203.0.113.9/32 dev lo
+ip -n p addr add 1.1.1.1/32 dev lo      # адрес пробы сторожа — за ux0, иначе ux «мёртв» всегда
+mkconf "$OBFS2"
+sed -i 's/^Endpoint = .*/Endpoint = 203.0.113.9:51820/' $T/nl.conf
+cat > $T/spec.json <<EOF
+{ "schema": 2, "from_default": ["192.168.1.0/24"],
+  "outputs": { "ux": { "kind": "interface", "device": "ux0", "on_fail": "drop" },
+               "nl": { "kind": "awg", "conf": "$T/nl.conf", "device": "nl", "via": "ux",
+                       "on_fail": "drop" } },
+  "channels": [ { "name": "a", "match": { "prefixes_file": "$T/a.lst" }, "out": "nl" } ] }
+EOF
+steer apply $S >$T/apply5.out 2>&1
+check "via: apply проходит" "0" "$?"
+omark() { st | grep -o "\"$1\":{[^}]*" | grep -o '"mark":"0x[0-9a-f]*"' | cut -d'"' -f4; }
+check "via: метка сокета туннеля — метка выхода ux" "$(printf '0x%x' "$(($(omark ux)))")" \
+      "$(awg show nl fwmark)"
+cping 3
+check "via: клиент раздачи → 198.51.100.1 через awg, awg — через ux" "0" "$?"
+check "via: пир видит нас с адреса ux0" "10.78.0.1" \
+      "$(ip netns exec p awg show wgp endpoints | cut -f2 | cut -d: -f1)"
+nlt="$(st | grep -o '"nl":{[^}]*' | grep -o '"table":[0-9]*' | cut -d: -f2)"
+steer failover $S >$T/fo5.out 2>&1
+check "via: ux жив — nl в работе" "1" "$(ip route show table "$nlt" | grep -c 'default dev nl')"
+ip link set ux0 down
+steer failover $S >$T/fo5.out 2>&1
+check "via: ux лёг — nl объявлен нерабочим" "1" "$(grep -c 'выход nl: идёт через ux' $T/fo5.out)"
+check "via: у nl blackhole" "1" "$(ip route show table "$nlt" | grep -c blackhole)"
+ip link set ux0 up
+steer failover $S >$T/fo5.out 2>&1
+check "via: ux ожил — nl вернулся" "1" "$(ip route show table "$nlt" | grep -c 'default dev nl')"
+cping 3
+check "via: трафик после возврата ux" "0" "$?"
+# Дальше — прежняя спека без via: часть 7 проверяет свои вещи, и via ей ни к чему.
+cat > $T/spec.json <<EOF
+{ "schema": 2, "from_default": ["192.168.1.0/24"],
+  "outputs": { "nl": { "kind": "awg", "conf": "$T/nl.conf", "on_fail": "drop" } },
+  "channels": [ { "name": "a", "match": { "prefixes_file": "$T/a.lst" }, "out": "nl" } ] }
+EOF
+
 # ---- 6. down ---------------------------------------------------------------------------
 steer down >/dev/null 2>&1
 check "down: устройство снято" "0" "$(ip link show nl 2>/dev/null | grep -c 'nl:')"

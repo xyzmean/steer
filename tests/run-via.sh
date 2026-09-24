@@ -22,8 +22,17 @@
 # masquerade у выхода-интерфейса правилом iptables). Раскладка правил — STEER_NFT_COMPAT
 # (modern или legacy-min: та, что на ядре 4.9 телефона, с битом перемаршрутизации).
 #
-# Затем — контроль, без которого первая часть ничего не доказывает: тот же выход без via обязан
-# ходить к серверу через WAN. И отказ цели: vx0 лёг — сторож объявляет нерабочим и vl.
+# Затем — отказ цели (vx0 лёг — сторож объявляет нерабочим и vl, ожил — возвращает тем же
+# проходом) и контроль, без которого первая часть ничего не доказывает: тот же выход без via
+# обязан ходить к серверу через WAN. Последняя часть — пример владельца, WireGuard внутри VLESS:
+# выход awg с via на vl, то есть цепочка nl → vl → vx из трёх выходов, с настоящим пиром
+# WireGuard за сервером VLESS (fake-vless.py --udp-relay пересылает UDP по адресу из запроса);
+# без wg или модуля wireguard эта часть пропускается вслух.
+#
+# Движок — расширенная сборка с mbedtls 3.x и src/awg.c, статикой musl (glibc не даёт потокам
+# туннеля стек в 128 КБ при их __thread-буферах — pthread_create отвечает EINVAL). Для
+# Android-сборки на обычном Linux: -DSTEER_ANDROID и каталоги в /tmp (-DSTEER_TMP_DIR,
+# -DSTEER_STATE_DIR, -DSTEER_ETC_DIR, как в шапке local49.sh) плюс -DSTEER_TUN_DEV='"/dev/net/tun"'.
 #
 # Использование:
 #   STEER=<расширенный движок> sh tests/run-via.sh router
@@ -98,7 +107,7 @@ else
     FROM="\"uid:$APP_UID\""
 fi
 
-inS python3 tests/fake-vless.py --port $PORT --uuid $UUID --mb $MB --bind $NODE \
+inS python3 tests/fake-vless.py --port $PORT --uuid $UUID --mb $MB --bind $NODE --udp-relay \
     > "$WORK/srv.log" 2>&1 &
 sleep 1
 
@@ -139,12 +148,26 @@ start_vless() {
         inA ip link show vl >/dev/null 2>&1 && break
         sleep 0.2
     done
-    inA ip link show vl >/dev/null 2>&1
+    inA ip link show vl >/dev/null 2>&1 || return 1
+    # И маршрута в таблице vl: клиент привязывает её сам после появления устройства, а до того
+    # помеченное уходит по blackhole (или, в миг между flush и add у bind_device, мимо таблицы).
+    for _ in $(seq 50); do
+        inA ip route show table all | grep -q '^default dev vl ' && return 0
+        sleep 0.2
+    done
+    return 1
 }
 stop_vless() {
     kill "$VL_PID" 2>/dev/null || true
     wait "$VL_PID" 2>/dev/null || true
     for _ in $(seq 25); do inA ip link show vl >/dev/null 2>&1 || break; sleep 0.2; done
+    # Соединения убитого клиента закрываются ещё какое-то время (FIN, последний ACK), и эти
+    # пакеты идут прежним путём: без ожидания они попали бы в счётчики следующей части.
+    for _ in $(seq 25); do
+        [ -z "$(inA ss -tnH state connected "( dport = :$PORT )" 2>/dev/null | grep -v TIME-WAIT)" ] && break
+        sleep 0.2
+    done
+    sleep 1
 }
 fetch() {
     rm -f "$WORK/dl"
@@ -227,6 +250,64 @@ if [ "$MODE" = android ]; then want="fwmark:0xfc00000 "; else want=""; fi
 [ "$fwm" = "$want" ] && ok "без via: метка сокета «мимо каналов» (${fwm:-нет})" \
     || bad "без via: метка сокета $fwm, ждали ${want:-никакой}"
 stop_vless
+
+# ---- 4. WireGuard внутри VLESS: awg через vl, vl через vx --------------------------------
+# Пример владельца, и сразу цепочкой из трёх выходов: UDP туннеля awg получает метку vl и уходит
+# в его TUN, клиент VLESS несёт его потоком UDP (команда 2) до сервера, а своё соединение с
+# сервером — с меткой vx в vx0. Пир WireGuard стоит за сервером VLESS (--udp-relay пересылает
+# датаграммы по адресу из запроса). Нужны wg и модуль wireguard; нет — пропуск вслух.
+if command -v wg >/dev/null 2>&1 && inA ip link add awgprobe type wireguard 2>/dev/null; then
+    inA ip link del awgprobe
+    inA sysctl -qw net.ipv4.conf.all.rp_filter=0 net.ipv4.conf.default.rp_filter=0
+    ( umask 077
+      wg genkey > "$WORK/our.key"; wg pubkey < "$WORK/our.key" > "$WORK/our.pub"
+      wg genkey > "$WORK/peer.key"; wg pubkey < "$WORK/peer.key" > "$WORK/peer.pub" )
+    inS ip link add wgpeer type wireguard
+    inS wg set wgpeer listen-port 51820 private-key "$WORK/peer.key" \
+        peer "$(cat "$WORK/our.pub")" allowed-ips 10.77.0.0/24
+    inS ip addr add 10.77.0.1/24 dev wgpeer
+    inS ip link set wgpeer up
+    inS ip addr add 198.51.100.1/32 dev node
+    cat > "$WORK/nl.conf" <<CONF
+[Interface]
+PrivateKey = $(cat "$WORK/our.key")
+Address = 10.77.0.2/24
+[Peer]
+PublicKey = $(cat "$WORK/peer.pub")
+Endpoint = $NODE:51820
+AllowedIPs = 0.0.0.0/0
+CONF
+    chmod 600 "$WORK/nl.conf"
+    cat > "$WORK/spec.json" <<SPEC
+{"schema":2,"lan_devices":["$LAN_DEV"],
+ "outputs":{
+   "vx":{"kind":"interface","device":"vx0","on_fail":"drop"},
+   "vl":{"kind":"vless","sub_file":"$WORK/sub.txt","node":0,"via":"vx"},
+   "nl":{"kind":"awg","conf":"$WORK/nl.conf","device":"nl","via":"vl","on_fail":"drop"}},
+ "channels":[{"name":"all","out":"vl","scope":"device","from":[$FROM],"match":{"any":true}}]}
+SPEC
+    inA nft add rule inet viacnt post oifname '"vl"' udp dport 51820 counter comment '"wg-vl"'
+    if inA "$BIN" apply --spec "$WORK/spec.json" --state-dir "$WORK/state" > "$WORK/apply3.log" 2>&1
+    then ok "awg: apply цепочки nl → vl → vx"; else bad "awg: apply"; sed 's/^/    /' "$WORK/apply3.log"; fi
+    start_vless || { bad "awg: устройство vl не поднялось"; sed 's/^/    /' "$WORK/tun.log"; }
+    mk_hex() { printf '0x%x' "$((0x$(mk_of "$1")))"; }
+    [ "$(inA wg show nl fwmark 2>/dev/null)" = "$(mk_hex vl)" ] && ok "awg: метка сокета туннеля — метка vl" \
+        || bad "awg: fwmark $(inA wg show nl fwmark 2>/dev/null), у vl $(mk_hex vl)"
+    cnt_zero
+    if inA ping -q -c 3 -W 3 -m "$((0x$(mk_of nl)))" -I 10.77.0.2 198.51.100.1 > "$WORK/ping.log" 2>&1
+    then ok "awg: ping через WireGuard внутри VLESS"; else bad "awg: ping не прошёл"; sed 's/^/    /' "$WORK/ping.log"; fi
+    n_wg=$(cnt wg-vl); n_vx=$(cnt node-vx0); n_wan=$(cnt node-wan0)
+    echo "    UDP WireGuard в vl: $n_wg пакетов; к серверу VLESS: vx0 $n_vx, wan0 $n_wan"
+    [ "${n_wg:-0}" -gt 0 ] && ok "awg: UDP туннеля ушёл в устройство vl" || bad "awg: в vl UDP туннеля — ноль"
+    [ "${n_vx:-0}" -gt 0 ] && [ "${n_wan:-0}" -eq 0 ] && ok "awg: а vl — в vx0, мимо WAN" \
+        || bad "awg: к серверу vx0 $n_vx, wan0 $n_wan"
+    hs=$(inS wg show wgpeer latest-handshakes | awk '{print $2}')
+    [ "${hs:-0}" -gt 0 ] && ok "awg: пир видит рукопожатие" || bad "awg: рукопожатия у пира нет"
+    stop_vless
+    inA "$BIN" down --state-dir "$WORK/state" >/dev/null 2>&1 || true
+else
+    echo "  skip awg через vl: нет wg или модуля wireguard"
+fi
 
 echo "run-via ($MODE): $pass passed, $fail failed"
 [ "$fail" -eq 0 ]

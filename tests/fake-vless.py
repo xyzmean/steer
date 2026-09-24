@@ -39,7 +39,10 @@ def recv_exactly(sock, n):
 
 
 def read_request(sock):
-    """Разобрать заголовок запроса. Возвращает (uuid, cmd, port) или None."""
+    """Разобрать заголовок запроса. Возвращает (uuid, cmd, port, адрес) или None.
+
+    Адрес — строкой (IPv4, IPv6 или имя); нужен только пересылке UDP (--udp-relay), остальные
+    режимы его выбрасывают."""
     head = recv_exactly(sock, 18)           # версия + UUID + длина_доп
     if not head or head[0] != 0:
         return None
@@ -61,9 +64,16 @@ def read_request(sock):
         need = ln[0]
     else:
         return None
-    if recv_exactly(sock, need) is None:
+    raw = recv_exactly(sock, need)
+    if raw is None:
         return None
-    return uuid, cmd, port
+    if atype == ADDR_IPV4:
+        addr = socket.inet_ntop(socket.AF_INET, raw)
+    elif atype == ADDR_IPV6:
+        addr = socket.inet_ntop(socket.AF_INET6, raw)
+    else:
+        addr = raw.decode("ascii", "replace")
+    return uuid, cmd, port, addr
 
 
 class Handler(socketserver.BaseRequestHandler):
@@ -73,12 +83,15 @@ class Handler(socketserver.BaseRequestHandler):
         req = read_request(sock)
         if req is None:
             return
-        uuid, cmd, port = req
+        uuid, cmd, port, addr = req
         if uuid != self.server.uuid:
             return                          # чужой ключ — молчим, как настоящий сервер
 
         if cmd == CMD_UDP:
-            self.serve_udp(sock)
+            if self.server.udp_relay:
+                self.relay_udp(sock, addr, port)
+            else:
+                self.serve_udp(sock)
             return
 
         # Порт 9 (discard) — соединение, которое ОТКРЫТО и молчит.
@@ -206,6 +219,54 @@ class Handler(socketserver.BaseRequestHandler):
         print("fake-vless: UDP-поток закрыт, датаграмм %d" % n_dg, file=sys.stderr, flush=True)
 
 
+    def relay_udp(self, sock, addr, port):
+        """Поток UDP с НАСТОЯЩЕЙ пересылкой: датаграммы уходят туда, куда просил клиент, ответы
+        возвращаются тем же кадром. Включается --udp-relay.
+
+        Нужен стенду tests/run-via.sh: WireGuard внутри VLESS (выход awg с via на выход vless)
+        проверяется только настоящим пиром WireGuard за сервером — эхо вернуло бы клиенту его же
+        рукопожатие, и туннель не встал бы никогда."""
+        sock.sendall(b"\x00\x00")
+        fam = socket.AF_INET6 if ":" in addr else socket.AF_INET
+        u = socket.socket(fam, socket.SOCK_DGRAM)
+        u.connect((addr, port))
+        stop = threading.Event()
+
+        def back():
+            try:
+                while not stop.is_set():
+                    u.settimeout(1.0)
+                    try:
+                        d = u.recv(65535)
+                    except socket.timeout:
+                        continue
+                    sock.sendall(bytes([len(d) >> 8, len(d) & 255]) + d)
+            except OSError:
+                pass
+        t = threading.Thread(target=back, daemon=True)
+        t.start()
+        buf = b""
+        n_dg = 0
+        try:
+            while True:
+                if len(buf) >= 2 and len(buf) >= 2 + ((buf[0] << 8) | buf[1]):
+                    want = (buf[0] << 8) | buf[1]
+                    u.send(buf[2:2 + want])
+                    buf = buf[2 + want:]
+                    n_dg += 1
+                    continue
+                chunk = sock.recv(65536)
+                if not chunk:
+                    break
+                buf += chunk
+        except OSError:
+            pass
+        stop.set()
+        u.close()
+        print("fake-vless: пересылка UDP на %s:%d закрыта, датаграмм %d" % (addr, port, n_dg),
+              file=sys.stderr, flush=True)
+
+
 class Server(socketserver.ThreadingTCPServer):
     allow_reuse_address = True
     daemon_threads = True
@@ -223,11 +284,14 @@ def main():
     # Стенду от этого доставалось заодно — туннель не поднимался вовсе, — поэтому сервер
     # стенда слушает на обычном адресе, который туннель считает законным узлом.
     ap.add_argument("--bind", default="127.0.0.1", help="адрес слушателя")
+    ap.add_argument("--udp-relay", action="store_true",
+                    help="UDP (команда 2) пересылать по адресу из запроса, а не эхом")
     a = ap.parse_args()
 
     srv = Server((a.bind, a.port), Handler)
     srv.uuid = bytes.fromhex(a.uuid.replace("-", ""))
     srv.body_n = a.mb * 1024 * 1024
+    srv.udp_relay = a.udp_relay
     # Наполнитель фиксированный: содержимое стенду безразлично, а генерация 64 КБ на
     # каждую порцию упиралась в питон, а не в туннель.
     srv.filler = bytes(i * 131 % 251 for i in range(64 * 1024))

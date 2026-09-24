@@ -842,16 +842,19 @@ int out_node_named(const struct output *o);
 
 /* Выход, у которого ЕСТЬ СВОЙ СОКЕТ НАВЕРХ, — только ему `via` и имеет смысл: метку ставит тот,
  * кто открывает соединение с сервером. vless и xsteer — наш процесс; interface с obfs — наш
- * обфускатор (его сырой сокет к серверу обфускации несёт UDP WireGuard). Обычный interface —
- * НЕТ: его сокет открывает ядро WireGuard по настройке netifd, и метку ему ставить не нам.
- * Одной функцией, чтобы новый вид (awg) добавлялся одной строкой, а не поиском по проверкам. */
+ * обфускатор (его сырой сокет к серверу обфускации несёт UDP WireGuard); awg — ядро WireGuard,
+ * но настраивает его движок, и метку сокета туннеля он задаёт сам (WGDEVICE_A_FWMARK, src/awg.c).
+ * Обычный interface — НЕТ: его сокет открывает ядро WireGuard по настройке netifd, и метку ему
+ * ставить не нам. Одной функцией, чтобы новый вид добавлялся одной строкой, а не поиском по
+ * проверкам. */
 static inline int out_via_capable(const struct output *o) {
-    return o->kind == OUT_VLESS || o->kind == OUT_XSTEER
+    return o->kind == OUT_VLESS || o->kind == OUT_XSTEER || o->kind == OUT_AWG
         || (o->kind == OUT_INTERFACE && o->obfs.on);
 }
 
 /* Годится ли выход в цели `via`: у него должны быть устройство и таблица маршрутизации, иначе
- * метке некуда вести. Это ровно out_has_device — direct, zapret и tgws отпадают (у первых двух
+ * метке некуда вести. Это ровно out_has_device (interface, vless, xsteer, awg) — direct, zapret
+ * и tgws отпадают (у первых двух
  * пакет уходит обычным маршрутом, у tgws перехват стоит на prerouting и трафика самого роутера
  * не касается). Отдельным именем, а не прямым вызовом, чтобы смысл читался в проверке. */
 static inline int out_via_target_ok(const struct output *o) {
@@ -882,7 +885,7 @@ static inline int out_via_depth(const struct output *o) {
  *
  * При `via` — метка выхода-цели: по ней ip rule цели уводит пакет в её таблицу, то есть в её
  * устройство. Метка у цели появляется в registry_assign, поэтому звать эту функцию можно только
- * после него — до реестра она вернула бы ноль, то есть «напрямую», молча.
+ * после него — до реестра она вернула бы «мимо каналов», то есть «напрямую», молча.
  *
  * Без `via` — обычное «мимо каналов». На роутере это ноль (сокет не метится вовсе): трафик самого
  * роутера каналы не трогают, они на prerouting. На телефоне — STEER_SELF_MARK, значение «сам
@@ -896,7 +899,9 @@ static inline int out_via_depth(const struct output *o) {
  * свои поля. */
 static inline uint32_t out_underlay_mark(const struct output *o) {
     const struct output *v = out_via(o);
-    if (v) return v->mark;
+    /* Цель без метки (реестр ещё не прочитан) — «напрямую»: метка 0 значила бы ровно то же, но
+     * на телефоне «мимо каналов» — это значение «сам движок», а не ноль. */
+    if (v && v->mark) return v->mark;
 #ifdef STEER_ANDROID
     return STEER_SELF_MARK;
 #else

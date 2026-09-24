@@ -204,6 +204,61 @@ dev="$(field device)"
 check "устройство — нейтральное if…" "1" "$(printf '%s' "$dev" | grep -cE '^if[0-9a-f]{8}$')"
 check "и оно создано" "1" "$(ip link show "$dev" 2>/dev/null | grep -c "$dev")"
 
+# ---- 6a. via: UDP туннеля — через выход-интерфейс -----------------------------------------
+# Второй путь к пиру — ux0, устройство выхода kind=interface (подделка другого туннеля: veth без
+# маршрута по умолчанию). Endpoint пира — адрес на его dummy, до которого из этого пространства
+# без метки нет маршрута вовсе: дойти туда UDP туннеля может только меткой выхода ux, то есть
+# через его таблицу и ux0. Рукопожатие и ping через туннель это и доказывают, а счётчик на ux0 и
+# адрес, с которого пир видит нас, — что путь именно тот.
+ip link add ux0 type veth peer name ux1
+ip link set ux1 netns "$peer"
+ip addr add 10.78.0.1/24 dev ux0
+ip link set ux0 up
+$P ip addr add 10.78.0.2/24 dev ux1
+$P ip link set ux1 up
+$P ip addr add 203.0.113.9/32 dev dum0
+# Адрес пробы сторожа — за ux0 тоже: иначе сторож считал бы ux мёртвым всегда, и проверка
+# отказа ниже проходила бы, ничего не проверяя.
+$P ip addr add 1.1.1.1/32 dev dum0
+sed -i 's/^Endpoint = .*/Endpoint = 203.0.113.9:51820/' "$tmp/nl.conf"
+cat > "$tmp/spec.json" <<SPEC
+{ "schema": 2, "from_default": ["192.168.1.0/24"],
+  "outputs": { "ux": { "kind": "interface", "device": "ux0", "on_fail": "drop" },
+               "nl": { "kind": "awg", "conf": "$tmp/nl.conf", "device": "nl", "via": "ux",
+                       "on_fail": "drop" } },
+  "channels": [ { "name": "a", "match": { "prefixes_file": "$tmp/a.lst" }, "out": "nl" } ] }
+SPEC
+nft add table inet awgvia
+nft add chain inet awgvia post '{ type filter hook postrouting priority 300; policy accept; }'
+nft add rule inet awgvia post oifname ux0 udp dport 51820 counter
+"$BIN" apply $S >/dev/null 2>&1
+check "via: apply проходит" "0" "$?"
+omark() { st | grep -o "\"$1\":{[^}]*" | grep -o '"mark":"0x[0-9a-f]*"' | cut -d'"' -f4; }
+uxmark="$(omark ux)"; nlmark="$(omark nl)"
+check "via: метка сокета туннеля — метка выхода ux" "$(printf '0x%x' "$((uxmark))")" \
+      "$(wg show nl fwmark 2>/dev/null)"
+check "via: status называет цель" "1" "$(st | grep -o '"nl":{[^}]*' | grep -c '"via":"ux"')"
+ping -q -c 3 -W 2 -m "$((nlmark))" -I 10.77.0.2 198.51.100.1 >"$tmp/ping.out" 2>&1
+rc=$?
+[ "$rc" = 0 ] || cat "$tmp/ping.out"
+check "via: трафик канала дошёл через awg, а awg — через ux" "0" "$rc"
+n="$(nft list chain inet awgvia post | sed -n 's/.*packets \([0-9]*\).*/\1/p')"
+check "via: UDP туннеля ушёл в ux0 (пакетов > 0)" "1" "$([ "${n:-0}" -gt 0 ] && echo 1)"
+check "via: пир видит нас с адреса ux0" "10.78.0.1" \
+      "$($P wg show wgpeer endpoints | cut -f2 | cut -d: -f1)"
+# Отказ цели: ux0 лёг — сторож объявляет нерабочим и nl (его on_fail — blackhole в его таблице).
+nltable="$(st | grep -o '"nl":{[^}]*' | grep -o '"table":[0-9]*' | cut -d: -f2)"
+"$BIN" failover $S >"$tmp/fo.out" 2>&1
+check "via: ux жив — nl в работе" "1" "$(ip route show table "$nltable" | grep -c 'default dev nl')"
+ip link set ux0 down
+"$BIN" failover $S >"$tmp/fo.out" 2>&1
+check "via: ux лёг — nl объявлен нерабочим" "1" "$(grep -c 'выход nl: идёт через ux' "$tmp/fo.out")"
+check "via: у nl blackhole" "1" "$(ip route show table "$nltable" | grep -c blackhole)"
+ip link set ux0 up
+"$BIN" failover $S >"$tmp/fo.out" 2>&1
+check "via: ux ожил — nl вернулся" "1" "$(ip route show table "$nltable" | grep -c 'default dev nl')"
+nft delete table inet awgvia
+
 # ---- 7. down снимает туннель -------------------------------------------------------------
 "$BIN" down --state-dir "$tmp/state" >/dev/null 2>&1
 check "down: устройство снято" "0" "$(ip link show "$dev" 2>/dev/null | grep -c "$dev")"

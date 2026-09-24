@@ -1499,8 +1499,25 @@ int main(void) {
     check("via: пул цели без него — принята", 0, load_from_str(SPEC(
         "\"outputs\":{\"a\":" OBFS("wg0") ",\"via\":\"p\"},"
         "\"p\":{\"kind\":\"interface\",\"devices\":[\"wg1\",\"wg2\"]}},\"channels\":[]}")));
+    /* kind=awg — в обе стороны: его UDP метит движок (WGDEVICE_A_FWMARK), и у него устройство с
+     * таблицей, то есть он годится и во внутренние, и в цели. */
+    {
+        check("via: awg через interface — принята", 0, load_from_str(SPEC(
+            "\"outputs\":{\"a\":{\"kind\":\"awg\",\"via\":\"w\"},"
+            "\"w\":{\"kind\":\"interface\",\"device\":\"wg0\"}},\"channels\":[]}")));
+        check("via: awg умеет via", 1, g_out_n == 2 && out_via_capable(&g_out[0]));
+        check("via: interface с obfs через awg — принята", 0, load_from_str(SPEC(
+            "\"outputs\":{\"o\":" OBFS("wg0") ",\"via\":\"a\"},"
+            "\"a\":{\"kind\":\"awg\"}},\"channels\":[]}")));
+        check("via: awg ↔ awg по кругу — отказ", 2, load_from_str(SPEC(
+            "\"outputs\":{\"a\":{\"kind\":\"awg\",\"via\":\"b\"},"
+            "\"b\":{\"kind\":\"awg\",\"via\":\"a\"}},\"channels\":[]}")));
+    }
 #ifdef STEER_EXTENDED
     {
+        check("via: awg через vless (пример владельца) — принята", 0, load_from_str(SPEC(
+            "\"outputs\":{\"a\":{\"kind\":\"awg\",\"via\":\"v\"},"
+            "\"v\":{\"kind\":\"vless\",\"sub_file\":\"/tmp/s\"}},\"channels\":[]}")));
         /* Пример владельца наоборот и прямо: VLESS через интерфейс; xsteer через VLESS. */
         check("via: vless через interface — принята", 0, load_from_str(SPEC(
             "\"outputs\":{\"v\":{\"kind\":\"vless\",\"sub_file\":\"/tmp/s\",\"via\":\"w\"},"
