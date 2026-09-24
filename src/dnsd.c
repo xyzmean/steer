@@ -2614,13 +2614,55 @@ int dnsd_sig_print(const char *spec, FILE *out) {
  * Отдельной функцией, а не куском cmd_dnsd, ради стенда: пропуск выключенного правила
  * и слияние каналов в один набор — решения о смысле, и проверять их надо прямо, а не
  * через запуск резолвера с сетью и netlink. */
+/* Имя доменного набора канала `c`, если бы у него был режим `realip`. */
+static void dch_name(char *dst, size_t n, const struct channel *c, int realip) {
+    size_t fn = c->from_n ? c->from_n : g_from_default_n;
+    const char (*fr)[64] = c->from_n ? c->from : g_from_default;
+    group_set_name(dst, n, c->out, "dom", fr, fn, realip, &c->l4);
+}
+
+/* В какой доменный набор компилятор кладёт канал БЕЗ доменных списков. 1 — в набор `set`
+ * с режимом `*realip`, 0 — ни в какой: его группа адресная, и доменной части у канала нет.
+ *
+ * ЗАЧЕМ. Прежде резолвер заводил доменную часть каждому каналу с адресными файлами — ради
+ * гибридных списков (см. ниже), — и имя ей считал сам, словно канал доменный. Но набор
+ * `_dom` у компилятора появляется, только если в группе есть хоть один канал с доменными
+ * списками (build_groups в steer.c: `domains = c->domains_n > 0`). Канал голоса Discord —
+ * одни подсети Cloudflare плюс udp и порты — давал у резолвера канал `vpn_dom_c0_p1`, а в
+ * ядре был только `vpn_ip_c0_p1`. Имя, совпавшее с правилом такого канала, получало
+ * поддельный адрес для набора, которого нет: вставка отказывала, и резолвер держал SERVFAIL
+ * окно пересборки (map_refusal_is_window), вместо того чтобы сразу ответить настоящим.
+ *
+ * Решение повторяет компилятор, а не угадывает. Адресный канал попадает в доменную группу,
+ * когда совпадает с доменным каналом по выходу, клиентам и сужению — ровно то, что входит в
+ * имя набора; режим группы — у первого такого доменного канала в порядке компилятора
+ * (сначала правила на устройство, потом остальные). Поэтому имя адресного канала считается
+ * с режимом каждого кандидата и сравнивается с именем кандидата: совпало — это его группа. */
+static int dch_join_domain_group(const struct channel *c, char *set, size_t n, int *realip) {
+    for (int pass = 0; pass < 2; pass++)
+        for (size_t j = 0; j < g_ch_n; j++) {
+            const struct channel *d = &g_ch[j];
+            if ((pass == 0) != (d->dev_scope != 0)) continue;
+            if (d->disabled || !d->domains_n) continue;
+            char want[64], mine[64];
+            dch_name(want, sizeof(want), d, d->realip);
+            dch_name(mine, sizeof(mine), c, d->realip);
+            if (strcmp(want, mine)) continue;
+            snprintf(set, n, "%s", want);
+            *realip = d->realip;
+            return 1;
+        }
+    return 0;
+}
+
 static void dch_build(void) {
     g_dch_n = 0;
     /* Same coalescing the compiler does, and it must agree with it exactly: the set
      * names here ARE the sets it generated. Domain channels that share an output, the
      * same clients and the same mode are one set — which is why this groups by
      * (out, realip) rather than walking channels one by one. */
-    /* ГИБРИДНЫЕ СПИСКИ: канал попадает сюда и по адресным файлам тоже.
+    /* ГИБРИДНЫЕ СПИСКИ: канал попадает сюда и по адресным файлам тоже — но только если у
+     * его группы в ядре есть доменный набор (см. dch_join_domain_group выше).
      *
      * Прежде здесь стоял пропуск канала без `domains_files`, и это был не гейт по цене, а
      * решение о смысле: доменность канала определялась ИМЕНЕМ КЛЮЧА в спеке. Из этого
@@ -2653,25 +2695,28 @@ static void dch_build(void) {
         if (g_ch[i].disabled) continue;
         if (!g_ch[i].domains_n && !g_ch[i].prefixes_n) continue;
         char set[64];
+        int realip = g_ch[i].realip;
         /* Имя считает ОБЩАЯ функция, та же, что у компилятора: своя формула здесь была
          * `%.24s_dom` и не знала ни про список клиентов, ни про режим, поэтому доменные
          * каналы одного выхода с разными from сливались в один набор, а fakeip и realip
-         * попадали туда же вместе. Разойтись двум формулам теперь негде — она одна. */
-        size_t fn = g_ch[i].from_n ? g_ch[i].from_n : g_from_default_n;
-        const char (*fr)[64] = g_ch[i].from_n ? g_ch[i].from : g_from_default;
-        /* Сужение канала (протокол и порты) уходит в имя набора наравне с `from` и
+         * попадали туда же вместе. Разойтись двум формулам теперь негде — она одна.
+         *
+         * Сужение канала (протокол и порты) уходит в имя набора наравне с `from` и
          * режимом: компилятор по нему РАЗДЕЛЯЕТ наборы, и резолвер, не передавший его,
-         * наполнял бы набор, которого нет. Ровно та беда, от которой эта функция общая. */
-        group_set_name(set, sizeof(set), g_ch[i].out, "dom", fr, fn, g_ch[i].realip,
-                       &g_ch[i].l4);
+         * наполнял бы набор, которого нет. Ровно та беда, от которой эта функция общая.
+         *
+         * Канал без доменных списков доменной части не получает, если только компилятор не
+         * положил его в доменную группу соседа, — см. dch_join_domain_group. */
+        if (g_ch[i].domains_n) dch_name(set, sizeof(set), &g_ch[i], realip);
+        else if (!dch_join_domain_group(&g_ch[i], set, sizeof(set), &realip)) continue;
         size_t k = 0;
         for (; k < g_dch_n; k++)
-            if (!strcmp(g_dch[k].set, set) && g_dch[k].realip == g_ch[i].realip) break;
+            if (!strcmp(g_dch[k].set, set) && g_dch[k].realip == realip) break;
         if (k == g_dch_n) {
             if (g_dch_n >= MAX_CHANNELS) break;
             memset(&g_dch[g_dch_n], 0, sizeof(g_dch[g_dch_n]));
             snprintf(g_dch[g_dch_n].set, sizeof(g_dch[g_dch_n].set), "%s", set);
-            g_dch[g_dch_n].realip = g_ch[i].realip;
+            g_dch[g_dch_n].realip = realip;
             k = g_dch_n++;
         }
         for (size_t f = 0; f < g_ch[i].domains_n && g_dch[k].rules_n < MAX_FILES; f++)

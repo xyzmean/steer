@@ -1343,6 +1343,30 @@ check "правило у канала по-прежнему одно" "1" \
 # читается порт.
 check "порты без указания протокола не печатаются" "0" \
     "$(printf '%s\n' "$dout" | grep 'th dport' | grep -vc 'meta l4proto')"
+# Доменной части у такого канала нет: доменных списков у него нет, и в ядре стоит только
+# vpn_ip_c0_p1. Резолвер прежде заводил ему vpn_dom_c0_p1 — набор, которого нет, — и имя,
+# совпавшее с его правилом, получало поддельный адрес в никуда (SERVFAIL на окно пересборки).
+check "резолвер не заводит доменный набор каналу без доменов" "0" \
+    "$("$BIN" dnsd-sig --spec "$tmp/spec.json" --state-dir "$tmp/st-dc" 2>/dev/null | grep -c _dom)"
+# А адресный канал, который компилятор кладёт в доменную группу соседа (тот же выход, те же
+# клиенты, то же сужение), у резолвера в этой группе и остаётся — гибридные списки.
+printf 'example.org\n' > "$tmp/dcnames.lst"
+spec <<'EOF'
+{ "schema": 2,
+  "from_default": ["192.168.1.0/24"],
+  "outputs": { "vpn": { "kind": "interface", "device": "wg0" } },
+  "channels": [
+    { "name": "имена", "out": "vpn", "match": { "domains_files": ["TMP/dcnames.lst"] } },
+    { "name": "гибрид", "out": "vpn", "match": { "prefixes_files": ["TMP/dc.lst"] } },
+    { "name": "голос", "out": "vpn",
+      "match": { "prefixes_files": ["TMP/dc.lst"], "proto": "udp", "ports": ["50000-65535"] } }
+  ] }
+EOF
+hsig="$("$BIN" dnsd-sig --spec "$tmp/spec.json" --state-dir "$tmp/st-dch" 2>/dev/null)"
+check "гибридный канал в доменной группе соседа" "vpn_dom|0|$tmp/dcnames.lst|$tmp/dc.lst" "$hsig"
+hout="$("$BIN" apply --dry-run --spec "$tmp/spec.json" --state-dir "$tmp/st-dch" 2>/dev/null)"
+check "и компилятор завёл ровно эти наборы" "set vpn_dom {|set vpn_ip_c0_p1 {" \
+    "$(printf '%s\n' "$hout" | grep -o 'set [a-z0-9_]* {' | paste -sd'|')"
 # Встречный путь: клиент — ПОЛУЧАТЕЛЬ, значит порт сервера здесь исходящий. Без зеркала
 # счётчик скачанного считал бы и тот TCP, который правило разметки не берёт, — то есть
 # врал бы ровно на ту величину, ради которой заведены порты.
