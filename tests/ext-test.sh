@@ -57,7 +57,11 @@ if [ -n "$STEER_MBEDTLS" ] && [ -f "$STEER_MBEDTLS/include/mbedtls/version.h" ];
 	MBED_INC="-I$STEER_MBEDTLS/include"
 	VH="$STEER_MBEDTLS/include/mbedtls/version.h"
 	if [ -f "$STEER_MBEDTLS/library/libmbedcrypto.a" ]; then
+		# x509 из ТОГО ЖЕ дерева и первым: иначе проба ниже добавит -lmbedx509, и компоновщик
+		# возьмёт системную библиотеку другой версии (на Ubuntu — 2.28 рядом с деревом 3.6).
 		MBED_LIB="$STEER_MBEDTLS/library/libmbedcrypto.a"
+		[ -f "$STEER_MBEDTLS/library/libmbedx509.a" ] &&
+			MBED_LIB="$STEER_MBEDTLS/library/libmbedx509.a $MBED_LIB"
 	else
 		MBED_LIB="-L$STEER_MBEDTLS/lib -lmbedcrypto"
 	fi
@@ -98,6 +102,9 @@ if [ -z "$VH" ]; then
 fi
 MBED_VER=""
 [ -n "$VH" ] && MBED_VER=$(sed -n 's/.*MBEDTLS_VERSION_STRING  *"\([^"]*\)".*/\1/p' "$VH" | head -1)
+# В 3.x строка версии переехала из version.h в build_info.h рядом с ним.
+[ -z "$MBED_VER" ] && [ -n "$VH" ] && [ -f "$(dirname "$VH")/build_info.h" ] &&
+	MBED_VER=$(sed -n 's/.*MBEDTLS_VERSION_STRING  *"\([^"]*\)".*/\1/p' "$(dirname "$VH")/build_info.h" | head -1)
 MBED_MAJOR=$(printf '%s' "$MBED_VER" | cut -d. -f1)
 
 if [ "$MBED_MAJOR" = "3" ]; then
@@ -239,6 +246,15 @@ $CC -O1 -g -w -Isrc $ASAN $MBED_INC "$PRIV" $X509W -o "$BUILD/vlessmatch" tests/
 	src/ext/reality.c src/ext/h2.c src/ext/tun.c src/ext/rtx.c src/ext/sub.c \
 	src/spec.c $MBED_LIB -lpthread
 "$BUILD/vlessmatch"
+
+# androidroots — склейка каталога корней Android в файл для certverify (cert_roots в
+# client.c под STEER_ANDROID). Выпуск X.509 нужен тот же, что у случаев security=tls выше.
+echo "ext-test: собираю и прогоняю androidroots..."
+$CC -O1 -g -w -Isrc $MBED_INC "$PRIV" $X509W -o "$BUILD/androidroots" tests/androidroots.c \
+	src/ext/vless_proto.c src/ext/vision.c src/ext/tls13.c src/ext/certverify.c \
+	src/ext/reality.c src/ext/h2.c src/ext/tun.c src/ext/rtx.c src/ext/sub.c \
+	src/spec.c $MBED_LIB -lpthread
+"$BUILD/androidroots"
 
 # hubmatch — согласие правила набора пачки с размером строки воркера.
 echo "ext-test: собираю и прогоняю hubmatch..."

@@ -380,6 +380,14 @@ static int xs_hs_client_hello_impl(struct xs_hs *hs, const struct xs_secrets *se
 
 static int xs_hs_server_read_impl(struct xs_hs *hs, const struct xs_secrets *sec,
                       const uint8_t *rec, size_t n, uint8_t peer_static[32]) {
+    /* Ключ шага обнуляется ДО разбора. Отказы ниже (битый ClientHello — ровно то, что шлют
+     * сканеры на публичный порт) случаются раньше hs_begin, а обёртка hs_cleanup при отказе
+     * освобождает hs->hk — то есть без этой строки освобождала бы то, что лежало в памяти
+     * вызывающего. Хаб держит сессию обнулённой и этого не замечал; стенд xsloop со структурой
+     * на стеке падал в mbedtls_cipher_free, как только мусор на стеке оказывался ненулевым
+     * (сборка NDK под Android с -O2). Прежний ключ этим не теряется: hs_begin ниже обнуляет
+     * состояние целиком, это первый шаг рукопожатия. */
+    memset(&hs->hk, 0, sizeof(hs->hk));
     struct chello_ref ref;
     if (chello_parse(rec, n, &ref) != 0) return XS_EFORMAT;
     if (!ref.ech_off || ref.ech_n < XS_ECH_USED) return XS_EFORMAT;
