@@ -21,6 +21,9 @@
 #include <unistd.h>
 #include <sys/stat.h>
 #include <sys/wait.h>
+#include <linux/netlink.h>
+#include <linux/rtnetlink.h>
+#include <poll.h>
 #include <signal.h>
 #include <fcntl.h>
 #include <sys/socket.h>
@@ -4078,12 +4081,43 @@ static int cmd_supervise(const char *spec) {
  *
  * СОН НА CLOCK_MONOTONIC — требование батареи. Этот таймер во сне устройства стоит и не
  * будит его (будят только *_ALARM и удерживаемый wakelock, которых здесь нет): пока телефон
- * спит, сторож молчит, а проснувшись, досыпает остаток периода. Проверка по событиям (смена
- * сети, включение экрана) вместо периода — следующий шаг, см. B4 в брифе Android.
+ * спит, сторож молчит, а проснувшись, досыпает остаток периода.
+ *
+ * ПО СОБЫТИЯМ, А НЕ ТОЛЬКО ПО ПЕРИОДУ: смена интерфейса или адреса (сеть сменилась, TUN выхода
+ * поднялся или упал) — внеочередной проход через секунду после события, см.
+ * failover_events_open. Период остаётся для того, чего событием не увидеть: туннель поднят,
+ * а трафик через него не идёт.
  *
  * init гасит сервис сигналом всей группе процессов, поэтому дочерний проход получает свой
  * SIGTERM и убирает за собой так же, как от kill на роутере. */
+/* Сокет событий ядра для сторожа: смена состояния интерфейса и его адресов. -1 — не
+ * открылся, и сторож живёт одним периодом, как раньше.
+ *
+ * ИНТЕРФЕЙСЫ И АДРЕСА, НО НЕ МАРШРУТЫ. Маршруты в таблицах выходов меняет сам сторож (и apply)
+ * — подписка на них будила бы его собственными действиями по кругу. А то, ради чего события и
+ * нужны, видно именно здесь: сменилась сеть (у Wi-Fi или сотовой появился или пропал адрес),
+ * поднялся TUN выхода, который создал помощник, упал интерфейс туннеля. */
+static int failover_events_open(void) {
+    int fd = socket(AF_NETLINK, SOCK_RAW | SOCK_CLOEXEC | SOCK_NONBLOCK, NETLINK_ROUTE);
+    if (fd < 0) return -1;
+    struct sockaddr_nl a;
+    memset(&a, 0, sizeof(a));
+    a.nl_family = AF_NETLINK;
+    a.nl_groups = RTMGRP_LINK | RTMGRP_IPV4_IFADDR | RTMGRP_IPV6_IFADDR;
+    if (bind(fd, (struct sockaddr *)&a, sizeof(a)) != 0) { close(fd); return -1; }
+    return fd;
+}
+
+/* Дочитать всё, что накопилось. 1 — было хоть одно событие. */
+static int failover_events_drain(int fd) {
+    char buf[8192];
+    int any = 0;
+    while (recv(fd, buf, sizeof(buf), 0) > 0) any = 1;
+    return any;
+}
+
 static int failover_loop(const char *spec, int verbose, int period) {
+    int ev = failover_events_open();
     for (;;) {
         pid_t pid = fork();
         if (pid == 0) exit(cmd_failover(spec, verbose));
@@ -4091,8 +4125,39 @@ static int failover_loop(const char *spec, int verbose, int period) {
             while (waitpid(pid, NULL, 0) < 0 && errno == EINTR) {}
         else
             fprintf(stderr, "steer[warn] failover: fork: %s\n", strerror(errno));
-        struct timespec left = { period, 0 };
-        while (clock_nanosleep(CLOCK_MONOTONIC, 0, &left, &left) == EINTR) {}
+#ifndef STEER_ANDROID
+        /* На роутере проход сам делает ifdown/ifup мёртвому интерфейсу, и события за время
+         * прохода — его же следы: реагировать на них значило бы будить себя по кругу. На
+         * телефоне сторож интерфейсы не трогает (только ждёт), и событие за время прохода —
+         * настоящее: например, TUN, который как раз поднял помощник выхода. */
+        if (ev >= 0) failover_events_drain(ev);
+#endif
+
+        /* Ждать период ИЛИ событие. poll на монотонном времени: во сне устройства ожидание
+         * стоит и не будит его. Событие — не повод бежать сразу: смена сети приходит пачкой
+         * (адрес ушёл, интерфейс лёг, поднялся, адрес пришёл), и за секунду она успевает
+         * закончиться; проход на середине увидел бы полусобранную сеть. */
+        long left = (long)period * 1000;
+        struct timespec t0;
+        clock_gettime(CLOCK_MONOTONIC, &t0);
+        for (;;) {
+            struct pollfd p = { ev, POLLIN, 0 };
+            int r = ev >= 0 ? poll(&p, 1, (int)(left > 0x7fffffff ? 0x7fffffff : left))
+                            : poll(NULL, 0, (int)(left > 0x7fffffff ? 0x7fffffff : left));
+            if (r > 0 && failover_events_drain(ev)) {
+                struct timespec q = { 1, 0 };
+                while (nanosleep(&q, &q) != 0 && errno == EINTR) {}
+                failover_events_drain(ev);
+                if (verbose)
+                    fprintf(stderr, "steer[info] failover: сеть изменилась — проверяю выходы\n");
+                break;
+            }
+            struct timespec t1;
+            clock_gettime(CLOCK_MONOTONIC, &t1);
+            long spent = (t1.tv_sec - t0.tv_sec) * 1000L + (t1.tv_nsec - t0.tv_nsec) / 1000000L;
+            if (spent >= (long)period * 1000) break;
+            left = (long)period * 1000 - spent;
+        }
     }
 }
 
