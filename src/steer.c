@@ -1563,6 +1563,68 @@ static void report_traceroute_dep(void) {
                         "time-exceeded towards %s\n", g_lan_dev[0]);
 }
 
+/* ЧУЖИЕ ПРАВИЛА НА БИТАХ 16-23 — предупреждение, а не отказ.
+ *
+ * Поле метки движка — биты 20-27 (STEER_MARK_MASK, контракт). Tailscale и pbr держат свою
+ * метку маской 0x00ff0000, то есть битами 16-23, и на битах 20-23 два поля ПЕРЕСЕКАЮТСЯ —
+ * подробно у STEER_MARK_MASK в spec.h. Раскладку не меняем: это контракт, и сдвиг поля
+ * означал бы новые метки у всех выходов на всех роутерах. Зато говорим, когда соседство
+ * действительно есть, — иначе его последствия выглядят как «канал иногда идёт мимо выхода»
+ * без единой строки в журнале.
+ *
+ * Признак — число в выражении с меткой в ЧУЖОЙ таблице: 0x00ff0000 (маска поля 16-23) или
+ * 0xff00ffff (она же, дополнением: «стереть биты 16-23»). Так их печатает nft и для
+ * Tailscale (снято с роутера: `meta mark set mark and 0xff00ffff xor 0x40000`), и для
+ * всякого, кто метит по той же схеме. Разбираются числа, а не строка: ведущие нули nft то
+ * печатает, то нет.
+ *
+ * Не отказ, потому что соседство законно и чаще всего безвредно: Tailscale переписывает
+ * метку в хуке forward, то есть ПОСЛЕ решения о маршруте, и ip rule выхода его не замечает;
+ * единственный наш читатель метки после forward — очередь kind=zapret — узнаёт выход по
+ * метке соединения. Отказ применить спеку на роутере с Tailscale снял бы маршрутизацию у
+ * людей, у которых всё работает. Вредные случаи — чужое правило, которое метит ТОТ ЖЕ пакет
+ * в prerouting после нас (стирает наши биты — пакет уходит по main, мимо выхода и мимо
+ * запрета on_fail=drop), или до нас (мы стираем его биты 20-23 — его политика на этом
+ * пакете перестаёт совпадать), — по дампу не отличить, поэтому о них говорится словами.
+ *
+ * Возвращает, о скольких таблицах сказано: стенд fwmatch проверяет признак на дампах. */
+static int report_mark_overlap(void) {
+    const char *pos = ruleset_dump();
+    char line[2048], table[96] = "", said[8][96];
+    int n_said = 0;
+    while ((pos = dump_line(pos, line, sizeof(line))) != NULL) {
+        const char *p = line;
+        while (*p == ' ' || *p == '\t') p++;
+        if (!strncmp(p, "table ", 6)) {
+            snprintf(table, sizeof(table), "%s", p + 6);
+            char *b = strchr(table, '{');
+            if (b) *b = '\0';
+            for (size_t k = strlen(table); k && table[k - 1] == ' '; k--) table[k - 1] = '\0';
+            continue;
+        }
+        if (!*table || !strstr(p, "mark")) continue;
+        /* Своя таблица — «семейство имя», имя вторым словом. */
+        const char *tn = strchr(table, ' ');
+        if (tn && !strcmp(tn + 1, nft_table())) continue;
+        int hit = 0;
+        for (const char *q = p; (q = strstr(q, "0x")) != NULL; q += 2) {
+            unsigned long v = strtoul(q, NULL, 16);
+            if (v == 0x00ff0000ul || v == 0xff00fffful) { hit = 1; break; }
+        }
+        if (!hit) continue;
+        int dup = 0;
+        for (int k = 0; k < n_said; k++) if (!strcmp(said[k], table)) dup = 1;
+        if (dup || n_said >= 8) continue;
+        snprintf(said[n_said++], sizeof(said[0]), "%s", table);
+        fprintf(stderr, LOG_W "таблица %s метит пакеты маской 0x00ff0000 (биты 16-23, так "
+                        "работают Tailscale и pbr), а поле движка — биты 20-27: на битах "
+                        "20-23 метки пересекаются. Если её правило метит тот же пакет в "
+                        "prerouting после нас, трафик канала уйдёт мимо выхода; если до нас — "
+                        "перестанет действовать её политика на этом пакете\n", table);
+    }
+    return n_said;
+}
+
 static void report_output_deps(void) {
     for (size_t i = 0; i < g_out_n; i++) {
         if (!out_has_device(&g_out[i])) continue;
@@ -1871,6 +1933,7 @@ static int cmd_apply(const char *spec, int dry) {
     unlink(snap);
     report_output_deps();
     report_traceroute_dep();
+    report_mark_overlap();
     printf("steer: applied %zu channel(s), %zu output(s)\n", g_ch_n, g_out_n);
     return 0;
 }

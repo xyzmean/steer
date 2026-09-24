@@ -215,10 +215,57 @@ int main(void) {
         }
     }
 
+    /* Соседи на битах 16-23 (Tailscale, pbr) пересекаются с полем движка на битах 20-23 —
+     * apply об этом говорит, но только когда сосед действительно есть. Строка Tailscale —
+     * та, что снята с роутера (I-265); ведущих нулей nft в ней не печатает. Своя таблица и
+     * чужие правила с другими масками (mwan3 0x3f00, zapret 0x40000000) не в счёт. */
+    {
+        static const char *const ts =
+            "table inet steer {\n"
+            "\tchain prerouting_mark {\n"
+            "\t\tmeta mark set meta mark & 0xf00fffff | 0x40100000 return\n"
+            "\t}\n"
+            "}\n"
+            "table ip mangle {\n"
+            "\tchain ts-forward {\n"
+            "\t\tiifname \"tailscale0\" meta mark set meta mark & 0xff00ffff ^ 0x40000\n"
+            "\t}\n"
+            "}\n";
+        static const char *const cmp =
+            "table inet fw4 {\n"
+            "\tchain policy {\n"
+            "\t\tmeta mark & 0x00ff0000 == 0x00010000 return\n"
+            "\t}\n"
+            "}\n";
+        static const char *const quiet =
+            "table inet steer {\n"
+            "\tchain prerouting_mark {\n"
+            "\t\tmeta mark set meta mark & 0xf00fffff | 0x40100000 return\n"
+            "\t}\n"
+            "}\n"
+            "table inet mwan3 {\n"
+            "\tchain m { meta mark & 0x00003f00 == 0x00000100 }\n"
+            "}\n"
+            "table inet zapret {\n"
+            "\tchain postnat_hook { meta mark & 0x40000000 == 0x00000000 jump postnat }\n"
+            "}\n";
+        const struct { const char *what, *rs; int want; } t[] = {
+            { "Tailscale рядом — сказано", ts, 1 },
+            { "сравнение маской 0x00ff0000 в чужой таблице — сказано", cmp, 1 },
+            { "своя таблица и чужие маски — тишина", quiet, 0 },
+        };
+        for (size_t i = 0; i < sizeof(t) / sizeof(*t); i++) {
+            g_ruleset = t[i].rs;
+            free(g_ruleset_dump);
+            g_ruleset_dump = NULL;
+            check(t[i].what, report_mark_overlap(), t[i].want);
+        }
+    }
+
     if (g_fail) {
         fprintf(stderr, "fwmatch: провалено проверок: %d\n", g_fail);
         return 1;
     }
-    printf("fwmatch: 16/16 проверок пройдено плюс 7 про объяснение совпадения\n");
+    printf("fwmatch: 16/16 проверок пройдено плюс 7 про объяснение совпадения и 3 про соседей на битах 16-23\n");
     return 0;
 }
