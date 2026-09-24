@@ -268,7 +268,7 @@ int main(void) {
         PEER1 "PresharedKey = " PSK "\nEndpoint = 192.0.2.7:51820\n"
         "AllowedIPs = 0.0.0.0/0, fd00::/8\nPersistentKeepalive = 25\n";
     check("файл для сборки разобран", 0, parse(setconf));
-    check("литерал Endpoint разрешается без сети", 0, resolve_peers(&C, "ifab", 0));
+    check("литерал Endpoint разрешается без сети", 0, resolve_peers(&C, "ifab", 0, 0));
     static uint8_t m[65536];
     for (int ver = 1; ver <= 3; ver++) {
         char t[96];
@@ -437,6 +437,40 @@ int main(void) {
         check("  значение", 0x00300000, (long)mk);
         check("via на direct — как без via", 0, (awg_sock_mark("d", &mk), (long)(mk != self)));
         check("via на несуществующий выход — отказ", -1, awg_sock_mark("nope", &mk));
+    }
+
+    /* ---- 10. туннель через via — только IPv4 -------------------------------------------
+     * Таблица выхода-цели и её ip rule — только IPv4: датаграмма WireGuard к серверу по IPv6 с
+     * меткой цели ушла бы мимо цели, напрямую. Литерал IPv6 при via — отказ с причиной, имя при
+     * via разрешается только в IPv4; без via IPv6 законен. */
+    {
+        const char *v6 = "[Interface]\nPrivateKey = " PRIV "\n"
+                         "[Peer]\nPublicKey = " PUB1 "\nEndpoint = [2001:db8::1]:51820\n"
+                         "AllowedIPs = 0.0.0.0/0\n";
+        check("файл с Endpoint IPv6 разобран", 0, parse(v6));
+        char why[512] = "";
+        check("Endpoint IPv6 без via — годен", 0, awg_via_check(&C, NULL, why, sizeof why));
+        check("Endpoint IPv6 при via — отказ", -1, awg_via_check(&C, "up", why, sizeof why));
+        check("  причина называет IPv6 и via", 1,
+              strstr(why, "IPv6") && strstr(why, "via up") && strstr(why, "2001:db8::1"));
+        const char *v4 = "[Interface]\nPrivateKey = " PRIV "\n"
+                         "[Peer]\nPublicKey = " PUB1 "\nEndpoint = 192.0.2.2:51820\n"
+                         "AllowedIPs = 0.0.0.0/0\n"
+                         "[Peer]\nPublicKey = " PUB2 "\nEndpoint = ip6-localhost:51820\n"
+                         "AllowedIPs = 10.0.0.0/8\n";
+        check("файл с IPv4 и именем разобран", 0, parse(v4));
+        check("IPv4 и имя при via — годны", 0, awg_via_check(&C, "up", why, sizeof why));
+        /* Имя при via — только IPv4: ip6-localhost (у машины разработки это только ::1) при via не
+         * разрешается вовсе, без via — законно в IPv6. Где имени нет в /etc/hosts, обе половины
+         * сводятся к «не разрешилось», и проверка ничего не утверждает зря. */
+        resolve_peers(&C, "nl", 0, 1);
+        check("via: литерал IPv4 разрешён в IPv4", AF_INET,
+              C.peer[0].ep_len ? ((struct sockaddr *)&C.peer[0].ep)->sa_family : -1);
+        check("via: имя не разрешено в IPv6", 1,
+              C.peer[1].ep_len == 0 || ((struct sockaddr *)&C.peer[1].ep)->sa_family == AF_INET);
+        resolve_peers(&C, "nl", 0, 0);
+        check("без via: имя разрешено как есть, в IPv6", 1,
+              C.peer[1].ep_len == 0 || ((struct sockaddr *)&C.peer[1].ep)->sa_family == AF_INET6);
     }
 
     awg_conf_free(&C);

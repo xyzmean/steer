@@ -263,6 +263,19 @@ ip link set ux0 up
 "$BIN" failover $S >"$tmp/fo.out" 2>&1
 check "via: ux ожил — nl вернулся" "1" "$(ip route show table "$nltable" | grep -c 'default dev nl')"
 nft delete table inet awgvia
+# Endpoint по IPv6 при via: таблица цели — только IPv4, и такой туннель ушёл бы мимо ux. Отказ с
+# причиной и при --dry-run, и при apply; устройство не перенастраивается на адрес IPv6.
+sed -i 's/^Endpoint = .*/Endpoint = [2001:db8::9]:51820/' "$tmp/nl.conf"
+err="$("$BIN" apply --dry-run $S 2>&1 >/dev/null)"
+check "via + Endpoint IPv6: --dry-run называет причину" "1" \
+      "$(printf '%s\n' "$err" | grep -c 'адрес IPv6 (2001:db8::9), а туннель идёт через via ux')"
+err="$("$BIN" apply $S 2>&1 >/dev/null)"
+check "via + Endpoint IPv6: apply отказывает туннелю с причиной" "1" \
+      "$(printf '%s\n' "$err" | grep -c 'туннель не поднят')"
+check "via + Endpoint IPv6: адрес IPv6 на устройство не лёг" "0" \
+      "$(wg show nl endpoints 2>/dev/null | grep -c '2001:db8::9')"
+sed -i 's/^Endpoint = .*/Endpoint = 203.0.113.9:51820/' "$tmp/nl.conf"
+"$BIN" apply $S >/dev/null 2>&1
 
 # ---- 7. down снимает туннель -------------------------------------------------------------
 "$BIN" down --state-dir "$tmp/state" >/dev/null 2>&1

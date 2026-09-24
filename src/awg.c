@@ -964,6 +964,40 @@ int awg_sock_mark(const char *via, uint32_t *mark) {
     return 0;
 }
 
+/* ТУННЕЛЬ ЧЕРЕЗ via — ТОЛЬКО ПО IPv4, и это проверка, а не пожелание.
+ *
+ * Метка цели ведёт пакет в её таблицу через `ip rule fwmark …`, а и правило, и маршрут по
+ * умолчанию в таблице выхода движок ставит только для IPv4 (`ip rule add` без семейства — это
+ * IPv4). У датаграммы WireGuard к серверу по IPv6 с той же меткой в IPv6 нет ни правила, ни
+ * таблицы — она идёт по обычным правилам системы, то есть НАПРЯМУЮ, мимо цели: ровно то, ради
+ * чего via заводили (UDP к серверу режут, или сервер виден только из сети цели), молча не
+ * происходит, а на телефоне это ещё и адрес человека у сервера мимо туннеля.
+ *
+ * Почему отказ, а не IPv6 для таблицы цели. Полноценный IPv6 — это `ip -6 rule` по той же метке,
+ * маршрут в таблицу, запасной запрет, сверка и снятие в обоих семействах — во всём слое
+ * маршрутизации (apply, сторож, down), и он менял бы судьбу и помеченного IPv6 приложений у
+ * каждого выхода-цели, а не только туннеля. Остальные туннели через via этого не требуют вовсе:
+ * клиенты vless, xsteer и обфускатор открывают сокеты только AF_INET (адрес узла, Endpoint и
+ * сервер обфускации принимаются только как IPv4 или имя, разрешаемое в IPv4), так что их трафик
+ * к серверу по IPv6 не уходит ни через цель, ни мимо. Единственный, кто мог так уйти, — awg:
+ * адрес пира ядро берёт из настройки как есть. Поэтому здесь: литерал IPv6 при via — отказ с
+ * понятной причиной (туннель не поднимается), имя при via разрешается только в IPv4
+ * (resolve_peers), и тихой отправки мимо цели нет ни в одном случае. */
+int awg_via_check(const struct awg_conf *c, const char *via, char *err, size_t n) {
+    if (!via || !*via) return 0;
+    for (size_t i = 0; i < c->peer_n; i++) {
+        const struct awg_peer *pe = &c->peer[i];
+        struct in6_addr a6;
+        if (!pe->has_ep || inet_pton(AF_INET6, pe->ep_host, &a6) != 1) continue;
+        snprintf(err, n, "Endpoint пира %zu — адрес IPv6 (%s), а туннель идёт через via %s: у "
+                         "выхода-цели маршрут только для IPv4, и туннель ушёл бы мимо него — "
+                         "напишите адрес IPv4 или имя с адресом IPv4; туннель не поднят",
+                 i + 1, pe->ep_host, via);
+        return -1;
+    }
+    return 0;
+}
+
 /* ---- адреса ----------------------------------------------------------------------------- */
 
 static int prefix_of_mask(const struct sockaddr *m) {
@@ -1029,23 +1063,30 @@ static void addrs_sync(const char *dev, const struct awg_conf *c) {
 
 /* Имя — при apply, одной попыткой и без ожидания: apply не должен висеть на DNS, которого
  * при загрузке телефона ещё нет. Не разрешилось — пир ставится без эндпоинта, туннель
- * молчит, и сторож в revive разрешит заново (не чаще раза в пять минут на устройство). */
-static int resolve_peers(struct awg_conf *c, const char *dev, int loud) {
+ * молчит, и сторож в revive разрешит заново (не чаще раза в пять минут на устройство).
+ *
+ * v4only — туннель идёт через via: имя разрешается только в IPv4. Иначе на сети с IPv6 (у
+ * телефона это обычное дело) getaddrinfo по RFC 6724 отдал бы первым адрес IPv6, и туннель
+ * ушёл бы мимо цели — см. awg_via_check. Имя без адреса IPv4 при via не разрешится вовсе, и
+ * журнал говорит почему. */
+static int resolve_peers(struct awg_conf *c, const char *dev, int loud, int v4only) {
     int bad = 0;
     for (size_t i = 0; i < c->peer_n; i++) {
         struct awg_peer *pe = &c->peer[i];
         pe->ep_len = 0;
         if (!pe->has_ep) continue;
-        struct addrinfo hints = { .ai_family = AF_UNSPEC, .ai_socktype = SOCK_DGRAM,
-                                  .ai_protocol = IPPROTO_UDP };
+        struct addrinfo hints = { .ai_family = v4only ? AF_INET : AF_UNSPEC,
+                                  .ai_socktype = SOCK_DGRAM, .ai_protocol = IPPROTO_UDP };
         struct addrinfo *res = NULL;
         char port[8];
         snprintf(port, sizeof port, "%u", pe->ep_port);
         int rc = getaddrinfo(pe->ep_host, port, &hints, &res);
         if (rc != 0 || !res) {
             if (loud)
-                fprintf(stderr, LOG_W "%s: Endpoint %s не разрешился (%s) — пир без адреса, "
-                                "повторю при починке туннеля\n", dev, pe->ep_host, gai_strerror(rc));
+                fprintf(stderr, LOG_W "%s: Endpoint %s не разрешился%s (%s) — пир без адреса, "
+                                "повторю при починке туннеля\n", dev, pe->ep_host,
+                        v4only ? " в IPv4 (туннель через via идёт только по IPv4)" : "",
+                        gai_strerror(rc));
             bad++;
             continue;
         }
@@ -1171,6 +1212,16 @@ static int awg_configure(const struct output *o, int loud) {
         fprintf(stderr, LOG_W "выход %s: via %s — такого выхода нет\n", o->name, via);
         goto out;
     }
+    /* До создания устройства: туннель через via с сервером по IPv6 ушёл бы мимо цели, и
+     * поднимать его нельзя вовсе (см. awg_via_check). Отказ всегда громкий — и при apply, и в
+     * починке сторожа: это не шум, а причина, по которой туннель не работает. */
+    {
+        char verr[512];     /* текст длиннее обычной ошибки разбора: адрес и имя цели */
+        if (awg_via_check(&c, via, verr, sizeof verr) != 0) {
+            fprintf(stderr, LOG_W "выход %s: %s\n", o->name, verr);
+            goto out;
+        }
+    }
 
     /* КАКОЙ МОДУЛЬ. AmneziaWG — всегда, когда он есть: он понимает и обычный WireGuard (файл
      * без параметров обфускации). Модуль wireguard — только запасной путь для такого файла.
@@ -1246,7 +1297,7 @@ static int awg_configure(const struct output *o, int loud) {
         if (link_query(dev, NULL, 0, &index) != 0) goto out;
     }
 
-    resolve_peers(&c, dev, loud);
+    resolve_peers(&c, dev, loud, via != NULL);
 
     /* Пиры, которых в файле нет, снимаются флагом REPLACE_PEERS. Ставится он ТОЛЬКО когда
      * состав пиров действительно разошёлся: флаг снимает всех и ставит заново, то есть рвёт
@@ -1351,6 +1402,11 @@ int awg_check_all(void) {
             fprintf(stderr, LOG_W "выход %s: %s\n", o->name, err);
             bad++;
             continue;
+        }
+        char verr[512];
+        if (awg_via_check(&c, awg_out_via(o), verr, sizeof verr) != 0) {
+            fprintf(stderr, LOG_W "выход %s: %s\n", o->name, verr);
+            bad++;
         }
         awg_secrets_wipe(&s);
         awg_conf_free(&c);

@@ -172,6 +172,11 @@ size_t awg_build_getfamily(uint8_t *buf, size_t cap, const char *name, uint32_t 
  * в *mark. Подробности — у определения. */
 int awg_sock_mark(const char *via, uint32_t *mark);
 
+/* Годится ли файл для туннеля, который идёт через via: 0 — да; -1 — нет, причина в err (без
+ * ключей). Сейчас одна причина — Endpoint с адресом IPv6: таблица выхода-цели и её ip rule
+ * только для IPv4, и такой туннель ушёл бы мимо цели. Подробности — у определения. */
+int awg_via_check(const struct awg_conf *c, const char *via, char *err, size_t n);
+
 /* ---- то, что зовут apply, down, status и сторож ------------------------------------ */
 
 /* Поднять и настроить устройства всех выходов kind=awg, снять устройства выходов, которых в
