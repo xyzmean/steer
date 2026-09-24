@@ -48,7 +48,9 @@
 /* Таблица и приоритет правила для проб. Далеко от 300+, которые раздаёт реестр:
  * проба обязана быть невидимой для боевой маршрутизации. */
 #define PROBE_TABLE 299
-#define PROBE_PRIO  29999
+/* Приоритет правила пробы — из spec.h (STEER_PROBE_PREF): на Android он обязан стоять ниже
+ * лестницы правил netd, на роутере остаётся прежним 29999. */
+#define PROBE_PRIO  STEER_PROBE_PREF
 
 /* Куда пинговать. Два адреса, потому что один может быть заблокирован именно в
  * этом туннеле, и тогда здоровый путь выглядел бы мёртвым. */
@@ -441,6 +443,17 @@ void rule_add(unsigned mark, int table) {
     char m[32], t[16];
     snprintf(m, sizeof(m), "0x%08x/0x%08x", mark, STEER_MARK_MASK);
     snprintf(t, sizeof(t), "%d", table);
+    /* Приоритет — только если сборка его задаёт (STEER_RULE_PREF, spec.h): на роутере его нет,
+     * и команда остаётся прежней до последнего слова. rule_drop приоритета не называет и
+     * снимает правило при любом. */
+    if (STEER_RULE_PREF) {
+        char pr[16];
+        snprintf(pr, sizeof(pr), "%d", STEER_RULE_PREF);
+        const char *addp[] = { "ip", "rule", "add", "fwmark", m, "table", t,
+                               "priority", pr, NULL };
+        run_quiet(addp);
+        return;
+    }
     const char *add[] = { "ip", "rule", "add", "fwmark", m, "table", t, NULL };
     run_quiet(add);
 }
@@ -1149,6 +1162,18 @@ static int revive(const struct output *o, const char *dev, int verbose) {
         return 0;
     }
 
+#ifdef STEER_ANDROID
+    /* На телефоне нет ни netifd (ifdown/ifup), ни procd с ubus: интерфейс туннеля поднимает
+     * тот, кто его завёл, — приложение VPN или наш же процесс, и перезапускать его отсюда
+     * нечем. Дело сторожа то же, что у выходов, чьё устройство заводит движок: сказать и
+     * подождать, не оживёт ли. */
+    fprintf(stderr, LOG_W "%s: не отвечает — жду, не поднимется ли\n", dev);
+    for (int i = 0; i < 10; i++) {
+        sleep(1);
+        if (device_healthy_for(o, dev)) return 1;
+    }
+    return 0;
+#endif
     fprintf(stderr, LOG_W "%s: не отвечает — перезапускаю интерфейс\n", dev);
     /* Сначала обфускатор, потом интерфейс, и порядок здесь — не вкусовщина.
      *

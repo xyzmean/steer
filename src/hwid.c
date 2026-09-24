@@ -335,6 +335,14 @@ static void hdr_clean(const char *in, char *out, size_t n) {
 }
 
 void steer_dev_os(char *out, size_t n) {
+#ifdef STEER_ANDROID
+    /* На телефоне /etc/openwrt_release нет, а «OpenWrt» в заголовке подписки было бы
+     * неправдой, по которой панель провайдера посчитала бы устройство роутером. Версию
+     * Android без libc-свойств (property_get) не прочесть, а тянуть ради заголовка bionic-
+     * зависимость незачем: имени системы панели достаточно. */
+    hdr_clean(steer_env_or("STEER_DEVICE_OS", "Android"), out, n);
+    return;
+#endif
     char ver[80] = "";
     FILE *f = fopen(steer_env_or("STEER_OPENWRT_RELEASE", "/etc/openwrt_release"), "r");
     if (f) {
@@ -360,8 +368,14 @@ void steer_dev_os(char *out, size_t n) {
 
 void steer_dev_model(char *out, size_t n) {
     char m[160] = "";
+#ifdef STEER_ANDROID
+    /* Модель телефона ядро отдаёт из дерева устройств; /tmp/sysinfo — изобретение OpenWrt. */
+    if (!read_line(steer_env_or("STEER_SYSINFO_MODEL", "/proc/device-tree/model"), m, sizeof m))
+        snprintf(m, sizeof m, "android");
+#else
     if (!read_line(steer_env_or("STEER_SYSINFO_MODEL", "/tmp/sysinfo/model"), m, sizeof m))
         snprintf(m, sizeof m, "router");
+#endif
     hdr_clean(m, out, n);
 }
 

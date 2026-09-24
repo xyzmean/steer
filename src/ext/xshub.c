@@ -51,6 +51,7 @@
 #include <pthread.h>
 
 #include "chello.h"
+#include "../paths.h"
 #include "xsconn.h"
 #include "xsconf.h"
 #include "xslink.h"
@@ -1837,7 +1838,7 @@ static void *worker_loop(void *arg) {
 }
 
 int cmd_xsteer_hub(const char *conf_path) {
-    const char *path = conf_path ? conf_path : "/etc/steer/xsteer/hub.conf";
+    const char *path = conf_path ? conf_path : STEER_ETC_DIR "/xsteer/hub.conf";
     char err[256];
     /* «-» здесь тоже принимается: конфигурацию хаба удобно подавать конвейером в контейнере, где
      * файла нет вовсе. Ссылку хабу подать нельзя, и об этом скажет сам разбор — ссылка описывает

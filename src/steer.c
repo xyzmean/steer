@@ -1539,6 +1539,7 @@ static struct fwcheck fw_check(const char *device) {
     return r;
 }
 
+#ifndef STEER_ANDROID   /* на телефоне не зовётся — см. конец cmd_apply */
 static void report_traceroute_dep(void) {
     if (!g_traceroute_hops) return;
     /* Say the useless case out loud rather than leaving the operator to discover it
@@ -1567,6 +1568,7 @@ static void report_traceroute_dep(void) {
                         "firewall (not here): accept ct state untracked icmp type "
                         "time-exceeded towards %s\n", g_lan_dev[0]);
 }
+#endif
 
 /* ЧУЖИЕ ПРАВИЛА НА БИТАХ 16-23 — предупреждение, а не отказ.
  *
@@ -1594,6 +1596,9 @@ static void report_traceroute_dep(void) {
  *
  * Возвращает, о скольких таблицах сказано: стенд fwmatch проверяет признак на дампах. */
 static int report_mark_overlap(void) {
+    /* Поле целиком выше бита 23 (мини-сборка моста живёт в бите 28) — с масками 16-23 оно не
+     * пересекается, и говорить не о чем. */
+    if (STEER_MARK_LOBIT > 23) return 0;
     const char *pos = ruleset_dump();
     char line[2048], table[96] = "", said[8][96];
     int n_said = 0;
@@ -1621,15 +1626,19 @@ static int report_mark_overlap(void) {
         for (int k = 0; k < n_said; k++) if (!strcmp(said[k], table)) dup = 1;
         if (dup || n_said >= 8) continue;
         snprintf(said[n_said++], sizeof(said[0]), "%s", table);
+        /* Биты — из базы и ширины поля (STEER_MARK_LOBIT/HIBIT), а не строкой: у сборки под
+         * Android поле 22-27, и пересекается оно с 16-23 на двух битах, а не на четырёх. */
         fprintf(stderr, LOG_W "таблица %s метит пакеты маской 0x00ff0000 (биты 16-23, так "
-                        "работают Tailscale и pbr), а поле движка — биты 20-27: на битах "
-                        "20-23 метки пересекаются. Если её правило метит тот же пакет в "
+                        "работают Tailscale и pbr), а поле движка — биты %d-%d: на битах "
+                        "%d-23 метки пересекаются. Если её правило метит тот же пакет в "
                         "prerouting после нас, трафик канала уйдёт мимо выхода; если до нас — "
-                        "перестанет действовать её политика на этом пакете\n", table);
+                        "перестанет действовать её политика на этом пакете\n", table,
+                STEER_MARK_LOBIT, STEER_MARK_HIBIT, STEER_MARK_LOBIT);
     }
     return n_said;
 }
 
+#ifndef STEER_ANDROID   /* на телефоне не зовётся — см. конец cmd_apply */
 static void report_output_deps(void) {
     for (size_t i = 0; i < g_out_n; i++) {
         if (!out_has_device(&g_out[i])) continue;
@@ -1666,6 +1675,7 @@ static void report_output_deps(void) {
                     g_out[i].name, g_out[i].device);
     }
 }
+#endif
 
 /* ---- apply ---------------------------------------------------------------- */
 /* Экспортируется для failover.c: он запускает те же ip/ping, и второй такой же
@@ -1936,8 +1946,14 @@ static int cmd_apply(const char *spec, int dry) {
     char snap[256];
     status_snap_path(snap, sizeof snap);
     unlink(snap);
+    /* Проверки чужого firewall — про fw4: зона выхода и masquerade в его наборе правил. На
+     * телефоне fw4 нет, трафик раздачи транслирует netd через iptables, и по дампу nftables
+     * эти проверки говорили бы «устройство не упомянуто в firewall» и «нет masquerade» на
+     * каждом apply — ложные тревоги, после которых настоящим перестают верить. */
+#ifndef STEER_ANDROID
     report_output_deps();
     report_traceroute_dep();
+#endif
     report_mark_overlap();
     printf("steer: applied %zu channel(s), %zu output(s)\n", g_ch_n, g_out_n);
     return 0;
@@ -2461,6 +2477,7 @@ static const char *list_finds_resolver(const char *path, char *found, size_t fou
  * Путь — швом, по той же причине, что g_state_dir у остальной части движка: загрузить модуль
  * в контейнере стенда нельзя, а приговор обязан проверяться так же, как все прочие. Имя
  * переменной STEER_BRIDGE_NF, читается один раз. */
+#ifndef STEER_ANDROID   /* на телефоне не зовётся — см. проверку 3b в cmd_diag */
 static int bridge_nf_on(void) {
     const char *path = getenv("STEER_BRIDGE_NF");
     if (!path || !*path) path = "/proc/sys/net/bridge/bridge-nf-call-iptables";
@@ -2472,6 +2489,7 @@ static int bridge_nf_on(void) {
     if (c == '1') return 1;
     return -1;
 }
+#endif
 
 static int cmd_diag(const char *spec) {
     load_spec(spec);
@@ -2580,6 +2598,10 @@ static int cmd_diag(const char *spec) {
      *     верное всегда, и warn на нём красил бы исправный роутер жёлтым навсегда. Здесь же
      *     переключаемая настройка ЭТОЙ системы с наблюдаемым следствием — то есть находка,
      *     которая объясняет будущую жалобу, и она обязана попасть в счётчик. */
+#ifndef STEER_ANDROID
+    /* На телефоне моста с br_netfilter нет (раздача интернета идёт без моста Linux), а
+     * приговор «кадры внутри моста идут мимо наших правил» был бы ответом на вопрос, которого
+     * там никто не задаёт. */
     {
         int brnf = bridge_nf_on();
         if (brnf == 1)
@@ -2594,6 +2616,7 @@ static int cmd_diag(const char *spec) {
             diag("bridge_nf", "ok", "кадры внутри моста идут мимо наших правил", "");
         /* brnf < 0 — в файле не 0 и не 1. Молчим: приговор наугад хуже молчания. */
     }
+#endif
 
     /* 4. Резолвер и редирект. Доменные каналы держатся на обоих: без редиректа клиент
      *    спрашивает не нас, без процесса спрашивать некого. */
@@ -3168,7 +3191,7 @@ int main(int argc, char **argv) {
      * не объясняет, что именно не так с порядком слов. */
     if (cmd[0] == '-') {
         fprintf(stderr, "steer: флаги идут после команды, а не до неё: %s\n", cmd);
-        fputs("       например: steer apply --spec /etc/steer/spec.json\n"
+        fputs("       например: steer apply --spec " STEER_ETC_DIR "/spec.json\n"
               "       список команд: steer help\n", stderr);
         return 2;
     }

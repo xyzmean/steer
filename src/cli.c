@@ -7,6 +7,7 @@
 #include <stdarg.h>
 
 #include "cli.h"
+#include "spec.h"
 
 /* Версию подставляет сборка (-DSTEER_VERSION) из файла VERSION. Умолчание нужно
  * потому, что исходники движка компилируют ещё и стенды из tests/: им до версии дела
@@ -47,8 +48,8 @@ struct cli_flag {
 };
 
 static const struct cli_flag FLAGS[] = {
-    {"--spec",      NULL, "ФАЙЛ",       "спека каналов (по умолчанию /etc/steer/spec.json)"},
-    {"--state-dir", NULL, "КАТАЛОГ",    "каталог состояния (по умолчанию /var/lib/steer)"},
+    {"--spec",      NULL, "ФАЙЛ",       "спека каналов (по умолчанию " STEER_ETC_DIR "/spec.json)"},
+    {"--state-dir", NULL, "КАТАЛОГ",    "каталог состояния (по умолчанию " STEER_STATE_DIR ")"},
     {"--dry-run",   NULL, NULL,         "напечатать готовый ruleset и ничего не применять"},
     {"--verbose",   "-v", NULL,         "рассказывать по шагам, что проверяется"},
     {"--kind",      NULL, "ВИД",        "только выходы этого вида: direct, interface, vless, xsteer, zapret, tgws"},
@@ -61,7 +62,7 @@ static const struct cli_flag FLAGS[] = {
     {"--listen",    NULL, "ПОРТ",       "порт поддельного TCP, который слушает сервер"},
     {"--forward",   NULL, "АДРЕС:ПОРТ", "куда отдавать распакованные датаграммы"},
     {"--config",    NULL, "ФАЙЛ",       "конфигурация xsteer в стиле wg "
-                                        "(по умолчанию /etc/steer/xsteer/hub.conf)"},
+                                        "(по умолчанию " STEER_ETC_DIR "/xsteer/hub.conf)"},
     {"--device",    NULL, "ИМЯ",        "готовое устройство TUN: им владеет netifd, "
                                         "движок только открывает его"},
     {"--out",       NULL, "ФАЙЛ",       "куда положить скачанное"},
@@ -367,7 +368,7 @@ static const struct cli_cmd CMDS[] = {
 {"xsteer", "Звезда xsteer", "[<выход>]",
  "поднять клиент xsteer: для выхода спеки или для готового устройства",
  "С именем выхода: читает конфигурацию в стиле wg (по умолчанию\n"
- "/etc/steer/xsteer/<выход>.conf), сам создаёт TUN и сам привязывает к нему таблицу\n"
+ STEER_ETC_DIR "/xsteer/<выход>.conf), сам создаёт TUN и сам привязывает к нему таблицу\n"
  "маршрутизации выхода. Так его поднимает procd для выхода kind=xsteer.\n"
  "\n"
  "Без имени выхода: спека не читается вовсе, нужны --config и --device. Устройством в\n"
@@ -678,7 +679,7 @@ static int cli_int(const char *flag, const char *s, int lo, int hi) {
 void cli_parse(const struct cli_cmd *cmd, int argc, char **argv, int from,
                struct cli_args *out) {
     memset(out, 0, sizeof *out);
-    out->spec = "/etc/steer/spec.json";
+    out->spec = STEER_ETC_DIR "/spec.json";
     /* Умолчание по узлу — «до первого рабочего»: то же решение, что принимает подъём
      * выхода, поэтому проверка отвечает на вопрос «что будет, если применить». */
     out->node = -1;

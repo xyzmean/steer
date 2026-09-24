@@ -50,7 +50,7 @@ size_t g_lan_dev_n = 1;
  * see the comment on the generated chain in steer.c. Defaulting it on would turn
  * legible-but-wrong hops into no hops at all. */
 int g_traceroute_hops;
-const char *g_state_dir = "/var/lib/steer";
+const char *g_state_dir = STEER_STATE_DIR;
 /* Имена таблиц для iproute2. Каталог, а не сам rt_tables: файл принадлежит пакету iproute2,
  * и дописывать в него значило бы править чужое; rt_tables.d для этого и существует. */
 const char *g_rt_tables_d = "/etc/iproute2/rt_tables.d";
@@ -827,7 +827,7 @@ static void parse_outputs(struct js *j) {
             if (!o.device[0]) snprintf(o.device, sizeof(o.device), "%.15s", o.name);
             if (!o.devices_n) snprintf(o.devices[o.devices_n++], 32, "%s", o.device);
             if (!o.xs_conf[0])
-                snprintf(o.xs_conf, sizeof(o.xs_conf), "/etc/steer/xsteer/%.200s.conf", o.name);
+                snprintf(o.xs_conf, sizeof(o.xs_conf), STEER_ETC_DIR "/xsteer/%.200s.conf", o.name);
             /* Абсолютный путь: процесс запускает procd со своим рабочим каталогом, а не
              * наша оболочка, — относительный «работал бы из шелла» и не работал у
              * сервиса. Годность к JSON: путь печатается в status, diag и xsteer-peers. */
@@ -854,7 +854,7 @@ static void parse_outputs(struct js *j) {
              * имени, которым позволено разойтись, пользы не приносят. Имя уже проверено
              * name_ok выше, поэтому путь собирается из проверенного. */
             if (!o.zp_opts[0])
-                snprintf(o.zp_opts, sizeof(o.zp_opts), "/etc/steer/zapret/%.200s.opts", o.name);
+                snprintf(o.zp_opts, sizeof(o.zp_opts), STEER_ETC_DIR "/zapret/%.200s.opts", o.name);
             /* Абсолютный путь и годность к JSON: путь печатается в status и в diag, а
              * запускает процесс procd со своим рабочим каталогом — относительный «работал
              * бы из шелла» и не работал бы у службы. Тот же барьер, что у conf. */
@@ -1583,6 +1583,13 @@ void registry_assign(void) {
  * Поэтому молча, без предупреждений: на busybox-ip имён нет вовсе, и жаловаться было бы не
  * на что. */
 static void rt_tables_write(void) {
+#ifdef STEER_ANDROID
+    /* На телефоне каталога iproute2 в /etc нет и быть не может: /etc там — ссылка в системный
+     * раздел только для чтения. Имена таблиц — удобство диагностики (см. выше), и отказ записи
+     * был бы тихим и так; но и mkdir в чужой системный каталог при каждом status пробовать
+     * незачем. */
+    return;
+#endif
     char path[512];
     /* Файл — свой у каждой сборки: мини-сборка с тем же именем перезаписывала бы имена таблиц
      * полного движка своими. */

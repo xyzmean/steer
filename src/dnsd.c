@@ -2535,8 +2535,8 @@ static int cmd_fakeip(const char *state_path, const char *domain) {
  * аргументов, и описание, лежащее отдельно от него, разошлось бы с ним при первой же
  * правке. Формат строк — тот же, что у общих флагов. */
 void dnsd_usage_flags(FILE *out) {
-    fputs("  --spec ФАЙЛ              спека каналов (по умолчанию /etc/steer/spec.json)\n"
-          "  --state-dir КАТАЛОГ      каталог состояния (по умолчанию /var/lib/steer)\n"
+    fputs("  --spec ФАЙЛ              спека каналов (по умолчанию " STEER_ETC_DIR "/spec.json)\n"
+          "  --state-dir КАТАЛОГ      каталог состояния (по умолчанию " STEER_STATE_DIR ")\n"
           "  --listen-port ПОРТ       порт, на котором отвечать LAN (по умолчанию 5300)\n"
           "  --upstream-port ПОРТ     порт апстрима, куда переспрашивать (по умолчанию 53)\n"
           "  --fakeip-state ФАЙЛ      где хранить раздачу поддельных адресов\n"
@@ -2742,7 +2742,7 @@ static void dnsd_usage(void) {
 int dnsd_main(int argc, char **argv) {
     int listen_port = 5300;
     int upstream_port = 53;
-    const char *spec = "/etc/steer/spec.json";
+    const char *spec = STEER_ETC_DIR "/spec.json";
 
     for (int i = 0; i < argc; i++) {
         if (strcmp(argv[i], "--selftest") == 0) {
