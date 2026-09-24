@@ -475,6 +475,11 @@ int main(void) {
     g_route_add_fails = 0;
     check("отказ привязки при on_fail=direct — запрет не ставится",
           cmd_seen("ip route add blackhole default table 300"), 0);
+    /* Пустая таблица при on_fail=direct уводит пакет в main — напрямую. Значит и бит «не
+     * для zapret» ему больше не положен: трафик упавшего выхода обязан идти как обычный
+     * трафик роутера, через общий обход (см. out_failopen_capable в spec.h). */
+    check("отказ привязки при on_fail=direct — выход отмечен «пущен напрямую»",
+          cmd_seen("nft add element inet steer failopen { 0x00100000 }"), 1);
 
     /* 9. Привязка прошла — запрета быть не должно ни при каком on_fail. */
     out_set("lo", FAIL_DROP);
@@ -484,6 +489,42 @@ int main(void) {
           cmd_seen("ip route add blackhole default table 300"), 0);
     check("успешная привязка — маршрут поставлен",
           cmd_seen("ip route add default dev lo table 300"), 1);
+    /* Выход снова несёт трафик сам — отметка «пущен напрямую» снимается, иначе его
+     * туннельные пакеты разбирал бы общий обход. */
+    check("успешная привязка — отметка «пущен напрямую» снята",
+          cmd_seen("nft delete element inet steer failopen { 0x00100000 }"), 1);
+    check("успешная привязка — отметка не ставится",
+          cmd_seen("nft add element inet steer failopen"), 0);
+
+    /* 9a. Выход мёртв, on_fail=direct, а правило fwmark на месте (его вернул apply, который
+     *     пересоздал таблицу с ПУСТЫМ набором failopen). Сверка обязана снять правило и
+     *     заново отметить выход — иначе после каждого «Применить» трафик упавшего выхода
+     *     снова шёл бы мимо общего обхода до его подъёма. */
+    out_set("nodev0", FAIL_DIRECT);
+    state_write("active", "vl -\n");
+    {
+        char stamp[32];
+        snprintf(stamp, sizeof(stamp), "%ld\n", (long)time(NULL));
+        state_write("restart-nodev0", stamp);
+    }
+    tick(RULES_WITH, "");
+    check("мёртвый выход direct с правилом — правило снято",
+          cmd_seen("ip rule del fwmark 0x00100000/0x0ff00000 table 300"), 1);
+    check("мёртвый выход direct с правилом — выход отмечен «пущен напрямую»",
+          cmd_seen("nft add element inet steer failopen { 0x00100000 }"), 1);
+    /* То же при on_fail=drop: напрямую ничего не идёт, отметка снимается, а не ставится. */
+    out_set("nodev0", FAIL_DROP);
+    state_write("active", "vl -\n");
+    {
+        char stamp[32];
+        snprintf(stamp, sizeof(stamp), "%ld\n", (long)time(NULL));
+        state_write("restart-nodev0", stamp);
+    }
+    tick(RULES_WITH, "default dev nodev0 scope link\n");
+    check("мёртвый выход drop — отметка «пущен напрямую» не ставится",
+          cmd_seen("nft add element inet steer failopen"), 0);
+    check("мёртвый выход drop — прежняя отметка снимается",
+          cmd_seen("nft delete element inet steer failopen { 0x00100000 }"), 1);
 
     /* Контроль к проверке 1a: на тике, где состояние целое и менять нечего, соединения
      * трогать НЕЛЬЗЯ. Снятие записи установленного соединения — это разрыв закачки для

@@ -1546,6 +1546,40 @@ eout="$("$BIN" explain 104.16.0.1 --spec "$tmp/spec.json" --state-dir "$tmp/st-e
 check "explain называет сужение канала" "1" \
     "$(printf '%s\n' "$eout" | grep -c 'udp 50000-65535')"
 
+# ---- упавший выход, пущенный напрямую, идёт через общий обход ----------------
+# Правило разметки ставит бит 0x40000000 («не для zapret») безусловно. При on_fail=direct и
+# on_fail=zapret сторож, уронив выход, отдаёт его трафик таблице main — открытому пути, — и
+# там бит обязан сниматься: иначе «напрямую» значило «напрямую и мимо обхода». Снимает его
+# цепочка prerouting_failopen по набору меток, который ведёт сторож.
+for of in direct zapret; do
+spec <<EOF
+{ "schema": 2,
+  "from_default": ["192.168.1.0/24"],
+  "outputs": { "vpn": { "kind": "interface", "device": "wg0", "on_fail": "$of" } },
+  "channels": [ { "name": "a", "match": { "prefixes_file": "TMP/a.lst" }, "out": "vpn" } ] }
+EOF
+fout="$("$BIN" apply --dry-run --spec "$tmp/spec.json" --state-dir "$tmp/st-fo-$of" 2>/dev/null)"
+check "on_fail=$of: набор выходов, пущенных напрямую" "1" \
+    "$(printf '%s\n' "$fout" | grep -c 'set failopen {')"
+check "on_fail=$of: бит «не для zapret» снимается с их пакетов сразу после разметки" "1" \
+    "$(printf '%s\n' "$fout" | grep -c 'meta mark and 0x0ff00000 @failopen meta mark set mark and 0xbfffffff')"
+done
+# При on_fail=drop напрямую не идёт ничего — ни набора, ни лишнего поиска на каждый пакет.
+spec <<'EOF'
+{ "schema": 2,
+  "from_default": ["192.168.1.0/24"],
+  "outputs": { "vpn": { "kind": "interface", "device": "wg0", "on_fail": "drop" } },
+  "channels": [ { "name": "a", "match": { "prefixes_file": "TMP/a.lst" }, "out": "vpn" } ] }
+EOF
+check "on_fail=drop: цепочки снятия бита нет" "0" \
+    "$("$BIN" apply --dry-run --spec "$tmp/spec.json" --state-dir "$tmp/st-fo-drop" 2>/dev/null |
+       grep -c failopen)"
+# --dry-run печатает сам набор правил — строк замены таблицы (они есть только в файле для
+# `nft -f` при настоящем apply) в нём нет.
+check "dry-run без строк замены таблицы" "0" \
+    "$("$BIN" apply --dry-run --spec "$tmp/spec.json" --state-dir "$tmp/st-fo-drop" 2>/dev/null |
+       grep -c '^delete table')"
+
 printf '\n%s passed, %s failed\n' "$pass" "$fail"
 [ "$fail" -eq 0 ]
 

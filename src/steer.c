@@ -42,32 +42,8 @@
 
 int dnsd_main(int argc, char **argv);
 
-/* ИМЯ ТАБЛИЦЫ ПРАВИЛ — НЕ КОНСТАНТА, потому что движок на роутере бывает не один.
- *
- * Рядом с полным движком ставится микропакет tgws: своя спека, своё состояние, свой бинарник
- * с другим именем. Таблица же у обоих называлась `steer`, а `nft -f` со своим определением
- * таблицы ЗАМЕЩАЕТ её целиком — то есть кто применил спеку последним, тот и стёр правила
- * другого. Из-за этого микропакет отказывался работать рядом с полным движком вовсе; отказ
- * владелец потребовал убрать: «stgws должен работать параллельно со steer, не глядя,
- * установлен он или нет».
- *
- * Имя берётся из STEER_NFT_TABLE, умолчание прежнее. Проверка символов не педантизм: имя
- * уходит в командную строку nft, и пробел или кавычка в нём означали бы чужую команду. */
-static const char *nft_table(void) {
-    static const char *cached;
-    if (cached) return cached;
-    const char *e = getenv("STEER_NFT_TABLE");
-    cached = "steer";
-    if (e && *e && strlen(e) < 32) {
-        const char *p = e;
-        for (; *p; p++)
-            if (!((*p >= 'a' && *p <= 'z') || (*p >= 'A' && *p <= 'Z') ||
-                  (*p >= '0' && *p <= '9') || *p == '_' || *p == '-'))
-                break;
-        if (!*p) cached = e;
-    }
-    return cached;
-}
+/* Имя таблицы правил (nft_table) — в spec.h: его спрашивает и сторож, см. failopen_mark в
+ * failover.c. */
 
 /* Путь снимка состояния. Объявлен здесь потому, что apply его СНИМАЕТ (см. там же), а сам
  * снимок живёт ниже, рядом с тем, что его пишет. */
@@ -1000,6 +976,27 @@ static void generate(FILE *f) {
     }
     fprintf(f, "    }\n");
 
+    /* ВЫХОД УПАЛ И ПУЩЕН НАПРЯМУЮ — бит «не для zapret» снимается. Правило разметки выше
+     * ставит его безусловно, а при on_fail=direct/zapret упавший выход отдаёт трафик
+     * таблице main, то есть открытому пути; там пакет обязан быть обычным трафиком роутера
+     * и для общего обхода тоже. Какие выходы сейчас в таком состоянии, знает сторож: он
+     * держит их метки в наборе. Зачем именно так — у out_failopen_capable в spec.h.
+     *
+     * mangle + 2 — сразу после разметки (mangle + 1), то есть задолго до цепочек zapret на
+     * postrouting. Счётчик — чтобы по дампу было видно, что правило действительно брало
+     * пакеты, а не только стояло. */
+    int failopen = 0;
+    for (size_t i = 0; i < g_out_n; i++)
+        if (out_failopen_capable(&g_out[i])) failopen = 1;
+    if (failopen)
+        fprintf(f, "\n    set %s {\n        type mark\n    }\n"
+                   "    chain prerouting_failopen {\n"
+                   "        type filter hook prerouting priority mangle + 2; policy accept;\n"
+                   "        meta mark and 0x%08x @%s meta mark set mark and 0x%08x counter "
+                   "comment \"steer-failopen\"\n"
+                   "    }\n",
+                FAILOPEN_SET, STEER_MARK_MASK, FAILOPEN_SET, ~ZAPRET_SKIP_MARK);
+
     /* Встречный путь — только чтобы его было ЧЕМ ПОСЧИТАТЬ. Метку здесь не ставим и
      * решений не принимаем: маршрут ответным пакетам не нужен, их ведёт conntrack.
      *
@@ -1691,6 +1688,11 @@ static void apply_routing(void) {
                 run(bh);
                 fprintf(stderr, LOG_W "output %s: трафик остановлен до появления "
                                 "рабочего устройства (on_fail=drop)\n", g_out[i].name);
+            } else {
+                /* direct/zapret: таблица пуста, пакет уйдёт напрямую — значит и через общий
+                 * обход, как обычный (см. out_failopen_capable в spec.h). Таблица правил к
+                 * этому мгновению уже загружена, набор в ней есть. */
+                failopen_mark(&g_out[i], 1);
             }
         }
     }

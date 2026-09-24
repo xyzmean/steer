@@ -502,6 +502,24 @@ void rule_drop(unsigned mark, int table) {
     while (run_quiet(dell) == 0) ;
 }
 
+/* Пущен ли выход напрямую — отметка в наборе FAILOPEN_SET нашей таблицы. Зачем она и почему
+ * так, а не иначе, — у out_failopen_capable в spec.h: пока метка выхода в наборе, цепочка
+ * prerouting_failopen снимает с его пакетов бит ZAPRET_SKIP_MARK, и трафик упавшего выхода
+ * идёт как обычный трафик роутера — через общий обход, если тот запущен.
+ *
+ * Молча: `add` существующего элемента nft принимает, а отказ `delete` отсутствующего — обычное
+ * дело (выход и не был отмечен). Набора нет, если в спеке нет ни одного выхода, которому он
+ * нужен, — тогда отказывает любая из двух команд, и это тоже ничего не значит. */
+void failopen_mark(const struct output *o, int on) {
+    if (!o->mark || !out_has_device(o) || !out_skips_zapret(o)) return;
+    if (on && !out_failopen_capable(o)) on = 0;   /* on_fail=drop: напрямую не пускаем */
+    char el[32];
+    snprintf(el, sizeof(el), "{ 0x%08x }", o->mark);
+    const char *cmd[] = { "nft", on ? "add" : "delete", "element", "inet", nft_table(),
+                          FAILOPEN_SET, el, NULL };
+    run_quiet(cmd);
+}
+
 /* announce=0 — то же самое приведение состояния в порядок, но без объявления отказа:
  * сторож зовёт apply_failed не только когда выход ТОЛЬКО ЧТО отказал, но и когда отказ
  * длится, а состояние в ядре с тех пор разъехалось (см. сверку ниже). Строку «живых
@@ -527,6 +545,9 @@ static void apply_failed(struct output *o, int announce) {
          * в интерфейсе, не перезапуская ничего. */
         rule_drop(o->mark, o->table);
         rule_add(o->mark, o->table);
+        /* Режим мог смениться с direct/zapret на drop, пока выход лежал: отметка «пущен
+         * напрямую» от прежнего отказа здесь больше не правда. */
+        failopen_mark(o, 0);
         /* Запрет поставлен — теперь он обязан касаться и уже установленных соединений,
          * иначе on_fail=drop это обещание только для новых. */
         conntrack_evict(o->mark);
@@ -536,8 +557,13 @@ static void apply_failed(struct output *o, int announce) {
         return;
     }
 
-    /* direct и zapret: снимаем правило, чтобы помеченный трафик шёл обычным путём. */
+    /* direct и zapret: снимаем правило, чтобы помеченный трафик шёл обычным путём, — и
+     * обычным он обязан стать целиком, то есть и для общего обхода DPI: отметка в наборе
+     * снимает с него бит «не для zapret» (см. out_failopen_capable в spec.h). Отметка — ДО
+     * снятия соединений: следующий пакет каждого из них пройдёт разметку заново и должен
+     * застать её уже на месте. */
     rule_drop(o->mark, o->table);
+    failopen_mark(o, 1);
     conntrack_evict(o->mark);
 
     if (!announce) return;
@@ -564,6 +590,10 @@ void bind_device(struct output *o, const char *dev) {
 
     rule_drop(o->mark, o->table);
     rule_add(o->mark, o->table);
+    /* Выход снова несёт трафик сам — бит «не для zapret» его пакетам опять нужен. Снимается
+     * до привязки и до снятия соединений по той же причине, по какой в apply_failed
+     * ставится до них. При отказе привязки ниже отметка возвращается. */
+    failopen_mark(o, 0);
     const char *flush[] = { "ip", "route", "flush", "table", tbl, NULL };
     run_quiet(flush);
     const char *rt[] = { "ip", "route", "add", "default", "dev", dev, "table", tbl, NULL };
@@ -591,6 +621,10 @@ void bind_device(struct output *o, const char *dev) {
             run_quiet(bh);
             fprintf(stderr, LOG_W "выход %s: трафик остановлен до успешной привязки "
                             "(on_fail=drop)\n", o->name);
+        } else {
+            /* direct/zapret: пустая таблица уводит пакет в main, то есть напрямую, — пусть
+             * и идёт как обычный, через общий обход. */
+            failopen_mark(o, 1);
         }
     }
 }
