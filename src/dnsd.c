@@ -676,12 +676,14 @@ static const char *g_nft_table = "inet steer"; /* "<family> <table>" */
  * NFPROTO number. Defaults to INET — this daemon only ever targets "inet fw4". */
 static uint8_t nftlk_family(const char *fam) {
     if (!fam) return SPL_NFPROTO_INET;
-    if (strcmp(fam, "inet") == 0)    return SPL_NFPROTO_INET;
-    if (strcmp(fam, "ip") == 0)      return SPL_NFPROTO_IPV4;
-    if (strcmp(fam, "ip6") == 0)     return SPL_NFPROTO_IPV6;
-    if (strcmp(fam, "arp") == 0)     return SPL_NFPROTO_ARP;
-    if (strcmp(fam, "bridge") == 0)  return SPL_NFPROTO_BRIDGE;
-    if (strcmp(fam, "netdev") == 0)  return SPL_NFPROTO_NETDEV;
+    size_t n = strcspn(fam, " ");
+    static const struct { const char *name; uint8_t proto; } FAM[] = {
+        { "inet", SPL_NFPROTO_INET }, { "ip", SPL_NFPROTO_IPV4 }, { "ip6", SPL_NFPROTO_IPV6 },
+        { "arp", SPL_NFPROTO_ARP }, { "bridge", SPL_NFPROTO_BRIDGE },
+        { "netdev", SPL_NFPROTO_NETDEV },
+    };
+    for (size_t i = 0; i < sizeof(FAM) / sizeof(FAM[0]); i++)
+        if (strlen(FAM[i].name) == n && !strncmp(fam, FAM[i].name, n)) return FAM[i].proto;
     return SPL_NFPROTO_INET;
 }
 static void nftlk_split_table(const char *fam_tbl, const char **out_fam, const char **out_tbl) {
