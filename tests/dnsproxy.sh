@@ -26,10 +26,57 @@ LPORT=15300
 UPORT=15353
 
 cat > "$tmp/upstream.py" <<'PY'
-import socket, sys
+import socket, struct, sys, threading
 s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-s.bind(("127.0.0.1", int(sys.argv[1]))); s.settimeout(6)
+s.bind(("127.0.0.1", int(sys.argv[1]))); s.settimeout(20)
 seen = []
+
+# TCP на том же порту: резолвер спрашивает наверх по TCP то, что к нему пришло по TCP. Ответ
+# по TCP — ДРУГИМ адресом (…35 против …34 по UDP): так клиент видит, каким путём шёл вопрос.
+# big.test — ответ на 300 записей (больше 4 КБ, то есть больше любого буфера датаграммы
+# резолвера): по TCP он обязан пройти целиком.
+def tcp_answer(q):
+    qend = 12
+    while q[qend]: qend += 1 + q[qend]
+    qend += 5
+    name = q[12:qend - 4]
+    n = 300 if name == b'\x03big\x04test\x00' else 1
+    hdr = q[:2] + b'\x81\x80' + q[4:6] + struct.pack('>HHH', n, 0, 0)
+    ans = b''.join(b'\xc0\x0c\x00\x01\x00\x01\x00\x00\x00\x3c\x00\x04'
+                   + bytes([93, 184, (216 + i // 256) % 256, (35 + i) % 256]) for i in range(n))
+    return hdr + q[12:qend] + ans
+
+def recvn(c, k):
+    b = b''
+    while len(b) < k:
+        d = c.recv(k - len(b))
+        if not d: return None
+        b += d
+    return b
+
+def tcp_conn(c):
+    c.settimeout(10)
+    try:
+        while True:
+            h = recvn(c, 2)
+            if not h: break
+            q = recvn(c, struct.unpack('>H', h)[0])
+            if not q: break
+            r = tcp_answer(q)
+            c.sendall(struct.pack('>H', len(r)) + r)
+            with open(sys.argv[2] + '.tcp', 'a') as f: f.write('q\n')
+    except Exception:
+        pass
+    c.close()
+
+def tcp_srv():
+    t = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    t.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    t.bind(("127.0.0.1", int(sys.argv[1]))); t.listen(64)
+    while True:
+        c, _ = t.accept()
+        threading.Thread(target=tcp_conn, args=(c,), daemon=True).start()
+threading.Thread(target=tcp_srv, daemon=True).start()
 try:
     while True:
         data, addr = s.recvfrom(2048)
@@ -68,6 +115,89 @@ for i in range(1, n + 1):
 print("%d %d %d %d" % (ok, bad_id, lost, bad_addr))
 PY
 
+cat > "$tmp/tcpclient.py" <<'PY'
+# Клиент по TCP: конвейер (несколько запросов одной записью, до первого ответа), ответ больше
+# 4 КБ, медленный клиент (полсообщения и тишина) не мешает остальным, и простой закрывается.
+import socket, struct, sys, time
+port, what = int(sys.argv[1]), sys.argv[2]
+
+def q(tid, name, qtype=1):
+    b = struct.pack('>HHHHHH', tid, 0x0100, 1, 0, 0, 0)
+    for l in name.split('.'): b += bytes([len(l)]) + l.encode()
+    return b + b'\x00' + struct.pack('>HH', qtype, 1)
+
+def framed(m): return struct.pack('>H', len(m)) + m
+
+def recvn(c, k):
+    b = b''
+    while len(b) < k:
+        d = c.recv(k - len(b))
+        if not d: return None
+        b += d
+    return b
+
+def reply(c):
+    h = recvn(c, 2)
+    if not h: return None
+    return recvn(c, struct.unpack('>H', h)[0])
+
+def conn():
+    c = socket.create_connection(('127.0.0.1', port), timeout=4)
+    return c
+
+if what == 'pipeline':
+    # Три запроса одной записью: два разных имени и одно повторно. Ответы могут прийти в любом
+    # порядке — сопоставление по номеру.
+    c = conn()
+    names = {0x2001: 'example.com', 0x2002: 'other.test', 0x2003: 'www.example.com'}
+    c.sendall(b''.join(framed(q(t, n)) for t, n in names.items()))
+    got = {}
+    for _ in names:
+        r = reply(c)
+        if r is None: break
+        got[struct.unpack('>H', r[:2])[0]] = r
+    ok = sum(1 for t in names if t in got and got[t][-4:] == bytes([93, 184, 216, 35]))
+    # Затем в том же соединении — ещё пять последовательно, запрос-ответ.
+    seq = 0
+    for i in range(5):
+        c.sendall(framed(q(0x3000 + i, 'seq%d.test' % i)))
+        r = reply(c)
+        if r and struct.unpack('>H', r[:2])[0] == 0x3000 + i and r[-4:] == bytes([93, 184, 216, 35]):
+            seq += 1
+    print(ok, seq)
+elif what == 'big':
+    c = conn()
+    c.sendall(framed(q(0x4242, 'big.test')))
+    r = reply(c)
+    print(len(r) if r else 0, struct.unpack('>H', r[6:8])[0] if r else 0)
+elif what == 'slow':
+    # Полсообщения — и тишина. Пока это соединение висит, UDP и другое TCP-соединение
+    # обязаны получать ответы: цикл резолвера не ждёт медленного клиента.
+    s = conn()
+    s.sendall(b'\x00')
+    u = socket.socket(socket.AF_INET, socket.SOCK_DGRAM); u.settimeout(3)
+    u.sendto(q(0x5151, 'example.com'), ('127.0.0.1', port))
+    try:
+        d, _ = u.recvfrom(2048); udp = 1 if d[:2] == b'\x51\x51' else 0
+    except socket.timeout:
+        udp = 0
+    c = conn()
+    c.sendall(framed(q(0x5252, 'other.test')))
+    r = reply(c)
+    tcp = 1 if r and r[:2] == b'\x52\x52' else 0
+    print(udp, tcp)
+elif what == 'idle':
+    # Соединение без запросов закрывается резолвером по простою (10 с), а не держит место.
+    c = conn(); c.settimeout(20)
+    t0 = time.time()
+    try:
+        d = c.recv(1)
+    except socket.timeout:
+        d = b'x'
+    el = time.time() - t0
+    print('closed' if d == b'' and 8 <= el <= 14 else 'open %.1f' % el)
+PY
+
 printf 'example.com\n' > "$tmp/d.lst"
 printf '{"schema":1,"from_default":["127.0.0.0/8"],'\
 '"outputs":{"direct":{"kind":"direct"},"vpn":{"kind":"interface","device":"lo"}},'\
@@ -84,8 +214,14 @@ if ! kill -0 "$DPID" 2>/dev/null; then
     echo "FAIL резолвер не поднялся:"; cat "$tmp/log"; exit 1
 fi
 
+python3 "$tmp/tcpclient.py" "$LPORT" idle > "$tmp/idle.txt" 2>&1 & IDLE=$!
 set -- $(python3 "$tmp/client.py" "$LPORT" 20)
 ok=$1 bad_id=$2 lost=$3 bad_addr=$4
+tcp_pipe="$(python3 "$tmp/tcpclient.py" "$LPORT" pipeline 2>&1)"
+tcp_big="$(python3 "$tmp/tcpclient.py" "$LPORT" big 2>&1)"
+tcp_slow="$(python3 "$tmp/tcpclient.py" "$LPORT" slow 2>&1)"
+wait "$IDLE"
+tcp_idle="$(cat "$tmp/idle.txt")"
 kill "$DPID" 2>/dev/null; wait "$DPID" 2>/dev/null
 sleep 1
 kill "$UPID" 2>/dev/null; wait "$UPID" 2>/dev/null
@@ -103,11 +239,21 @@ check "ни одного ответа с чужим номером транза�
 check "ни одного потерянного" "0" "$lost"
 check "адрес в ответе не искажён" "0" "$bad_addr"
 
-# Наверх ушло столько же запросов, сколько пришло снизу, и номера у них РАЗНЫЕ: слот
+# Наверх по UDP ушло столько же запросов, сколько пришло снизу по UDP (20 и один из стенда
+# медленного клиента), и номера у них РАЗНЫЕ: слот
 # переиспользуется, но поколение в старшем байте меняет номер, иначе запоздавший ответ
 # на закрытое ожидание попал бы в чужой слот.
 up="$(cat "$tmp/up.txt" 2>/dev/null || echo '0 0')"
-check "наверх ушли все запросы и все с разными номерами" "20 20" "$up"
+check "наверх ушли все запросы и все с разными номерами" "21 21" "$up"
+
+# DNS по TCP (RFC 7766): тот же путь, что у датаграммы, ответ — по TCP, наверх — тоже по TCP.
+check "TCP: конвейер из трёх запросов одной записью и пять подряд — все ответы по TCP сверху" \
+    "3 5" "$tcp_pipe"
+check "TCP: ответ больше 4 КБ (300 записей) пришёл целиком" "4826 300" "$tcp_big"
+check "TCP: медленный клиент не держит цикл — UDP и другое соединение отвечают" "1 1" "$tcp_slow"
+check "TCP: соединение без запросов закрыто по простою" "closed" "$tcp_idle"
+check "TCP: наверх по TCP ушли ровно вопросы клиентов TCP" "10" \
+    "$(cat "$tmp/up.txt.tcp" 2>/dev/null | wc -l | tr -d ' ')"
 
 printf '\n%d проверок пройдено' "$pass"
 if [ "$fail" -gt 0 ]; then printf ', %d ПРОВАЛЕНО\n' "$fail"; exit 1; fi

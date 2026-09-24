@@ -594,14 +594,21 @@ static int has_local_domains(void) {
  * делает для раздачи: поддельный адрес из кэша DnsResolver получает любое приложение, и у
  * приложения вне канала соединение должно уйти напрямую к настоящему адресу, а не в никуда.
  *
- * Только UDP, как и у раздачи: резолвер движка TCP не слушает (см. prerouting_dns). DNS по
- * IPv6 на старом ядре без nat в ip6 не заворачивается — там такого правила не поставить. */
+ * И UDP, и TCP: по TCP приходят переспросы после усечённого ответа (TC=1) и запросы приложений,
+ * которые ходят по TCP сразу, — без заворота имя, спрошенное так, прошло бы мимо канала, и
+ * соединение ушло бы по настоящему адресу. Резолвер слушает TCP на том же порту (см. «DNS по
+ * TCP» в dnsd.c). DNS по IPv6 на старом ядре без nat в ip6 не заворачивается — там такого
+ * правила не поставить. */
 static void emit_local_dns(FILE *f, const char *dnat_kw, int inet) {
     /* Всех, кроме собственного запроса резолвера наверх (STEER_SELF_MARK): DnsResolver шлёт
      * запросы приложений от root. Только IPv4: запрос по IPv6 резолвер переспросить не может
      * (исходное назначение он ищет только для IPv4), и заворачивать его — значит потерять. */
     fprintf(f, "        %smeta mark and 0x%08x != 0x%08x udp dport 53 counter redirect to :%d "
                "comment \"steer-dns-local\"\n", inet ? "meta nfproto ipv4 " : "",
+            STEER_MARK_MASK, STEER_SELF_MARK, DNS_PORT);
+    /* Метка «сам движок» у запроса наверх по TCP та же (tcpu_open в dnsd.c). */
+    fprintf(f, "        %smeta mark and 0x%08x != 0x%08x tcp dport 53 counter redirect to :%d "
+               "comment \"steer-dns-local-tcp\"\n", inet ? "meta nfproto ipv4 " : "",
             STEER_MARK_MASK, STEER_SELF_MARK, DNS_PORT);
     if (has_fakeip())
         fprintf(f, "        ip daddr 198.18.0.0/15 counter %s to ip daddr map @fakeip "
@@ -1222,6 +1229,17 @@ static void generate_legacy_tail(FILE *f) {
             emit_ifs(f, 0);
             fprintf(f, "udp dport 53 counter redirect to :%d\n", DNS_PORT);
         }
+#ifdef STEER_ANDROID
+        /* TCP/53 — только в Android-сборке; почему — у prerouting_dns в generate. */
+        for (size_t i = 0; i < g_from_default_n; i++)
+            fprintf(f, "        ip saddr %s tcp dport 53 counter redirect to :%d\n",
+                    g_from_default[i], DNS_PORT);
+        if (!g_from_default_n) {
+            fprintf(f, "        ");
+            emit_ifs(f, 0);
+            fprintf(f, "tcp dport 53 counter redirect to :%d\n", DNS_PORT);
+        }
+#endif
 #endif
         if (fakeip)
             fprintf(f, "        ip daddr 198.18.0.0/15 counter dnat to ip daddr map @fakeip\n");
@@ -1253,10 +1271,16 @@ static void generate_legacy_tail(FILE *f) {
                    "        type nat hook prerouting priority dstnat - 1; policy accept;\n"
                    "        ", nft_table());
         emit_ifs(f, 0);
-        fprintf(f, "udp dport 53 counter redirect to :%d\n    }\n"
+        fprintf(f, "udp dport 53 counter redirect to :%d\n", DNS_PORT);
+#ifdef STEER_ANDROID
+        fprintf(f, "        ");
+        emit_ifs(f, 0);
+        fprintf(f, "tcp dport 53 counter redirect to :%d\n", DNS_PORT);
+#endif
+        fprintf(f, "    }\n"
                    "    chain postrouting_nat {\n"
                    "        type nat hook postrouting priority srcnat + 1; policy accept;\n"
-                   "    }\n}\n", DNS_PORT);
+                   "    }\n}\n");
     }
 }
 
@@ -1745,6 +1769,20 @@ static void generate(FILE *f) {
     if (g_from_default_n) fprintf(f, "meta nfproto ipv6 ");
     emit_ifs(f, 0);
     fprintf(f, "udp dport 53 counter redirect to :%d\n", DNS_PORT);
+#ifdef STEER_ANDROID
+    /* TCP/53 рядом с UDP/53 — ТОЛЬКО В ANDROID-СБОРКЕ. Резолвер слушает TCP везде (dnsd.c, «DNS
+     * по TCP»), но вывод этого генератора для роутера стерегут побайтно (tests/gen.sh), и
+     * заворот TCP там — отдельное решение со своей проверкой на живых клиентах, а не попутная
+     * правка. На телефоне же без него доменный канал слеп ко всему, что спрошено по TCP: и к
+     * переспросу после TC=1, и к приложениям, которые ходят по TCP сразу. */
+    for (size_t i = 0; i < g_from_default_n; i++)
+        fprintf(f, "        ip saddr %s tcp dport 53 counter redirect to :%d\n",
+                g_from_default[i], DNS_PORT);
+    fprintf(f, "        ");
+    if (g_from_default_n) fprintf(f, "meta nfproto ipv6 ");
+    emit_ifs(f, 0);
+    fprintf(f, "tcp dport 53 counter redirect to :%d\n", DNS_PORT);
+#endif
     fprintf(f, "    }\n");
 #endif
 
@@ -1795,8 +1833,10 @@ static void generate(FILE *f) {
          * router advertises itself as an IPv6 resolver by default and clients prefer
          * that server, so an IPv4-only redirect catches almost nothing — measured on a
          * real client, 15 of its DNS packets went over IPv6 against 20 over IPv4.
-         * TCP/53 stays with the system resolver: this daemon is UDP-only, so
-         * redirecting TCP would break the truncated-answer retry.
+         * TCP/53 stays with the system resolver on the router: the daemon does listen
+         * on TCP now (dnsd.c, «DNS по TCP»), but redirecting it here would change the
+         * router ruleset, which tests/gen.sh pins byte for byte — that is a separate
+         * decision. The Android build redirects TCP/53 as well (prerouting_dns above).
          */
     }
     fprintf(f, "}\n");

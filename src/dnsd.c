@@ -1547,6 +1547,10 @@ struct pending {
      * `hit`: ответ несёт то же имя, и второй проход по каналам ничего не узнаёт. */
     uint64_t sets;
     unsigned rules_gen;
+    /* Запрос наверх по TCP (номер в g_tcpu) или -1 — по UDP. Ответ по TCP приходит на свой
+     * сокет, и датаграмма с тем же номером транзакции на сокет UDP этому ожиданию не ответ
+     * (см. dns over TCP ниже, у struct tcpu). */
+    int tcp_up;
     struct sockaddr_storage client;
     socklen_t client_len;
     /* Куда ушёл запрос наверх — только в режиме --upstream-origdst (см. g_origdst): ответ
@@ -1636,8 +1640,20 @@ static uint16_t rand16(void) {
  * явного адреса источника ядро выбрало бы адрес Wi-Fi. Ответ с чужого адреса conntrack не
  * узнаёт, обратного перевода нет, и DnsResolver (он connect'ит сокет и сверяет, откуда пришёл
  * ответ) его выбрасывает — DNS приложений не работал бы вовсе. */
+/* Соединение TCP, чей запрос (или ответ на чей запрос) обрабатывается прямо сейчас, — или NULL,
+ * если датаграмма пришла по UDP. Обработка запроса и ответа — одна на оба протокола (см.
+ * dns_query и upstream_answer), и чтобы не протаскивать «куда отвечать» через каждую её ветку,
+ * место ответа выставляется вокруг вызова, а reply_client и ct_origdst его читают. Цикл
+ * однопоточный, так что это не гонка, а просто контекст вызова. */
+struct tcpc;
+static struct tcpc *g_tcp_cur;
+static void tcpc_reply(struct tcpc *c, const void *b, size_t n);
+static int tcpu_open(struct pending *p, const uint8_t *q, size_t n, const struct sockaddr_in *up,
+                     uint16_t tag, size_t qend);
+
 static void reply_client(const void *b, size_t n, const struct sockaddr_storage *cl,
                          socklen_t cll, const struct in_addr *local, int have_local) {
+    if (g_tcp_cur) { tcpc_reply(g_tcp_cur, b, n); return; }
     if (!g_origdst || !have_local) {
         sendto(g_listen_fd, b, n, 0, (const struct sockaddr *)cl, cll);
         return;
@@ -1716,7 +1732,8 @@ static int ct_origdst(const struct sockaddr_storage *cli, const struct in_addr *
         ((struct nlattr *)(req + pos))->nla_type = (type) | NLA_F_NESTED; pos += NLA_HDRLEN; } while (0)
 #define CT_CLOSE(at) (((struct nlattr *)(req + (at)))->nla_len = (uint16_t)(pos - (at)))
     size_t t, ip, pr;
-    uint8_t proto = IPPROTO_UDP;
+    /* Протокол — тот, которым пришёл запрос: у соединения TCP своя запись conntrack. */
+    uint8_t proto = g_tcp_cur ? IPPROTO_TCP : IPPROTO_UDP;
     uint16_t lp = htons((uint16_t)lport);
     CT_OPEN(CTA_TUPLE_REPLY, t);
     CT_OPEN(CTA_TUPLE_IP, ip);
@@ -2038,6 +2055,8 @@ static struct pending *pending_alloc(void) {
  * epoll_wait на пачку вместо круга через ядро на каждую датаграмму. */
 /* upstream_port больше не нужен на этом пути: сокет наверх открыт и connect'нут один раз
  * в run_proxy, порт задан там. */
+static int dns_query(uint8_t *buf, ssize_t n, struct sockaddr_storage from, socklen_t fromlen,
+                     struct in_addr local, int have_local);
 static int handle_client_query(void) {
     uint8_t buf[MAX_PKT];
     /* Dual-stack listener -> the client may be IPv6 (or v4-mapped). The reply is
@@ -2080,7 +2099,15 @@ static int handle_client_query(void) {
         n = recvfrom(g_listen_fd, buf, sizeof(buf), 0, (struct sockaddr *)&from, &fromlen);
         if (n <= 0) return 0;
     }
+    return dns_query(buf, n, from, fromlen, local, have_local);
+}
 
+/* Запрос клиента — один путь для UDP и TCP: разбор, доменные каналы, быстрый путь, пересылка
+ * наверх. Откуда пришёл запрос, решает g_tcp_cur (NULL — UDP). Аргументы по значению: так тело
+ * осталось тем же, каким было внутри handle_client_query. Буфер переписывается (номер
+ * транзакции наверх). Возвращает 1 — как handle_client_query, «запрос был». */
+static int dns_query(uint8_t *buf, ssize_t n, struct sockaddr_storage from, socklen_t fromlen,
+                     struct in_addr local, int have_local) {
     /* Быстрый путь: на вопрос, ответ на который НЕ ЗАВИСИТ от upstream, отвечаем
      * прямо из запроса. Это и есть задержка fake-ip глазами клиента: раньше каждый
      * запрос — включая повторный A для уже выданного fake-IP и AAAA/HTTPS/SVCB,
@@ -2186,7 +2213,14 @@ static int handle_client_query(void) {
 
     struct sockaddr_in up;
     upstream_for(&from, &local, have_local, &up);
-    if ((g_origdst ? sendto(ufd, buf, (size_t)n, 0, (struct sockaddr *)&up, sizeof(up))
+    /* Запрос, пришедший по TCP, уходит наверх тоже по TCP (почему — у struct tcpu); тихий
+     * (клиенту уже ответили из быстрого пути, ответ нужен только ради карты) — по UDP, как
+     * любой: ответ ему не нужен целиком, а круг по UDP дешевле рукопожатия. */
+    int tcpu = -1;
+    if (g_tcp_cur && !quiet) {
+        tcpu = tcpu_open(p, buf, (size_t)n, &up, tag, qend);
+        if (tcpu < 0) return 1;                /* ответ SERVFAIL уже ушёл клиенту */
+    } else if ((g_origdst ? sendto(ufd, buf, (size_t)n, 0, (struct sockaddr *)&up, sizeof(up))
                    : send(g_up_fd, buf, (size_t)n, 0)) < 0) {
         /* Чаще всего это ECONNREFUSED от петли: резолвер наверху не запущен или
          * перезапускается. Ядро отдаёт такую ошибку отложенно, следующим системным
@@ -2207,6 +2241,7 @@ static int handle_client_query(void) {
     p->qsec_end = (uint16_t)((p->qfp) ? qend : 0);
 
     p->in_use = 1;
+    p->tcp_up = tcpu;
     p->quiet = quiet;
     p->hit = hit;
     p->sets = sets;
@@ -2260,6 +2295,7 @@ static size_t build_rewritten_response(const uint8_t *orig, size_t qend,
 /* Возвращает 1, если датаграмма была прочитана (есть смысл читать дальше), 0 — если
  * очередь пуста. Ответы всех ожиданий приходят на один сокет, поэтому своё ожидание
  * находится по номеру транзакции, который мы же и проставили при отправке. */
+static int upstream_answer(struct pending *p, uint8_t *buf, ssize_t n);
 static int handle_upstream_response(int ufd) {
     uint8_t buf[MAX_PKT];
     struct sockaddr_in src;
@@ -2302,7 +2338,14 @@ static int handle_upstream_response(int ufd) {
      * другой вопрос — чужой адрес вместо нужного, молча и без единой строки в журнале. */
     if (p->qfp && ((size_t)n < p->qsec_end || question_fp(buf, p->qsec_end) != p->qfp))
         return 1;
+    /* Ожидание, ушедшее наверх по TCP, ждёт ответа на своём соединении, а не здесь. */
+    if (p->tcp_up >= 0) return 1;
+    return upstream_answer(p, buf, n);
+}
 
+/* Ответ сверху, уже сверенный со своим ожиданием, — один путь для UDP и TCP: доменные каналы,
+ * fakeip, наборы, ответ клиенту. Кому отвечать, решает g_tcp_cur (см. reply_client). */
+static int upstream_answer(struct pending *p, uint8_t *buf, ssize_t n) {
     /* Номер клиента возвращается на место ДО любой отправки вниз: клиент сопоставляет
      * ответ с запросом именно по нему, а дальше буфер уходит клиенту и как есть, и
      * переписанным. */
@@ -2511,6 +2554,563 @@ static int handle_upstream_response(int ufd) {
     return 1;
 }
 
+/* ---------------------------------------------------------------------- */
+/* DNS по TCP (RFC 7766)                                                  */
+/* ---------------------------------------------------------------------- */
+
+/* ЗАЧЕМ РЕЗОЛВЕРУ TCP. По TCP спрашивают три рода клиентов: получившие по UDP усечённый ответ
+ * (TC=1 — большой ответ, DNSSEC, длинные цепочки CNAME), те, кому ответ заведомо велик, и
+ * приложения, которые ходят по TCP сразу. Пока резолвер слушал только UDP, такие вопросы шли
+ * мимо него: доменный канал имени не видел, поддельный адрес не выдавался, набор канала не
+ * наполнялся, и соединение уходило по настоящему адресу — мимо туннеля, молча.
+ *
+ * Слушает резолвер TCP всегда, на том же адресе и порту, что и UDP, а заворачивает к нему
+ * TCP/53 только Android-сборка (steer.c: prerouting_dns, prerouting_nat, emit_local_dns).
+ * Правила роутера этим изменением не тронуты: их вывод стерегут побайтно, и включать заворот
+ * TCP на роутере — отдельное решение. Лишний слушающий сокет без заворота к нему ничего не
+ * ломает: к порту 5300 по TCP никто, кроме заворота, не обращается.
+ *
+ * УСТРОЙСТВО. Цикл однопоточный, и медленный клиент TCP не должен его останавливать: все сокеты
+ * неблокирующие, чтение копится в буфере соединения, недописанный ответ — в его очереди, и ни
+ * одна операция не ждёт. Каждое сообщение потока (два байта длины и сам запрос) идёт тем же
+ * dns_query, что и датаграмма, — с теми же доменными каналами, быстрым путём, fakeip и
+ * наборами. Несколько запросов подряд в одном соединении (конвейер) обрабатываются по мере
+ * прихода, и ответы уходят в порядке готовности: RFC 7766 это разрешает, клиент сопоставляет
+ * ответ с вопросом по номеру транзакции.
+ *
+ * ЛИМИТЫ. TCP_MAX_CONN соединений клиентов; новое сверх него вытесняет самое давно молчащее из
+ * тех, у кого нет запросов в пути и кто молчит хотя бы секунду, а если таких нет — закрывается
+ * сразу. Секунда — не прихоть: на всплеске соединений вытеснялись бы только что принятые, ещё не
+ * успевшие прислать вопрос, и из перегрузки не выигрывал бы никто. Простой — TCP_IDLE_SEC,
+ * и отсчитывается он от последнего ЦЕЛОГО запроса или сдвига очереди записи, а не от последнего
+ * байта: иначе клиент, присылающий по байту раз в несколько секунд, держал бы место вечно.
+ * Проверка простоя и сроков — на секундном тике цикла, который уже есть ради pending_reap: своих
+ * таймеров у TCP нет, и будить устройство ему нечем — epoll_wait ждёт по CLOCK_MONOTONIC,
+ * который во сне стоит. Если тик когда-нибудь станет «только пока есть ожидания», соединения
+ * TCP тоже должны его держать — иначе простой не снимется до следующего события. */
+#include <netinet/tcp.h>
+#include <stddef.h>
+
+#define TCP_MAX_CONN 32
+#define TCP_MAX_UP   64
+#define TCP_IDLE_SEC 10
+/* Предел недописанных ответов одного соединения. Ответ — до 64 КБ; клиент, который не читает
+ * и четыре таких, больше не клиент, а место в памяти. */
+#define TCP_OUT_MAX  (256 * 1024)
+
+/* Соединение клиента. Буфер чтения — на одно сообщение наибольшей длины, которую мы принимаем
+ * (MAX_PKT, как у датаграммы): полный запрос в нём помещается всегда, и после его разбора
+ * место под следующий есть. Запрос длиннее — не запрос, а мусор, и соединение закрывается. */
+struct tcpc {
+    int fd;                         /* -1 — место свободно */
+    uint32_t gen;                   /* растёт на каждом открытии: так запрос наверху узнаёт,
+                                     * что его соединение закрыто и место отдано другому */
+    int eof;                        /* клиент закрыл свою сторону: дописать ответы и закрыть */
+    int inflight;                   /* его запросов наверху (g_tcpu) */
+    uint32_t ev;                    /* интерес в epoll сейчас */
+    time_t last;                    /* последний целый запрос или сдвиг записи */
+    struct sockaddr_storage peer;
+    socklen_t peer_len;
+    struct in_addr local;           /* куда подключился клиент — для conntrack (origdst) */
+    int have_local;
+    size_t in_len;
+    uint8_t in[2 + MAX_PKT];
+    uint8_t *out;
+    size_t out_len, out_cap;
+};
+
+/* ЗАПРОС НАВЕРХ ПО TCP — для вопроса, пришедшего по TCP. Почему не по UDP с повтором по TC=1:
+ * по TCP клиент спрашивает в основном потому, что уже получил по UDP усечённый ответ, и тот же
+ * вопрос наверх по UDP почти наверняка вернул бы TC снова — лишний круг перед тем же TCP. Ответ
+ * по TCP бывает до 64 КБ, и ему незачем проходить через буфер датаграммы. Сервер видит тот же
+ * протокол, что видел бы без нас: не умеет он TCP — клиент получил бы отказ и напрямую, и наш
+ * SERVFAIL передаёт ровно это. И в режиме origdst, где наверху сервер чужой сети, рукопожатие
+ * TCP само закрывает подделку ответа со стороны — то, что для UDP закрывают случайные номер и
+ * порт.
+ *
+ * Соединение наверх — одно на запрос: так спрашивает и обычный клиент (DnsResolver открывает TCP
+ * на вопрос), серверы наверху в режиме origdst разные, а держать постоянные соединения ради
+ * редкого TCP — сложность без выигрыша. Срок — срок ожидания (PENDING_TTL_SEC): протухшее
+ * ожидание закрывает соединение, и клиенту уходит SERVFAIL, а не тишина — по TCP он ждал бы
+ * своего таймаута с занятым соединением. */
+struct tcpu {
+    int fd;                         /* -1 — место свободно */
+    int slot;                       /* ожидание в g_pending */
+    int conn;                       /* соединение клиента и его поколение */
+    uint32_t conn_gen;
+    uint16_t tag;                   /* номер транзакции, с которым вопрос ушёл наверх */
+    uint16_t cli_id;                /* номер клиента — для SERVFAIL */
+    size_t qend;                    /* конец вопроса в q + 2 (0 — не разобрался) */
+    int connected;
+    uint8_t *q;                     /* вопрос с двумя байтами длины */
+    size_t qlen, qoff;              /* сколько отправлять и сколько ушло */
+    uint8_t hdr[2];                 /* длина ответа */
+    uint8_t *r;                     /* ответ */
+    size_t rlen, rgot;              /* rgot считает и два байта длины */
+};
+
+static int g_tcp_lfd = -1;
+static struct tcpc g_tcpc[TCP_MAX_CONN];
+static struct tcpu g_tcpu[TCP_MAX_UP];
+/* Куда отвечать, когда соединение клиента уже закрыто: ответ сверху всё равно доводится до
+ * карты и наборов (они нужны и следующему вопросу), а tcpc_reply на закрытом месте молчит. */
+static struct tcpc g_tcp_dead = { .fd = -1 };
+
+static void tcpc_set_ev(struct tcpc *c) {
+    uint32_t want = (c->eof ? 0u : (uint32_t)EPOLLIN) | (c->out_len ? (uint32_t)EPOLLOUT : 0u);
+    if (want == c->ev) return;
+    struct epoll_event ev = {0};
+    ev.events = want;
+    ev.data.ptr = c;
+    epoll_ctl(g_epfd, EPOLL_CTL_MOD, c->fd, &ev);
+    c->ev = want;
+}
+
+static void tcpc_close(struct tcpc *c) {
+    if (c->fd < 0) return;
+    epoll_ctl(g_epfd, EPOLL_CTL_DEL, c->fd, NULL);
+    close(c->fd);
+    c->fd = -1;
+    free(c->out);
+    c->out = NULL;
+    c->out_len = c->out_cap = 0;
+    c->in_len = 0;
+    c->inflight = 0;
+    c->eof = 0;
+}
+
+static void tcpc_maybe_close(struct tcpc *c) {
+    if (c->fd >= 0 && c->eof && !c->inflight && !c->out_len) tcpc_close(c);
+}
+
+/* Положить байты в очередь записи. Сверх TCP_OUT_MAX — соединение закрывается: клиент не
+ * читает, и копить для него дальше значит отдать ему память процесса. */
+static int tcpc_queue(struct tcpc *c, const uint8_t *b, size_t n) {
+    if (c->out_len + n > TCP_OUT_MAX) { tcpc_close(c); return -1; }
+    if (c->out_len + n > c->out_cap) {
+        size_t cap = c->out_cap ? c->out_cap : 1024;
+        while (cap < c->out_len + n) cap *= 2;
+        uint8_t *nb = realloc(c->out, cap);
+        if (!nb) { tcpc_close(c); return -1; }
+        c->out = nb;
+        c->out_cap = cap;
+    }
+    memcpy(c->out + c->out_len, b, n);
+    c->out_len += n;
+    return 0;
+}
+
+/* Ответ клиенту TCP: два байта длины и сообщение. Сначала — сразу в сокет; что не влезло
+ * (клиент читает медленно) — в очередь, и дописывается по EPOLLOUT. Вне очереди писать нельзя:
+ * ответы в потоке обязаны идти целиком, один за другим. */
+static void tcpc_reply(struct tcpc *c, const void *b, size_t n) {
+    if (c->fd < 0 || n > 65535) return;
+    uint8_t hdr[2] = { (uint8_t)(n >> 8), (uint8_t)n };
+    size_t done = 0;
+    if (!c->out_len) {
+        struct iovec iov[2] = { { hdr, 2 }, { (void *)b, n } };
+        struct msghdr mh;
+        memset(&mh, 0, sizeof(mh));
+        mh.msg_iov = iov;
+        mh.msg_iovlen = 2;
+        ssize_t w = sendmsg(c->fd, &mh, MSG_NOSIGNAL | MSG_DONTWAIT);
+        if (w < 0) {
+            if (errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR) { tcpc_close(c); return; }
+            w = 0;
+        }
+        done = (size_t)w;
+        if (done) c->last = time(NULL);
+        if (done == n + 2) return;
+    }
+    if (done < 2 && tcpc_queue(c, hdr + done, 2 - done) != 0) return;
+    size_t boff = done > 2 ? done - 2 : 0;
+    if (tcpc_queue(c, (const uint8_t *)b + boff, n - boff) != 0) return;
+    tcpc_set_ev(c);
+}
+
+static void tcpc_flush(struct tcpc *c) {
+    while (c->out_len) {
+        ssize_t w = send(c->fd, c->out, c->out_len, MSG_NOSIGNAL | MSG_DONTWAIT);
+        if (w < 0) {
+            if (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR) break;
+            tcpc_close(c);
+            return;
+        }
+        memmove(c->out, c->out + w, c->out_len - (size_t)w);
+        c->out_len -= (size_t)w;
+        c->last = time(NULL);
+    }
+    tcpc_set_ev(c);
+}
+
+/* Дочитать, что пришло, и отдать каждый целый запрос в dns_query. Не больше нескольких чтений
+ * за событие: epoll уровневый и вернётся сам, а один болтливый клиент не должен заслонять
+ * остальные события витка. */
+static void tcpc_read(struct tcpc *c) {
+    for (int k = 0; k < 8 && c->fd >= 0 && !c->eof; k++) {
+        ssize_t r = recv(c->fd, c->in + c->in_len, sizeof(c->in) - c->in_len, MSG_DONTWAIT);
+        if (r < 0) {
+            if (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR) return;
+            tcpc_close(c);
+            return;
+        }
+        if (r == 0) {                   /* клиент дописал своё: ответить на начатое и закрыть */
+            c->eof = 1;
+            tcpc_set_ev(c);
+            return;
+        }
+        c->in_len += (size_t)r;
+        size_t off = 0;
+        while (c->fd >= 0 && c->in_len - off >= 2) {
+            size_t mlen = ((size_t)c->in[off] << 8) | c->in[off + 1];
+            if (mlen < 12 || mlen > MAX_PKT) { tcpc_close(c); return; }
+            if (c->in_len - off < 2 + mlen) break;
+            uint8_t *msg = c->in + off + 2;
+            off += 2 + mlen;
+            c->last = time(NULL);
+            /* Сообщение обрабатывается прямо в буфере: dns_query переписывает в нём только
+             * номер транзакции, а байты эти уже прочитаны. Буфер статический, и закрытие
+             * соединения посреди обработки (очередь записи переполнилась) его не освобождает. */
+            g_tcp_cur = c;
+            dns_query(msg, (ssize_t)mlen, c->peer, c->peer_len, c->local, c->have_local);
+            g_tcp_cur = NULL;
+        }
+        if (c->fd < 0) return;
+        memmove(c->in, c->in + off, c->in_len - off);
+        c->in_len -= off;
+    }
+}
+
+/* SERVFAIL клиенту — из заголовка и вопроса его же запроса. Вопрос не разобрался — только
+ * заголовок, без секции вопроса. */
+static void tcp_servfail(struct tcpc *c, const uint8_t *q, size_t qend, uint16_t cli_id) {
+    if (!c || c->fd < 0) return;
+    uint8_t out[512];
+    size_t use = (qend >= 12 && qend <= sizeof(out)) ? qend : 12;
+    size_t len = build_rewritten_response(q, use, out, sizeof(out), 0, 0);
+    if (!len) return;
+    if (use == 12) { out[4] = 0; out[5] = 0; }
+    out[0] = (uint8_t)(cli_id >> 8);
+    out[1] = (uint8_t)cli_id;
+    out[3] = (uint8_t)((out[3] & 0xf0) | 0x02);     /* RCODE 2 — SERVFAIL */
+    tcpc_reply(c, out, len);
+}
+
+static struct tcpc *tcpu_conn(const struct tcpu *u) {
+    struct tcpc *c = &g_tcpc[u->conn];
+    return (c->fd >= 0 && c->gen == u->conn_gen) ? c : &g_tcp_dead;
+}
+
+static void tcpu_close(struct tcpu *u) {
+    if (u->fd < 0) return;
+    epoll_ctl(g_epfd, EPOLL_CTL_DEL, u->fd, NULL);
+    close(u->fd);
+    u->fd = -1;
+    free(u->q);
+    free(u->r);
+    u->q = u->r = NULL;
+    struct tcpc *c = tcpu_conn(u);
+    if (c->fd >= 0) {
+        if (c->inflight > 0) c->inflight--;
+        tcpc_maybe_close(c);
+    }
+}
+
+/* Ожидание ещё наше? Протухшее (pending_reap) или отданное другому вопросу — уже нет. */
+static struct pending *tcpu_pending(const struct tcpu *u) {
+    struct pending *p = &g_pending[u->slot];
+    return (p->in_use && p->tcp_up == (int)(u - g_tcpu)) ? p : NULL;
+}
+
+/* Наверх не вышло (не соединился, оборвал, ответил не то) — SERVFAIL клиенту и конец. */
+static void tcpu_fail(struct tcpu *u) {
+    struct pending *p = tcpu_pending(u);
+    if (p) p->in_use = 0;
+    tcp_servfail(tcpu_conn(u), u->q + 2, u->qend, u->cli_id);
+    tcpu_close(u);
+}
+
+static int tcpu_open(struct pending *p, const uint8_t *q, size_t n, const struct sockaddr_in *up,
+                     uint16_t tag, size_t qend) {
+    struct tcpc *c = g_tcp_cur;
+    struct tcpu *u = NULL;
+    for (int i = 0; i < TCP_MAX_UP; i++)
+        if (g_tcpu[i].fd < 0) { u = &g_tcpu[i]; break; }
+    int fd = -1;
+    const char *why = "все соединения наверх заняты";
+    if (u) {
+        fd = socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
+        why = "сокет не открылся";
+    }
+    uint8_t *fq = fd >= 0 ? malloc(n + 2) : NULL;
+    if (fd >= 0 && !fq) why = "нет памяти";
+    if (fd >= 0 && fq) {
+#ifdef STEER_ANDROID
+        /* Та же метка, что у запросов наверх по UDP (см. run_proxy): без неё заворот TCP/53
+         * на output вернул бы наш же запрос к нам. */
+        unsigned mk = STEER_SELF_MARK;
+        setsockopt(fd, SOL_SOCKET, SO_MARK, &mk, sizeof(mk));
+#endif
+        int one = 1;
+        setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
+        int rc = connect(fd, (const struct sockaddr *)up, sizeof(*up));
+        if (rc == 0 || errno == EINPROGRESS) {
+            fq[0] = (uint8_t)(n >> 8);
+            fq[1] = (uint8_t)n;
+            memcpy(fq + 2, q, n);
+            memset(u, 0, sizeof(*u));
+            u->fd = fd;
+            u->slot = (int)(p - g_pending);
+            u->conn = (int)(c - g_tcpc);
+            u->conn_gen = c->gen;
+            u->tag = tag;
+            u->cli_id = p->cli_id;
+            u->qend = qend;
+            u->connected = rc == 0;
+            u->q = fq;
+            u->qlen = n + 2;
+            struct epoll_event ev = {0};
+            ev.events = EPOLLOUT;
+            ev.data.ptr = u;
+            if (epoll_ctl(g_epfd, EPOLL_CTL_ADD, fd, &ev) == 0) {
+                c->inflight++;
+                return (int)(u - g_tcpu);
+            }
+            u->fd = -1;
+            u->q = NULL;
+        }
+        why = strerror(errno);
+    }
+    free(fq);
+    if (fd >= 0) close(fd);
+    static time_t said;
+    if (warn_due(&said, time(NULL)))
+        fprintf(stderr, "steer dnsd: запрос по TCP не ушёл наверх: %s — клиенту SERVFAIL\n", why);
+    uint16_t cli = p->cli_id;
+    tcp_servfail(c, q, qend, cli);
+    return -1;
+}
+
+/* Толкнуть запрос наверх дальше: соединиться, дописать вопрос, дочитать ответ. Решение — по
+ * состоянию сокета, а не по маске события: событие могло остаться от прежнего сокета на этом
+ * месте, а неготовый сокет просто отвечает EAGAIN. */
+static void tcpu_poke(struct tcpu *u) {
+    if (u->fd < 0) return;
+    struct pending *p = tcpu_pending(u);
+    if (!p) { tcpu_fail(u); return; }
+    if (u->qoff < u->qlen) {
+        if (!u->connected) {
+            int err = 0;
+            socklen_t el = sizeof(err);
+            if (getsockopt(u->fd, SOL_SOCKET, SO_ERROR, &err, &el) != 0 || err) {
+                tcpu_fail(u);
+                return;
+            }
+        }
+        ssize_t w = send(u->fd, u->q + u->qoff, u->qlen - u->qoff, MSG_NOSIGNAL | MSG_DONTWAIT);
+        if (w < 0) {
+            if (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR || errno == ENOTCONN)
+                return;
+            tcpu_fail(u);
+            return;
+        }
+        u->connected = 1;
+        u->qoff += (size_t)w;
+        if (u->qoff < u->qlen) return;
+        struct epoll_event ev = {0};
+        ev.events = EPOLLIN;
+        ev.data.ptr = u;
+        epoll_ctl(g_epfd, EPOLL_CTL_MOD, u->fd, &ev);
+        return;
+    }
+    for (;;) {
+        uint8_t *dst;
+        size_t want;
+        if (u->rgot < 2) { dst = u->hdr + u->rgot; want = 2 - u->rgot; }
+        else { dst = u->r + (u->rgot - 2); want = u->rlen - (u->rgot - 2); }
+        ssize_t r = recv(u->fd, dst, want, MSG_DONTWAIT);
+        if (r < 0 && (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR)) return;
+        if (r <= 0) { tcpu_fail(u); return; }
+        u->rgot += (size_t)r;
+        if (u->rgot == 2) {
+            u->rlen = ((size_t)u->hdr[0] << 8) | u->hdr[1];
+            if (u->rlen < 12 || !(u->r = malloc(u->rlen))) { tcpu_fail(u); return; }
+        }
+        if (u->rgot >= 2 && u->rgot - 2 == u->rlen) break;
+    }
+    /* Ответ целиком. Сверка — та же, что у датаграммы: наш номер и НАШ вопрос. Соединение
+     * наше собственное, так что чужой ответ здесь — это сбой сервера, а не подделка, и клиент
+     * получает SERVFAIL, а не молчание. */
+    if (((u->r[0] << 8) | u->r[1]) != u->tag ||
+        (p->qfp && (u->rlen < p->qsec_end || question_fp(u->r, p->qsec_end) != p->qfp))) {
+        tcpu_fail(u);
+        return;
+    }
+    g_tcp_cur = tcpu_conn(u);
+    upstream_answer(p, u->r, (ssize_t)u->rlen);
+    g_tcp_cur = NULL;
+    tcpu_close(u);
+}
+
+/* Место под новое соединение: свободное, иначе — давно молчащее без запросов в пути и без
+ * начатого запроса в буфере (см. «ЛИМИТЫ» выше). */
+static struct tcpc *tcpc_slot(void) {
+    struct tcpc *old = NULL;
+    time_t now = time(NULL);
+    for (int i = 0; i < TCP_MAX_CONN; i++) {
+        struct tcpc *c = &g_tcpc[i];
+        if (c->fd < 0) return c;
+        if (!c->inflight && !c->in_len && now - c->last >= 1 && (!old || c->last < old->last))
+            old = c;
+    }
+    if (old) tcpc_close(old);
+    return old;
+}
+
+static void tcp_accept(void) {
+    for (int k = 0; k < TCP_MAX_CONN; k++) {
+        struct sockaddr_storage peer;
+        socklen_t pl = sizeof(peer);
+        int fd = accept(g_tcp_lfd, (struct sockaddr *)&peer, &pl);
+        if (fd < 0) return;
+        struct tcpc *c = tcpc_slot();
+        if (!c) {
+            static time_t said;
+            close(fd);
+            if (warn_due(&said, time(NULL)))
+                fprintf(stderr, "steer dnsd: соединений TCP больше %d, и все с запросами в "
+                                "пути — новое закрыто\n", TCP_MAX_CONN);
+            continue;
+        }
+        fcntl(fd, F_SETFL, O_NONBLOCK);
+        fcntl(fd, F_SETFD, FD_CLOEXEC);
+        int one = 1;
+        setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
+        uint32_t gen = c->gen + 1;
+        memset(c, 0, offsetof(struct tcpc, in));
+        c->fd = fd;
+        c->gen = gen;
+        c->peer = peer;
+        c->peer_len = pl;
+        c->last = time(NULL);
+        /* Адрес, к которому подключился клиент: после redirect это наш адрес (петля или адрес
+         * интерфейса раздачи), и по нему вместе с адресом клиента conntrack находит исходное
+         * назначение — как для датаграммы по IP_PKTINFO. */
+        struct sockaddr_storage ls;
+        socklen_t ll = sizeof(ls);
+        if (getsockname(fd, (struct sockaddr *)&ls, &ll) == 0) {
+            if (ls.ss_family == AF_INET) {
+                c->local = ((struct sockaddr_in *)&ls)->sin_addr;
+                c->have_local = 1;
+            } else if (ls.ss_family == AF_INET6 &&
+                       IN6_IS_ADDR_V4MAPPED(&((struct sockaddr_in6 *)&ls)->sin6_addr)) {
+                memcpy(&c->local, &((struct sockaddr_in6 *)&ls)->sin6_addr.s6_addr[12], 4);
+                c->have_local = 1;
+            }
+        }
+        struct epoll_event ev = {0};
+        ev.events = EPOLLIN;
+        ev.data.ptr = c;
+        if (epoll_ctl(g_epfd, EPOLL_CTL_ADD, fd, &ev) != 0) { close(fd); c->fd = -1; continue; }
+        c->ev = EPOLLIN;
+    }
+}
+
+static void tcpc_event(struct tcpc *c, uint32_t evs) {
+    if (c->fd < 0) return;
+    if (evs & (EPOLLERR | EPOLLHUP)) {
+        /* Ошибка или обе стороны закрыты: дописать некому. Сверка с сокетом — на случай, если
+         * событие осталось от прежнего соединения на этом месте. */
+        int err = 0;
+        socklen_t el = sizeof(err);
+        char b;
+        getsockopt(c->fd, SOL_SOCKET, SO_ERROR, &err, &el);
+        if (err || ((evs & EPOLLHUP) && recv(c->fd, &b, 1, MSG_PEEK | MSG_DONTWAIT) == 0)) {
+            tcpc_close(c);
+            return;
+        }
+    }
+    if (c->out_len) tcpc_flush(c);
+    if (c->fd >= 0 && !c->eof) tcpc_read(c);
+    tcpc_maybe_close(c);
+}
+
+/* Событие epoll, если оно TCP: 1 — обработано здесь, 0 — не наше. */
+static int tcp_event(void *ptr, uint32_t evs) {
+    uintptr_t a = (uintptr_t)ptr;
+    if (ptr == &g_tcp_lfd) { tcp_accept(); return 1; }
+    if (a >= (uintptr_t)g_tcpc && a < (uintptr_t)(g_tcpc + TCP_MAX_CONN)) {
+        tcpc_event((struct tcpc *)ptr, evs);
+        return 1;
+    }
+    if (a >= (uintptr_t)g_tcpu && a < (uintptr_t)(g_tcpu + TCP_MAX_UP)) {
+        tcpu_poke((struct tcpu *)ptr);
+        return 1;
+    }
+    return 0;
+}
+
+/* Секундный тик: запросы наверх, чьё ожидание протухло, — SERVFAIL и закрыть; соединения
+ * клиентов без дела дольше TCP_IDLE_SEC — закрыть. */
+static void tcp_reap(time_t now) {
+    for (int i = 0; i < TCP_MAX_UP; i++)
+        if (g_tcpu[i].fd >= 0 && !tcpu_pending(&g_tcpu[i])) tcpu_fail(&g_tcpu[i]);
+    for (int i = 0; i < TCP_MAX_CONN; i++) {
+        struct tcpc *c = &g_tcpc[i];
+        if (c->fd >= 0 && !c->inflight && now - c->last >= TCP_IDLE_SEC) tcpc_close(c);
+    }
+}
+
+/* Слушать TCP на том же порту, что и UDP, двойным стеком так же. Не вышло — не отказ: UDP
+ * работает, а запросы по TCP пройдут тем путём, каким шли до этого. */
+static void tcp_listen_open(int port) {
+    for (int i = 0; i < TCP_MAX_CONN; i++) g_tcpc[i].fd = -1;
+    for (int i = 0; i < TCP_MAX_UP; i++) g_tcpu[i].fd = -1;
+    int on = 1, off = 0;
+    int fd = socket(AF_INET6, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
+    if (fd >= 0) {
+        struct sockaddr_in6 a6;
+        memset(&a6, 0, sizeof(a6));
+        a6.sin6_family = AF_INET6;
+        a6.sin6_port = htons((uint16_t)port);
+        a6.sin6_addr = in6addr_any;
+        setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &on, sizeof(on));
+        if (setsockopt(fd, IPPROTO_IPV6, IPV6_V6ONLY, &off, sizeof(off)) != 0 ||
+            bind(fd, (struct sockaddr *)&a6, sizeof(a6)) != 0) {
+            close(fd);
+            fd = -1;
+        }
+    }
+    if (fd < 0) {
+        fd = socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
+        struct sockaddr_in a4;
+        memset(&a4, 0, sizeof(a4));
+        a4.sin_family = AF_INET;
+        a4.sin_port = htons((uint16_t)port);
+        a4.sin_addr.s_addr = htonl(INADDR_ANY);
+        if (fd >= 0) setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &on, sizeof(on));
+        if (fd >= 0 && bind(fd, (struct sockaddr *)&a4, sizeof(a4)) != 0) { close(fd); fd = -1; }
+    }
+    if (fd < 0 || listen(fd, TCP_MAX_CONN) != 0) {
+        fprintf(stderr, "steer dnsd: TCP на :%d не слушается (%s) — запросы по TCP пройдут "
+                        "мимо доменных каналов\n", port, strerror(errno));
+        if (fd >= 0) close(fd);
+        return;
+    }
+    struct epoll_event ev = {0};
+    ev.events = EPOLLIN;
+    ev.data.ptr = &g_tcp_lfd;
+    if (epoll_ctl(g_epfd, EPOLL_CTL_ADD, fd, &ev) != 0) { close(fd); return; }
+    g_tcp_lfd = fd;
+}
+
+static void tcp_close_all(void) {
+    for (int i = 0; i < TCP_MAX_UP; i++) tcpu_close(&g_tcpu[i]);
+    for (int i = 0; i < TCP_MAX_CONN; i++) tcpc_close(&g_tcpc[i]);
+    if (g_tcp_lfd >= 0) close(g_tcp_lfd);
+    g_tcp_lfd = -1;
+}
+
 /* Восстановить DNAT-карту и наборы каналов после (пере)запуска. Возвращает число
  * восстановленных отображений fake→real, в *routed_out — число вновь утверждённых маршрутов.
  *
@@ -2616,6 +3216,8 @@ static int run_proxy(int listen_port, int upstream_port) {
     ev.events = EPOLLIN;
     ev.data.ptr = NULL; /* NULL marks the listen socket */
     epoll_ctl(g_epfd, EPOLL_CTL_ADD, g_listen_fd, &ev);
+    /* И TCP на том же порту — см. «DNS по TCP» выше. */
+    tcp_listen_open(listen_port);
 
     /* Один сокет наверх на весь процесс — см. комментарий у struct pending. Открывается
      * здесь, а не при первом запросе, чтобы отказ был виден сразу, а не превращался в
@@ -2719,6 +3321,7 @@ static int run_proxy(int listen_port, int upstream_port) {
         if (now != last_reap) {
             /* Секундный тик: снять протухшие ожидания (см. pending_reap). */
             pending_reap(now);
+            tcp_reap(now);
             last_reap = now;
         }
         if (g_fakeip_dirty) {
@@ -2746,6 +3349,8 @@ static int run_proxy(int listen_port, int upstream_port) {
                  * upstream, которые ждут в этом же массиве событий. */
                 for (int k = 0; k < 64; k++)
                     if (!handle_client_query()) break;
+            } else if (tcp_event(events[i].data.ptr, events[i].events)) {
+                /* соединение TCP — клиента или наверх; всё сделано внутри */
             } else {
                 /* Ответы всех ожиданий приходят на один сокет, поэтому очередь тоже
                  * дочитывается до конца пачкой — иначе на всплеске за один виток цикла
@@ -2757,6 +3362,7 @@ static int run_proxy(int listen_port, int upstream_port) {
         }
     }
 
+    tcp_close_all();
     if (g_nlk_fd >= 0) close(g_nlk_fd);
     if (g_up_fd >= 0) close(g_up_fd);
     close(g_listen_fd);

@@ -11,6 +11,9 @@
  *                                          «syn SRC -> DST:PORT» или «none»
  *   local49-tool dns UID SERVER NAME     — от имени UID спросить A у SERVER:53, напечатать
  *                                          первый адрес ответа или «timeout»
+ *   local49-tool dnstcp UID SERVER NAME…  — то же по TCP/53 (RFC 7766): все вопросы одной
+ *                                          записью в одном соединении (конвейер), по строке
+ *                                          на имя в порядке имён: адрес, «rcodeN» или «timeout»
  *
  * Статически и без libc-зависимостей сверх POSIX: собирается и musl-gcc для стенда vm49, и
  * обычным cc для сетевого пространства на хосте. */
@@ -136,7 +139,59 @@ int main(int argc, char **argv) {
         printf("%s\n", ip);
         return 0;
     }
+    if (argc >= 5 && argc <= 12 && !strcmp(argv[1], "dnstcp")) {
+        unsigned uid = (unsigned)strtoul(argv[2], NULL, 10);
+        if (uid && (setgid(uid) != 0 || setuid(uid) != 0)) { perror("setuid"); return 1; }
+        int k = argc - 4;
+        unsigned char all[2048];
+        int len = 0;
+        for (int i = 0; i < k; i++) {
+            unsigned char *q = all + len + 2;
+            int n = 12;
+            memset(q, 0, 12);
+            q[0] = 0x56; q[1] = (unsigned char)i; q[2] = 1; q[5] = 1;
+            char name[256];
+            snprintf(name, sizeof name, "%s", argv[4 + i]);
+            for (char *t = strtok(name, "."); t; t = strtok(NULL, ".")) {
+                q[n++] = (unsigned char)strlen(t); memcpy(q + n, t, strlen(t)); n += (int)strlen(t);
+            }
+            q[n++] = 0; q[n++] = 0; q[n++] = 1; q[n++] = 0; q[n++] = 1;
+            all[len] = (unsigned char)(n >> 8); all[len + 1] = (unsigned char)n;
+            len += n + 2;
+        }
+        int s = socket(AF_INET, SOCK_STREAM, 0);
+        struct timeval tv = { 3, 0 };
+        setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof tv);
+        setsockopt(s, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof tv);
+        struct sockaddr_in a;
+        memset(&a, 0, sizeof a);
+        a.sin_family = AF_INET;
+        a.sin_port = htons(53);
+        inet_pton(AF_INET, argv[3], &a.sin_addr);
+        if (connect(s, (struct sockaddr *)&a, sizeof a) != 0) { printf("connect\n"); return 0; }
+        if (send(s, all, (size_t)len, 0) != len) { printf("send\n"); return 0; }
+        char res[8][32];
+        memset(res, 0, sizeof res);
+        for (int i = 0; i < k; i++) {
+            unsigned char h[2], r[1024];
+            int got = 0, m;
+            while (got < 2 && (m = (int)recv(s, h + got, 2 - got, 0)) > 0) got += m;
+            if (got < 2) break;
+            int rl = h[0] << 8 | h[1];
+            if (rl > (int)sizeof r) break;
+            got = 0;
+            while (got < rl && (m = (int)recv(s, r + got, rl - got, 0)) > 0) got += m;
+            if (got < rl || rl < 12) break;
+            int id = r[1];
+            if (r[0] != 0x56 || id >= k) continue;
+            if (r[3] & 15) snprintf(res[id], sizeof res[id], "rcode%d", r[3] & 15);
+            else if (!r[7] || rl < 4) snprintf(res[id], sizeof res[id], "empty");
+            else inet_ntop(AF_INET, r + rl - 4, res[id], sizeof res[id]);
+        }
+        for (int i = 0; i < k; i++) printf("%s\n", res[i][0] ? res[i] : "timeout");
+        return 0;
+    }
     fprintf(stderr, "usage: mk NAME CIDR | conn UID ADDR PORT | watch NAME MS | "
-                    "dns UID SERVER NAME\n");
+                    "dns UID SERVER NAME | dnstcp UID SERVER NAME...\n");
     return 2;
 }

@@ -126,6 +126,20 @@ check "DNS телефона — все, кроме запроса самого �
     "$(c "$m2" 'meta nfproto ipv4 meta mark and 0x0fc00000 != 0x0fc00000 udp dport 53 counter redirect to :5300')"
 check "  и на старой раскладке — в таблице ip" "1" \
     "$(c "$l2" 'meta mark and 0x0fc00000 != 0x0fc00000 udp dport 53 counter redirect to :5300')"
+check "DNS телефона по TCP/53 — рядом с UDP, с тем же исключением метки движка" "1" \
+    "$(c "$m2" 'meta nfproto ipv4 meta mark and 0x0fc00000 != 0x0fc00000 tcp dport 53 counter redirect to :5300')"
+check "  и на старой раскладке — в таблице ip" "1" \
+    "$(c "$l2" 'meta mark and 0x0fc00000 != 0x0fc00000 tcp dport 53 counter redirect to :5300')"
+# Раздача: TCP/53 заворачивается рядом с UDP/53 в обеих раскладках (на старой — и в ip6).
+check "раздача: TCP/53 к резолверу, современная раскладка" "1" \
+    "$(c "$m2" 'iifname "rndis0" tcp dport 53 counter redirect to :5300')"
+check "раздача: TCP/53 к резолверу, старая раскладка без nat в ip6 (только ip)" "1" \
+    "$(c "$l2" 'iifname "rndis0" tcp dport 53 counter redirect to :5300')"
+check "раздача: TCP/53 к резолверу, старая раскладка с nat в ip6 (ip и ip6)" "2" \
+    "$(c "$(STEER_NFT_COMPAT=legacy "$BIN" apply --dry-run --spec "$tmp/loc2.json" --state-dir "$tmp/state" 2>/dev/null)" \
+         'iifname "rndis0" tcp dport 53 counter redirect to :5300')"
+check "раздача: TCP/53 стоит сразу за UDP/53" "1" \
+    "$(printf '%s\n' "$m2" | grep -A1 'iifname "rndis0" udp dport 53' | grep -c 'tcp dport 53')"
 check "поддельные адреса для соединений телефона переводятся на output" "1" \
     "$(c "$m2" 'comment "steer-fakeip-local"')"
 check "masquerade — не в nft (его ставит iptables при apply)" "0" "$(c "$m2$l2" 'masquerade')"
