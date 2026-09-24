@@ -7,13 +7,24 @@
  *
  *   local49-tool mk NAME A.B.C.D/NN      — постоянное TUN-устройство с адресом, поднятое
  *   local49-tool conn UID A.B.C.D PORT   — от имени UID начать TCP-соединение (SYN) и выйти
- *   local49-tool watch NAME MS           — MS миллисекунд читать NAME и печатать TCP SYN:
- *                                          «syn SRC -> DST:PORT» или «none»
- *   local49-tool dns UID SERVER NAME     — от имени UID спросить A у SERVER:53, напечатать
- *                                          первый адрес ответа или «timeout»
- *   local49-tool dnstcp UID SERVER NAME…  — то же по TCP/53 (RFC 7766): все вопросы одной
+ *   local49-tool watch NAME MS           — MS миллисекунд читать NAME и печатать TCP SYN
+ *                                          «syn SRC -> DST:PORT» и UDP «udp SRC -> DST:PORT»
+ *                                          (IPv4 и IPv6, адрес IPv6 — в скобках); ничего —
+ *                                          «none»
+ *   local49-tool dns UID SERVER NAME [MARK]
+ *                                        — от имени UID спросить A у SERVER:53 (IPv4 или
+ *                                          IPv6), напечатать первый адрес ответа или
+ *                                          «timeout»; MARK — SO_MARK сокета, как fwmark,
+ *                                          которым netd метит сокет DnsResolver
+ *   local49-tool dnstcp UID[/MARK] SERVER NAME…
+ *                                        — то же по TCP/53 (RFC 7766): все вопросы одной
  *                                          записью в одном соединении (конвейер), по строке
- *                                          на имя в порядке имён: адрес, «rcodeN» или «timeout»
+ *                                          на имя в порядке имён: адрес, «rcodeN» или
+ *                                          «timeout»; MARK — как у dns
+ *   local49-tool serve6 PORT ADDR6 A.B.C.D [TCPADDR]
+ *                                        — DNS-сервер на [ADDR6]:PORT по UDP и TCP: на любой
+ *                                          вопрос A отвечает A.B.C.D, по TCP — TCPADDR, если
+ *                                          задан (dnstool стенда — только IPv4)
  *
  * Статически и без libc-зависимостей сверх POSIX: собирается и musl-gcc для стенда vm49, и
  * обычным cc для сетевого пространства на хосте. */
@@ -27,6 +38,8 @@
 #include <poll.h>
 #include <time.h>
 #include <sys/ioctl.h>
+#include <sys/prctl.h>
+#include <signal.h>
 #include <sys/time.h>
 #include <sys/socket.h>
 #include <netinet/in.h>
@@ -92,6 +105,35 @@ int main(int argc, char **argv) {
             if (poll(&p, 1, (int)left) <= 0) continue;
             unsigned char b[2048];
             ssize_t n = read(fd, b, sizeof b);
+            if (n >= 48 && (b[0] >> 4) == 6 && b[6] == 17) {        /* IPv6 + UDP */
+                char src[64], dst[64];
+                inet_ntop(AF_INET6, b + 8, src, sizeof src);
+                inet_ntop(AF_INET6, b + 24, dst, sizeof dst);
+                printf("udp %s -> [%s]:%d\n", src, dst, (b[42] << 8) | b[43]);
+                fflush(stdout);
+                seen++;
+                continue;
+            }
+            if (n >= 28 && (b[0] >> 4) == 4 && b[9] == 17) {        /* IPv4 + UDP */
+                int ihl = (b[0] & 15) * 4;
+                char src[16], dst[16];
+                inet_ntop(AF_INET, b + 12, src, sizeof src);
+                inet_ntop(AF_INET, b + 16, dst, sizeof dst);
+                printf("udp %s -> %s:%d\n", src, dst, (b[ihl + 2] << 8) | b[ihl + 3]);
+                fflush(stdout);
+                seen++;
+                continue;
+            }
+            if (n >= 60 && (b[0] >> 4) == 6 && b[6] == 6) {         /* IPv6 + TCP */
+                if (!(b[53] & 0x02) || (b[53] & 0x10)) continue;   /* только SYN */
+                char src[64], dst[64];
+                inet_ntop(AF_INET6, b + 8, src, sizeof src);
+                inet_ntop(AF_INET6, b + 24, dst, sizeof dst);
+                printf("syn %s -> [%s]:%d\n", src, dst, (b[42] << 8) | b[43]);
+                fflush(stdout);
+                seen++;
+                continue;
+            }
             if (n < 40 || (b[0] >> 4) != 4 || b[9] != 6) continue;
             int ihl = (b[0] & 15) * 4;
             if (!(b[ihl + 13] & 0x02) || (b[ihl + 13] & 0x10)) continue;   /* только SYN */
@@ -105,8 +147,18 @@ int main(int argc, char **argv) {
         if (!seen) printf("none\n");
         return 0;
     }
-    if (argc == 5 && !strcmp(argv[1], "dns")) {
+    if ((argc == 5 || argc == 6) && !strcmp(argv[1], "dns")) {
         unsigned uid = (unsigned)strtoul(argv[2], NULL, 10);
+        int v6 = strchr(argv[3], ':') != NULL;
+        /* Сокет и метка — до смены UID: SO_MARK требует CAP_NET_ADMIN (у DnsResolver метку
+         * ставит netd, у которого она есть). */
+        int s = socket(v6 ? AF_INET6 : AF_INET, SOCK_DGRAM, 0);
+        if (argc == 6) {
+            unsigned mk = (unsigned)strtoul(argv[5], NULL, 0);
+            if (setsockopt(s, SOL_SOCKET, SO_MARK, &mk, sizeof mk) != 0) {
+                perror("SO_MARK"); return 1;
+            }
+        }
         if (uid && (setgid(uid) != 0 || setuid(uid) != 0)) { perror("setuid"); return 1; }
         unsigned char q[300], r[600];
         int n = 12;
@@ -118,17 +170,28 @@ int main(int argc, char **argv) {
             q[n++] = (unsigned char)strlen(t); memcpy(q + n, t, strlen(t)); n += (int)strlen(t);
         }
         q[n++] = 0; q[n++] = 0; q[n++] = 1; q[n++] = 0; q[n++] = 1;
-        int s = socket(AF_INET, SOCK_DGRAM, 0);
         struct timeval tv = { 2, 0 };
         setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof tv);
-        struct sockaddr_in a;
-        memset(&a, 0, sizeof a);
-        a.sin_family = AF_INET;
-        a.sin_port = htons(53);
-        inet_pton(AF_INET, argv[3], &a.sin_addr);
+        struct sockaddr_storage ss;
+        socklen_t sl;
+        memset(&ss, 0, sizeof ss);
+        if (v6) {
+            struct sockaddr_in6 *a6 = (struct sockaddr_in6 *)&ss;
+            a6->sin6_family = AF_INET6;
+            a6->sin6_port = htons(53);
+            inet_pton(AF_INET6, argv[3], &a6->sin6_addr);
+            sl = sizeof *a6;
+        } else {
+            struct sockaddr_in *a = (struct sockaddr_in *)&ss;
+            a->sin_family = AF_INET;
+            a->sin_port = htons(53);
+            inet_pton(AF_INET, argv[3], &a->sin_addr);
+            sl = sizeof *a;
+        }
         /* connect, как DnsResolver: ответ с чужого адреса (например, с адреса Wi-Fi вместо
-         * того, к которому шёл запрос) ядро такому сокету не отдаст — стенд увидит timeout. */
-        if (connect(s, (struct sockaddr *)&a, sizeof a) != 0) { printf("connect\n"); return 0; }
+         * того, к которому шёл запрос, или с ::1 вместо сервера) ядро такому сокету не
+         * отдаст — стенд увидит timeout. */
+        if (connect(s, (struct sockaddr *)&ss, sl) != 0) { printf("connect\n"); return 0; }
         send(s, q, n, 0);
         int m = (int)recv(s, r, sizeof r, 0);
         if (m < n + 16 || !r[7]) { printf("timeout\n"); return 0; }
@@ -140,7 +203,17 @@ int main(int argc, char **argv) {
         return 0;
     }
     if (argc >= 5 && argc <= 12 && !strcmp(argv[1], "dnstcp")) {
+        char *slash = strchr(argv[2], '/');
         unsigned uid = (unsigned)strtoul(argv[2], NULL, 10);
+        int v6 = strchr(argv[3], ':') != NULL;
+        /* Сокет и метка — до смены UID, как у dns. */
+        int s = socket(v6 ? AF_INET6 : AF_INET, SOCK_STREAM, 0);
+        if (slash) {
+            unsigned mk = (unsigned)strtoul(slash + 1, NULL, 0);
+            if (setsockopt(s, SOL_SOCKET, SO_MARK, &mk, sizeof mk) != 0) {
+                perror("SO_MARK"); return 1;
+            }
+        }
         if (uid && (setgid(uid) != 0 || setuid(uid) != 0)) { perror("setuid"); return 1; }
         int k = argc - 4;
         unsigned char all[2048];
@@ -159,16 +232,26 @@ int main(int argc, char **argv) {
             all[len] = (unsigned char)(n >> 8); all[len + 1] = (unsigned char)n;
             len += n + 2;
         }
-        int s = socket(AF_INET, SOCK_STREAM, 0);
         struct timeval tv = { 3, 0 };
         setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof tv);
         setsockopt(s, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof tv);
-        struct sockaddr_in a;
-        memset(&a, 0, sizeof a);
-        a.sin_family = AF_INET;
-        a.sin_port = htons(53);
-        inet_pton(AF_INET, argv[3], &a.sin_addr);
-        if (connect(s, (struct sockaddr *)&a, sizeof a) != 0) { printf("connect\n"); return 0; }
+        struct sockaddr_storage ss;
+        socklen_t sl;
+        memset(&ss, 0, sizeof ss);
+        if (v6) {
+            struct sockaddr_in6 *a6 = (struct sockaddr_in6 *)&ss;
+            a6->sin6_family = AF_INET6;
+            a6->sin6_port = htons(53);
+            inet_pton(AF_INET6, argv[3], &a6->sin6_addr);
+            sl = sizeof *a6;
+        } else {
+            struct sockaddr_in *a = (struct sockaddr_in *)&ss;
+            a->sin_family = AF_INET;
+            a->sin_port = htons(53);
+            inet_pton(AF_INET, argv[3], &a->sin_addr);
+            sl = sizeof *a;
+        }
+        if (connect(s, (struct sockaddr *)&ss, sl) != 0) { printf("connect\n"); return 0; }
         if (send(s, all, (size_t)len, 0) != len) { printf("send\n"); return 0; }
         char res[8][32];
         memset(res, 0, sizeof res);
@@ -191,7 +274,72 @@ int main(int argc, char **argv) {
         for (int i = 0; i < k; i++) printf("%s\n", res[i][0] ? res[i] : "timeout");
         return 0;
     }
+    if ((argc == 5 || argc == 6) && !strcmp(argv[1], "serve6")) {
+        int s = socket(AF_INET6, SOCK_DGRAM, 0);
+        struct sockaddr_in6 a;
+        memset(&a, 0, sizeof a);
+        a.sin6_family = AF_INET6;
+        a.sin6_port = htons((unsigned short)atoi(argv[2]));
+        inet_pton(AF_INET6, argv[3], &a.sin6_addr);
+        if (bind(s, (struct sockaddr *)&a, sizeof a) != 0) { perror("bind"); return 1; }
+        struct in_addr ip;
+        inet_pton(AF_INET, argv[4], &ip);
+        /* И TCP на том же адресе — отдельным процессом: резолвер движка переспрашивает по TCP
+         * то, что пришло к нему по TCP, и соединение на вопрос обслуживается целиком. */
+        if (fork() == 0) {
+            prctl(PR_SET_PDEATHSIG, SIGKILL);       /* kill родителя снимает и нас */
+            int t = socket(AF_INET6, SOCK_STREAM, 0), one = 1;
+            setsockopt(t, SOL_SOCKET, SO_REUSEADDR, &one, sizeof one);
+            if (bind(t, (struct sockaddr *)&a, sizeof a) != 0 || listen(t, 16) != 0) {
+                perror("bind tcp"); return 1;
+            }
+            struct in_addr tip = ip;
+            if (argc == 6) inet_pton(AF_INET, argv[5], &tip);
+            for (;;) {
+                int c = accept(t, NULL, NULL);
+                if (c < 0) continue;
+                struct timeval tv = { 3, 0 };
+                setsockopt(c, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof tv);
+                unsigned char h[2], q[512], r[602];
+                while (recv(c, h, 2, MSG_WAITALL) == 2) {
+                    int n = h[0] << 8 | h[1];
+                    if (n < 13 || n > (int)sizeof q || recv(c, q, n, MSG_WAITALL) != n) break;
+                    int e = 12;
+                    while (e < n && q[e]) e += 1 + q[e];
+                    e += 5;
+                    if (e > n) break;
+                    memcpy(r + 2, q, e);
+                    r[4] = 0x81; r[5] = 0x80; r[8] = 0; r[9] = 1;
+                    r[10] = r[11] = r[12] = r[13] = 0;
+                    unsigned char ans[16] = { 0xc0, 0x0c, 0, 1, 0, 1, 0, 0, 0, 60, 0, 4 };
+                    memcpy(ans + 12, &tip, 4);
+                    memcpy(r + 2 + e, ans, 16);
+                    r[0] = (unsigned char)((e + 16) >> 8); r[1] = (unsigned char)(e + 16);
+                    send(c, r, e + 18, 0);
+                }
+                close(c);
+            }
+        }
+        for (;;) {
+            unsigned char q[512], r[600];
+            struct sockaddr_in6 f;
+            socklen_t fl = sizeof f;
+            int n = (int)recvfrom(s, q, sizeof q, 0, (struct sockaddr *)&f, &fl);
+            if (n < 13) continue;
+            int e = 12;
+            while (e < n && q[e]) e += 1 + q[e];
+            e += 5;
+            if (e > n) continue;
+            memcpy(r, q, e);
+            r[2] = 0x81; r[3] = 0x80; r[6] = 0; r[7] = 1; r[8] = r[9] = r[10] = r[11] = 0;
+            unsigned char ans[16] = { 0xc0, 0x0c, 0, 1, 0, 1, 0, 0, 0, 60, 0, 4 };
+            memcpy(ans + 12, &ip, 4);
+            memcpy(r + e, ans, 16);
+            sendto(s, r, e + 16, 0, (struct sockaddr *)&f, fl);
+        }
+    }
     fprintf(stderr, "usage: mk NAME CIDR | conn UID ADDR PORT | watch NAME MS | "
-                    "dns UID SERVER NAME | dnstcp UID SERVER NAME...\n");
+                    "dns UID SERVER NAME [MARK] | dnstcp UID[/MARK] SERVER NAME... | "
+                    "serve6 PORT ADDR6 A.B.C.D [TCPADDR]\n");
     return 2;
 }

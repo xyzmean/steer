@@ -1019,6 +1019,11 @@ void rule_add(unsigned mark, int table);
  * решение о маршруте заново. Нужна потому, что при включённой выгрузке потоков пакеты
  * установленного соединения до нашей цепочки не доходят — подробности у определения. */
 void conntrack_evict(unsigned mark);
+/* Снять записи conntrack, у которых (метка & mask) == val, — самим движком, через ctnetlink
+ * (dnsd.c). Сколько снято, или -1, если разговора с ядром не вышло (нет сокета
+ * NETLINK_NETFILTER или подсистемы conntrack в нём) — тогда conntrack_evict пробует внешний
+ * инструмент. Живёт в dnsd.c, рядом с другим разговором с conntrack. */
+int ctnl_evict_mark(uint32_t val, uint32_t mask);
 /* Отметить выход «пущен напрямую» (on=1) или снять отметку — см. out_failopen_capable. */
 void failopen_mark(const struct output *o, int on);
 /* Жив ли обработчик очереди nfqueue с этим номером — то есть работает ли выход kind=zapret.

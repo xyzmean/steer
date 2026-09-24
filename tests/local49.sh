@@ -18,9 +18,12 @@
 # задевает; «self» берёт всех, кроме root; канал «весь трафик» приложения — всё его IPv4;
 # адрес источника в туннеле — адрес устройства туннеля (masquerade), а не адрес Wi-Fi; DNS
 # приложений заворачивается к резолверу движка, а тот переспрашивает сервер, к которому шёл
-# запрос (адрес из conntrack), и соединение к поддельному адресу уходит к настоящему; то же
-# по TCP/53 — заворот, доменный канал, переспрос того же сервера по TCP, конвейер; down
-# снимает цепочки выхода. Устройства — постоянные TUN (local49-tool mk), «сеть» — up0 с
+# запрос (адрес из conntrack), и соединение к поддельному адресу уходит к настоящему;
+# переспрос уходит с меткой сети исходного запроса (часть netd плюс «сам движок»), и маршрут
+# ему выбирает она; DNS по IPv6 заворачивается так же и переспрашивает тот же IPv6-сервер, а
+# ответ приходит с его адреса; то же по TCP/53 — заворот, доменный канал, переспрос того же
+# сервера по TCP (IPv4 и IPv6, с меткой сети), конвейер; down снимает цепочки выхода.
+# Устройства — постоянные TUN (local49-tool mk), «сеть» — up0 с
 # маршрутом по умолчанию, туннели — wg9 и wg8.
 set -u
 pass=0 fail=0
@@ -31,6 +34,10 @@ check() {
 }
 uname -r
 W=${WORK:-/work}
+# Состояние резолвера — с чистого листа: на хосте (unshare -n) /tmp/st переживает прогон, и
+# поддельный адрес имени из прошлого прогона отвечался бы из быстрого пути с прошлым настоящим
+# адресом — проверка «адрес из ответа сервера» смотрела бы на вчерашний ответ.
+rm -rf /tmp/st
 mkdir -p /data/misc/steer/state /data/misc/steer/tmp /tmp/st
 local49-tool mk up0 10.66.0.1/24 && ip route add default dev up0
 local49-tool mk wg9 10.77.0.1/24
@@ -122,7 +129,69 @@ check "приложение канала к поддельному адресу 
     "wg9 10.77.0.1" "$(probe2 10123 "$fake" 443 203.0.113.77)"
 check "другое приложение к тому же поддельному — напрямую к настоящему" \
     "up0 10.66.0.1" "$(probe2 10124 "$fake" 443 203.0.113.77)"
-echo "=== 5б. DNS приложений по TCP/53"
+
+echo "=== 5а. переспрос с меткой сети исходного запроса"
+# Как netd: fwmark сокета DnsResolver несёт номер сети (биты 0-15) и explicitlySelected (16), и
+# по нему лестница ip rule уводит пакет в таблицу своей сети. Здесь «сеть 100» — таблица 164 с
+# маршрутом в wg8, а сервер 10.99.0.53 без метки лежит за маршрутом по умолчанию (up0).
+# Переспрос резолвера обязан уйти с той же частью netd (0x10064) и с меткой «сам движок» в
+# поле движка (0x0fc00000) — иначе он ушёл бы по сети по умолчанию. Запрос приложения сам до
+# wg8 не доходит (его заворачивает nat output), так что wg8 здесь — это переспрос.
+ip rule add fwmark 0x64/0xffff lookup 164 pref 8000
+ip route add default dev wg8 table 164
+nft add table ip t49
+nft add chain ip t49 o '{ type filter hook output priority 0; policy accept; }'
+nft add rule ip t49 o meta mark 0x0fc10064 udp dport 53 counter
+# dnsq UID СЕРВЕР ИМЯ [МЕТКА] — через какое устройство ушёл UDP к СЕРВЕРУ:53 (первое).
+dnsq() {
+    for d in up0 wg9 wg8; do local49-tool watch $d 1500 > /tmp/w.$d & done
+    sleep 0.3
+    local49-tool dns "$@" > /dev/null
+    wait
+    for d in up0 wg9 wg8; do
+        grep -qE "^udp .* -> \[?$2\]?:53$" /tmp/w.$d && echo $d
+    done | head -1
+}
+check "запрос с меткой сети 100 — переспрос по её маршруту (wg8)" "wg8" \
+    "$(dnsq 0 10.99.0.53 other.example 0x10064)"
+check "запрос без метки — переспрос обычным путём (up0)" "up0" \
+    "$(dnsq 0 10.99.0.53 other.example)"
+check "снова с меткой — метка на сокете пула сменилась обратно" "wg8" \
+    "$(dnsq 0 10.99.0.53 other2.example 0x10064)"
+check "метка переспроса — часть netd плюс «сам движок» (0x0fc10064), оба раза" "2" \
+    "$(nft list chain ip t49 o | sed -n 's/.*counter packets \([0-9]*\).*/\1/p')"
+
+echo "=== 5б. DNS по IPv6"
+# Сервер сети по IPv6 — fd66::53, отвечает 203.0.113.78 (не тем, что сервер IPv4: так видно,
+# что спросили именно его).
+# На 4.9 — цепочка nat output в таблице ip6, на свежем ядре — то же правило в inet (оно одно на
+# оба семейства). nft печатает `ct mark set mark` как `ct mark set meta mark`.
+check "заворот по IPv6 стоит (с меткой в метку соединения)" "1" \
+    "$(nft list ruleset | sed -n '/^table ip6 steer/,/^}/p;/^table inet steer/,/^}/p' |
+       grep -c 'udp dport 53 ct mark set .*redirect to :5300 comment "steer-dns-local"')"
+ip -6 addr add fd66::53/128 dev up0 nodad
+local49-tool serve6 53 fd66::53 203.0.113.78 192.0.2.79 & U6=$!
+sleep 0.5
+check "имя канала по IPv6 — поддельный адрес (запрос дошёл до резолвера)" "198.18" \
+    "$(local49-tool dns 10123 fd66::53 example.com | cut -d. -f1-2)"
+check "чужое имя по IPv6 — ответ IPv6-сервера, и пришёл с его адреса (сокет connect'нут)" \
+    "203.0.113.78" "$(local49-tool dns 10124 fd66::53 other.example)"
+# IPv6 с меткой сети: сервер fd99::53 достижим только маршрутом сети 100 (в wg8) — и исходный
+# запрос, и переспрос. Без метки переспросу уйти было бы некуда. Устройство одно и то же у
+# незавёрнутого запроса и у переспроса — различает их счётчик по метке 0x0fc10064 (у запроса
+# приложения метка 0x10064): только он и доказывает, что наверх ушёл переспрос резолвера.
+ip -6 addr add fd78::1/64 dev wg8 nodad
+ip -6 rule add fwmark 0x64/0xffff lookup 164 pref 8000
+ip -6 route add default dev wg8 table 164
+nft add table ip6 t49
+nft add chain ip6 t49 o '{ type filter hook output priority 0; policy accept; }'
+nft add rule ip6 t49 o meta mark 0x0fc10064 udp dport 53 counter
+check "IPv6 с меткой сети 100 — переспрос к тому же серверу по её маршруту (wg8)" "wg8" \
+    "$(dnsq 0 fd99::53 other.example 0x10064)"
+check "  и с меткой 0x0fc10064" "1" \
+    "$(nft list chain ip6 t49 o | sed -n 's/.*counter packets \([0-9]*\).*/\1/p')"
+
+echo "=== 5в. DNS приложений по TCP/53"
 # Новое имя канала по TCP: без заворота ответил бы сам сервер сети (адрес 10.66.0.53 — свой,
 # и запрос дошёл бы до него напрямую) настоящим адресом, а не поддельным.
 tfake="$(local49-tool dnstcp 10123 10.66.0.53 tcp.example.com)"
@@ -138,7 +207,42 @@ check "TCP: конвейер из двух запросов в одном сое
        sed '1s/^\(198\.18\)\..*/\1/' | tr '\n' ' ' | sed 's/ $//')"
 check "TCP: повтор имени канала — тот же поддельный адрес" "$tfake" \
     "$(local49-tool dnstcp 10124 10.66.0.53 tcp.example.com)"
-kill $DP $UP 2>/dev/null
+# Переспрос по TCP — с той же меткой сети, что по UDP (5а): SYN резолвера к 10.99.0.53 уходит
+# маршрутом сети 100 (wg8), без метки — обычным (up0). Сервер за ними немой, ответа нет — важно,
+# куда ушёл SYN. Счётчик по метке 0x0fc10064 — своя цепочка, чтобы не путать с UDP из 5а.
+nft add chain ip t49 ot '{ type filter hook output priority 0; policy accept; }'
+nft add rule ip t49 ot meta mark 0x0fc10064 tcp dport 53 counter
+# dnst UID[/МЕТКА] СЕРВЕР ИМЯ — через какое устройство ушёл SYN к СЕРВЕРУ:53 (первое).
+dnst() {
+    for d in up0 wg9 wg8; do local49-tool watch $d 1500 > /tmp/w.$d & done
+    sleep 0.3
+    local49-tool dnstcp "$@" > /dev/null
+    wait
+    for d in up0 wg9 wg8; do
+        grep -qE "^syn .* -> \[?$2\]?:53$" /tmp/w.$d && echo $d
+    done | head -1
+}
+check "TCP с меткой сети 100 — переспрос по её маршруту (wg8)" "wg8" \
+    "$(dnst 0/0x10064 10.99.0.53 tcpmark.example)"
+check "TCP без метки — переспрос обычным путём (up0)" "up0" \
+    "$(dnst 0 10.99.0.53 tcpmark2.example)"
+check "TCP: метка переспроса — часть netd плюс «сам движок» (0x0fc10064)" "yes" \
+    "$(nft list chain ip t49 ot | sed -n 's/.*counter packets \([0-9]*\).*/\1/p' |
+       awk '{ print ($1 > 0) ? "yes" : "no" }')"
+# По IPv6: сервер сети fd66::53 по TCP отвечает 192.0.2.79 (serve6 выше), fd99::53 — только
+# маршрутом сети 100.
+check "TCP по IPv6: имя канала — поддельный адрес" "198.18" \
+    "$(local49-tool dnstcp 10123 fd66::53 six.example.com | cut -d. -f1-2)"
+check "TCP по IPv6: чужое имя — ответ IPv6-сервера, спрошенного по TCP" "192.0.2.79" \
+    "$(local49-tool dnstcp 10124 fd66::53 other6.tcp.example)"
+nft add chain ip6 t49 ot '{ type filter hook output priority 0; policy accept; }'
+nft add rule ip6 t49 ot meta mark 0x0fc10064 tcp dport 53 counter
+check "TCP по IPv6 с меткой сети 100 — переспрос к тому же серверу по её маршруту (wg8)" "wg8" \
+    "$(dnst 0/0x10064 fd99::53 tcpmark6.example)"
+check "  и с меткой 0x0fc10064" "yes" \
+    "$(nft list chain ip6 t49 ot | sed -n 's/.*counter packets \([0-9]*\).*/\1/p' |
+       awk '{ print ($1 > 0) ? "yes" : "no" }')"
+kill $DP $UP $U6 2>/dev/null
 grep -v 'realip' /tmp/dnsd.log | head -3
 
 echo "=== 6. down"

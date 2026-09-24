@@ -1504,6 +1504,16 @@ static void fakeip_route_set(const char *domain, uint64_t want);
 /* proxy state                                                           */
 /* ---------------------------------------------------------------------- */
 
+/* Адрес сервера наверху в режиме origdst — IPv4 или IPv6 (см. g_origdst). Объединение, а не
+ * sockaddr_storage: слотов MAX_PENDING, и 128 байт на слот ради 28 нужных незачем. */
+union dnsd_sa { struct sockaddr sa; struct sockaddr_in v4; struct sockaddr_in6 v6; };
+
+/* Адрес, на который пришёл запрос (режим origdst): по нему ищется запись conntrack, и с него
+ * же уходит ответ клиенту (см. reply_client). af — AF_INET, AF_INET6 или 0 («не узнали»).
+ * IPv4 у двойного стека приходит v4-mapped и хранится здесь как v4: и в conntrack, и в
+ * ответе это IPv4-соединение, а не IPv6. */
+struct dnsd_local { int af; struct in_addr v4; struct in6_addr v6; };
+
 /* sockaddr_storage, not sockaddr_in: the listen socket is dual-stack, so a
  * client can be IPv6. See run_proxy's socket setup for why that matters. */
 struct pending {
@@ -1556,12 +1566,12 @@ struct pending {
     /* Куда ушёл запрос наверх — только в режиме --upstream-origdst (см. g_origdst): ответ
      * принимается лишь от этого адреса. В обычном режиме сокет connect'нут к петле, и
      * сравнивать нечего. */
-    struct sockaddr_in up;
+    union dnsd_sa up;
     /* Режим origdst: сокет пула, которым ушёл запрос, номер транзакции наверх (случайный, см.
      * g_txmap) и адрес, на который пришёл запрос, — с него обязан уйти ответ клиенту. */
     int up_fd;
     uint16_t txid;
-    struct in_addr local;
+    struct dnsd_local local;
     int have_local;
     time_t expire;
 };
@@ -1596,8 +1606,20 @@ static uint8_t g_gen_next;
  * Сокет наверх в этом режиме не connect'нут (серверы разные), и ответ принимается только от
  * того адреса, куда ушёл запрос: иначе подделать ответ мог бы кто угодно, угадав номер
  * транзакции. Записи NAT нет (к нам обратились напрямую, мимо redirect) или назначение —
- * мы сами — запрос уходит на петлю, как в обычном режиме: так петли не бывает. IPv6-клиент
- * тоже уходит на петлю: сокет наверх — IPv4. */
+ * мы сами — запрос уходит на петлю, как в обычном режиме: так петли не бывает.
+ *
+ * IPv6 — ТАК ЖЕ, СВОИМ ПУЛОМ. Запрос приложения к серверу сети по IPv6 заворот на output
+ * переводит на ::1 (redirect на выходе всегда даёт петлю своего семейства), запись conntrack
+ * ищется в семействе AF_INET6, и переспрос уходит к тому же IPv6-серверу сокетом из пула
+ * AF_INET6 (g_up_pool6). Отдельный пул, а не двойной стек на одном: у IPv4-пути остаются ровно
+ * прежние сокеты и прежнее поведение, а ядро без IPv6 просто не откроет второй пул — тогда
+ * IPv6-запрос уходит на петлю, как раньше.
+ *
+ * Сервер по адресу link-local (fe80::…, его раздаёт RDNSS в объявлении маршрутизатора) —
+ * частый случай на Wi-Fi, и зоны (интерфейса) в записи conntrack нет. Переспрос уходит без
+ * sin6_scope_id, и интерфейс выбирает маршрут: на Android — по метке сети (см. g_up_mark ниже),
+ * которая ведёт в таблицу своей сети, где fe80::/64 указывает на её интерфейс. Без метки
+ * решила бы основная таблица. */
 /* Раскладка IPV6_PKTINFO и IP_PKTINFO — своя, а не из netinet/in.h: там их видно только с
  * _GNU_SOURCE, а этот файл включают и стенды со своим порядком заголовков. Поля и размеры —
  * ядра (include/uapi/linux/ipv6.h и in.h), от libc они не зависят. */
@@ -1627,7 +1649,56 @@ static int g_listen_port;
  * запись безвредна — слот сверяется с номером. */
 #define UP_POOL 8
 static int g_up_pool[UP_POOL];
+static int g_up_pool6[UP_POOL];
+static int g_up_pool6_n;              /* открытые сокеты g_up_pool6 — первые g_up_pool6_n */
 static int16_t g_txmap[65536];
+
+#ifdef STEER_ANDROID
+/* ПЕРЕСПРОС С МЕТКОЙ СЕТИ ИСХОДНОГО ЗАПРОСА (только Android, только origdst).
+ *
+ * Зачем. netd метит каждый сокет fwmark'ом (Fwmark.h: номер сети — биты 0-15, explicitly
+ * selected — 16, protectedFromVpn — 17, права — 18-19, uidBillingDone — 20), и маршрут на
+ * телефоне выбирает не адрес, а эта метка: лестница ip rule netd сравнивает её поля масками и
+ * отправляет пакет в таблицу своей сети. Приложение, привязанное к мобильной сети при живом
+ * Wi-Fi, или DnsResolver, спрашивающий «по сети N» (у каждой сети свои серверы и свой кэш),
+ * шлёт запрос с номером той сети. Переспрашивай мы все запросы одной меткой движка, запрос
+ * ушёл бы по сети по умолчанию — к серверу мобильной сети через Wi-Fi (где он недоступен или
+ * отвечает другое), а сервер link-local — вовсе в чужой интерфейс.
+ *
+ * Как метка до нас доходит. SO_RCVMARK появился в 5.19, на 4.9 телефона метку датаграммы
+ * принятым сокетом не узнать. Зато метку знает правило заворота: оно видит пакет с fwmark
+ * приложения и пишет её в метку соединения (`ct mark set mark` в правиле steer-dns-local,
+ * см. emit_local_dns в steer.c). А запись conntrack dnsd и так берёт целиком — ради
+ * исходного назначения (ct_origdst), — и CTA_MARK лежит в том же ответе ядра: ни одного
+ * лишнего системного вызова на запрос.
+ *
+ * Что уходит наверх: метка соединения без поля движка (биты 22-27) и без бита
+ * перемаршрутизации (21), плюс STEER_SELF_MARK в поле движка. Всё прочее — поля netd и биты
+ * vendor/ingress — копируется как есть: это их правила, и решать за них нечего. SELF в поле
+ * обязателен: по нему правило заворота пропускает наш же переспрос (иначе он завернулся бы
+ * к нам по кругу), и по нему же разметка каналов его не трогает. Поэтому канал движка у
+ * исходного запроса (приложение «весь трафик», спрашивающее свой DNS само) на переспрос не
+ * переносится — он уходит сетью netd, как и шёл бы DnsResolver.
+ *
+ * Метка ставится на сокет пула прямо перед sendto. Процесс однопоточный (один цикл epoll,
+ * без потоков), поэтому между setsockopt и sendto на этот сокет никто не вклинится, а
+ * метка у неподключённого UDP-сокета читается ядром на каждой отправке (udp_sendmsg берёт
+ * sk_mark и для поиска маршрута, и для skb->mark) — кэша маршрута, который пришлось бы
+ * сбрасывать, у него нет. Отдельный сокет на каждую сеть не нужен: ответ приходит на порт
+ * сокета независимо от метки. Текущая метка сокета запоминается (g_up_mark), и setsockopt
+ * зовётся только при смене — на телефоне с одной сетью это ноль вызовов сверх прежнего. */
+static unsigned g_up_mark[UP_POOL], g_up_mark6[UP_POOL];
+
+static unsigned up_mark_for(uint32_t ctmark, int have) {
+    if (!have) return STEER_SELF_MARK;
+    return (ctmark & ~(STEER_MARK_MASK | STEER_REROUTE_BIT)) | STEER_SELF_MARK;
+}
+
+static void up_mark_set(int fd, unsigned *cur, unsigned want) {
+    if (*cur == want) return;
+    if (setsockopt(fd, SOL_SOCKET, SO_MARK, &want, sizeof(want)) == 0) *cur = want;
+}
+#endif
 
 static uint16_t rand16(void) {
     uint16_t v = 0;
@@ -1635,11 +1706,6 @@ static uint16_t rand16(void) {
     return v;
 }
 
-/* Ответ клиенту. В режиме origdst — с того адреса, на который пришёл запрос: заворот на
- * output переводит запрос приложения на 127.0.0.1, а сокет слушает любой адрес, и без
- * явного адреса источника ядро выбрало бы адрес Wi-Fi. Ответ с чужого адреса conntrack не
- * узнаёт, обратного перевода нет, и DnsResolver (он connect'ит сокет и сверяет, откуда пришёл
- * ответ) его выбрасывает — DNS приложений не работал бы вовсе. */
 /* Соединение TCP, чей запрос (или ответ на чей запрос) обрабатывается прямо сейчас, — или NULL,
  * если датаграмма пришла по UDP. Обработка запроса и ответа — одна на оба протокола (см.
  * dns_query и upstream_answer), и чтобы не протаскивать «куда отвечать» через каждую её ветку,
@@ -1648,11 +1714,16 @@ static uint16_t rand16(void) {
 struct tcpc;
 static struct tcpc *g_tcp_cur;
 static void tcpc_reply(struct tcpc *c, const void *b, size_t n);
-static int tcpu_open(struct pending *p, const uint8_t *q, size_t n, const struct sockaddr_in *up,
-                     uint16_t tag, size_t qend);
+static int tcpu_open(struct pending *p, const uint8_t *q, size_t n, const union dnsd_sa *up,
+                     uint16_t tag, size_t qend, uint32_t ctmark, int have_mark);
 
+/* Ответ клиенту. В режиме origdst — с того адреса, на который пришёл запрос: заворот на
+ * output переводит запрос приложения на 127.0.0.1, а сокет слушает любой адрес, и без
+ * явного адреса источника ядро выбрало бы адрес Wi-Fi. Ответ с чужого адреса conntrack не
+ * узнаёт, обратного перевода нет, и DnsResolver (он connect'ит сокет и сверяет, откуда пришёл
+ * ответ) его выбрасывает — DNS приложений не работал бы вовсе. */
 static void reply_client(const void *b, size_t n, const struct sockaddr_storage *cl,
-                         socklen_t cll, const struct in_addr *local, int have_local) {
+                         socklen_t cll, const struct dnsd_local *local, int have_local) {
     if (g_tcp_cur) { tcpc_reply(g_tcp_cur, b, n); return; }
     if (!g_origdst || !have_local) {
         sendto(g_listen_fd, b, n, 0, (const struct sockaddr *)cl, cll);
@@ -1668,10 +1739,16 @@ static void reply_client(const void *b, size_t n, const struct sockaddr_storage 
     mh.msg_control = cb.b;
     struct cmsghdr *c = (struct cmsghdr *)cb.b;
     if (cl->ss_family == AF_INET6) {
+        /* Слушающий сокет двойного стека: IPv4-клиенту — v4-mapped адрес приёма, IPv6-клиенту
+         * (запрос по IPv6, заворот на ::1) — сам адрес приёма. */
         struct dnsd_in6_pktinfo pi;
         memset(&pi, 0, sizeof(pi));
-        pi.addr.s6_addr[10] = 0xff; pi.addr.s6_addr[11] = 0xff;
-        memcpy(&pi.addr.s6_addr[12], local, 4);
+        if (local->af == AF_INET6) {
+            pi.addr = local->v6;
+        } else {
+            pi.addr.s6_addr[10] = 0xff; pi.addr.s6_addr[11] = 0xff;
+            memcpy(&pi.addr.s6_addr[12], &local->v4, 4);
+        }
         c->cmsg_level = IPPROTO_IPV6; c->cmsg_type = IPV6_PKTINFO;
         c->cmsg_len = CMSG_LEN(sizeof(pi));
         memcpy(CMSG_DATA(c), &pi, sizeof(pi));
@@ -1679,7 +1756,7 @@ static void reply_client(const void *b, size_t n, const struct sockaddr_storage 
     } else {
         struct dnsd_in_pktinfo pi;
         memset(&pi, 0, sizeof(pi));
-        pi.spec_dst = *local;
+        pi.spec_dst = local->v4;
         c->cmsg_level = IPPROTO_IP; c->cmsg_type = IP_PKTINFO;
         c->cmsg_len = CMSG_LEN(sizeof(pi));
         memcpy(CMSG_DATA(c), &pi, sizeof(pi));
@@ -1688,23 +1765,62 @@ static void reply_client(const void *b, size_t n, const struct sockaddr_storage 
     sendmsg(g_listen_fd, &mh, 0);
 }
 
-/* Исходное назначение запроса из conntrack. 0 — найдено (out заполнен), -1 — нет. */
-static int ct_origdst(const struct sockaddr_storage *cli, const struct in_addr *local,
-                      int lport, struct sockaddr_in *out) {
-    struct in_addr ca;
+/* Атрибут ctnetlink по типу — среди атрибутов [p, end) или внутри вложенного `in`.
+ *
+ * Общий разбор для двух разговоров с conntrack: исходного назначения (ниже) и снятия записей
+ * выхода (ctnl_evict_mark). Каждая граница сверяется ДО чтения: ответ ядра — это чужие байты,
+ * и атрибут с длиной больше остатка сообщения (или меньше заголовка) — конец разбора, а не
+ * чтение за край буфера. Тип сравнивается без флагов: есть ли у вложенного атрибута флаг
+ * NLA_F_NESTED, зависит от версии ядра, а смысл у атрибута один. NULL на входе даёт NULL: так
+ * цепочка «кортеж → IP → адрес» пишется подряд, без проверки на каждом шаге. */
+static const struct nlattr *ct_attr(const uint8_t *p, const uint8_t *end, int type) {
+    if (!p) return NULL;
+    while (p + NLA_HDRLEN <= end) {
+        const struct nlattr *x = (const struct nlattr *)p;
+        if (x->nla_len < NLA_HDRLEN || p + x->nla_len > end) return NULL;
+        if ((x->nla_type & NLA_TYPE_MASK) == type) return x;
+        p += NLA_ALIGN(x->nla_len);
+    }
+    return NULL;
+}
+static const struct nlattr *ct_attr_in(const struct nlattr *in, int type) {
+    if (!in) return NULL;
+    return ct_attr((const uint8_t *)in + NLA_HDRLEN, (const uint8_t *)in + in->nla_len, type);
+}
+
+/* Исходное назначение запроса из conntrack. 0 — найдено (out заполнен), -1 — нет.
+ *
+ * Семейство — по клиенту: IPv4 (в том числе v4-mapped у двойного стека) ищется в AF_INET,
+ * настоящий IPv6 — в AF_INET6; адрес приёма обязан быть того же семейства, иначе такой
+ * записи не бывает. Попутно — метка соединения (CTA_MARK): *mark и *have_mark, см. g_up_mark.
+ * Атрибута нет (ядро собрано без метки соединений) — *have_mark остаётся 0. */
+static int ct_origdst(const struct sockaddr_storage *cli, const struct dnsd_local *local,
+                      int lport, union dnsd_sa *out, uint32_t *mark, int *have_mark) {
+    int fam;
+    uint8_t caddr[16];
     uint16_t cport;
+    *have_mark = 0;
     if (cli->ss_family == AF_INET) {
         const struct sockaddr_in *c4 = (const struct sockaddr_in *)cli;
-        ca = c4->sin_addr;
+        fam = AF_INET;
+        memcpy(caddr, &c4->sin_addr, 4);
         cport = c4->sin_port;
     } else if (cli->ss_family == AF_INET6) {
         const struct sockaddr_in6 *c6 = (const struct sockaddr_in6 *)cli;
-        if (!IN6_IS_ADDR_V4MAPPED(&c6->sin6_addr)) return -1;
-        memcpy(&ca, &c6->sin6_addr.s6_addr[12], 4);
+        if (IN6_IS_ADDR_V4MAPPED(&c6->sin6_addr)) {
+            fam = AF_INET;
+            memcpy(caddr, &c6->sin6_addr.s6_addr[12], 4);
+        } else {
+            fam = AF_INET6;
+            memcpy(caddr, &c6->sin6_addr, 16);
+        }
         cport = c6->sin6_port;
     } else {
         return -1;
     }
+    if (local->af != fam) return -1;
+    size_t alen = fam == AF_INET ? 4 : 16;
+    const void *laddr = fam == AF_INET ? (const void *)&local->v4 : (const void *)&local->v6;
     if (g_ct_fd < 0) {
         g_ct_fd = socket(AF_NETLINK, SOCK_RAW | SOCK_CLOEXEC, NETLINK_NETFILTER);
         if (g_ct_fd < 0) return -1;
@@ -1719,7 +1835,7 @@ static int ct_origdst(const struct sockaddr_storage *cli, const struct in_addr *
     nh->nlmsg_flags = NLM_F_REQUEST;
     nh->nlmsg_seq = ++seq;
     struct nfgenmsg *nf = (struct nfgenmsg *)NLMSG_DATA(nh);
-    nf->nfgen_family = AF_INET;
+    nf->nfgen_family = (uint8_t)fam;
     nf->version = NFNETLINK_V0;
     size_t pos = NLMSG_LENGTH(sizeof(*nf));
     /* Вложенные атрибуты по-простому: длина вложения дописывается после содержимого. */
@@ -1737,8 +1853,8 @@ static int ct_origdst(const struct sockaddr_storage *cli, const struct in_addr *
     uint16_t lp = htons((uint16_t)lport);
     CT_OPEN(CTA_TUPLE_REPLY, t);
     CT_OPEN(CTA_TUPLE_IP, ip);
-    CT_PUT(CTA_IP_V4_SRC, local, 4);
-    CT_PUT(CTA_IP_V4_DST, &ca, 4);
+    CT_PUT(fam == AF_INET ? CTA_IP_V4_SRC : CTA_IP_V6_SRC, laddr, alen);
+    CT_PUT(fam == AF_INET ? CTA_IP_V4_DST : CTA_IP_V6_DST, caddr, alen);
     CT_CLOSE(ip);
     CT_OPEN(CTA_TUPLE_PROTO, pr);
     CT_PUT(CTA_PROTO_NUM, &proto, 1);
@@ -1754,6 +1870,7 @@ static int ct_origdst(const struct sockaddr_storage *cli, const struct in_addr *
     if (sendto(g_ct_fd, req, pos, 0, (struct sockaddr *)&k, sizeof(k)) < 0) return -1;
 
     uint8_t buf[4096];
+    int dst_attr = fam == AF_INET ? CTA_IP_V4_DST : CTA_IP_V6_DST;
     for (;;) {
         ssize_t n = recv(g_ct_fd, buf, sizeof(buf), 0);
         if (n <= 0) return -1;
@@ -1763,58 +1880,253 @@ static int ct_origdst(const struct sockaddr_storage *cli, const struct in_addr *
             if (h->nlmsg_seq != seq) continue;           /* ответ на прежний, опоздавший */
             if (h->nlmsg_type == NLMSG_ERROR) return -1; /* записи нет — ENOENT */
             if (h->nlmsg_len < NLMSG_LENGTH(sizeof(struct nfgenmsg))) return -1;
-            /* Верхний уровень: ищем CTA_TUPLE_ORIG, в нём IP и порт назначения. */
-            uint8_t *a = (uint8_t *)NLMSG_DATA(h) + NLMSG_ALIGN(sizeof(struct nfgenmsg));
-            uint8_t *end = (uint8_t *)h + h->nlmsg_len;
+            /* Верхний уровень: CTA_TUPLE_ORIG (в нём IP и порт назначения) и CTA_MARK. */
+            const uint8_t *a = (const uint8_t *)NLMSG_DATA(h) + NLMSG_ALIGN(sizeof(struct nfgenmsg));
+            const uint8_t *end = (const uint8_t *)h + h->nlmsg_len;
+            const struct nlattr *cm = ct_attr(a, end, CTA_MARK);
+            if (cm && cm->nla_len >= NLA_HDRLEN + 4) {
+                uint32_t m;
+                memcpy(&m, (const uint8_t *)cm + NLA_HDRLEN, 4);
+                *mark = ntohl(m);
+                *have_mark = 1;
+            }
+            const struct nlattr *orig = ct_attr(a, end, CTA_TUPLE_ORIG);
+            const struct nlattr *tip = ct_attr_in(orig, CTA_TUPLE_IP);
+            const struct nlattr *tpr = ct_attr_in(orig, CTA_TUPLE_PROTO);
+            const struct nlattr *dst = ct_attr_in(tip, dst_attr);
+            const struct nlattr *dpt = ct_attr_in(tpr, CTA_PROTO_DST_PORT);
+            uint8_t oaddr[16];
+            uint16_t oport = 0;
             int got_ip = 0, got_port = 0;
-            for (struct nlattr *x = (struct nlattr *)a; (uint8_t *)x + NLA_HDRLEN <= end &&
-                 x->nla_len >= NLA_HDRLEN && (uint8_t *)x + x->nla_len <= end;
-                 x = (struct nlattr *)((uint8_t *)x + NLA_ALIGN(x->nla_len))) {
-                if ((x->nla_type & NLA_TYPE_MASK) != CTA_TUPLE_ORIG) continue;
-                uint8_t *xe = (uint8_t *)x + x->nla_len;
-                for (struct nlattr *y = (struct nlattr *)((uint8_t *)x + NLA_HDRLEN);
-                     (uint8_t *)y + NLA_HDRLEN <= xe && y->nla_len >= NLA_HDRLEN &&
-                     (uint8_t *)y + y->nla_len <= xe;
-                     y = (struct nlattr *)((uint8_t *)y + NLA_ALIGN(y->nla_len))) {
-                    int yt = y->nla_type & NLA_TYPE_MASK;
-                    if (yt != CTA_TUPLE_IP && yt != CTA_TUPLE_PROTO) continue;
-                    uint8_t *ye = (uint8_t *)y + y->nla_len;
-                    for (struct nlattr *z = (struct nlattr *)((uint8_t *)y + NLA_HDRLEN);
-                         (uint8_t *)z + NLA_HDRLEN <= ye && z->nla_len >= NLA_HDRLEN &&
-                         (uint8_t *)z + z->nla_len <= ye;
-                         z = (struct nlattr *)((uint8_t *)z + NLA_ALIGN(z->nla_len))) {
-                        int zt = z->nla_type & NLA_TYPE_MASK;
-                        uint8_t *zd = (uint8_t *)z + NLA_HDRLEN;
-                        if (yt == CTA_TUPLE_IP && zt == CTA_IP_V4_DST && z->nla_len >= NLA_HDRLEN + 4) {
-                            memcpy(&out->sin_addr, zd, 4); got_ip = 1;
-                        } else if (yt == CTA_TUPLE_PROTO && zt == CTA_PROTO_DST_PORT &&
-                                   z->nla_len >= NLA_HDRLEN + 2) {
-                            memcpy(&out->sin_port, zd, 2); got_port = 1;
-                        }
-                    }
-                }
+            if (dst && dst->nla_len >= NLA_HDRLEN + alen) {
+                memcpy(oaddr, (const uint8_t *)dst + NLA_HDRLEN, alen); got_ip = 1;
+            }
+            if (dpt && dpt->nla_len >= NLA_HDRLEN + 2) {
+                memcpy(&oport, (const uint8_t *)dpt + NLA_HDRLEN, 2); got_port = 1;
             }
             if (!got_ip || !got_port) return -1;
-            out->sin_family = AF_INET;
             /* Назначение — мы сами: к резолверу обратились напрямую, NAT не было. */
-            if (out->sin_addr.s_addr == local->s_addr && ntohs(out->sin_port) == lport)
-                return -1;
+            if (!memcmp(oaddr, laddr, alen) && ntohs(oport) == lport) return -1;
+            memset(out, 0, sizeof(*out));
+            if (fam == AF_INET) {
+                out->v4.sin_family = AF_INET;
+                memcpy(&out->v4.sin_addr, oaddr, 4);
+                out->v4.sin_port = oport;
+            } else {
+                out->v6.sin6_family = AF_INET6;
+                memcpy(&out->v6.sin6_addr, oaddr, 16);
+                out->v6.sin6_port = oport;
+            }
             return 0;
         }
     }
 }
 
-/* Куда слать запрос наверх: исходное назначение (в режиме origdst), иначе петля. */
-static void upstream_for(const struct sockaddr_storage *cli, const struct in_addr *local,
-                         int have_local, struct sockaddr_in *up) {
+/* ---- снятие записей conntrack выхода: ctnetlink без инструмента conntrack -------------
+ *
+ * ЗАЧЕМ ЗДЕСЬ. Снимать соединения выхода при смене его маршрута нужно сторожу
+ * (conntrack_evict в failover.c, там же — почему снимать вообще). До сих пор это делал
+ * внешний `conntrack -D --mark`, а его нет в образе Android: на телефоне смена выхода
+ * оставляла уже установленные соединения на прежнем, возможно мёртвом, выходе до их
+ * естественной смерти — то есть долгие соединения мессенджеров висели минутами. Разговор с
+ * conntrack по netlink в движке уже был — вот он, выше, у исходного назначения резолвера, —
+ * поэтому код лежит рядом с ним и берёт тот же разбор атрибутов (ct_attr) и тот же
+ * построитель сообщений (nlbuf), а не заводит свой файл: новый файл означал бы правку пяти
+ * списков сборки (Makefile, Android.bp, build.sh, стенды) ради одной функции.
+ *
+ * КАК, И ПОЧЕМУ НЕ ОДНИМ СООБЩЕНИЕМ. У ctnetlink есть «снять всё» — IPCTNL_MSG_CT_DELETE без
+ * кортежа, — и с атрибутами CTA_MARK/CTA_MARK_MASK оно снимает только совпавшее. В 4.9
+ * телефона этот фильтр есть (ctnetlink_flush_conntrack), но опора на него хрупкая с двух
+ * сторон: ядро старше фильтра атрибуты молча пропустит, а 4.9 без ОБОИХ атрибутов (скажем,
+ * маска потерялась при правке этого же кода) фильтра не заводит вовсе — и в обоих случаях
+ * сбрасывается ВСЯ таблица: у телефона — все соединения всех приложений, у роутера — вся
+ * сеть за ним. Ошибка такой цены не стоит одного сэкономленного сообщения, поэтому путь тот
+ * же, что у самого `conntrack -D --mark`: дамп (с фильтром по
+ * метке — его 4.9 уже знает, ctnetlink_dump_table проверено по дереву ядра телефона), и
+ * каждая совпавшая запись снимается ОТДЕЛЬНО по своему исходному кортежу. Метка сверяется
+ * ещё раз здесь, по CTA_MARK самой записи: если ядро фильтр дампа не поняло и прислало всё,
+ * чужое всё равно не будет тронуто. Запись без CTA_MARK (метка 0) не наша никогда — ноль
+ * метку выхода не несёт.
+ *
+ * Снимается строго запись с тем же CTA_ID: между дампом и удалением соединение могло умереть,
+ * а на его кортеже родиться новое — чужое, — и удаление по одному кортежу сняло бы его. С
+ * CTA_ID ядро отвечает ENOENT, и это не ошибка. CTA_ZONE копируется, если есть: без него
+ * поиск идёт в нулевой зоне, и запись другой зоны не нашлась бы.
+ *
+ * Семейства — по одному дампу на каждое: запрос с AF_UNSPEC в 4.9 отдаёт оба, но в свежих
+ * ядрах фильтр дампа переписан, и полагаться на смысл нуля в двух реализациях незачем, когда
+ * два дампа стоят один лишний системный вызов.
+ *
+ * Два сокета: дамп идёт частями — следующая часть готовится ядром на каждом recv, — и
+ * удаление на том же сокете смешало бы свои подтверждения с частями дампа. На втором сокете
+ * удаление идёт между частями, как у conntrack -D, и памяти под список найденного не нужно:
+ * запись, которую ядро держит как точку продолжения дампа, userspace ещё не видел и снять
+ * не мог, остальные из корзины уже отданы.
+ *
+ * БАТАРЕЯ. Один проход, без таймеров и повторов: ядро отвечает на каждый запрос сразу,
+ * внутри того же системного вызова. SO_RCVTIMEO — только страховка от вечного recv при
+ * невозможном «ядро не ответило», как у ct_origdst; в обычной работе он не срабатывает.
+ *
+ * Возврат: сколько записей снято (0 и больше) или -1 — «разговор с ctnetlink не состоялся»:
+ * нет сокета NETLINK_NETFILTER (на роутере нет nfnetlink), ядро не знает подсистемы
+ * conntrack (нет модуля nf_conntrack_netlink), нет прав. Тогда вызывающий пробует внешний
+ * инструмент. */
+#define CTNL_RCVBUF 32768   /* больше части дампа ядро не шлёт: netlink_dump режет по 32 КиБ */
+
+static int ctnl_socket(void) {
+    int fd = socket(AF_NETLINK, SOCK_RAW | SOCK_CLOEXEC, NETLINK_NETFILTER);
+    if (fd < 0) return -1;
+    struct sockaddr_nl sa = { .nl_family = AF_NETLINK };
+    if (bind(fd, (struct sockaddr *)&sa, sizeof(sa)) != 0) { close(fd); return -1; }
+    struct timeval tv = { 1, 0 };
+    setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+    return fd;
+}
+
+/* Заголовки сообщения ctnetlink в начале буфера; атрибуты дописываются за ними. */
+static struct nlmsghdr *ctnl_msg(struct nlbuf *b, void *mem, size_t cap, int type,
+                                 int flags, uint32_t seq, uint8_t family) {
+    size_t hl = NLMSG_ALIGN(sizeof(struct nlmsghdr)) + NLMSG_ALIGN(sizeof(struct nfgenmsg));
+    memset(mem, 0, hl);
+    nlbuf_init(b, mem, cap);
+    struct nlmsghdr *nh = (struct nlmsghdr *)b->p;
+    nh->nlmsg_type = (uint16_t)((NFNL_SUBSYS_CTNETLINK << 8) | type);
+    nh->nlmsg_flags = (uint16_t)flags;
+    nh->nlmsg_seq = seq;
+    struct nfgenmsg *nf = (struct nfgenmsg *)(b->p + NLMSG_ALIGN(sizeof(*nh)));
+    nf->nfgen_family = family;
+    nf->version = NFNETLINK_V0;
+    b->p += hl;
+    return nh;
+}
+
+/* Атрибут из ответа ядра — в запрос как есть, вместе с вложенным содержимым. */
+static int ctnl_copy_attr(struct nlbuf *b, const struct nlattr *x) {
+    if (!x) return 0;
+    size_t n = NLA_ALIGN(x->nla_len);
+    if (b->p + n > b->end) return -1;
+    memset(b->p, 0, n);
+    memcpy(b->p, x, x->nla_len);
+    b->p += n;
+    return 0;
+}
+
+/* Снять одну запись; 1 — снята, 0 — нет (уже умерла или ядро отказало). */
+static int ctnl_delete(int fd, uint8_t family, uint32_t seq, const struct nlattr *tuple,
+                       const struct nlattr *id, const struct nlattr *zone) {
+    uint8_t req[512];
+    struct nlbuf b;
+    struct nlmsghdr *nh = ctnl_msg(&b, req, sizeof(req), IPCTNL_MSG_CT_DELETE,
+                                   NLM_F_REQUEST | NLM_F_ACK, seq, family);
+    if (ctnl_copy_attr(&b, tuple) || ctnl_copy_attr(&b, id) || ctnl_copy_attr(&b, zone))
+        return 0;
+    nh->nlmsg_len = (uint32_t)(b.p - b.base);
+    struct sockaddr_nl k = { .nl_family = AF_NETLINK };
+    if (sendto(fd, req, nh->nlmsg_len, 0, (struct sockaddr *)&k, sizeof(k)) < 0) return 0;
+    uint8_t ack[512];
+    for (;;) {
+        ssize_t n = recv(fd, ack, sizeof(ack), 0);
+        if (n <= 0) return 0;
+        int len = (int)n;
+        for (struct nlmsghdr *h = (struct nlmsghdr *)ack; len > 0 && NLMSG_OK(h, (unsigned)len);
+             h = NLMSG_NEXT(h, len)) {
+            if (h->nlmsg_seq != seq || h->nlmsg_type != NLMSG_ERROR) continue;
+            if (h->nlmsg_len < NLMSG_LENGTH(sizeof(struct nlmsgerr))) return 0;
+            return ((struct nlmsgerr *)NLMSG_DATA(h))->error == 0;
+        }
+    }
+}
+
+/* Дамп одного семейства с удалением совпавшего. Возврат — как у ctnl_evict_mark. */
+static int ctnl_evict_family(int dfd, int xfd, uint8_t family, uint32_t val, uint32_t mask,
+                             uint32_t *seq, uint8_t *buf) {
+    uint8_t req[128];
+    struct nlbuf b;
+    uint32_t dseq = ++*seq;
+    struct nlmsghdr *nh = ctnl_msg(&b, req, sizeof(req), IPCTNL_MSG_CT_GET,
+                                   NLM_F_REQUEST | NLM_F_DUMP, dseq, family);
+    nlbuf_put_be32(&b, CTA_MARK, val);
+    nlbuf_put_be32(&b, CTA_MARK_MASK, mask);
+    nh->nlmsg_len = (uint32_t)(b.p - b.base);
+    struct sockaddr_nl k = { .nl_family = AF_NETLINK };
+    if (sendto(dfd, req, nh->nlmsg_len, 0, (struct sockaddr *)&k, sizeof(k)) < 0) return -1;
+
+    int evicted = 0;
+    for (;;) {
+        /* MSG_TRUNC: recv возвращает настоящую длину части. Больше буфера — значит часть
+         * обрезана, и разбирать её остаток нельзя; при CTNL_RCVBUF этого не бывает. */
+        ssize_t n = recv(dfd, buf, CTNL_RCVBUF, MSG_TRUNC);
+        if (n <= 0 || n > CTNL_RCVBUF) return -1;
+        int len = (int)n;
+        for (struct nlmsghdr *h = (struct nlmsghdr *)buf; len > 0 && NLMSG_OK(h, (unsigned)len);
+             h = NLMSG_NEXT(h, len)) {
+            if (h->nlmsg_seq != dseq) continue;
+            if (h->nlmsg_type == NLMSG_DONE) return evicted;
+            if (h->nlmsg_type == NLMSG_ERROR) {
+                if (h->nlmsg_len < NLMSG_LENGTH(sizeof(struct nlmsgerr))) return -1;
+                int err = ((struct nlmsgerr *)NLMSG_DATA(h))->error;
+                /* EOPNOTSUPP на фильтре — ядро собрано без CONFIG_NF_CONNTRACK_MARK. Метки
+                 * соединения у такого ядра нет вовсе, а значит и записей с меткой выхода: снимать
+                 * нечего, и внешний инструмент здесь не нужен. */
+                if (err == -EOPNOTSUPP) return 0;
+                return err == 0 ? evicted : -1;
+            }
+            if ((h->nlmsg_type >> 8) != NFNL_SUBSYS_CTNETLINK ||
+                h->nlmsg_len < NLMSG_LENGTH(sizeof(struct nfgenmsg)))
+                continue;
+            const uint8_t *a = (const uint8_t *)NLMSG_DATA(h) + NLMSG_ALIGN(sizeof(struct nfgenmsg));
+            const uint8_t *end = (const uint8_t *)h + h->nlmsg_len;
+            const struct nlattr *m = ct_attr(a, end, CTA_MARK);
+            if (!m || m->nla_len < NLA_HDRLEN + 4) continue;
+            uint32_t mv;
+            memcpy(&mv, (const uint8_t *)m + NLA_HDRLEN, 4);
+            if ((ntohl(mv) & mask) != val) continue;
+            const struct nlattr *tuple = ct_attr(a, end, CTA_TUPLE_ORIG);
+            if (!tuple) continue;
+            evicted += ctnl_delete(xfd, family, ++*seq, tuple, ct_attr(a, end, CTA_ID),
+                                   ct_attr(a, end, CTA_ZONE));
+        }
+    }
+}
+
+int ctnl_evict_mark(uint32_t val, uint32_t mask) {
+    /* Нулевое значение совпало бы с каждой записью без метки — то есть со всем чужим. Метка
+     * выхода нулём не бывает; защита от ошибки вызывающего, а не от ядра. */
+    if (!val || (val & ~mask)) return 0;
+    int dfd = ctnl_socket(), xfd = ctnl_socket();
+    uint8_t *buf = malloc(CTNL_RCVBUF);
+    int total = -1;
+    if (dfd >= 0 && xfd >= 0 && buf) {
+        static const uint8_t fam[] = { AF_INET, AF_INET6 };
+        uint32_t seq = (uint32_t)time(NULL);
+        total = 0;
+        for (size_t i = 0; i < sizeof(fam); i++) {
+            int n = ctnl_evict_family(dfd, xfd, fam[i], val, mask, &seq, buf);
+            if (n < 0) { total = -1; break; }
+            total += n;
+        }
+    }
+    free(buf);
+    if (dfd >= 0) close(dfd);
+    if (xfd >= 0) close(xfd);
+    return total;
+}
+
+/* Куда слать запрос наверх: исходное назначение (в режиме origdst), иначе петля. *mark — метка
+ * исходного соединения (см. g_up_mark), *have_mark — узнали ли её. */
+static void upstream_for(const struct sockaddr_storage *cli, const struct dnsd_local *local,
+                         int have_local, union dnsd_sa *up, uint32_t *mark, int *have_mark) {
     memset(up, 0, sizeof(*up));
-    up->sin_family = AF_INET;
-    up->sin_port = htons((uint16_t)g_up_port);
-    up->sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    up->v4.sin_family = AF_INET;
+    up->v4.sin_port = htons((uint16_t)g_up_port);
+    up->v4.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    *have_mark = 0;
     if (!g_origdst || !have_local) return;
-    struct sockaddr_in o;
-    memset(&o, 0, sizeof(o));
-    if (ct_origdst(cli, local, g_listen_port, &o) == 0) *up = o;
+    union dnsd_sa o;
+    if (ct_origdst(cli, local, g_listen_port, &o, mark, have_mark) != 0) { *have_mark = 0; return; }
+    /* IPv6-назначение, а пула AF_INET6 нет (ядро без IPv6) — на петлю, как раньше. */
+    if (o.sa.sa_family == AF_INET6 && g_up_pool6_n == 0) { *have_mark = 0; return; }
+    *up = o;
 }
 
 /* Поколение для нового ожидания. Оно ОБЯЗАНО быть усечённым здесь, а не только при
@@ -2056,7 +2368,7 @@ static struct pending *pending_alloc(void) {
 /* upstream_port больше не нужен на этом пути: сокет наверх открыт и connect'нут один раз
  * в run_proxy, порт задан там. */
 static int dns_query(uint8_t *buf, ssize_t n, struct sockaddr_storage from, socklen_t fromlen,
-                     struct in_addr local, int have_local);
+                     struct dnsd_local local, int have_local);
 static int handle_client_query(void) {
     uint8_t buf[MAX_PKT];
     /* Dual-stack listener -> the client may be IPv6 (or v4-mapped). The reply is
@@ -2066,7 +2378,8 @@ static int handle_client_query(void) {
     ssize_t n;
     /* Адрес, на который пришла датаграмма, нужен только режиму origdst: по нему (вместе с
      * адресом клиента) ищется запись conntrack. В обычном режиме — прежний recvfrom. */
-    struct in_addr local = { 0 };
+    struct dnsd_local local;
+    memset(&local, 0, sizeof(local));
     int have_local = 0;
     if (g_origdst) {
         struct iovec iov = { buf, sizeof(buf) };
@@ -2085,13 +2398,18 @@ static int handle_client_query(void) {
                 struct dnsd_in6_pktinfo pi;
                 memcpy(&pi, CMSG_DATA(c), sizeof(pi));
                 if (IN6_IS_ADDR_V4MAPPED(&pi.addr)) {
-                    memcpy(&local, &pi.addr.s6_addr[12], 4);
-                    have_local = 1;
+                    local.af = AF_INET;
+                    memcpy(&local.v4, &pi.addr.s6_addr[12], 4);
+                } else {
+                    local.af = AF_INET6;
+                    local.v6 = pi.addr;
                 }
+                have_local = 1;
             } else if (c->cmsg_level == IPPROTO_IP && c->cmsg_type == IP_PKTINFO) {
                 struct dnsd_in_pktinfo pi;
                 memcpy(&pi, CMSG_DATA(c), sizeof(pi));
-                local = pi.addr;
+                local.af = AF_INET;
+                local.v4 = pi.addr;
                 have_local = 1;
             }
         }
@@ -2107,7 +2425,7 @@ static int handle_client_query(void) {
  * осталось тем же, каким было внутри handle_client_query. Буфер переписывается (номер
  * транзакции наверх). Возвращает 1 — как handle_client_query, «запрос был». */
 static int dns_query(uint8_t *buf, ssize_t n, struct sockaddr_storage from, socklen_t fromlen,
-                     struct in_addr local, int have_local) {
+                     struct dnsd_local local, int have_local) {
     /* Быстрый путь: на вопрос, ответ на который НЕ ЗАВИСИТ от upstream, отвечаем
      * прямо из запроса. Это и есть задержка fake-ip глазами клиента: раньше каждый
      * запрос — включая повторный A для уже выданного fake-IP и AAAA/HTTPS/SVCB,
@@ -2200,27 +2518,46 @@ static int dns_query(uint8_t *buf, ssize_t n, struct sockaddr_storage from, sock
     p->gen = pending_next_gen();
     uint16_t tag = pending_tag(p);
     int ufd = g_up_fd;
+    union dnsd_sa up;
+    uint32_t ctmark = 0;
+    int have_mark = 0;
+    upstream_for(&from, &local, have_local, &up, &ctmark, &have_mark);
+    socklen_t uplen = up.sa.sa_family == AF_INET6 ? sizeof(up.v6) : sizeof(up.v4);
     if (g_origdst) {
         tag = rand16();
         g_txmap[tag] = (int16_t)(p - g_pending);
         p->txid = tag;
-        ufd = g_up_pool[rand16() % UP_POOL];
-        if (ufd < 0) ufd = g_up_fd;
+        /* Пул — по семейству сервера: IPv6-назначение upstream_for отдаёт, только если пул
+         * AF_INET6 открыт (g_up_pool6_n > 0). */
+        if (up.sa.sa_family == AF_INET6) {
+            int i = rand16() % g_up_pool6_n;
+            ufd = g_up_pool6[i];
+#ifdef STEER_ANDROID
+            up_mark_set(ufd, &g_up_mark6[i], up_mark_for(ctmark, have_mark));
+#endif
+        } else {
+            int i = rand16() % UP_POOL;
+            ufd = g_up_pool[i];
+            if (ufd < 0) ufd = g_up_fd;
+#ifdef STEER_ANDROID
+            else up_mark_set(ufd, &g_up_mark[i], up_mark_for(ctmark, have_mark));
+#endif
+        }
     }
+    (void)ctmark; (void)have_mark;
     p->up_fd = ufd;
     buf[0] = (uint8_t)(tag >> 8);
     buf[1] = (uint8_t)(tag & 0xFF);
 
-    struct sockaddr_in up;
-    upstream_for(&from, &local, have_local, &up);
-    /* Запрос, пришедший по TCP, уходит наверх тоже по TCP (почему — у struct tcpu); тихий
-     * (клиенту уже ответили из быстрого пути, ответ нужен только ради карты) — по UDP, как
-     * любой: ответ ему не нужен целиком, а круг по UDP дешевле рукопожатия. */
+    /* Запрос, пришедший по TCP, уходит наверх тоже по TCP (почему — у struct tcpu), к тому же
+     * серверу и с той же меткой сети; тихий (клиенту уже ответили из быстрого пути, ответ нужен
+     * только ради карты) — по UDP, как любой: ответ ему не нужен целиком, а круг по UDP дешевле
+     * рукопожатия. */
     int tcpu = -1;
     if (g_tcp_cur && !quiet) {
-        tcpu = tcpu_open(p, buf, (size_t)n, &up, tag, qend);
+        tcpu = tcpu_open(p, buf, (size_t)n, &up, tag, qend, ctmark, have_mark);
         if (tcpu < 0) return 1;                /* ответ SERVFAIL уже ушёл клиенту */
-    } else if ((g_origdst ? sendto(ufd, buf, (size_t)n, 0, (struct sockaddr *)&up, sizeof(up))
+    } else if ((g_origdst ? sendto(ufd, buf, (size_t)n, 0, &up.sa, uplen)
                    : send(g_up_fd, buf, (size_t)n, 0)) < 0) {
         /* Чаще всего это ECONNREFUSED от петли: резолвер наверху не запущен или
          * перезапускается. Ядро отдаёт такую ошибку отложенно, следующим системным
@@ -2292,16 +2629,27 @@ static size_t build_rewritten_response(const uint8_t *orig, size_t qend,
     return pos;
 }
 
+/* Ответ пришёл оттуда, куда ушёл вопрос: семейство, адрес и порт. Зона (sin6_scope_id) не
+ * сравнивается: вопрос к серверу link-local уходит без неё (см. g_origdst), а ответ приходит
+ * с номером интерфейса. */
+static int up_same(const union dnsd_sa *a, const union dnsd_sa *b) {
+    if (a->sa.sa_family != b->sa.sa_family) return 0;
+    if (a->sa.sa_family == AF_INET6)
+        return !memcmp(&a->v6.sin6_addr, &b->v6.sin6_addr, 16) &&
+               a->v6.sin6_port == b->v6.sin6_port;
+    return a->v4.sin_addr.s_addr == b->v4.sin_addr.s_addr && a->v4.sin_port == b->v4.sin_port;
+}
+
 /* Возвращает 1, если датаграмма была прочитана (есть смысл читать дальше), 0 — если
  * очередь пуста. Ответы всех ожиданий приходят на один сокет, поэтому своё ожидание
  * находится по номеру транзакции, который мы же и проставили при отправке. */
 static int upstream_answer(struct pending *p, uint8_t *buf, ssize_t n);
 static int handle_upstream_response(int ufd) {
     uint8_t buf[MAX_PKT];
-    struct sockaddr_in src;
+    union dnsd_sa src;
     socklen_t srclen = sizeof(src);
     memset(&src, 0, sizeof(src));
-    ssize_t n = recvfrom(ufd, buf, sizeof(buf), 0, (struct sockaddr *)&src, &srclen);
+    ssize_t n = recvfrom(ufd, buf, sizeof(buf), 0, &src.sa, &srclen);
     if (n < 0) {
         if (errno == EAGAIN || errno == EWOULDBLOCK) return 0;   /* очередь пуста */
         /* Прочая ошибка — это ОДНА отложенная ошибка сокета (обычно ECONNREFUSED с
@@ -2331,8 +2679,7 @@ static int handle_upstream_response(int ufd) {
         (!g_origdst && p->gen != (uint8_t)((tag >> PENDING_IDX_BITS) & PENDING_GEN_MASK)))
         return 1;
     /* Режим origdst: сокет не connect'нут, и ответ обязан прийти оттуда, куда ушёл вопрос. */
-    if (g_origdst && (src.sin_addr.s_addr != p->up.sin_addr.s_addr ||
-                      src.sin_port != p->up.sin_port)) return 1;
+    if (g_origdst && !up_same(&src, &p->up)) return 1;
     /* И ГЛАВНОЕ: ответ обязан отвечать на НАШ вопрос. Поколение когда-нибудь повторится
      * (шесть бит), и без этой проверки запоздавший ответ уехал бы клиенту как ответ на
      * другой вопрос — чужой адрес вместо нужного, молча и без единой строки в журнале. */
@@ -2579,9 +2926,13 @@ static int upstream_answer(struct pending *p, uint8_t *buf, ssize_t n) {
  * ответ с вопросом по номеру транзакции.
  *
  * ЛИМИТЫ. TCP_MAX_CONN соединений клиентов; новое сверх него вытесняет самое давно молчащее из
- * тех, у кого нет запросов в пути и кто молчит хотя бы секунду, а если таких нет — закрывается
- * сразу. Секунда — не прихоть: на всплеске соединений вытеснялись бы только что принятые, ещё не
- * успевшие прислать вопрос, и из перегрузки не выигрывал бы никто. Простой — TCP_IDLE_SEC,
+ * тех, у кого нет запросов в пути и кто молчит хотя бы секунду. Секунда — не прихоть: на всплеске
+ * соединений вытеснялись бы только что принятые, ещё не успевшие прислать вопрос, и из перегрузки
+ * не выигрывал бы никто. Вытеснить некого — новое соединение не принимается вовсе, а ждёт в
+ * очереди ядра (listen), пока место не освободится: слушающий сокет на это время снимается с
+ * epoll (иначе уровневый epoll будил бы цикл впустую), а возвращается при закрытии соединения и
+ * на секундном тике. Закрыть принятое сразу было бы хуже: клиент получил бы обрыв, а не ожидание
+ * в полсекунды. Простой — TCP_IDLE_SEC,
  * и отсчитывается он от последнего ЦЕЛОГО запроса или сдвига очереди записи, а не от последнего
  * байта: иначе клиент, присылающий по байту раз в несколько секунд, держал бы место вечно.
  * Проверка простоя и сроков — на секундном тике цикла, который уже есть ради pending_reap: своих
@@ -2611,7 +2962,7 @@ struct tcpc {
     time_t last;                    /* последний целый запрос или сдвиг записи */
     struct sockaddr_storage peer;
     socklen_t peer_len;
-    struct in_addr local;           /* куда подключился клиент — для conntrack (origdst) */
+    struct dnsd_local local;        /* куда подключился клиент — для conntrack (origdst) */
     int have_local;
     size_t in_len;
     uint8_t in[2 + MAX_PKT];
@@ -2650,6 +3001,7 @@ struct tcpu {
 };
 
 static int g_tcp_lfd = -1;
+static int g_tcp_paused;            /* слушающий сокет снят с epoll: мест нет (см. «ЛИМИТЫ») */
 static struct tcpc g_tcpc[TCP_MAX_CONN];
 static struct tcpu g_tcpu[TCP_MAX_UP];
 /* Куда отвечать, когда соединение клиента уже закрыто: ответ сверху всё равно доводится до
@@ -2666,8 +3018,17 @@ static void tcpc_set_ev(struct tcpc *c) {
     c->ev = want;
 }
 
+static void tcp_listen_pause(int pause) {
+    if (g_tcp_lfd < 0 || g_tcp_paused == pause) return;
+    struct epoll_event ev = {0};
+    ev.events = pause ? 0u : (uint32_t)EPOLLIN;
+    ev.data.ptr = &g_tcp_lfd;
+    if (epoll_ctl(g_epfd, EPOLL_CTL_MOD, g_tcp_lfd, &ev) == 0) g_tcp_paused = pause;
+}
+
 static void tcpc_close(struct tcpc *c) {
     if (c->fd < 0) return;
+    tcp_listen_pause(0);                /* место освободилось — принимать снова */
     epoll_ctl(g_epfd, EPOLL_CTL_DEL, c->fd, NULL);
     close(c->fd);
     c->fd = -1;
@@ -2830,8 +3191,8 @@ static void tcpu_fail(struct tcpu *u) {
     tcpu_close(u);
 }
 
-static int tcpu_open(struct pending *p, const uint8_t *q, size_t n, const struct sockaddr_in *up,
-                     uint16_t tag, size_t qend) {
+static int tcpu_open(struct pending *p, const uint8_t *q, size_t n, const union dnsd_sa *up,
+                     uint16_t tag, size_t qend, uint32_t ctmark, int have_mark) {
     struct tcpc *c = g_tcp_cur;
     struct tcpu *u = NULL;
     for (int i = 0; i < TCP_MAX_UP; i++)
@@ -2839,21 +3200,26 @@ static int tcpu_open(struct pending *p, const uint8_t *q, size_t n, const struct
     int fd = -1;
     const char *why = "все соединения наверх заняты";
     if (u) {
-        fd = socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
+        fd = socket(up->sa.sa_family, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
         why = "сокет не открылся";
     }
     uint8_t *fq = fd >= 0 ? malloc(n + 2) : NULL;
     if (fd >= 0 && !fq) why = "нет памяти";
     if (fd >= 0 && fq) {
 #ifdef STEER_ANDROID
-        /* Та же метка, что у запросов наверх по UDP (см. run_proxy): без неё заворот TCP/53
-         * на output вернул бы наш же запрос к нам. */
-        unsigned mk = STEER_SELF_MARK;
+        /* Та же метка, что у переспроса по UDP (up_mark_for): поля netd исходного соединения —
+         * чтобы запрос ушёл сетью, по которой спрашивал клиент, — и «сам движок» в поле
+         * движка, без которого заворот TCP/53 на output вернул бы наш же запрос к нам. Ставится
+         * до connect: SYN уже идёт по маршруту этой метки. */
+        unsigned mk = up_mark_for(ctmark, have_mark);
         setsockopt(fd, SOL_SOCKET, SO_MARK, &mk, sizeof(mk));
+#else
+        (void)ctmark; (void)have_mark;
 #endif
         int one = 1;
         setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
-        int rc = connect(fd, (const struct sockaddr *)up, sizeof(*up));
+        int rc = connect(fd, &up->sa, up->sa.sa_family == AF_INET6 ? sizeof(up->v6)
+                                                                     : sizeof(up->v4));
         if (rc == 0 || errno == EINPROGRESS) {
             fq[0] = (uint8_t)(n >> 8);
             fq[1] = (uint8_t)n;
@@ -2953,8 +3319,9 @@ static void tcpu_poke(struct tcpu *u) {
 }
 
 /* Место под новое соединение: свободное, иначе — давно молчащее без запросов в пути и без
- * начатого запроса в буфере (см. «ЛИМИТЫ» выше). */
-static struct tcpc *tcpc_slot(void) {
+ * начатого запроса в буфере (см. «ЛИМИТЫ» выше); NULL — вытеснить некого. Само место не
+ * освобождается: вытеснять стоит, только когда соединение и правда принято. */
+static struct tcpc *tcpc_pick(void) {
     struct tcpc *old = NULL;
     time_t now = time(NULL);
     for (int i = 0; i < TCP_MAX_CONN; i++) {
@@ -2963,25 +3330,25 @@ static struct tcpc *tcpc_slot(void) {
         if (!c->inflight && !c->in_len && now - c->last >= 1 && (!old || c->last < old->last))
             old = c;
     }
-    if (old) tcpc_close(old);
     return old;
 }
 
 static void tcp_accept(void) {
     for (int k = 0; k < TCP_MAX_CONN; k++) {
+        struct tcpc *c = tcpc_pick();
+        if (!c) {
+            static time_t said;
+            tcp_listen_pause(1);
+            if (warn_due(&said, time(NULL)))
+                fprintf(stderr, "steer dnsd: соединений TCP %d, и все заняты — новые ждут в "
+                                "очереди\n", TCP_MAX_CONN);
+            return;
+        }
         struct sockaddr_storage peer;
         socklen_t pl = sizeof(peer);
         int fd = accept(g_tcp_lfd, (struct sockaddr *)&peer, &pl);
         if (fd < 0) return;
-        struct tcpc *c = tcpc_slot();
-        if (!c) {
-            static time_t said;
-            close(fd);
-            if (warn_due(&said, time(NULL)))
-                fprintf(stderr, "steer dnsd: соединений TCP больше %d, и все с запросами в "
-                                "пути — новое закрыто\n", TCP_MAX_CONN);
-            continue;
-        }
+        if (c->fd >= 0) tcpc_close(c);  /* вытеснение — теперь, когда новое точно есть */
         fcntl(fd, F_SETFL, O_NONBLOCK);
         fcntl(fd, F_SETFD, FD_CLOEXEC);
         int one = 1;
@@ -2999,12 +3366,20 @@ static void tcp_accept(void) {
         struct sockaddr_storage ls;
         socklen_t ll = sizeof(ls);
         if (getsockname(fd, (struct sockaddr *)&ls, &ll) == 0) {
+            /* Как у датаграммы (handle_client_query): IPv4 двойного стека приходит v4-mapped и
+             * хранится как v4 — в conntrack это IPv4-соединение. */
+            const struct sockaddr_in6 *l6 = (const struct sockaddr_in6 *)&ls;
             if (ls.ss_family == AF_INET) {
-                c->local = ((struct sockaddr_in *)&ls)->sin_addr;
+                c->local.af = AF_INET;
+                c->local.v4 = ((struct sockaddr_in *)&ls)->sin_addr;
                 c->have_local = 1;
-            } else if (ls.ss_family == AF_INET6 &&
-                       IN6_IS_ADDR_V4MAPPED(&((struct sockaddr_in6 *)&ls)->sin6_addr)) {
-                memcpy(&c->local, &((struct sockaddr_in6 *)&ls)->sin6_addr.s6_addr[12], 4);
+            } else if (ls.ss_family == AF_INET6 && IN6_IS_ADDR_V4MAPPED(&l6->sin6_addr)) {
+                c->local.af = AF_INET;
+                memcpy(&c->local.v4, &l6->sin6_addr.s6_addr[12], 4);
+                c->have_local = 1;
+            } else if (ls.ss_family == AF_INET6) {
+                c->local.af = AF_INET6;
+                c->local.v6 = l6->sin6_addr;
                 c->have_local = 1;
             }
         }
@@ -3053,6 +3428,9 @@ static int tcp_event(void *ptr, uint32_t evs) {
 /* Секундный тик: запросы наверх, чьё ожидание протухло, — SERVFAIL и закрыть; соединения
  * клиентов без дела дольше TCP_IDLE_SEC — закрыть. */
 static void tcp_reap(time_t now) {
+    /* Место могло стать вытесняемым без закрытия (соединение отмолчало секунду) — пусть
+     * следующий приём проверит заново; мест нет — tcp_accept снимет сокет снова. */
+    tcp_listen_pause(0);
     for (int i = 0; i < TCP_MAX_UP; i++)
         if (g_tcpu[i].fd >= 0 && !tcpu_pending(&g_tcpu[i])) tcpu_fail(&g_tcpu[i]);
     for (int i = 0; i < TCP_MAX_CONN; i++) {
@@ -3109,6 +3487,7 @@ static void tcp_close_all(void) {
     for (int i = 0; i < TCP_MAX_CONN; i++) tcpc_close(&g_tcpc[i]);
     if (g_tcp_lfd >= 0) close(g_tcp_lfd);
     g_tcp_lfd = -1;
+    g_tcp_paused = 0;
 }
 
 /* Восстановить DNAT-карту и наборы каналов после (пере)запуска. Возвращает число
@@ -3253,7 +3632,8 @@ static int run_proxy(int listen_port, int upstream_port) {
     epoll_ctl(g_epfd, EPOLL_CTL_ADD, g_up_fd, &uev);
     /* Пул сокетов наверх на случайных портах — только в режиме origdst (см. g_up_pool).
      * bind на порт 0: ядро выдаёт эфемерный порт случайно. */
-    for (int i = 0; i < UP_POOL; i++) g_up_pool[i] = -1;
+    for (int i = 0; i < UP_POOL; i++) g_up_pool[i] = g_up_pool6[i] = -1;
+    g_up_pool6_n = 0;
     memset(g_txmap, 0xff, sizeof(g_txmap));
     if (g_origdst) {
         for (int i = 0; i < UP_POOL; i++) {
@@ -3264,11 +3644,33 @@ static int run_proxy(int listen_port, int upstream_port) {
 #ifdef STEER_ANDROID
             unsigned mk = STEER_SELF_MARK;
             setsockopt(fd, SOL_SOCKET, SO_MARK, &mk, sizeof(mk));
+            g_up_mark[i] = mk;
 #endif
             g_up_pool[i] = fd;
             struct epoll_event pev = {0};
             pev.events = EPOLLIN;
             pev.data.ptr = &g_up_pool[i];
+            epoll_ctl(g_epfd, EPOLL_CTL_ADD, fd, &pev);
+        }
+        /* Пул AF_INET6 — для запросов по IPv6 (см. g_origdst). Только IPv6 (V6ONLY): IPv4
+         * ходит своим пулом. Не открылся ни один — IPv6-запросы уходят на петлю. */
+        for (int i = 0; i < UP_POOL; i++) {
+            int fd = socket(AF_INET6, SOCK_DGRAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
+            if (fd < 0) break;
+            int on = 1;
+            setsockopt(fd, IPPROTO_IPV6, IPV6_V6ONLY, &on, sizeof(on));
+            struct sockaddr_in6 any6 = { .sin6_family = AF_INET6 };
+            if (bind(fd, (struct sockaddr *)&any6, sizeof(any6)) != 0) { close(fd); break; }
+            int k = g_up_pool6_n++;
+#ifdef STEER_ANDROID
+            unsigned mk = STEER_SELF_MARK;
+            setsockopt(fd, SOL_SOCKET, SO_MARK, &mk, sizeof(mk));
+            g_up_mark6[k] = mk;
+#endif
+            g_up_pool6[k] = fd;
+            struct epoll_event pev = {0};
+            pev.events = EPOLLIN;
+            pev.data.ptr = &g_up_pool6[k];
             epoll_ctl(g_epfd, EPOLL_CTL_ADD, fd, &pev);
         }
     }

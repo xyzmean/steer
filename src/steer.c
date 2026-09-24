@@ -596,20 +596,45 @@ static int has_local_domains(void) {
  *
  * И UDP, и TCP: по TCP приходят переспросы после усечённого ответа (TC=1) и запросы приложений,
  * которые ходят по TCP сразу, — без заворота имя, спрошенное так, прошло бы мимо канала, и
- * соединение ушло бы по настоящему адресу. Резолвер слушает TCP на том же порту (см. «DNS по
- * TCP» в dnsd.c). DNS по IPv6 на старом ядре без nat в ip6 не заворачивается — там такого
- * правила не поставить. */
-static void emit_local_dns(FILE *f, const char *dnat_kw, int inet) {
-    /* Всех, кроме собственного запроса резолвера наверх (STEER_SELF_MARK): DnsResolver шлёт
-     * запросы приложений от root. Только IPv4: запрос по IPv6 резолвер переспросить не может
-     * (исходное назначение он ищет только для IPv4), и заворачивать его — значит потерять. */
-    fprintf(f, "        %smeta mark and 0x%08x != 0x%08x udp dport 53 counter redirect to :%d "
-               "comment \"steer-dns-local\"\n", inet ? "meta nfproto ipv4 " : "",
+ * соединение ушло бы по настоящему адресу. Резолвер слушает TCP на том же порту и переспрашивает
+ * тот же сервер тоже по TCP (см. «DNS по TCP» в dnsd.c).
+ *
+ * ОБА СЕМЕЙСТВА. Запрос по IPv6 (сервер сети из RDNSS, в том числе link-local) заворачивается
+ * так же: резолвер ищет исходное назначение и в AF_INET6 и переспрашивает тот же IPv6-сервер
+ * (см. g_origdst в dnsd.c). В современной раскладке это одно правило в inet, в старой — по
+ * цепочке nat output в ip и ip6 (emit_local_dns_redirect); на старом ядре без nat в ip6
+ * (NFTC_IP6NAT) IPv6-половины нет — там такого правила не поставить, и apply об этом говорит. */
+
+/* Само правило заворота — одно на всех раскладках и семействах (по правилу на протокол).
+ *
+ * Всех, кроме собственного запроса резолвера наверх (STEER_SELF_MARK): DnsResolver шлёт
+ * запросы приложений от root. Метка «сам движок» у переспроса по TCP та же, что по UDP
+ * (tcpu_open в dnsd.c).
+ *
+ * `ct mark set mark` — чтобы резолвер узнал метку сети исходного запроса: на 4.9 принятому сокету
+ * метку датаграммы не узнать (SO_RCVMARK — с 5.19), а запись conntrack резолвер и так читает
+ * целиком (подробно — у g_up_mark в dnsd.c). У TCP это та же запись conntrack, что ищет резолвер
+ * по соединению, и цепочка nat видит её первый пакет (SYN) — метку сокета приложения. Копируется
+ * метка ЦЕЛИКОМ, и это не расходится с тем, как метку соединения пишет сам движок: разметка
+ * каналов (output_mark, раньше по приоритету) тоже делает `ct mark set mark` целиком
+ * (out_needs_ctmark верно для всякого выхода канала телефона: tgws там спека отвергает), то есть к
+ * этому правилу пакет приходит с той же меткой, что уже лежит в ct mark, и перезапись ничего не
+ * меняет. У запроса, который канал не пометил, ct mark получает fwmark netd — поле движка там
+ * нулевое, и читателям ct mark движка (сравнения `ct mark and МАСКА == метка`) это ничего не
+ * значит. Смешать метку пакета со старой ct mark (`ct mark and … or mark`) на 4.9 нельзя вовсе:
+ * там нет bitwise двух регистров. Цепочка nat видит только первый пакет соединения — ровно тот
+ * момент, когда метку и надо запомнить. */
+static void emit_local_dns_redirect(FILE *f) {
+    fprintf(f, "        meta mark and 0x%08x != 0x%08x udp dport 53 ct mark set mark counter "
+               "redirect to :%d comment \"steer-dns-local\"\n",
             STEER_MARK_MASK, STEER_SELF_MARK, DNS_PORT);
-    /* Метка «сам движок» у запроса наверх по TCP та же (tcpu_open в dnsd.c). */
-    fprintf(f, "        %smeta mark and 0x%08x != 0x%08x tcp dport 53 counter redirect to :%d "
-               "comment \"steer-dns-local-tcp\"\n", inet ? "meta nfproto ipv4 " : "",
+    fprintf(f, "        meta mark and 0x%08x != 0x%08x tcp dport 53 ct mark set mark counter "
+               "redirect to :%d comment \"steer-dns-local-tcp\"\n",
             STEER_MARK_MASK, STEER_SELF_MARK, DNS_PORT);
+}
+
+static void emit_local_dns(FILE *f, const char *dnat_kw) {
+    emit_local_dns_redirect(f);
     if (has_fakeip())
         fprintf(f, "        ip daddr 198.18.0.0/15 counter %s to ip daddr map @fakeip "
                    "comment \"steer-fakeip-local\"\n", dnat_kw);
@@ -1249,7 +1274,7 @@ static void generate_legacy_tail(FILE *f) {
         if (has_local_domains()) {
             fprintf(f, "    chain output_nat {\n"
                        "        type nat hook output priority dstnat - 1; policy accept;\n");
-            emit_local_dns(f, "dnat", 0);
+            emit_local_dns(f, "dnat");
             fprintf(f, "    }\n");
         }
         /* Снятие бита перемаршрутизации — см. STEER_REROUTE_BIT в spec.h. mangle + 2: сразу
@@ -1277,8 +1302,18 @@ static void generate_legacy_tail(FILE *f) {
         emit_ifs(f, 0);
         fprintf(f, "tcp dport 53 counter redirect to :%d\n", DNS_PORT);
 #endif
-        fprintf(f, "    }\n"
-                   "    chain postrouting_nat {\n"
+        fprintf(f, "    }\n");
+#ifdef STEER_ANDROID
+        /* IPv6-половина заворота DNS приложений (см. emit_local_dns): та же цепочка, что в
+         * таблице ip, без fakeip — поддельные адреса только IPv4. */
+        if (has_local_domains()) {
+            fprintf(f, "    chain output_nat {\n"
+                       "        type nat hook output priority dstnat - 1; policy accept;\n");
+            emit_local_dns_redirect(f);
+            fprintf(f, "    }\n");
+        }
+#endif
+        fprintf(f, "    chain postrouting_nat {\n"
                    "        type nat hook postrouting priority srcnat + 1; policy accept;\n"
                    "    }\n}\n");
     }
@@ -1812,7 +1847,7 @@ static void generate(FILE *f) {
         if (has_local_domains()) {
             fprintf(f, "    chain output_dns {\n"
                        "        type nat hook output priority dstnat; policy accept;\n");
-            emit_local_dns(f, "dnat ip", 1);
+            emit_local_dns(f, "dnat ip");
             fprintf(f, "    }\n");
         }
 #endif
@@ -2442,6 +2477,12 @@ static void report_legacy_gaps(void) {
         fprintf(stderr, LOG_W "ядро не умеет nat для IPv6: запросы DNS клиентов по IPv6 идут "
                         "мимо резолвера движка, и доменные каналы видят только тех, кто "
                         "спрашивает по IPv4\n");
+#endif
+#ifdef STEER_ANDROID
+    if (!(g_nftc & NFTC_IP6NAT) && has_local_domains())
+        fprintf(stderr, LOG_W "ядро не умеет nat для IPv6: запросы DNS приложений телефона по "
+                        "IPv6 идут мимо резолвера движка, и доменные каналы телефона их не "
+                        "видят\n");
 #endif
 #ifndef STEER_ANDROID
     /* На Android таблица nat iptables есть всегда, но PREROUTING в ней у netd — пустая
