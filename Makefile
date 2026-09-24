@@ -34,6 +34,7 @@ test: all ext-syntax $(BUILD)/tgwssim $(BUILD)/dnsmatch $(BUILD)/specmatch $(BUI
 	@sh tests/climatch.sh
 	@sh tests/dnsproxy.sh
 	@sh tests/dnsnft.sh
+	@sh tests/applynft.sh
 	@sh tests/diagmatch.sh
 	@sh tests/statusmatch.sh
 	@sh tests/buildmatch.sh
