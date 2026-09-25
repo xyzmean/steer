@@ -293,7 +293,10 @@ $CC -O2 -w $STEER_INC $MBED_INC "$PRIV" -o "$BUILD/devupmatch" tests/devupmatch.
 # test`. Урок ровно про это: барьер, который нужно ЗАПУСТИТЬ РУКАМИ, не барьер.
 echo "ext-test: собираю серверный бинарник для стенда зондирования..."
 $CC -O1 -w $STEER_INC $MBED_INC "$PRIV" -DSTEER_SERVER -o "$BUILD/steer-hub-native" \
-	src/daemon/steer.c src/model/spec.c src/dnsd/dnsd.c src/daemon/failover.c src/tools/aggregate.c src/proto/obfs/obfs.c src/cli/cli.c \
+	src/daemon/steer.c src/model/spec.c \
+	src/lib/sindex.c src/lib/nftnl.c src/lib/ctnl.c \
+	src/dnsd/rules.c src/dnsd/wire.c src/dnsd/fakeip.c src/dnsd/table.c src/dnsd/dlog.c src/dnsd/proxy.c src/dnsd/main.c \
+	src/daemon/failover.c src/tools/aggregate.c src/proto/obfs/obfs.c src/cli/cli.c \
 	src/tools/srs.c src/tools/puff.c src/tools/hwid.c src/daemon/ctl.c src/kinds/awg.c \
 	src/proto/xsteer/xswire.c src/proto/xsteer/xsconf.c src/proto/xsteer/xslink.c src/proto/xsteer/xsroute.c src/proto/tls/chello.c src/proto/xsteer/xshake.c \
 	src/proto/xsteer/xsconn.c src/proto/xsteer/xsstream.c src/proto/xsteer/xsepoch.c src/proto/tls/tls13.c src/proto/tls/certverify.c src/proto/tls/reality.c \

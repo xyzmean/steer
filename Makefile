@@ -146,9 +146,12 @@ ext-test:
 	@BUILD=$(BUILD) CC="$(CC)" sh tests/ext-test.sh
 
 # Подбор доменного правила проверяется отдельной программой, а не через движок: сам подбор
-# статический внутри dnsd.c, и дотянуться до него иначе значило бы добавить в движок
-# подкоманду ради теста. Файл включает исходник резолвера — см. tests/dnsmatch.c.
-$(BUILD)/dnsmatch: tests/dnsmatch.c src/dnsd/dnsd.c src/model/spec.c src/model/spec.h
+# статический внутри резолвера, и дотянуться до него иначе значило бы добавить в движок
+# подкоманду ради теста. Файл включает исходники резолвера целиком — см. tests/dnsmatch.c.
+$(BUILD)/dnsmatch: tests/dnsmatch.c src/lib/sindex.c src/lib/sindex.h src/lib/nftnl.c src/lib/nftnl.h \
+                   src/lib/ctnl.c src/lib/ctnl.h src/dnsd/dnsd_int.h src/dnsd/rules.c src/dnsd/wire.c \
+                   src/dnsd/fakeip.c src/dnsd/table.c src/dnsd/dlog.c src/dnsd/proxy.c src/dnsd/main.c \
+                   src/model/spec.c src/model/spec.h
 	@mkdir -p $(BUILD)
 	$(CC) $(CFLAGS) -o $@ tests/dnsmatch.c src/model/spec.c
 

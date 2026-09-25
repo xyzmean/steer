@@ -25,7 +25,14 @@ CORE_DIRS := src/lib src/model src/daemon src/kinds src/cli src/dnsd src/tools s
 EXT_DIRS  := src/tunnel src/proto/tls src/proto/vless src/proto/xsteer src/proto/tgws
 INC_DIRS  := $(CORE_DIRS) $(EXT_DIRS)
 
-CORE_SRC := src/daemon/steer.c src/model/spec.c src/dnsd/dnsd.c src/daemon/failover.c src/tools/aggregate.c src/proto/obfs/obfs.c \
+# Резолвер: src/dnsd/dnsd.c был один файл, теперь — DNSD_SRC. lib/sindex.c, lib/nftnl.c,
+# lib/ctnl.c родились из того же файла (хеш-индекс строк, транзакции nf_tables по netlink,
+# разговор с conntrack) и собираются только вместе с резолвером — CORE_SRC берёт весь список.
+DNSD_SRC := src/lib/sindex.c src/lib/nftnl.c src/lib/ctnl.c \
+            src/dnsd/rules.c src/dnsd/wire.c src/dnsd/fakeip.c src/dnsd/table.c src/dnsd/dlog.c \
+            src/dnsd/proxy.c src/dnsd/main.c
+
+CORE_SRC := src/daemon/steer.c src/model/spec.c $(DNSD_SRC) src/daemon/failover.c src/tools/aggregate.c src/proto/obfs/obfs.c \
             src/cli/cli.c src/tools/srs.c src/tools/puff.c src/tools/hwid.c src/daemon/ctl.c src/kinds/awg.c
 
 # Общее для обеих ролей: формат кадра, конфигурация, маршрутизация, рукопожатие, соединение
