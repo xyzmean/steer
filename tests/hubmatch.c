@@ -21,7 +21,7 @@
  *        src/proto/xsteer/xsconn.c src/proto/xsteer/xswire.c src/proto/xsteer/xsepoch.c src/proto/xsteer/xsroute.c \
  *        src/proto/xsteer/xsconf.c src/proto/xsteer/xsstream.c src/proto/xsteer/xshake.c src/proto/tls/chello.c \
  *        src/proto/tls/reality.c src/proto/tls/tls13.c src/proto/tls/h2.c src/tunnel/tun.c src/proto/obfs/obfs.c \
- *        src/model/spec.c <mbedtls>/library/libmbedcrypto.a -lpthread
+ *        src/lib/jsonr.c src/lib/tmpfile.c src/model/parse.c src/model/registry.c src/model/probe.c src/compile/nftcompat.c <mbedtls>/library/libmbedcrypto.a -lpthread
  */
 #define _GNU_SOURCE
 #include <stdio.h>

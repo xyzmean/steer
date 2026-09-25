@@ -21,11 +21,17 @@
 # Каталоги слоёв (docs/architecture.md). Заголовки подключаются по имени (`#include "spec.h"`)
 # из любого слоя, поэтому каждая сборка получает -I на все каталоги сразу; имена заголовков
 # в дереве уникальны, и стенд tests/buildmatch.sh за этим следит.
-CORE_DIRS := src/lib src/model src/daemon src/kinds src/cli src/dnsd src/tools src/proto/obfs
+CORE_DIRS := src/lib src/model src/daemon src/kinds src/cli src/dnsd src/tools src/proto/obfs src/compile
 EXT_DIRS  := src/tunnel src/proto/tls src/proto/vless src/proto/xsteer src/proto/tgws
 INC_DIRS  := $(CORE_DIRS) $(EXT_DIRS)
 
-CORE_SRC := src/daemon/steer.c src/model/spec.c src/dnsd/dnsd.c src/daemon/failover.c src/tools/aggregate.c src/proto/obfs/obfs.c \
+# Модель спеки — то, во что нарезан прежний src/model/spec.c (docs/architecture.md, «Слои и
+# каталоги»): JSON-ридер, сам разбор спеки, реестр меток/таблиц, ход перебора узлов подписки и
+# раскладка правил старого ядра. Порядок — тот, в котором они шли в неразрезанном файле.
+MODEL_SRC := src/lib/jsonr.c src/lib/tmpfile.c src/model/parse.c src/model/registry.c \
+             src/model/probe.c src/compile/nftcompat.c
+
+CORE_SRC := src/daemon/steer.c $(MODEL_SRC) src/dnsd/dnsd.c src/daemon/failover.c src/tools/aggregate.c src/proto/obfs/obfs.c \
             src/cli/cli.c src/tools/srs.c src/tools/puff.c src/tools/hwid.c src/daemon/ctl.c src/kinds/awg.c
 
 # Общее для обеих ролей: формат кадра, конфигурация, маршрутизация, рукопожатие, соединение
