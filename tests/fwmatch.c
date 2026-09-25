@@ -12,31 +12,26 @@
  * скопированы, включая то, что имя ЗОНЫ и имя УСТРОЙСТВА — разные вещи, совпадающие лишь
  * по привычке называть зону как интерфейс.
  *
- * Дотянуться до fw_check иначе нельзя: она статическая, а данные берёт из popen(). Поэтому
- * стенд включает исходник движка и подменяет popen/pclose на чтение из памяти (fmemopen) —
- * тот же приём, что в specmatch.c с exit: проверяется настоящая функция, а не её копия,
- * и ради теста в движок не добавляется ни строки. */
+ * Дотянуться до fw_check иначе нельзя: данные она берёт из popen(). fwcheck.c/explain.c
+ * линкуются отдельными объектами (docs/architecture.md, раздел 4), поэтому подмена popen —
+ * не макрос (тот виден только внутри своей единицы трансляции), а функция с именем и
+ * подписью из <stdio.h>: сильный символ в объекте стенда перекрывает слабый из libc при
+ * компоновке, и вызовы из fwcheck.o приходят сюда, а не в ядро. Проверяется настоящая
+ * функция, а не её копия, и ради теста в движок не добавляется ни строки. */
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
 
+#include "spec.h"
+#include "daemon.h"
+
 static const char *g_ruleset;    /* что «вернёт» nft этому вызову */
 
-static FILE *test_popen(const char *cmd, const char *mode) {
+FILE *popen(const char *cmd, const char *mode) {
     (void)cmd; (void)mode;
     return fmemopen((void *)g_ruleset, strlen(g_ruleset), "r");
 }
-
-#define popen(cmd, mode) test_popen(cmd, mode)
-#define pclose(f) fclose(f)
-#define main steer_main_unused
-
-#include "../src/daemon/fwcheck.c"
-#include "../src/daemon/explain.c"
-
-#undef popen
-#undef pclose
-#undef main
+int pclose(FILE *f) { return fclose(f); }
 
 static int g_fail;
 
@@ -50,11 +45,10 @@ static void probe(const char *what, const char *ruleset, const char *device,
                   int want_in_firewall, int want_masq) {
     char label[256];
     g_ruleset = ruleset;
-    /* Дамп кэшируется на процесс (см. ruleset_dump в steer.c), а каждая проба
-     * изображает ОТДЕЛЬНЫЙ запуск движка со своим набором правил — поэтому
-     * кэш сбрасывается: он всегда NULL или malloc'ов, free() достаточно. */
-    free(g_ruleset_dump);
-    g_ruleset_dump = NULL;
+    /* Дамп кэшируется на процесс (см. ruleset_dump в fwcheck.c), а каждая проба
+     * изображает ОТДЕЛЬНЫЙ запуск движка со своим набором правил — поэтому кэш
+     * сбрасывается перед каждой. */
+    fwcheck_reset_cache();
     struct fwcheck r = fw_check(device);
     snprintf(label, sizeof(label), "%s — устройство в firewall", what);
     check(label, r.in_firewall, want_in_firewall);
@@ -257,8 +251,7 @@ int main(void) {
         };
         for (size_t i = 0; i < sizeof(t) / sizeof(*t); i++) {
             g_ruleset = t[i].rs;
-            free(g_ruleset_dump);
-            g_ruleset_dump = NULL;
+            fwcheck_reset_cache();
             check(t[i].what, report_mark_overlap(), t[i].want);
         }
     }

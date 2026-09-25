@@ -581,6 +581,14 @@ int from_is_local(const char *s);
 /* Разобрать "uid:N" или "uid:N-M". 0 — годится, lo/hi заполнены; -1 — нет. */
 int from_uid_range(const char *s, unsigned *lo, unsigned *hi);
 
+/* Виды выходов ОДНИМ списком (parse.c): из него читают печать (out_kind_name), проверку
+ * --kind (out_kind_known) и разбор поля kind. "static" снят ради tests/specmatch.c: стенд
+ * идёт по KINDS и красится, если кто-то добавит вид и забудет прикрыть его случаем — так
+ * пропуск ловится компиляцией теста, а не чтением диффа. */
+struct out_kind_entry { const char *name; enum out_kind kind; };
+extern const struct out_kind_entry KINDS[7];
+#define KINDS_N (sizeof(KINDS) / sizeof(KINDS[0]))
+
 const char *out_kind_name(enum out_kind k);
 int out_kind_known(const char *s);
 

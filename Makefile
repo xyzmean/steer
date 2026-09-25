@@ -145,18 +145,19 @@ ext-syntax:
 ext-test:
 	@BUILD=$(BUILD) CC="$(CC)" sh tests/ext-test.sh
 
-# Подбор доменного правила проверяется отдельной программой, а не через движок: сам подбор
-# статический внутри резолвера, и дотянуться до него иначе значило бы добавить в движок
-# подкоманду ради теста. Файл включает исходники резолвера целиком — см. tests/dnsmatch.c.
+# Подбор доменного правила проверяется отдельной программой, а не через движок: подбор
+# сам — публичная функция резолвера (ruleset_match), а дотянуться до него иначе значило бы
+# добавить в движок подкоманду ради теста. Резолвер (DNSD_SRC) линкуется отдельными
+# объектами, как и модель (MODEL_SRC) — см. tests/dnsmatch.c.
 $(BUILD)/dnsmatch: tests/dnsmatch.c $(DNSD_SRC) src/lib/sindex.h src/lib/nftnl.h src/lib/ctnl.h \
-                   src/dnsd/dnsd_int.h $(MODEL_SRC) src/model/spec.h
+                   src/lib/jsonw.c src/dnsd/dnsd_int.h $(MODEL_SRC) src/model/spec.h
 	@mkdir -p $(BUILD)
-	$(CC) $(CFLAGS) -o $@ tests/dnsmatch.c $(MODEL_SRC)
+	$(CC) $(CFLAGS) -o $@ tests/dnsmatch.c $(DNSD_SRC) src/lib/jsonw.c $(MODEL_SRC)
 
 # Парсер конфигурации проверяется отдельной программой по той же причине: load_spec
 # читает файл и зовёт die()/exit(2) на неверной спеке — перехватить это через подкоманду
-# движка нельзя. Файл включает исходник парсера и перехватывает exit через setjmp —
-# см. tests/specmatch.c.
+# движка нельзя. load_spec ошибку возвращает (правило 5, docs/architecture.md, раздел 2), и
+# стенд линкуется с парсером отдельным объектом (MODEL_SRC) — см. tests/specmatch.c.
 # Таблица дата-центров Telegram — см. пояснение в самом стенде. Собирается с заглушками
 # mbedtls (-Itests/stub) по той же причине, что и ext-syntax: настоящей библиотеки в `make
 # test` нет по построению.
@@ -197,7 +198,7 @@ $(BUILD)/tgwsfailmatch: tests/tgwsfailmatch.c src/proto/tgws/tgws.c
 
 $(BUILD)/specmatch: tests/specmatch.c $(MODEL_SRC) src/model/spec.h
 	@mkdir -p $(BUILD)
-	$(CC) $(CFLAGS) -o $@ tests/specmatch.c
+	$(CC) $(CFLAGS) -o $@ tests/specmatch.c $(MODEL_SRC)
 
 # Тот же исходник, собранный КАК РАСШИРЕННЫЙ. Нужен потому, что виды выходов vless и
 # xsteer в базовой сборке отвергаются парсером (и обязаны отвергаться — см. spec.c), а
@@ -207,7 +208,7 @@ $(BUILD)/specmatch: tests/specmatch.c $(MODEL_SRC) src/model/spec.h
 # #ifdef — так «базовая отказывает» и «расширенная разбирает» проверяются одним файлом.
 $(BUILD)/specmatch-ext: tests/specmatch.c $(MODEL_SRC) src/model/spec.h
 	@mkdir -p $(BUILD)
-	$(CC) $(CFLAGS) -DSTEER_EXTENDED -o $@ tests/specmatch.c
+	$(CC) $(CFLAGS) -DSTEER_EXTENDED -o $@ tests/specmatch.c $(MODEL_SRC)
 
 # Поддельный TCP проверяется в памяти: сборка и разбор сегмента, контрольные суммы и
 # арифметика номеров — чистые функции без сокетов, поэтому стенд не требует ни сети, ни
@@ -216,20 +217,23 @@ $(BUILD)/obfsmatch: tests/obfsmatch.c src/proto/obfs/obfs.c src/proto/obfs/obfs.
 	@mkdir -p $(BUILD)
 	$(CC) $(CFLAGS) -o $@ tests/obfsmatch.c $(MODEL_SRC)
 
-# Выход kind=awg без ядра: разбор файла awg-quick, спека, побайтная сборка сообщений netlink
-# (tests/awgmatch.c включает spec.c и awg.c). Дважды — роутерная и Android-сборка: у них разная
-# метка сокета туннеля без via (0 против STEER_SELF_MARK). С ядром — tests/awgns.sh.
+# Выход kind=awg без ядра: разбор файла awg-quick, спека, побайтная сборка сообщений netlink.
+# Модель (MODEL_SRC) линкуется отдельным объектом, src/kinds/awg.c — по-прежнему #include
+# (вне пяти каталогов правила 4, docs/architecture.md, раздел 4) — см. шапку tests/awgmatch.c.
+# Дважды — роутерная и Android-сборка: у них разная метка сокета туннеля без via (0 против
+# STEER_SELF_MARK). С ядром — tests/awgns.sh.
 $(BUILD)/awgmatch: tests/awgmatch.c src/kinds/awg.c src/kinds/awg.h src/lib/nlbuf.h $(MODEL_SRC) src/model/spec.h
 	@mkdir -p $(BUILD)
-	$(CC) $(CFLAGS) -o $@ tests/awgmatch.c
+	$(CC) $(CFLAGS) -o $@ tests/awgmatch.c $(MODEL_SRC)
 
 $(BUILD)/awgmatch-android: tests/awgmatch.c src/kinds/awg.c src/kinds/awg.h src/lib/nlbuf.h $(MODEL_SRC) src/model/spec.h
 	@mkdir -p $(BUILD)
-	$(CC) $(CFLAGS) -DSTEER_ANDROID -o $@ tests/awgmatch.c
+	$(CC) $(CFLAGS) -DSTEER_ANDROID -o $@ tests/awgmatch.c $(MODEL_SRC)
 
-$(BUILD)/failovermatch: tests/failovermatch.c src/daemon/failover.c
+$(BUILD)/failovermatch: tests/failovermatch.c src/daemon/failover.c src/daemon/daemon.h \
+                        src/daemon/failover_int.h src/model/spec.h src/lib/err.c
 	@mkdir -p $(BUILD)
-	$(CC) $(CFLAGS) -o $@ tests/failovermatch.c
+	$(CC) $(CFLAGS) -o $@ tests/failovermatch.c src/daemon/failover.c src/lib/err.c
 
 # Зависимость выхода от чужого firewall: fw_check судит о конфигурации по тексту дампа
 # nft, и проверить эвристику можно только примерами. Стенд включает исходник движка и
@@ -237,7 +241,7 @@ $(BUILD)/failovermatch: tests/failovermatch.c src/daemon/failover.c
 $(BUILD)/fwmatch: tests/fwmatch.c $(CORE_SRC) $(CORE_HDR)
 	@mkdir -p $(BUILD)
 	$(CC) $(CFLAGS) -o $@ tests/fwmatch.c \
-		$(filter-out src/daemon/fwcheck.c src/daemon/explain.c src/daemon/main.c,$(CORE_SRC))
+		$(filter-out src/daemon/main.c,$(CORE_SRC))
 
 # Управление потоком HTTP/2 проверяется в памяти: h2.c общается с сетью только через
 # struct h2_io, поэтому стенд подменяет его целиком. -Itests/stub нужен, чтобы не тянуть

@@ -51,7 +51,7 @@
  *
  * Отдельной функцией — чтобы это проверялось стендом: разбор ответа ядра для проверки
  * требует живого nft, а выбор фразы — нет. */
-static const char *explain_set_phrase(const char *addr, int has_files, int has_domains) {
+const char *explain_set_phrase(const char *addr, int has_files, int has_domains) {
     int fake = addr && (strncmp(addr, "198.18.", 7) == 0 || strncmp(addr, "198.19.", 7) == 0);
     if (fake) return "domain set";
     if (has_files && has_domains) return "address+domain set";

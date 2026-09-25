@@ -15,6 +15,12 @@ struct fwcheck { int in_firewall, masqueraded; };
 
 struct fwcheck fw_check(const char *device);
 int report_mark_overlap(void);
+/* Сброс кэша дампа ruleset (fwcheck.c) — только для tests/fwmatch.c: изображает свежий
+ * процесс на каждую пробу, как в бою (короткоживущий CLI). */
+void fwcheck_reset_cache(void);
+/* Чем объяснять совпадение адреса — доменным списком, адресным или обоими (explain.c);
+ * отдельной функцией ради стенда tests/fwmatch.c, см. её шапку там же. */
+const char *explain_set_phrase(const char *addr, int has_files, int has_domains);
 #ifndef STEER_ANDROID
 void report_traceroute_dep(const struct spec *sp);
 void report_output_deps(const struct spec *sp);

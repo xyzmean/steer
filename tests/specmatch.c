@@ -18,23 +18,19 @@
  *
  * load_spec() ошибку ВОЗВРАЩАЕТ, а не завершает процесс сама (правило 5, docs/architecture.md,
  * раздел 2) — код 2 ниже не результат перехваченного exit(), а то же число, каким точка входа
- * (err_die) отвечает на -1 от load_spec. Перехватывать здесь больше нечего: тест включает
- * ИСХОДНИК парсера (#include "../src/model/parse.c" и соседей) и читает код возврата
- * load_spec напрямую. Текст отказа кладётся в struct err, а не идёт в stderr сам — в этом
- * стенде он не проверяется (проверяется код), а сверяет его текст снимок apply --dry-run
- * (tests/snapshot.sh), который гоняет настоящий бинарник. */
+ * (err_die) отвечает на -1 от load_spec. Перехватывать здесь больше нечего: стенд линкуется с
+ * парсером отдельным объектом (MODEL_SRC, Makefile) и читает код возврата load_spec напрямую.
+ * Текст отказа кладётся в struct err, а не идёт в stderr сам — в этом стенде он не
+ * проверяется (проверяется код), а сверяет его текст снимок apply --dry-run (tests/snapshot.sh),
+ * который гоняет настоящий бинарник. */
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
+#include <sys/stat.h>
+#include <time.h>
 #include <unistd.h>
 
-#include "../src/lib/err.c"
-#include "../src/lib/jsonr.c"
-#include "../src/lib/tmpfile.c"
-#include "../src/model/parse.c"
-#include "../src/model/registry.c"
-#include "../src/model/probe.c"
-#include "../src/compile/nftcompat.c"
+#include "spec.h"
 
 static int fails;
 

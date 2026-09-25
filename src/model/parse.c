@@ -380,8 +380,10 @@ static int parse_obfs(struct js *j, struct output *o, struct err *e) {
 
 /* Виды выходов ОДНИМ списком: из него и печать (out_kind_name), и проверка флага
  * --kind (out_kind_known), и разбор поля kind ниже. Три места, читающие одну таблицу,
- * вместо трёх списков, которые расходятся молча — см. объяснение у объявлений в spec.h. */
-static const struct { const char *name; enum out_kind kind; } KINDS[] = {
+ * вместо трёх списков, которые расходятся молча — см. объяснение у объявлений в spec.h.
+ * struct out_kind_entry, KINDS_N и объявление KINDS[7] — там же: "static" снят ради
+ * tests/specmatch.c. */
+const struct out_kind_entry KINDS[7] = {
     { "direct",    OUT_DIRECT },
     { "interface", OUT_INTERFACE },
     { "vless",     OUT_VLESS },
@@ -390,7 +392,6 @@ static const struct { const char *name; enum out_kind kind; } KINDS[] = {
     { "tgws",      OUT_TGWS },
     { "awg",       OUT_AWG },
 };
-#define KINDS_N (sizeof(KINDS) / sizeof(KINDS[0]))
 
 const char *out_kind_name(enum out_kind k) {
     for (size_t i = 0; i < KINDS_N; i++)

@@ -14,21 +14,12 @@
  *   - одно и то же имя, заданное и точным, и доменным правилом, работает как доменное: в
  *     индексе это один ключ с двумя метками, и потеря метки была бы невидима.
  *
- * Включаются ИСХОДНИКИ резолвера, в порядке исходного файла: подбор — статическая функция
- * внутри него, и вызывать её иначе можно было бы только через новую подкоманду, то есть
- * добавив в движок код ради теста. */
-#include "../src/lib/sindex.c"
-#include "../src/lib/nftnl.c"
-#include "../src/lib/jsonw.c"
-#include "../src/lib/ctnl.c"
-#include "../src/dnsd/rules.c"
-#include "../src/dnsd/wire.c"
-#include "../src/dnsd/origdst.c"
-#include "../src/dnsd/fakeip.c"
-#include "../src/dnsd/table.c"
-#include "../src/dnsd/dlog.c"
-#include "../src/dnsd/proxy.c"
-#include "../src/dnsd/main.c"
+ * Резолвер (DNSD_SRC) линкуется отдельным объектом (Makefile, docs/architecture.md, раздел
+ * 4): подбор — публичная функция резолвера (ruleset_match, dnsd_int.h), а таблица ожиданий
+ * (struct pending и соседи, проверяемая ниже отдельно) — единственный кусок, у которого
+ * "static" снят ради этого стенда, тоже в dnsd_int.h. */
+#include "dnsd_int.h"
+#include "nftnl.h"
 #include <sys/stat.h>
 
 static int fails;

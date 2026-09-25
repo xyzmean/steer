@@ -21,6 +21,7 @@
 #include <time.h>
 #include <unistd.h>
 #include <sys/stat.h>
+#include <fcntl.h>
 
 int rule_added = 0;
 int rule_deleted = 0;
@@ -92,23 +93,28 @@ static int cmd_count(const char *line) {
 static const char *g_rules = "";
 static const char *g_routes = "";
 
-static FILE *test_popen(const char *cmd, const char *mode) {
+/* failover.c линкуется отдельным объектом (docs/architecture.md, раздел 4), поэтому подмену
+ * popen/pclose/sleep нельзя сделать макросом — макрос виден только внутри своей единицы
+ * трансляции. Вместо него — три функции с именами и подписями из <stdio.h>/<unistd.h>:
+ * сильные символы в объекте стенда перекрывают слабые из libc при компоновке (тот же приём,
+ * которым тесты подменяют библиотечные функции без LD_PRELOAD), и вызовы из failover.o
+ * приходят сюда, а не в ядро. */
+FILE *popen(const char *cmd, const char *mode) {
     (void)mode;
     const char *text = strstr(cmd, "rule") ? g_rules : g_routes;
     return fmemopen((void *)text, strlen(text), "r");
 }
-
-#define popen(cmd, mode) test_popen(cmd, mode)
-#define pclose(f) fclose(f)
+int pclose(FILE *f) { return fclose(f); }
 
 /* Ожидание подъёма подменено пустышкой. revive ждёт десятью секундными шагами, и настоящий
  * sleep стоил бы десять секунд на каждую проверку этой ветки, не добавляя к ней ничего:
  * устройства в стенде по ходу прохода не появляются и не исчезают. */
 static int g_slept;
-static unsigned test_sleep(unsigned n) { (void)n; g_slept++; return 0; }
-#define sleep(n) test_sleep(n)
+unsigned sleep(unsigned n) { (void)n; g_slept++; return 0; }
 
 #include "../src/model/spec.h"
+#include "daemon.h"
+#include "failover_int.h"
 
 /* Спека — значение, а не глобалы (правило 6, docs/architecture.md, раздел 2): один экземпляр
  * на весь стенд, ровно как в других стендах модели. load_spec/registry_assign здесь мокнуты —
@@ -144,11 +150,6 @@ int ctnl_evict_mark(uint32_t val, uint32_t mask) {
  * здоровье устройств он задаёт своим швом g_health_probe, и до этих функций дело не доходит. */
 int awg_healthy(const struct output *o, const char *dev) { (void)o; (void)dev; return 1; }
 int awg_revive(const struct spec *sp, const struct output *o, const char *dev) { (void)sp; (void)o; (void)dev; return 0; }
-#include "../src/daemon/failover.c"
-
-#undef popen
-#undef pclose
-#undef sleep
 
 static int g_fail;
 

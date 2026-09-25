@@ -88,9 +88,17 @@ static void remember_chain(char tab[FWC_CHAINS][64], size_t *n, const char *name
  * `nft -f`, а status/diag ruleset не трогают. Дамп по-прежнему --terse (см.
  * комментарий в fw_check), так что в памяти он занимает килобайты, а живёт до
  * конца короткоживущего CLI-процесса. */
-/* Кэш всегда либо NULL, либо получен malloc'ом: tests/fwmatch.c сбрасывает его
- * между пробами обычным free(), изображая свежий процесс на каждую пробу. */
+/* Кэш всегда либо NULL, либо получен malloc'ом: tests/fwmatch.c сбрасывает его между
+ * пробами через fwcheck_reset_cache(), изображая свежий процесс на каждую пробу. */
 static char *g_ruleset_dump;
+
+/* Сброс кэша дампа — единственное, что стенду нужно от него самого, а не через fw_check().
+ * g_ruleset_dump — static (правило 4, docs/architecture.md, раздел 4: только то, что
+ * пересекает границу файла, выходит из static, и то функцией, а не голым указателем). */
+void fwcheck_reset_cache(void) {
+    free(g_ruleset_dump);
+    g_ruleset_dump = NULL;
+}
 
 static const char *ruleset_dump(void) {
     if (g_ruleset_dump) return g_ruleset_dump;

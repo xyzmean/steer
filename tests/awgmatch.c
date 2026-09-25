@@ -13,21 +13,18 @@
  * tests/awgns.sh (свежее ядро, модуль wireguard, без AmneziaWG — там же отказ без модуля) и
  * tests/awg49e.sh (ядро 4.9 с модулем AmneziaWG).
  *
- * Стенд включает исходники spec.c и awg.c целиком: load_spec() возвращает отказ, а не зовёт
- * exit() сама (правило 5, docs/architecture.md, раздел 2), и spec_str ниже читает код возврата
- * напрямую — перехватывать больше нечего. run_quiet — заглушка: до команд ip стенд не доходит. */
+ * Парсер спеки (MODEL_SRC) линкуется отдельным объектом (Makefile): load_spec() возвращает
+ * отказ, а не зовёт exit() сама (правило 5, docs/architecture.md, раздел 2), и spec_str ниже
+ * читает код возврата напрямую — перехватывать больше нечего. src/kinds/awg.c — вне пяти
+ * каталогов правила 4 (раздел 4), поэтому остаётся #include: awg_conf_free и другие его
+ * статические помощники стенду нужны как есть. run_quiet — заглушка: до команд ip стенд не
+ * доходит. */
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
 #include <unistd.h>
 
-#include "../src/lib/err.c"
-#include "../src/lib/jsonr.c"
-#include "../src/lib/tmpfile.c"
-#include "../src/model/parse.c"
-#include "../src/model/registry.c"
-#include "../src/model/probe.c"
-#include "../src/compile/nftcompat.c"
+#include "spec.h"
 
 int run_quiet(const char *const argv[]) { (void)argv; return 0; }
 

@@ -16,8 +16,7 @@
  * TLS/SNI parsing needed at all). Pool: 198.18.0.0/15, the RFC 2544
  * benchmarking range, the same convention already used by Clash/sing-box/
  * mihomo for this exact purpose; effectively never a real destination. */
-#define FAKEIP_POOL_BASE 0xC6120000u /* 198.18.0.0 */
-#define FAKEIP_POOL_SIZE 131072u     /* 198.18.0.0 - 198.19.255.255 */
+/* FAKEIP_POOL_BASE/SIZE — в dnsd_int.h. */
 
 struct fakeip_table g_fakeip;
 const char *g_fakeip_state_path;
@@ -25,7 +24,7 @@ const char *g_fakeip_state_path;
 /* Индекс домен -> номер записи. Тот же приём, что у правил, и по той же причине: без него
  * каждый ответ стоил трёх переборов таблицы со сравнением строк, а загрузка состояния была
  * квадратичной — файл на 5000 записей означал 12,5 миллиона сравнений при старте. */
-static struct sindex g_fakeip_idx;
+struct sindex g_fakeip_idx;
 
 static const char *fakeip_key(const void *owner, uint32_t idx) {
     return ((const struct fakeip_table *)owner)->entries[idx].domain;
@@ -49,7 +48,7 @@ static uint32_t fakeip_index_to_addr(size_t idx) { return FAKEIP_POOL_BASE + (ui
  * allocate .3 as well — two domains on ONE fake IP, whose DNAT entry then points
  * at whichever was inserted last, i.e. one of them silently reaches the other's
  * site. */
-static size_t g_fakeip_next;
+size_t g_fakeip_next;
 
 static int fakeip_table_add(struct fakeip_table *t, const char *domain, uint32_t addr) {
     if (t->n == t->cap) {

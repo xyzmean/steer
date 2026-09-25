@@ -39,6 +39,7 @@
 #include "spec.h"
 #include "awg.h"
 #include "run.h"
+#include "failover_int.h"
 
 /* Уровень в журнале приписывается КАЖДОЙ строке — это контракт, по которому управляющий
  * слой (splify2) раскрашивает журнал, и он разбирает именно префикс, а не текст. Базовый
@@ -257,8 +258,9 @@ static int xs_state_read(const char *dev, int *up, int *fresh) {
 #define TCP_PROBE_TIMEOUT 4
 
 /* Шов замера — симметрично шву здоровья и по той же причине: стенду нужно задавать
- * задержки кандидатов, не поднимая сокетов. В бою указатель NULL и меряет device_latency. */
-static int (*g_latency_probe)(const struct spec *, const struct output *, const char *);
+ * задержки кандидатов, не поднимая сокетов. В бою указатель NULL и меряет device_latency.
+ * Объявление (extern) — в failover_int.h: его присваивает tests/failovermatch.c. */
+int (*g_latency_probe)(const struct spec *, const struct output *, const char *);
 
 /* ЗАДЕРЖКА КАНДИДАТА в миллисекундах, -1 — не измерилась.
  *
@@ -310,17 +312,18 @@ const struct output *out_for_device(const struct spec *sp, const struct output *
     return owner ? owner : o;
 }
 
-static int device_healthy_for(const struct spec *sp, const struct output *o, const char *dev);
+int device_healthy_for(const struct spec *sp, const struct output *o, const char *dev);
 /* Проба здоровья вызывается через указатель, а не напрямую, ровно ради одного: стенд
  * гистерезиса задаёт здоровье устройств по тику, не создавая интерфейсов в /sys и не открывая
  * сокетов. В бою указатель НИКОГДА не меняется и всегда ссылается на device_healthy_for —
- * ветка предсказуемая, той же природы, что швы путей для стендов в остальном коде. */
-static int (*g_health_probe)(const struct spec *, const struct output *, const char *);
+ * ветка предсказуемая, той же природы, что швы путей для стендов в остальном коде.
+ * Объявление (extern) — в failover_int.h: его присваивает tests/failovermatch.c. */
+int (*g_health_probe)(const struct spec *, const struct output *, const char *);
 static int health_of(const struct spec *sp, const struct output *o, const char *dev) {
     return g_health_probe ? g_health_probe(sp, o, dev) : device_healthy_for(sp, o, dev);
 }
 
-static int device_healthy_for(const struct spec *sp, const struct output *o, const char *dev) {
+int device_healthy_for(const struct spec *sp, const struct output *o, const char *dev) {
     if (!device_present(dev)) return 0;
     /* Мера здоровья принадлежит УСТРОЙСТВУ, а не виду выхода, который его назвал: у
      * устройства с владельцем спрашиваем так, как спросил бы владелец. Для выхода,
@@ -562,18 +565,8 @@ void rule_drop(unsigned mark, int table) {
  * снимались точно, по приоритету, а не «первая попавшаяся». wrong[] — наше правило на чужом
  * приоритете: осталось от сборки, где приоритет выбирало ядро. Чистая функция — стенд
  * failovermatch. */
-#define RULE_COPIES_MAX 8
-struct rule_copies {
-    int known;                      /* дамп прочитан (пустым он на живой коробке не бывает) */
-    int n;                          /* верных копий */
-    unsigned long pref[RULE_COPIES_MAX];
-    int wrong_n;                    /* копий на чужом приоритете */
-    unsigned long wrong[RULE_COPIES_MAX];
-    int legacy_n;                   /* прежняя форма без маски (см. rule_drop) */
-    unsigned long legacy[RULE_COPIES_MAX];
-};
-
-static struct rule_copies rule_copies_of(const char *rules, uint32_t mark, int table) {
+/* struct rule_copies и RULE_COPIES_MAX — в failover_int.h: их читает и стенд failovermatch. */
+struct rule_copies rule_copies_of(const char *rules, uint32_t mark, int table) {
     struct rule_copies c;
     memset(&c, 0, sizeof c);
     c.known = rules && rules[0] != '\0';
@@ -952,42 +945,18 @@ void bind_device(struct output *o, const char *dev) {
  * снять нельзя только потому, что TUN ещё не поднялся» здесь ничем не задет: сверка
  * ниже правило не снимает, а возвращает. */
 
-enum tbl_state {
-    TBL_EMPTY,        /* в таблице нет ничего похожего на default */
-    TBL_BLACKHOLE,    /* запрет: blackhole/unreachable/prohibit default */
-    TBL_DEV,          /* default через устройство */
-    TBL_OTHER,        /* default есть, но устройство из него не вычитывается */
-};
-
-struct route_facts {
-    /* known — удалось ли вообще прочитать состояние ядра.
-     *
-     * Это не перестраховка, а защита от худшего исхода всей затеи. Сверка отвечает на вопрос
-     * «состояние разъехалось?», и если ответ построен на ПУСТОМ дампе, он всегда «да» — тогда
-     * сторож каждую минуту сносил бы привязку живого выхода (`ip route flush table N`) и
-     * поднимал заново, то есть сам делал бы короткий провал помеченного трафика раз в минуту и
-     * заливал журнал. Ровно этот класс беды в этом файле уже описан выше про ifdown/ifup.
-     *
-     * Признак «прочитать не удалось» — ПУСТОЙ вывод `ip rule show`. На живой коробке он пуст не
-     * бывает никогда: там всегда лежат три правила ядра (0, 32766, 32767). Поэтому пустота
-     * означает не «правил нет», а «спросить не получилось»: нет `ip`, busybox не понял ключ,
-     * отказал popen. Проверять код возврата было бы хуже — busybox отдаёт ноль и на том, чего
-     * не понял. */
-    int known;
-    int rule;             /* правило `fwmark <метка> table <таблица>` в ядре есть */
-    enum tbl_state table;
-    char dev[32];         /* устройство из default, когда table == TBL_DEV */
-    int backstop;         /* запасной запрет (STEER_BACKSTOP_METRIC) на месте */
-};
-
-/* Разбор дословного вывода `ip rule show` и `ip route show table N`.
+/* enum tbl_state и struct route_facts (known — удалось ли вообще прочитать состояние ядра;
+ * это не перестраховка, а защита от худшего исхода всей затеи — см. failover_int.h) — в
+ * failover_int.h: их читает и стенд failovermatch.
+ *
+ * Разбор дословного вывода `ip rule show` и `ip route show table N`.
  *
  * Чистая функция, без единого вызова ip: иначе решение «состояние разъехалось» нельзя
  * было бы закрыть стендом, а ошибка именно здесь ничего не сломает заметно — она просто
  * оставит туннель мёртвым до перезапуска движка, то есть вернёт ту самую неполадку.
  * Стенд: tests/failovermatch.c. */
-static struct route_facts route_facts_of(const char *rules, const char *routes,
-                                         uint32_t mark, int table) {
+struct route_facts route_facts_of(const char *rules, const char *routes,
+                                  uint32_t mark, int table) {
     struct route_facts f;
     f.known = rules && rules[0] != '\0';
     f.rule = 0;
@@ -1096,14 +1065,14 @@ static struct route_facts route_facts_of(const char *rules, const char *routes,
 }
 
 /* Годится ли фактическое состояние для «выход живёт через dev». */
-static int routing_live_ok(const struct route_facts *f, const char *dev) {
+int routing_live_ok(const struct route_facts *f, const char *dev) {
     return f->rule && f->table == TBL_DEV && strcmp(f->dev, dev) == 0;
 }
 
 /* Годится ли фактическое состояние для «живых устройств нет» при данном режиме отказа.
  * drop требует и правила, и запрета в таблице: запрет без правила — это утечка напрямую
  * (таблицу никто не спрашивает), правило без запрета — трафик в мёртвый туннель. */
-static int routing_failed_ok(const struct route_facts *f, enum on_fail of) {
+int routing_failed_ok(const struct route_facts *f, enum on_fail of) {
     /* Запрет — основной или только запасной: второе остаётся, когда ядро вычистило маршрут
      * исчезнувшего устройства, и трафик при нём стоит ровно так же. */
     if (of == FAIL_DROP)
@@ -1196,9 +1165,9 @@ static int failover_hyst(void) {
     }
     return g_hyst_cache;
 }
-/* Стенду нужно менять порог между проходами; в бою процесс короткоживущий и это не зовётся. */
-static void failover_hyst_reset_for_test(void) __attribute__((unused));
-static void failover_hyst_reset_for_test(void) { g_hyst_cache = -2; }
+/* Стенду нужно менять порог между проходами; в бою процесс короткоживущий и это не зовётся.
+ * Объявление — в failover_int.h. */
+void failover_hyst_reset_for_test(void) { g_hyst_cache = -2; }
 
 /* Счётчик подряд-здоровых тиков более предпочтительного устройства — рядом с активным, третьим
  * полем в том же файле. Все читатели файла обязаны СЪЕДАТЬ три поля, иначе оставшийся на строке
@@ -1281,7 +1250,7 @@ static int active_streak_get(const char *out) {
     return val;
 }
 
-static void active_get(const char *out, char *dev, size_t n) {
+void active_get(const char *out, char *dev, size_t n) {
     dev[0] = '\0';
     char path[256];
     active_path(path, sizeof(path));
@@ -1404,7 +1373,7 @@ static int restart_allowed(const char *dev) {
     return 1;
 }
 
-static int revive(const struct spec *sp, const struct output *o, const char *dev, int verbose) {
+int revive(const struct spec *sp, const struct output *o, const char *dev, int verbose) {
     if (!restart_allowed(dev)) {
         if (verbose)
             fprintf(stderr, LOG_I "%s: перезапуск был недавно, пропускаю\n", dev);
@@ -1524,7 +1493,7 @@ static int revive(const struct spec *sp, const struct output *o, const char *dev
     return 0;
 }
 
-static void cleanup_probe_rule(void) {
+void cleanup_probe_rule(void) {
     char prio[16];
     snprintf(prio, sizeof(prio), "%d", PROBE_PRIO);
     const char *del[] = { "ip", "-4", "rule", "del", "priority", prio, NULL };
