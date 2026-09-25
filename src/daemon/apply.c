@@ -326,7 +326,7 @@ static void report_legacy_gaps(const struct spec *sp, const struct groups *gr) {
 #ifndef STEER_ANDROID
     /* На Android таблица nat iptables есть всегда, но PREROUTING в ней у netd — пустая
      * oem_nat_pre, и предупреждать там не о чем. Почему это вообще важно — у
-     * generate_legacy_tail. */
+     * legacy.c (шаг 4, «почему dstnat - 1»). */
     FILE *t = fopen("/proc/net/ip_tables_names", "r");
     if (t) {
         char line[64];
@@ -494,7 +494,7 @@ int cmd_apply(const char *spec, int dry) {
      * стенды и интерфейс), а замена — дело применения. */
     fprintf(f, "table inet %s\ndelete table inet %s\n", nft_table(), nft_table());
     /* Таблицы ip и ip6 — тем же приёмом и в той же транзакции. Их создаёт только старая
-     * раскладка (generate_legacy_tail), но УДАЛЯТЬ их обязана любая: ядро телефона обновится
+     * раскладка (legacy.c), но УДАЛЯТЬ их обязана любая: ядро телефона обновится
      * до нового (Android 17 — ядра новее 5.2), apply выберет современную раскладку, и
      * оставшаяся от старой цепочка nat заворачивала бы DNS второй раз, а карта fakeip в ней
      * отставала бы от резолвера. И наоборот, выход раскладки из ip6 (ядро перестало

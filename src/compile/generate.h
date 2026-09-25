@@ -1,26 +1,35 @@
 #ifndef STEER_GENERATE_H
 #define STEER_GENERATE_H
 
-/* Компиляция набора групп в текст правил nftables (src/compile/generate.c). */
+/* Компиляция набора групп в набор правил nftables (src/compile/generate.c): дерево (ir.h),
+ * раскладка старого ядра (legacy.h) и печать (print.c). */
 
 #include <stdio.h>
 #include "groups.h"
+#include "ir.h"
+#include "legacy.h"
 
-/* Раскладка набора правил этого запуска — флаги NFTC_* из nft_compat (spec.h). Ставит
- * cmd_apply перед генерацией; читают и apply.c (report_legacy_gaps), и diag.c, и explain.c —
- * подробно у объявления в generate.c. */
-extern int g_nftc;
-#define NFT_LEGACY (g_nftc & NFTC_LEGACY)
-
-/* 0 — успех, текст ruleset записан в f; -1 — отказ (недостижимо на разобранной спеке, см.
- * определение), текст в e->msg — см. правило 5, docs/architecture.md, раздел 2. Читает
- * спеку sp и её группы gr (результат build_groups) — правило 6. */
+/* Дерево современной раскладки по спеке sp и её группам gr. 0 — успех; -1 — отказ
+ * (недостижимо на разобранной спеке, кроме нехватки памяти), текст в e->msg — правило 5,
+ * docs/architecture.md, раздел 2. Спека и группы — параметрами, правило 6. */
+int nft_build(struct nft_rs *rs, const struct spec *sp, const struct groups *gr, struct err *e);
+/* Текст ruleset в f: nft_build, legacy_rewrite по g_nftc, nft_print. На отказе в f не
+ * пишется ничего. */
 int generate(const struct spec *sp, const struct groups *gr, FILE *f, struct err *e);
+
+/* Построители видов выхода — будущий kind_ops.emit (docs/architecture.md, «Вид выхода»):
+ * дописывают в дерево то, что нужно одному выходу своего вида. */
+void nft_emit_zapret(struct nft_rs *rs, const struct spec *sp, const struct output *o);
+void nft_emit_tgws(struct nft_rs *rs, const struct spec *sp, const struct output *o);
+#ifdef STEER_ANDROID
+/* Части только телефона — будущий platform_ops. */
+int nft_emit_output_mark(struct nft_rs *rs, const struct spec *sp, const struct groups *gr,
+                         struct err *e);
+void nft_emit_output_dns(struct nft_rs *rs, const struct spec *sp, const struct groups *gr);
+#endif
+
 void counters_load(void);
 int counter_find(const char *name, int down, unsigned long *p, unsigned long *b);
 void l4_describe(const struct l4match *m, char *dst, size_t n);
-int legacy_has_ip(const struct spec *sp);
-int legacy_has_ip6(void);
-int legacy_may_have_static(const struct group *g);
 
 #endif

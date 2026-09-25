@@ -226,7 +226,7 @@ int has_local(const struct groups *gr) {
 }
 
 /* Есть ли доменный канал на сам телефон. Тогда DNS приложений заворачивается к резолверу —
- * см. emit_local_dns. */
+ * см. nft_emit_output_dns в generate.c. */
 int has_local_domains(const struct groups *gr) {
     for (size_t i = 0; i < gr->n; i++)
         if (group_is_local(&gr->g[i]) && gr->g[i].domains) return 1;
@@ -234,7 +234,7 @@ int has_local_domains(const struct groups *gr) {
 }
 
 /* Есть ли в спеке туннель через via — тогда его сокет несёт STEER_TUNNEL_BIT, и заворот DNS
- * обязан его пропускать (см. emit_local_dns_redirect). */
+ * обязан его пропускать (см. local_dns_redirect в generate.c). */
 int has_via(const struct spec *sp) {
     for (size_t i = 0; i < sp->out_n; i++) if (sp->out[i].via[0]) return 1;
     return 0;

@@ -373,7 +373,7 @@ int cmd_diag(const char *spec) {
      *    спрашивает не нас, без процесса спрашивать некого. */
     if (has_domains(&gr)) {
         /* В старой раскладке у заворота нет своей цепочки — он правило общей цепочки nat
-         * (generate_legacy_tail), и узнаётся по самому правилу. */
+         * (legacy.c, шаг 4), и узнаётся по самому правилу. */
         char redir_rule[40];
         snprintf(redir_rule, sizeof(redir_rule), "redirect to :%d", DNS_PORT);
         int redir = nft_has(NFT_LEGACY ? redir_rule : "chain prerouting_dns");
