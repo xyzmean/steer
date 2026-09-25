@@ -189,13 +189,14 @@ static int bridge_nf_on(void) {
 
 int cmd_diag(const char *spec) {
     static struct spec cfg;
+    static struct groups gr;
     const struct spec *sp = &cfg;
     /* Правило 5, docs/architecture.md, раздел 2: err_die здесь довершает то, что раньше делал
      * die() изнутри load_spec/build_groups. */
     struct err e = {0};
     if (load_spec(spec, &cfg, &e) < 0) err_die(&e);
     if (registry_assign(&cfg, &e) < 0) err_die(&e);
-    if (build_groups(&cfg, &e) < 0) err_die(&e);
+    if (build_groups(&cfg, &gr, &e) < 0) err_die(&e);
     /* Приговор выносится тому устройству, которое несёт трафик, — тому же, о котором
      * рассказывает status и к которому привязал таблицу apply (outputs_adopt_active). */
     outputs_adopt_active(&cfg);
@@ -220,8 +221,8 @@ int cmd_diag(const char *spec) {
 
     /* 3. Наборы. Пустой набор при непустом списке — самая частая настоящая поломка:
      *    правило на месте, трафик мимо, и по status этого не видно. */
-    for (size_t i = 0; i < g_grp_n; i++) {
-        struct group *g = &g_grp[i];
+    for (size_t i = 0; i < gr.n; i++) {
+        struct group *g = &gr.g[i];
         if (!g->files_n && !g->domains) continue;
         long n = set_count(g->name);
         /* Старая раскладка: префиксы доменной группы лежат во второй половине набора (<имя>_n,
@@ -331,9 +332,9 @@ int cmd_diag(const char *spec) {
 
     /* 4. Резолвер и редирект. Доменные каналы держатся на обоих: без редиректа клиент
      *    спрашивает не нас, без процесса спрашивать некого. */
-    if (has_domains()) {
+    if (has_domains(&gr)) {
         /* В старой раскладке у заворота нет своей цепочки — он правило общей цепочки nat
-         * (generate_legacy_tail), и узнаётся по самому правилу. */
+         * (legacy.c, шаг 4), и узнаётся по самому правилу. */
         char redir_rule[40];
         snprintf(redir_rule, sizeof(redir_rule), "redirect to :%d", DNS_PORT);
         int redir = nft_has(NFT_LEGACY ? redir_rule : "chain prerouting_dns");
@@ -364,8 +365,8 @@ int cmd_diag(const char *spec) {
         for (size_t i = 0; i < sp->out_n; i++)
             if (sp->out[i].on_fail == FAIL_DROP) drops++;
         int dom_only = 1;
-        for (size_t i = 0; i < g_grp_n; i++)
-            if (g_grp[i].files_n) dom_only = 0;
+        for (size_t i = 0; i < gr.n; i++)
+            if (gr.g[i].files_n) dom_only = 0;
         if (drops)
             diag("ipv6", "fail", "IPv6 наружу работает, а каналы его не разбирают",
                  "выход с on_fail=drop останавливает только IPv4: то, что должно быть "
@@ -403,21 +404,21 @@ int cmd_diag(const char *spec) {
      *    xsteer несёт сырой IP, как wireguard, никаких потоков к узлу у него нет, и цены
      *    тоже нет. Скопировать заметку на xsteer значило бы напечатать постоянную заметку
      *    без причины — ровно то, из-за чего была убрана проверка `udp`. */
-    for (size_t i = 0; i < g_grp_n; i++) {
-        struct output *o = out_by_name(sp, g_grp[i].out);
+    for (size_t i = 0; i < gr.n; i++) {
+        struct output *o = out_by_name(sp, gr.g[i].out);
         if (!o || !out_has_cap(o, KC_FLOW_UDP)) continue;
         char found[64];
         const char *who = NULL;
-        for (size_t k = 0; k < g_grp[i].files_n && !who; k++)
-            who = list_finds_resolver(g_grp[i].files[k], found, sizeof(found));
+        for (size_t k = 0; k < gr.g[i].files_n && !who; k++)
+            who = list_finds_resolver(gr.g[i].files[k], found, sizeof(found));
         if (!who) continue;
         /* Буферы с запасом: строки русские, в UTF-8 это два байта на букву, и обрезка по
          * границе буфера разрубила бы букву посередине. Ровно этим ломался вывод при первом
          * прогоне стенда — недобитый байт делал JSON неразбираемым (см. I-029). */
         char what[256], why[512];
         snprintf(what, sizeof(what), "канал %.40s: в списке %.20s — это %.40s",
-                 g_grp[i].members_n ? g_grp[i].members[0] : g_grp[i].name, found, who);
-        if (has_domains())
+                 gr.g[i].members_n ? gr.g[i].members[0] : gr.g[i].name, found, who);
+        if (has_domains(&gr))
             snprintf(why, sizeof(why),
                      "запросы DNS уйдут в туннель, а там на каждый запрос свой поток к узлу "
                      "со своим рукопожатием: имена разрешатся, но медленнее. Клиентов из "

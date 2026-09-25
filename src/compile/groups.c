@@ -28,8 +28,6 @@
 #include "groups.h"
 #include "daemon.h"
 
-struct group g_grp[MAX_CHANNELS];
-
 /* Дописать адресный список в группу, растя вектор вдвое. Отказ памяти здесь — это «правила
  * не собрать», поэтому громкий (в struct err, а не в stderr — см. правило 5, раздел 2
  * docs/architecture.md): тихо потерянный список превратил бы узкий канал в широкий. */
@@ -44,7 +42,11 @@ static int group_add_file(struct group *g, const char *path, struct err *e) {
     g->files[g->files_n++] = path;
     return 0;
 }
-size_t g_grp_n;
+
+void groups_free(struct groups *gr) {
+    for (size_t i = 0; i < gr->n; i++) free(gr->g[i].files);
+    gr->n = 0;
+}
 
 static int same_from(const struct spec *sp, const struct channel *c, const struct group *g) {
     const char (*cf)[64] = c->from_n ? c->from : sp->from_default;
@@ -70,8 +72,9 @@ static int same_from(const struct spec *sp, const struct channel *c, const struc
  *
  * Внутри каждой из двух групп порядок спеки сохраняется: два правила на разные устройства
  * или два глобальных по-прежнему читаются сверху вниз, как и раньше. */
-int build_groups(const struct spec *sp, struct err *e) {
-    g_grp_n = 0;
+int build_groups(const struct spec *sp, struct groups *gr, struct err *e) {
+    /* Прежние векторы файлов не теряются: повторный разбор в том же значении их отдаёт. */
+    groups_free(gr);
     for (int pass = 0; pass < 2; pass++)
     for (size_t i = 0; i < sp->ch_n; i++) {
         const struct channel *c = &sp->ch[i];
@@ -85,8 +88,8 @@ int build_groups(const struct spec *sp, struct err *e) {
         /* Канал, забирающий ВЕСЬ трафик: у него нет набора вовсе. */
         int all = c->any && !c->prefixes_n && !c->domains_n;
         size_t k = 0;
-        for (; k < g_grp_n; k++) {
-            struct group *g = &g_grp[k];
+        for (; k < gr->n; k++) {
+            struct group *g = &gr->g[k];
             if (strcmp(g->out, c->out) != 0) continue;
             /* «Весь трафик» и «трафик из списка» — РАЗНЫЕ группы, даже когда выход и
              * клиенты совпадают. Слияние их было молчаливой потерей: правило группы
@@ -111,8 +114,8 @@ int build_groups(const struct spec *sp, struct err *e) {
             if (!l4match_same(g->l4, &c->l4)) continue;
             break;
         }
-        if (k == g_grp_n) {
-            struct group *g = &g_grp[g_grp_n++];
+        if (k == gr->n) {
+            struct group *g = &gr->g[gr->n++];
             memset(g, 0, sizeof(*g));
             g->out = c->out;
             g->domains = 0;
@@ -127,7 +130,7 @@ int build_groups(const struct spec *sp, struct err *e) {
             group_set_name(sp, g->name, sizeof(g->name), g->out, all ? "all" : domains ? "dom" : "ip",
                            g->from, g->from_n, g->realip, g->l4);
         }
-        struct group *g = &g_grp[k];
+        struct group *g = &gr->g[k];
         /* Домены только помечаем: их файлы читает резолвер. Режим берём у первого доменного
          * правила в группе — у адресного его нет вовсе, и брать оттуда нечего. */
         if (domains) {
@@ -142,8 +145,8 @@ int build_groups(const struct spec *sp, struct err *e) {
     /* Окончательные имена. Группа с доменами — всегда _dom, потому что имя набора резолвер
      * вычисляет тем же правилом и по-другому его не найдёт. Группы `any` не трогаем: у них
      * набора нет вовсе. */
-    for (size_t i = 0; i < g_grp_n; i++) {
-        struct group *g = &g_grp[i];
+    for (size_t i = 0; i < gr->n; i++) {
+        struct group *g = &gr->g[i];
         if (!g->files_n && !g->domains) continue;
         group_set_name(sp, g->name, sizeof(g->name), g->out, g->domains ? "dom" : "ip",
                        g->from, g->from_n, g->realip, g->l4);
@@ -153,16 +156,16 @@ int build_groups(const struct spec *sp, struct err *e) {
      * выхода совпали после обрезки до 18 символов). Молчать здесь нельзя: именно молчание
      * и было прежней бедой — ядро сливает одноимённые наборы, и трафик уходит не туда без
      * единой строки. Лучше громкий отказ применить спеку, чем тихая ошибка маршрутизации. */
-    for (size_t i = 0; i < g_grp_n; i++)
-        for (size_t k = i + 1; k < g_grp_n; k++)
-            if (!strcmp(g_grp[i].name, g_grp[k].name))
+    for (size_t i = 0; i < gr->n; i++)
+        for (size_t k = i + 1; k < gr->n; k++)
+            if (!strcmp(gr->g[i].name, gr->g[k].name))
                 return err_set(e, "два разных набора каналов получили одно имя %s — "
-                    "укоротите или разведите имена выходов", g_grp[i].name);
+                    "укоротите или разведите имена выходов", gr->g[i].name);
     return 0;
 }
 
-int has_domains(void) {
-    for (size_t i = 0; i < g_grp_n; i++) if (g_grp[i].domains) return 1;
+int has_domains(const struct groups *gr) {
+    for (size_t i = 0; i < gr->n; i++) if (gr->g[i].domains) return 1;
     return 0;
 }
 
@@ -184,9 +187,9 @@ int has_tgws(const struct spec *sp) {
 }
 
 
-int has_fakeip(void) {
-    for (size_t i = 0; i < g_grp_n; i++)
-        if (g_grp[i].domains && !g_grp[i].realip) return 1;
+int has_fakeip(const struct groups *gr) {
+    for (size_t i = 0; i < gr->n; i++)
+        if (gr->g[i].domains && !gr->g[i].realip) return 1;
     return 0;
 }
 
@@ -217,21 +220,21 @@ int group_is_local(const struct group *g) {
 }
 
 #ifdef STEER_ANDROID
-int has_local(void) {
-    for (size_t i = 0; i < g_grp_n; i++) if (group_is_local(&g_grp[i])) return 1;
+int has_local(const struct groups *gr) {
+    for (size_t i = 0; i < gr->n; i++) if (group_is_local(&gr->g[i])) return 1;
     return 0;
 }
 
 /* Есть ли доменный канал на сам телефон. Тогда DNS приложений заворачивается к резолверу —
- * см. emit_local_dns. */
-int has_local_domains(void) {
-    for (size_t i = 0; i < g_grp_n; i++)
-        if (group_is_local(&g_grp[i]) && g_grp[i].domains) return 1;
+ * см. nft_emit_output_dns в generate.c. */
+int has_local_domains(const struct groups *gr) {
+    for (size_t i = 0; i < gr->n; i++)
+        if (group_is_local(&gr->g[i]) && gr->g[i].domains) return 1;
     return 0;
 }
 
 /* Есть ли в спеке туннель через via — тогда его сокет несёт STEER_TUNNEL_BIT, и заворот DNS
- * обязан его пропускать (см. emit_local_dns_redirect). */
+ * обязан его пропускать (см. local_dns_redirect в generate.c). */
 int has_via(const struct spec *sp) {
     for (size_t i = 0; i < sp->out_n; i++) if (sp->out[i].via[0]) return 1;
     return 0;
@@ -294,9 +297,9 @@ static int count_list(const char *path, size_t *total, size_t *bad,
  *   весь список не адреса  — это НЕ ТОТ список, отказываемся и говорим, что делать;
  *   несколько строк плохие — это мусор в файле, предупреждаем и пропускаем их, потому что
  *                            ронять канал из 19 тысяч префиксов из-за одной строки хуже. */
-int check_address_lists(struct err *e) {
-    for (size_t i = 0; i < g_grp_n; i++) {
-        struct group *g = &g_grp[i];
+int check_address_lists(struct groups *gr, struct err *e) {
+    for (size_t i = 0; i < gr->n; i++) {
+        struct group *g = &gr->g[i];
         /* Непрочитанный файл выбрасывается из группы ЗДЕСЬ, до подсчёта и до генерации:
          * дальше по коду его отсутствие уже не отличить от «списка не было», а разница
          * важна — про пропажу надо сказать. Причина почти всегда одна: обновление образа

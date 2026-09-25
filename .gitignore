@@ -40,6 +40,8 @@ build/tlsprobematch
 build/specmatch-ext
 build/awgmatch
 build/awgmatch-android
+build/irmatch
+build/irmatch-android
 build/xswirematch
 build/xsstreammatch
 build/xsepochmatch

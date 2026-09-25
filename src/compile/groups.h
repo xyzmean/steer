@@ -73,23 +73,33 @@ struct group {
 };
 
 
-extern struct group g_grp[MAX_CHANNELS];
-extern size_t g_grp_n;
+/* Группы одного разбора спеки — результат build_groups. До 1.7 они лежали в глобале
+ * g_grp/g_grp_n, и любой, кто читал группы (генератор, status, diag, explain), читал то, что
+ * оставил последний build_groups в процессе, — долг из раздела 5 docs/architecture.md. Теперь
+ * это значение: точка входа держит свой экземпляр (static — он около 45 КБ) и передаёт его
+ * параметром, как struct spec. Векторы files выделены в куче — groups_free их отдаёт;
+ * build_groups сам отдаёт прежние, поэтому экземпляр до первого вызова обязан быть нулевым
+ * (static или `= {0}`). */
+struct groups {
+    struct group g[MAX_CHANNELS];
+    size_t n;
+};
 
 /* build_groups/check_address_lists возвращают код ошибки, а не завершают процесс — правило 5,
  * docs/architecture.md, раздел 2. 0 — успех; -1 — отказ, текст в e->msg. Читают спеку sp — правило 6. */
-int build_groups(const struct spec *sp, struct err *e);
-int has_domains(void);
+int build_groups(const struct spec *sp, struct groups *gr, struct err *e);
+void groups_free(struct groups *gr);
+int has_domains(const struct groups *gr);
 int has_zapret(const struct spec *sp);
 int has_tgws(const struct spec *sp);
-int has_fakeip(void);
+int has_fakeip(const struct groups *gr);
 int is_mac(const char *s);
 int group_is_local(const struct group *g);
-int check_address_lists(struct err *e);
+int check_address_lists(struct groups *gr, struct err *e);
 
 #ifdef STEER_ANDROID
-int has_local(void);
-int has_local_domains(void);
+int has_local(const struct groups *gr);
+int has_local_domains(const struct groups *gr);
 int has_via(const struct spec *sp);
 #endif
 

@@ -46,7 +46,7 @@ $(BUILD)/steer-android: $(CORE_SRC) $(CORE_HDR) VERSION
 	@mkdir -p $(BUILD)
 	$(CC) $(CFLAGS) $(DEFS) -DSTEER_ANDROID -o $@ $(CORE_SRC)
 
-test: all ext-syntax $(BUILD)/steer-android $(BUILD)/tgwssim $(BUILD)/dnsmatch $(BUILD)/specmatch $(BUILD)/specmatch-ext $(BUILD)/xswirematch $(BUILD)/xsconnmatch $(BUILD)/xsstreammatch $(BUILD)/tungromatch $(BUILD)/tunnelmatch $(BUILD)/tunnamematch $(BUILD)/xsconfmatch $(BUILD)/xslinkmatch $(BUILD)/xsroutematch $(BUILD)/chellomatch $(BUILD)/failovermatch $(BUILD)/dcmatch $(BUILD)/msgsplitmatch $(BUILD)/warmmatch $(BUILD)/upmatch $(BUILD)/tgwsfailmatch $(BUILD)/h2match $(BUILD)/xhupmatch $(BUILD)/submatch $(BUILD)/subfetchmatch $(BUILD)/fwmatch $(BUILD)/obfsmatch $(BUILD)/visionmatch $(BUILD)/tlsprobematch $(BUILD)/diagsim $(BUILD)/hwidsum $(BUILD)/awgmatch $(BUILD)/awgmatch-android
+test: all ext-syntax $(BUILD)/steer-android $(BUILD)/tgwssim $(BUILD)/dnsmatch $(BUILD)/specmatch $(BUILD)/specmatch-ext $(BUILD)/xswirematch $(BUILD)/xsconnmatch $(BUILD)/xsstreammatch $(BUILD)/tungromatch $(BUILD)/tunnelmatch $(BUILD)/tunnamematch $(BUILD)/xsconfmatch $(BUILD)/xslinkmatch $(BUILD)/xsroutematch $(BUILD)/chellomatch $(BUILD)/failovermatch $(BUILD)/irmatch $(BUILD)/irmatch-android $(BUILD)/dcmatch $(BUILD)/msgsplitmatch $(BUILD)/warmmatch $(BUILD)/upmatch $(BUILD)/tgwsfailmatch $(BUILD)/h2match $(BUILD)/xhupmatch $(BUILD)/submatch $(BUILD)/subfetchmatch $(BUILD)/fwmatch $(BUILD)/obfsmatch $(BUILD)/visionmatch $(BUILD)/tlsprobematch $(BUILD)/diagsim $(BUILD)/hwidsum $(BUILD)/awgmatch $(BUILD)/awgmatch-android
 	@sh tests/run.sh
 	@sh tests/gen.sh
 	@sh tests/snapshot.sh
@@ -95,6 +95,8 @@ test: all ext-syntax $(BUILD)/steer-android $(BUILD)/tgwssim $(BUILD)/dnsmatch $
 	@$(BUILD)/awgmatch
 	@$(BUILD)/awgmatch-android
 	@sh tests/awgns.sh
+	@$(BUILD)/irmatch
+	@$(BUILD)/irmatch-android
 
 # Перезапись снимка генератора (tests/snapshot.sh). Только когда ruleset меняется
 # намеренно, и в том же коммите, что и изменение: иначе снимок перестаёт что-либо сторожить.
@@ -239,6 +241,19 @@ $(BUILD)/awgmatch-android: tests/awgmatch.c src/kinds/awg.c src/kinds/awg.h src/
 
 # Виды — объектами (без awg.c и без парсера: стенд подменяет load_spec своей спекой).
 FAILOVERMATCH_KINDS := $(filter-out src/kinds/awg.c,$(KINDS_BASE_SRC)) $(KINDS_EXT_SRC)
+
+# Дерево набора правил (src/compile/ir.h): генератор и раскладка старого ядра проверяются
+# запросами к дереву, а не текстом — см. шапку tests/irmatch.c. Модули компилятора линкуются
+# с моделью отдельными объектами. Дважды — роутер и телефон (цепочки на output).
+COMPILE_SRC := $(filter-out $(MODEL_SRC),$(filter src/compile/%,$(CORE_SRC)))
+$(BUILD)/irmatch: tests/irmatch.c tests/unit.h $(COMPILE_SRC) $(MODEL_KINDS) $(CORE_HDR)
+	@mkdir -p $(BUILD)
+	$(CC) $(CFLAGS) -o $@ tests/irmatch.c $(COMPILE_SRC) $(MODEL_KINDS)
+
+$(BUILD)/irmatch-android: tests/irmatch.c tests/unit.h $(COMPILE_SRC) $(MODEL_KINDS) $(CORE_HDR)
+	@mkdir -p $(BUILD)
+	$(CC) $(CFLAGS) -DSTEER_ANDROID -o $@ tests/irmatch.c $(COMPILE_SRC) $(MODEL_KINDS)
+
 $(BUILD)/failovermatch: tests/failovermatch.c src/daemon/failover.c src/daemon/daemon.h \
                         src/daemon/failover_int.h src/model/spec.h src/lib/err.c $(FAILOVERMATCH_KINDS)
 	@mkdir -p $(BUILD)

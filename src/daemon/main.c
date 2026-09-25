@@ -274,6 +274,7 @@ int main(int argc, char **argv) {
     /* Спека — значение, а не глобалы (правило 6): один экземпляр на весь диспетчер команд,
      * static — держать struct spec на стеке нельзя, он большой. */
     static struct spec cfg;
+    static struct groups gr;
     cli_parse(c, argc, argv, 2, &a);
     if (a.state_dir) g_state_dir = a.state_dir;
     const char *spec = a.spec, *arg = a.npos ? a.pos[0] : NULL;
@@ -365,7 +366,7 @@ int main(int argc, char **argv) {
          * «нужен ли», теперь — «поднимаем», и переворачиваться нечему. */
         if (load_spec(spec, &cfg, &e) < 0) err_die(&e);
         if (registry_assign(&cfg, &e) < 0) err_die(&e);
-        if (build_groups(&cfg, &e) < 0) err_die(&e);
+        if (build_groups(&cfg, &gr, &e) < 0) err_die(&e);
         /* В мини-сборке — «поднимать нечего», и это тот же ответ, что даёт генератор
          * правил: он там перенаправления DNS не ставит. Два ответа обязаны совпадать,
          * иначе init-скрипт однажды поднимет резолвер без правила или, хуже, правило
