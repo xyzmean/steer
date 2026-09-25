@@ -146,10 +146,10 @@ int ctnl_evict_mark(uint32_t val, uint32_t mask) {
     return g_ctnl_ret;
 }
 
-/* Выход kind=awg спрашивает ядро по netlink (src/kinds/awg.c); стенду сторожа ядро не нужно —
- * здоровье устройств он задаёт своим швом g_health_probe, и до этих функций дело не доходит. */
-int awg_healthy(const struct output *o, const char *dev) { (void)o; (void)dev; return 1; }
-int awg_revive(const struct spec *sp, const struct output *o, const char *dev) { (void)sp; (void)o; (void)dev; return 0; }
+/* Виды выхода компонуются объектами (src/kinds, кроме awg.c: стенду сторожа ядро не нужно, и
+ * вида awg в его реестре нет). Разбор их ключей зовёт label_ok из парсера, а парсера здесь нет —
+ * спеку стенд подставляет сам (load_spec выше), и до разбора дело не доходит. */
+int label_ok(const char *s) { (void)s; return 1; }
 
 static int g_fail;
 

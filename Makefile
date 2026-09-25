@@ -23,6 +23,11 @@ DEFS    := -DSTEER_VERSION='"$(VERSION)"' $(if $(REV),-DSTEER_REV='"$(REV)"',)
 include build/sources.mk
 CORE_HDR := $(wildcard $(addsuffix /*.h,$(CORE_DIRS)))
 EXT_ALL_SRC := $(sort $(XS_COMMON_SRC) $(EXT_ROUTER_SRC) $(EXT_SERVER_SRC) $(EXT_TGWS_SRC))
+# Модель для стендов, которые компонуют её отдельным списком: разбор спрашивает вид у реестра, поэтому
+# вместе с моделью идут виды (src/kinds). Без awg.c: он тянет run_quiet из lib/run.c, а стенды
+# подменяют run_quiet своим — awg.c берут только те, кому нужен сам вид awg (specmatch, awgmatch).
+# Вид, которого в списке нет, у реестра остаётся записью отказа (см. src/kinds/kind.c).
+MODEL_KINDS := $(MODEL_SRC) $(filter-out src/kinds/awg.c,$(KINDS_BASE_SRC))
 # -I на все каталоги слоёв — через override, чтобы `make CFLAGS=...` его не терял.
 override CFLAGS += $(addprefix -I,$(INC_DIRS))
 
@@ -112,9 +117,9 @@ $(BUILD)/tgwssim: $(CORE_SRC) $(CORE_HDR) tests/tgws-stub.c VERSION
 # diagmatch, потому что спеку с `kind: vless` базовая сборка отвергает парсером, а
 # проверять диагностику интереснее всего именно на VLESS-выходе. Три подкоманды
 # расширенной сборки заменены заглушками — см. tests/vless-stub.c.
-$(BUILD)/diagsim: $(CORE_SRC) $(CORE_HDR) tests/vless-stub.c
+$(BUILD)/diagsim: $(CORE_SRC) $(KINDS_EXT_SRC) $(CORE_HDR) tests/vless-stub.c
 	@mkdir -p $(BUILD)
-	$(CC) $(CFLAGS) $(DEFS) -DSTEER_EXTENDED -o $@ $(CORE_SRC) tests/vless-stub.c
+	$(CC) $(CFLAGS) $(DEFS) -DSTEER_EXTENDED -o $@ $(CORE_SRC) $(KINDS_EXT_SRC) tests/vless-stub.c
 
 # SHA-256 движка против sha256sum оболочки. Отдельная цель, потому что стенду нужен ПОЛНЫЙ
 # хеш: в самом идентификаторе он обрезан до двадцати знаков, и расхождение в старших байтах
@@ -150,9 +155,9 @@ ext-test:
 # добавить в движок подкоманду ради теста. Резолвер (DNSD_SRC) линкуется отдельными
 # объектами, как и модель (MODEL_SRC) — см. tests/dnsmatch.c.
 $(BUILD)/dnsmatch: tests/dnsmatch.c $(DNSD_SRC) src/lib/sindex.h src/lib/nftnl.h src/lib/ctnl.h \
-                   src/lib/jsonw.c src/dnsd/dnsd_int.h $(MODEL_SRC) src/model/spec.h
+                   src/lib/jsonw.c src/dnsd/dnsd_int.h $(MODEL_KINDS) src/model/spec.h
 	@mkdir -p $(BUILD)
-	$(CC) $(CFLAGS) -o $@ tests/dnsmatch.c $(DNSD_SRC) src/lib/jsonw.c $(MODEL_SRC)
+	$(CC) $(CFLAGS) -o $@ tests/dnsmatch.c $(DNSD_SRC) src/lib/jsonw.c $(MODEL_KINDS)
 
 # Парсер конфигурации проверяется отдельной программой по той же причине: load_spec
 # читает файл и зовёт die()/exit(2) на неверной спеке — перехватить это через подкоманду
@@ -196,9 +201,9 @@ $(BUILD)/tgwsfailmatch: tests/tgwsfailmatch.c src/proto/tgws/tgws.c
 	@mkdir -p $(BUILD)
 	$(CC) $(CFLAGS) -Itests/stub -o $@ tests/tgwsfailmatch.c
 
-$(BUILD)/specmatch: tests/specmatch.c $(MODEL_SRC) src/model/spec.h
+$(BUILD)/specmatch: tests/specmatch.c $(MODEL_KINDS) src/kinds/awg.c src/model/spec.h
 	@mkdir -p $(BUILD)
-	$(CC) $(CFLAGS) -o $@ tests/specmatch.c $(MODEL_SRC)
+	$(CC) $(CFLAGS) -o $@ tests/specmatch.c $(MODEL_KINDS) src/kinds/awg.c
 
 # Тот же исходник, собранный КАК РАСШИРЕННЫЙ. Нужен потому, что виды выходов vless и
 # xsteer в базовой сборке отвергаются парсером (и обязаны отвергаться — см. spec.c), а
@@ -206,34 +211,38 @@ $(BUILD)/specmatch: tests/specmatch.c $(MODEL_SRC) src/model/spec.h
 # бинарника kind=vless не проверялся здесь ни одной строкой, только комментарием.
 # Прецедент тот же, что у build/diagsim: один исходник, два бинарника, ветки внутри под
 # #ifdef — так «базовая отказывает» и «расширенная разбирает» проверяются одним файлом.
-$(BUILD)/specmatch-ext: tests/specmatch.c $(MODEL_SRC) src/model/spec.h
+# Отказ базовой сборки даёт реестр видов, а не #ifdef в разборе: здесь виды расширенной части
+# (KINDS_EXT_SRC) скомпонованы, в build/specmatch — нет.
+$(BUILD)/specmatch-ext: tests/specmatch.c $(MODEL_KINDS) src/kinds/awg.c $(KINDS_EXT_SRC) src/model/spec.h
 	@mkdir -p $(BUILD)
-	$(CC) $(CFLAGS) -DSTEER_EXTENDED -o $@ tests/specmatch.c $(MODEL_SRC)
+	$(CC) $(CFLAGS) -DSTEER_EXTENDED -o $@ tests/specmatch.c $(MODEL_KINDS) src/kinds/awg.c $(KINDS_EXT_SRC)
 
 # Поддельный TCP проверяется в памяти: сборка и разбор сегмента, контрольные суммы и
 # арифметика номеров — чистые функции без сокетов, поэтому стенд не требует ни сети, ни
 # прав root. Циклы клиента и сервера сюда не входят намеренно — см. заголовок файла.
-$(BUILD)/obfsmatch: tests/obfsmatch.c src/proto/obfs/obfs.c src/proto/obfs/obfs.h $(MODEL_SRC) src/model/spec.h
+$(BUILD)/obfsmatch: tests/obfsmatch.c src/proto/obfs/obfs.c src/proto/obfs/obfs.h $(MODEL_KINDS) src/model/spec.h
 	@mkdir -p $(BUILD)
-	$(CC) $(CFLAGS) -o $@ tests/obfsmatch.c $(MODEL_SRC)
+	$(CC) $(CFLAGS) -o $@ tests/obfsmatch.c $(MODEL_KINDS)
 
 # Выход kind=awg без ядра: разбор файла awg-quick, спека, побайтная сборка сообщений netlink.
 # Модель (MODEL_SRC) линкуется отдельным объектом, src/kinds/awg.c — по-прежнему #include
 # (вне пяти каталогов правила 4, docs/architecture.md, раздел 4) — см. шапку tests/awgmatch.c.
 # Дважды — роутерная и Android-сборка: у них разная метка сокета туннеля без via (0 против
 # STEER_SELF_MARK). С ядром — tests/awgns.sh.
-$(BUILD)/awgmatch: tests/awgmatch.c src/kinds/awg.c src/kinds/awg.h src/lib/nlbuf.h $(MODEL_SRC) src/model/spec.h
+$(BUILD)/awgmatch: tests/awgmatch.c src/kinds/awg.c src/kinds/awg.h src/lib/nlbuf.h $(MODEL_KINDS) src/model/spec.h
 	@mkdir -p $(BUILD)
-	$(CC) $(CFLAGS) -o $@ tests/awgmatch.c $(MODEL_SRC)
+	$(CC) $(CFLAGS) -o $@ tests/awgmatch.c $(MODEL_KINDS)
 
-$(BUILD)/awgmatch-android: tests/awgmatch.c src/kinds/awg.c src/kinds/awg.h src/lib/nlbuf.h $(MODEL_SRC) src/model/spec.h
+$(BUILD)/awgmatch-android: tests/awgmatch.c src/kinds/awg.c src/kinds/awg.h src/lib/nlbuf.h $(MODEL_KINDS) src/model/spec.h
 	@mkdir -p $(BUILD)
-	$(CC) $(CFLAGS) -DSTEER_ANDROID -o $@ tests/awgmatch.c $(MODEL_SRC)
+	$(CC) $(CFLAGS) -DSTEER_ANDROID -o $@ tests/awgmatch.c $(MODEL_KINDS)
 
+# Виды — объектами (без awg.c и без парсера: стенд подменяет load_spec своей спекой).
+FAILOVERMATCH_KINDS := $(filter-out src/kinds/awg.c,$(KINDS_BASE_SRC)) $(KINDS_EXT_SRC)
 $(BUILD)/failovermatch: tests/failovermatch.c src/daemon/failover.c src/daemon/daemon.h \
-                        src/daemon/failover_int.h src/model/spec.h src/lib/err.c
+                        src/daemon/failover_int.h src/model/spec.h src/lib/err.c $(FAILOVERMATCH_KINDS)
 	@mkdir -p $(BUILD)
-	$(CC) $(CFLAGS) -o $@ tests/failovermatch.c src/daemon/failover.c src/lib/err.c
+	$(CC) $(CFLAGS) -o $@ tests/failovermatch.c src/daemon/failover.c src/lib/err.c $(FAILOVERMATCH_KINDS)
 
 # Зависимость выхода от чужого firewall: fw_check судит о конфигурации по тексту дампа
 # nft, и проверить эвристику можно только примерами. Стенд включает исходник движка и
@@ -304,7 +313,7 @@ $(BUILD)/xswirematch: tests/xswirematch.c src/proto/xsteer/xswire.c src/proto/xs
 # а сокета у соединения в стенде нет вовсе.
 $(BUILD)/xsconnmatch: tests/xsconnmatch.c src/proto/xsteer/xsconn.c src/proto/xsteer/xsconn.h src/proto/obfs/obfs.c src/proto/obfs/obfs.h
 	@mkdir -p $(BUILD)
-	$(CC) $(CFLAGS) -o $@ tests/xsconnmatch.c src/proto/obfs/obfs.c $(MODEL_SRC)
+	$(CC) $(CFLAGS) -o $@ tests/xsconnmatch.c src/proto/obfs/obfs.c $(MODEL_KINDS)
 
 # Рамка записей по настоящему потоку TCP: границы записей, смещения (они же nonce) и досылка
 # недописанного хвоста. Стенд входит в обычный make test по той же причине, что xswirematch:
@@ -327,7 +336,7 @@ $(BUILD)/tungromatch: tests/tungromatch.c src/tunnel/tun.c src/tunnel/tun.h
 # включается целиком, client.c подменён, поэтому mbedtls не нужна — заголовки из tests/stub,
 # как у ext-syntax. Подробности — в шапке стенда.
 TUNNELMATCH_SRC = src/tunnel/tun.c src/tunnel/rtx.c src/proto/vless/vless_proto.c src/proto/vless/vision.c \
-                  src/proto/vless/sub.c src/lib/jsonw.c $(MODEL_SRC)
+                  src/proto/vless/sub.c src/lib/jsonw.c $(MODEL_KINDS) $(KINDS_EXT_SRC)
 $(BUILD)/tunnelmatch: tests/tunnelmatch.c src/tunnel/tunnel.c $(TUNNELMATCH_SRC)
 	@mkdir -p $(BUILD)
 	$(CC) $(CFLAGS) -Itests/stub -DSTEER_EXTENDED -o $@ tests/tunnelmatch.c \

@@ -2893,13 +2893,15 @@ int cmd_tgws(const char *spec, const char *name) {
     for (size_t i = 0; i < cfg.out_n; i++)
         if (!strcmp(cfg.out[i].name, name)) { o = &cfg.out[i]; break; }
     if (!o) { fprintf(stderr, LOG_W "нет выхода %s\n", name); return 2; }
-    if (o->kind != OUT_TGWS) {
+    /* Настройку своего выхода спрашиваем у вида: не tgws — не наш. */
+    const struct tgws_cfg *tc = out_tgws(o);
+    if (!tc) {
         fprintf(stderr, LOG_W "выход %s не kind=tgws\n", name);
         return 2;
     }
 
     dc_table_init();
-    domain_init(o->tg_domain);
+    domain_init(tc->domain);
     alt_init();
     route_init();
     (void)warp_dev_now();   /* строка «WARP: туннелей для моста N» при запуске */

@@ -1306,7 +1306,7 @@ static int awg_configure(const struct spec *sp, const struct output *o, int loud
     struct awg_secrets s;
     char err[256];
     const char *dev = o->device;
-    if (awg_conf_load(o->xs_conf, &c, &s, err, sizeof err) != 0) {
+    if (awg_conf_load(o->awg.conf, &c, &s, err, sizeof err) != 0) {
         fprintf(stderr, LOG_W "выход %s: %s\n", o->name, err);
         return -1;
     }
@@ -1478,12 +1478,12 @@ int awg_apply_all(const struct spec *sp) {
     int bad = 0;
     for (size_t i = 0; i < sp->out_n; i++) {
         const struct output *o = &sp->out[i];
-        if (o->kind != OUT_AWG) continue;
+        if (kind_of(o) != &kind_awg) continue;
         /* Два выхода на одно устройство настраивали бы его по очереди, и победил бы второй —
          * молча. Имена выводятся из имён выходов, так что это почти всегда явный `device`. */
         int dup = 0;
         for (size_t k = 0; k < i; k++)
-            if (sp->out[k].kind == OUT_AWG && !strcmp(sp->out[k].device, o->device)) dup = 1;
+            if (kind_of(&sp->out[k]) == &kind_awg && !strcmp(sp->out[k].device, o->device)) dup = 1;
         if (dup) {
             fprintf(stderr, LOG_W "выход %s: устройство %s уже занято другим выходом kind=awg\n",
                     o->name, o->device);
@@ -1516,11 +1516,11 @@ int awg_check_all(const struct spec *sp) {
     int bad = 0;
     for (size_t i = 0; i < sp->out_n; i++) {
         const struct output *o = &sp->out[i];
-        if (o->kind != OUT_AWG) continue;
+        if (kind_of(o) != &kind_awg) continue;
         static struct awg_conf c;
         struct awg_secrets s;
         char err[256];
-        if (awg_conf_load(o->xs_conf, &c, &s, err, sizeof err) != 0) {
+        if (awg_conf_load(o->awg.conf, &c, &s, err, sizeof err) != 0) {
             fprintf(stderr, LOG_W "выход %s: %s\n", o->name, err);
             bad++;
             continue;
@@ -1603,7 +1603,7 @@ int awg_healthy(const struct output *o, const char *dev) {
         static struct awg_conf c;
         struct awg_secrets s;
         char err[128];
-        if (o && awg_conf_load(o->xs_conf, &c, &s, err, sizeof err) == 0) {
+        if (o && awg_conf_load(o->awg.conf, &c, &s, err, sizeof err) == 0) {
             if ((c.r16_has >> AWG_REJECT_AFTER) & 1) {
                 int ra = (int)(c.r16[AWG_REJECT_AFTER] >> 16);
                 if (ra > fresh_s) fresh_s = ra;
@@ -1699,3 +1699,71 @@ void awg_status_json(FILE *out, const struct output *o) {
     else fprintf(out, ",\"endpoint\":null");
     fprintf(out, "}");
 }
+
+/* ---- вид выхода ---------------------------------------------------------------------------
+ *
+ * awg — туннель AmneziaWG/WireGuard в ядре, который создаёт и настраивает сам движок (зачем — в
+ * шапке awg.h). Для остальной части движка это выход С УСТРОЙСТВОМ, как interface: метка,
+ * таблица, masquerade. Отличие — чья жизнь устройства: его заводит apply и снимает down, поэтому
+ * out_engine_managed про него правда (ifdown/ifup netifd бесполезны), а out_self_natting — ложь:
+ * адреса клиентов уходят в туннель как есть и переводятся в адрес туннеля, ровно как у
+ * wireguard под netifd. В базовой сборке, а не в extended: ни TLS, ни mbedtls ему не нужны,
+ * только netlink. */
+static int awg_parse(struct output *o, const struct out_keys *k, struct err *e) {
+    snprintf(o->awg.conf, sizeof(o->awg.conf), "%s", k->conf);
+    /* Устройство у выхода ОДНО — его создаёт этот выход. Пул из нескольких туннелей
+     * собирается выходом kind=interface, в devices которого названо и это устройство;
+     * список здесь означал бы устройства, которые никто не создаст. */
+    if (o->devices_n > 1 ||
+        (o->devices_n == 1 && o->device[0] && strcmp(o->device, o->devices[0]) != 0))
+        return err_set(e, "outputs.%s: у kind awg одно устройство — его заводит движок; пул "
+            "собирается выходом kind=interface", o->name);
+    if (o->devices_n == 1 && !o->device[0])
+        snprintf(o->device, sizeof(o->device), "%s", o->devices[0]);
+    /* Имя устройства выбирает движок так, чтобы оно не выдавало туннель (см.
+     * awg_default_ifname в awg.h). Названное явно обязано тому же правилу: приложение
+     * видит имена интерфейсов, и «wg0» рядом с wlan0 — это ровно тот след, которого
+     * владелец просил не оставлять. */
+    if (o->device[0]) {
+        if (strlen(o->device) > 15)
+            return err_set(e, "outputs.%s: имя устройства длиннее 15 символов", o->name);
+        if (awg_ifname_conspicuous(o->device))
+            return err_set(e, "outputs.%s: имя устройства выдаёт туннель (tun, wg, awg, ppp, vpn…) — "
+                "уберите device, и движок выберет имя сам", o->name);
+    } else awg_default_ifname(o->name, o->device, sizeof(o->device));
+    o->devices_n = 0;
+    snprintf(o->devices[o->devices_n++], 32, "%s", o->device);
+    /* Путь к файлу — тем же порядком, что у xsteer: по умолчанию из имени выхода, иначе
+     * абсолютный и годный к JSON (печатается в status и diag). */
+    if (!o->awg.conf[0])
+        snprintf(o->awg.conf, sizeof(o->awg.conf), STEER_ETC_DIR "/awg/%.200s.conf", o->name);
+    else if (o->awg.conf[0] != '/' || !label_ok(o->awg.conf))
+        return err_set(e, "outputs.%s: conf должен быть абсолютным путём без кавычек", o->name);
+    return 0;
+}
+
+/* Мера — свежесть рукопожатия и счётчики пира, которые ядро и так ведёт, без единого пакета от
+ * нас. Ни ping, ни проба TCP: и то и другое будило бы радио телефона ради вопроса, на который
+ * ответ уже лежит в ядре, — см. awg_healthy выше, там же почему старое рукопожатие само по себе
+ * не приговор. */
+static int awg_health(const struct spec *sp, const struct output *o, const char *dev) {
+    (void)sp;
+    return awg_healthy(o, dev);
+}
+
+/* Рукопожатие, счётчики, эндпоинт — из ядра, см. awg_status_json. */
+static void awg_status(FILE *out, const struct spec *sp, const struct output *o) {
+    (void)sp;
+    awg_status_json(out, o);
+}
+
+const struct kind_ops kind_awg = {
+    .name = "awg",
+    .caps = KC_DEVICE | KC_MARK | KC_CTMARK | KC_ENGINE_OWNED | KC_OVER | KC_SKIP_ZAPRET,
+    .parse = awg_parse,
+    .health = awg_health,
+    /* Чинится не ожиданием: процесса, который поднял бы туннель заново, нет — устройство живёт в
+     * ядре. Лечится то же, что у netifd лечит ifdown/ifup: см. awg_revive выше. */
+    .revive = awg_revive,
+    .status = awg_status,
+};

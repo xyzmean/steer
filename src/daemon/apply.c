@@ -79,7 +79,7 @@ static void cleanup_stale_routing(const struct spec *sp) {
     for (size_t i = 0; i < g_oldreg_n; i++) {
         int live = 0;
         for (size_t k = 0; k < sp->out_n; k++)
-            if (sp->out[k].kind != OUT_DIRECT && sp->out[k].mark == g_oldreg[i].mark) {
+            if (out_needs_mark(&sp->out[k]) && sp->out[k].mark == g_oldreg[i].mark) {
                 live = 1;
                 break;
             }
@@ -193,7 +193,9 @@ static void android_masq_drop_all(void) {
 void android_masq_ensure(const struct spec *sp) {
     for (size_t i = 0; i < sp->out_n; i++) {
         const struct output *o = &sp->out[i];
-        if (o->kind != OUT_INTERFACE && o->kind != OUT_AWG) continue;
+        /* masquerade — выходам с устройством, кроме тех, кто наружу ходит от своего имени
+         * (out_self_natting): у interface и awg он нужен, у vless и xsteer — нет. */
+        if (!out_has_device(o) || out_self_natting(o)) continue;
         char mk[32];
         snprintf(mk, sizeof(mk), "0x%x/0x%x", o->mark, STEER_MARK_MASK);
         for (size_t k = 0; k < o->devices_n; k++) {
@@ -215,7 +217,7 @@ static void android_masq_sync(const struct spec *sp) {
     android_masq_drop_all();
     for (size_t i = 0; i < sp->out_n; i++) {
         const struct output *o = &sp->out[i];
-        if (o->kind != OUT_INTERFACE && o->kind != OUT_AWG) continue;
+        if (!out_has_device(o) || out_self_natting(o)) continue;
         char mk[32];
         snprintf(mk, sizeof(mk), "0x%x/0x%x", o->mark, STEER_MARK_MASK);
         for (size_t k = 0; k < o->devices_n; k++) {

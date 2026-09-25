@@ -2916,12 +2916,14 @@ static int load_nodes(const char *spec_path, const char *out_name, struct output
     if (load_spec(spec_path, &g_spec, &e) < 0) err_die(&e);
     struct output *o = out_by_name(&g_spec, out_name);
     if (!o) { fprintf(stderr, LOG_W2 "выхода %s нет в спеке\n", out_name); return 2; }
-    if (o->kind != OUT_VLESS) {
+    /* Настройку своего выхода спрашиваем у вида: не vless — не наш. */
+    const struct vless_cfg *vc = out_vless(o);
+    if (!vc) {
         fprintf(stderr, LOG_W2 "выход %s не vless (kind другой)\n", out_name);
         return 2;
     }
     *out = o;
-    return load_nodes_file(o->sub_file, cnt, st);
+    return load_nodes_file(vc->sub_file, cnt, st);
 }
 
 /* Метка сокетов к узлам — до первого соединения, то есть и до перебора узлов: проверка узла
@@ -2997,13 +2999,13 @@ int cmd_vless_nodes(const char *spec_path, const char *out_name) {
     printf("{\"output\":");
     jsonw_str(stdout, by_file ? "" : out_name);
     printf(",\"sub_file\":");
-    jsonw_str(stdout, by_file ? out_name : o->sub_file);
+    jsonw_str(stdout, by_file ? out_name : o->vless.sub_file);
     /* `node` — прежнее поле: один выбранный номер либо -1. Выбор из нескольких узлов оно
      * выразить не может, поэтому при нём печатается -1, а сам выбор лежит в `chosen`. Старый
      * потребитель этого поля читает то же, что читал: «узел не назначен, ищем рабочий». */
-    size_t chosen_n = o ? o->nodes_n : 0;
-    printf(",\"node\":%d,\"chosen\":[", chosen_n == 1 ? o->nodes[0] : -1);
-    for (size_t i = 0; i < chosen_n; i++) printf("%s%d", i ? "," : "", o->nodes[i]);
+    size_t chosen_n = o ? o->vless.nodes_n : 0;
+    printf(",\"node\":%d,\"chosen\":[", chosen_n == 1 ? o->vless.nodes[0] : -1);
+    for (size_t i = 0; i < chosen_n; i++) printf("%s%d", i ? "," : "", o->vless.nodes[i]);
     printf("],\"usable\":%zu,\"skipped\":%zu,\"foreign\":%zu,\"nodes\":[",
            cnt, st.skipped, st.foreign);
     for (size_t i = 0; i < cnt; i++) {
@@ -3070,7 +3072,7 @@ int cmd_vless_probe(const char *spec_path, const char *out_name, int node, int t
     printf("{\"output\":");
     jsonw_str(stdout, by_file ? "" : out_name);
     printf(",\"sub_file\":");
-    jsonw_str(stdout, by_file ? out_name : o->sub_file);
+    jsonw_str(stdout, by_file ? out_name : o->vless.sub_file);
     printf(",\"results\":[");
     for (size_t k = 0; k < sel_n; k++) {
         size_t i = (size_t)sel[k];
@@ -3134,14 +3136,14 @@ int cmd_vless(const char *spec_path, const char *out_name) {
          * на подписке из двадцати девяти живых узлов, где человек написал `node: 31`. Снято
          * с роутера; в запись теперь едет и номер, который он написал, и настоящее число
          * пригодных — по ним приговор читается без journal. */
-        probe_report(out_name, PROBE_NO_SUCH_NODE, o->nodes_n ? o->nodes[0] : -1, (int)cnt);
+        probe_report(out_name, PROBE_NO_SUCH_NODE, o->vless.nodes_n ? o->vless.nodes[0] : -1, (int)cnt);
         fprintf(stderr, LOG_W2 "выбранных узлов нет в подписке (пригодных всего %zu) — "
                         "проверьте nodes\n", cnt);
         return 1;
     }
-    if (sel_n < o->nodes_n)
+    if (sel_n < o->vless.nodes_n)
         fprintf(stderr, LOG_W2 "узлов выбрано %zu, в подписке есть %zu — остальные номера "
-                        "вне подписки\n", o->nodes_n, sel_n);
+                        "вне подписки\n", o->vless.nodes_n, sel_n);
 
     int chosen = -1;
     if (out_node_named(o)) {

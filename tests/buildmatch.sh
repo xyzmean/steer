@@ -39,10 +39,13 @@ disk_ext="$(in_dirs "$(profile_var EXT_DIRS)" | names)"
 # файл, не попавший ни в один профиль, не соберётся в релизе — и только в релизе, на чужой
 # машине. Снять проверку нельзя, она стоит на этой поломке.
 words() { tr ' ' '\n' | grep -v '^$'; }
-m_base="$(profile_src base | words | names)"
+# Виды выхода расширенной части (KINDS_EXT_SRC) лежат в src/kinds рядом с базовыми, но в профиль
+# base не входят — их отсутствие и есть отказ «требует пакет steer-extended» (src/kinds/kind.c).
+# Поэтому с каталогами ядра сверяется base вместе с ними, а их место — ниже, отдельной проверкой.
+m_base="$( { profile_src base; echo; profile_var KINDS_EXT_SRC; } | words | names)"
 m_ext="$( { profile_src extended; echo; profile_src server; echo; profile_src tgws; } | words |
           grep -E "^($(profile_var EXT_DIRS | tr ' ' '|'))/" | names)"
-check "sources.mk: профиль base — это все каталоги ядра"  "$disk_base" "$m_base"
+check "sources.mk: профиль base (с видами расширенной части) — это все каталоги ядра"  "$disk_base" "$m_base"
 check "sources.mk: профили покрывают всю расширенную часть" "$disk_ext" "$m_ext"
 
 # Каталог вне манифеста: файл в нём не попадёт ни в одну сборку и ни в одну проверку выше.
@@ -71,6 +74,18 @@ done
 for p in extended server; do
     check "sources.mk: общая часть xsteer входит в профиль $p" "" \
         "$(missing_in "$p" "$(profile_var XS_COMMON_SRC)")"
+done
+# Виды выхода — файлы, и реестр ссылается на них слабо (src/kinds/kind.c): вид, выпавший из
+# профиля, не ломает компоновку, а тихо становится отказом разбора. Поэтому состав сверяется
+# здесь. Базовые виды входят в CORE_SRC (то есть в каждый профиль — проверка «несёт всё ядро»
+# выше), виды расширенной части — в полный пакет и в прошивку телефона, и ни в какой другой.
+for p in extended android; do
+    check "sources.mk: виды расширенной части входят в профиль $p" "" \
+        "$(missing_in "$p" "$(profile_var KINDS_EXT_SRC)")"
+done
+for p in base server tgws; do
+    check "sources.mk: видов расширенной части нет в профиле $p" "$(profile_var KINDS_EXT_SRC)" \
+        "$(missing_in "$p" "$(profile_var KINDS_EXT_SRC)" | sed 's/ $//')"
 done
 
 # Сценарии сборки не перечисляют исходники сами: копия списка — ровно то, что расходилось
@@ -173,6 +188,30 @@ check "в src/model, src/compile и src/lib (кроме err.c) нет die()/exit
 # Старое имя проекта в журнале: строка с ним не содержит подстроки steer, а rpcd собирает
 # журнал как `logread | grep steer` — значит в интерфейс она не попадала никогда. Резолвер —
 # теперь несколько файлов src/dnsd (дьявол раньше жил в одном dnsd.c), проверяются все.
+# ---- правило 1 (docs/architecture.md, раздел 2): общий код спрашивает вид, а не сравнивает его ----
+# Всё, что знает о виде выхода, лежит в src/kinds/<вид>.c и отдаётся таблицей struct kind_ops;
+# общий код спрашивает её биты (out_has_device и соседи в spec.h) и функции. Сравнение с
+# конкретным видом вне src/kinds — это знание о виде, размазанное по движку: новый вид требует
+# найти все такие места, а забытое место — выход, который настроен и молча не работает.
+#
+# Что считается сравнением: прежние имена видов (OUT_DIRECT… — в kind.h они оставлены только
+# для генератора), записи видов по имени (kind_direct… — сравнение указателя с ними и есть
+# сравнение вида) и сравнение поля kind с адресом (`->kind == &…`). Имя вида строкой в
+# strcmp рядом с kind_of — та же проверка в другой одежде. Комментарии не в счёт.
+#
+# src/compile пока исключён: генератор переводят на промежуточное дерево, и его сравнения
+# вида (has_zapret, has_tgws, цепочки очередей и перехвата) уходят вместе с переводом — в поле
+# emit таблицы вида. Когда перевод закончится, исключение снимается.
+kindbad=""
+for f in $(find src -name '*.c' -o -name '*.h' | sort); do
+    case "$f" in src/kinds/*|src/compile/*) continue ;; esac
+    n=$(grep -vE '^[[:space:]]*(\*|//|/\*)' "$f" |
+        grep -cE '\<OUT_(DIRECT|INTERFACE|VLESS|XSTEER|ZAPRET|TGWS|AWG)\>|\<kind_(direct|interface|vless|xsteer|zapret|tgws|awg)\>|(->|\.)kind *[!=]= *&|kind_of\([^)]*\)->name *, *"|"(direct|interface|vless|xsteer|zapret|tgws|awg)" *, *kind_of')
+    [ -n "$n" ] || n=0
+    [ "$n" -gt 0 ] && kindbad="$kindbad$f:$n "
+done
+check "вне src/kinds (и src/compile, пока его переводят) вид выхода не сравнивается" "" "$kindbad"
+
 check "имени splify-dnsd в сообщениях журнала нет" "0" \
     "$(grep -c 'fprintf(stderr, "splify-dnsd' src/dnsd/*.c | awk -F: '{s+=$2} END{print s+0}')"
 
@@ -482,7 +521,8 @@ check "релиз выкладывает out/*.tar.gz" "1" "$(grep -c '^ *out/\*
 # diag: он может и расти, и сокращаться (проверка `udp` однажды исчезла), а потребитель
 # читает документ.
 API=docs/contract-v1.md
-code_ids="$(grep -o 'diag("[a-z_]*"' src/daemon/diag.c | sed 's/diag("//;s/"//' | sort -u | tr '\n' ' ')"
+# Проверки видов выхода (обфускация, zapret) живут в src/kinds/<вид>.c (kind_ops.diag).
+code_ids="$(grep -oh 'diag("[a-z_]*"' src/daemon/diag.c src/kinds/*.c | sed 's/diag("//;s/"//' | sort -u | tr '\n' ' ')"
 doc_ids="$(sed -n '/Идентификаторы проверок/,/^$/p' "$API" |
            grep -o '`[a-z_]*`' | tr -d '`' | sort -u | tr '\n' ' ')"
 check "идентификаторы проверок diag совпадают с кодом" "$code_ids" "$doc_ids"

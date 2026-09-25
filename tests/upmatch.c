@@ -70,6 +70,7 @@ int mbedtls_aes_crypt_ctr(mbedtls_aes_context *c, size_t n, size_t *off, unsigne
  * этого шага держит свой static struct spec сам. */
 int load_spec(const char *path, struct spec *s, struct err *e) { (void)path; (void)s; (void)e; return 0; }
 int registry_assign(struct spec *s, struct err *e) { (void)s; (void)e; return 0; }
+const struct tgws_cfg *out_tgws(const struct output *o) { (void)o; return NULL; }
 
 static int fails;
 
