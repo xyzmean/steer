@@ -1,7 +1,6 @@
 #include "dnsd_int.h"
 #include "sindex.h"
 #include "nftnl.h"
-#include "ctnl.h"
 
 #define MAX_PKT 4096
 /* Сколько запросов может ждать ответа одновременно.

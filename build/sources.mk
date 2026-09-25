@@ -34,9 +34,13 @@ MODEL_SRC := src/lib/jsonr.c src/lib/tmpfile.c src/model/parse.c src/model/regis
 # Резолвер: src/dnsd/dnsd.c был один файл, теперь — DNSD_SRC. lib/sindex.c, lib/nftnl.c,
 # lib/ctnl.c родились из того же файла (хеш-индекс строк, транзакции nf_tables по netlink,
 # разговор с conntrack) и собираются только вместе с резолвером — CORE_SRC берёт весь список.
+# dnsd/origdst.c (исходное назначение запроса) родился позже, разделением ctnl.c: он работает
+# на типах резолвера, а общий разговор с ctnetlink (ct_attr, ctnl_dump…) остался в lib/ctnl.c —
+# им пользуется и origdst.c, и список соединений `steer conns` (src/daemon/conns.c, CORE_SRC
+# ниже), а resolver-типов ctnl.h больше не подключает.
 DNSD_SRC := src/lib/sindex.c src/lib/nftnl.c src/lib/ctnl.c \
-            src/dnsd/rules.c src/dnsd/wire.c src/dnsd/fakeip.c src/dnsd/table.c src/dnsd/dlog.c \
-            src/dnsd/proxy.c src/dnsd/main.c
+            src/dnsd/rules.c src/dnsd/wire.c src/dnsd/origdst.c src/dnsd/fakeip.c src/dnsd/table.c \
+            src/dnsd/dlog.c src/dnsd/proxy.c src/dnsd/main.c
 
 # src/daemon/steer.c нарезан на модули (docs/architecture.md, раздел 2, «Слои и каталоги»):
 # компиляция спеки в правила — в src/compile, остальное ядро — в src/daemon, порядок ниже
@@ -45,7 +49,8 @@ CORE_SRC := src/lib/run.c src/lib/jsonw.c src/compile/groups.c src/compile/gener
             src/daemon/apply.c src/daemon/status.c src/daemon/nftquery.c src/daemon/diag.c \
             src/daemon/explain.c src/daemon/supervise.c src/daemon/watch.c src/daemon/main.c \
             $(MODEL_SRC) $(DNSD_SRC) src/daemon/failover.c src/tools/aggregate.c src/proto/obfs/obfs.c \
-            src/cli/cli.c src/tools/srs.c src/tools/puff.c src/tools/hwid.c src/daemon/ctl.c src/kinds/awg.c
+            src/cli/cli.c src/tools/srs.c src/tools/puff.c src/tools/hwid.c src/daemon/ctl.c \
+            src/daemon/conns.c src/kinds/awg.c
 
 # Общее для обеих ролей: формат кадра, конфигурация, маршрутизация, рукопожатие, соединение
 # и то, на чём они стоят (TLS-записи, примитивы Reality, TUN). Расходиться на проводе этим

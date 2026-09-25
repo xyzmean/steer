@@ -46,6 +46,7 @@ cc_defaults {
         "src/lib/ctnl.c",
         "src/dnsd/rules.c",
         "src/dnsd/wire.c",
+        "src/dnsd/origdst.c",
         "src/dnsd/fakeip.c",
         "src/dnsd/table.c",
         "src/dnsd/dlog.c",
@@ -59,6 +60,7 @@ cc_defaults {
         "src/tools/puff.c",
         "src/tools/hwid.c",
         "src/daemon/ctl.c",
+        "src/daemon/conns.c",
         "src/kinds/awg.c",
     ],
     // Каталоги слоёв — те же, что INC_DIRS в build/sources.mk (сверяет tests/buildmatch.sh).

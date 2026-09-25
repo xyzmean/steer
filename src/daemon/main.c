@@ -60,8 +60,8 @@ void aggregate_usage_flags(FILE *out);
 /* Подпись таблицы доменных каналов: ею init-скрипт решает, хватит ли резолверу SIGHUP или
  * нужен перезапуск с пятисекундной паузой procd. Живёт в dnsd.c — там таблица. */
 int dnsd_sig_print(const char *spec, FILE *out);
-/* Соединения с меткой движка (дамп ctnetlink) и журнал имён работающего резолвера — обе в
- * dnsd.c: первая рядом с другим разговором с conntrack, вторая рядом с самим журналом. */
+/* Соединения с меткой движка (дамп ctnetlink) — src/daemon/conns.c, тем же разговором с
+ * ctnetlink, что у ctnl.c; журнал имён работающего резолвера отдаёт сам резолвер, dlog.c. */
 int ctnl_conns_print(FILE *out);
 int dlog_print(FILE *out);
 /* Клиент VLESS есть только в расширенной сборке (steer-extended). В базовой команда

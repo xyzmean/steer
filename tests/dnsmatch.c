@@ -23,6 +23,7 @@
 #include "../src/lib/ctnl.c"
 #include "../src/dnsd/rules.c"
 #include "../src/dnsd/wire.c"
+#include "../src/dnsd/origdst.c"
 #include "../src/dnsd/fakeip.c"
 #include "../src/dnsd/table.c"
 #include "../src/dnsd/dlog.c"

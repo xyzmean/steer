@@ -2,7 +2,7 @@
 #define STEER_DNSD_INT_H
 
 /* Общий внутренний заголовок резолвера: структуры и объявления, которые нужны нескольким
- * файлам src/dnsd (rules.c, wire.c, fakeip.c, table.c, dlog.c, proxy.c, main.c). До
+ * файлам src/dnsd (rules.c, wire.c, fakeip.c, table.c, dlog.c, proxy.c, main.c, origdst.c). До
  * пересборки всё это было статикой одного файла, dnsd.c; здесь — только то подмножество,
  * которое пересекает границу нового файла. Имена не менялись при переносе. */
 
@@ -168,7 +168,7 @@ struct fakeip_table {
 };
 
 /* struct tcpc — соединение по TCP; полное определение приватно для proxy.c. Здесь достаточно
- * неполного типа: ctnl.c (ct_origdst) и dnsd_int.h сверяют только истинность указателя. */
+ * неполного типа: origdst.c (ct_origdst) и dnsd_int.h сверяют только истинность указателя. */
 struct tcpc;
 
 /* One entry per channel that matches domains, in SPEC ORDER. */
@@ -265,5 +265,9 @@ void dlog_serve(void);
 
 /* proxy.c */
 int run_proxy(int listen_port, int upstream_port);
+
+/* origdst.c */
+int ct_origdst(const struct sockaddr_storage *cli, const struct dnsd_local *local,
+               int lport, union dnsd_sa *out, uint32_t *mark, int *have_mark);
 
 #endif
