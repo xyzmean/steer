@@ -52,11 +52,10 @@
 #include "spec.h"
 #include "awg.h"
 #include "nlbuf.h"
+#include "run.h"
 
 #define LOG_W "steer[warn] awg: "
 #define LOG_I "steer[info] awg: "
-
-int run_quiet(const char *const argv[]);   /* из steer.c */
 
 /* ---- интерфейс модуля: числа из uapi ------------------------------------------------
  *

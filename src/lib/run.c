@@ -27,9 +27,6 @@
 #include "ctl.h"
 #include "run.h"
 
-/* Экспортируется для failover.c: он запускает те же ip/ping, и второй такой же
- * помощник означал бы два места, где решается, куда девать вывод. */
-int run_quiet(const char *const argv[]);
 int run(const char *const argv[]) {
     pid_t p = fork();
     if (p < 0) return -1;

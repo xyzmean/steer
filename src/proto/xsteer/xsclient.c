@@ -45,9 +45,7 @@
 #include "xsstream.h"
 #include "tun.h"
 #include "reality.h"
-
-/* Живёт в failover.c: запуск внешней команды без оболочки (argv массивом, не строкой). */
-int run_quiet(const char *const argv[]);
+#include "run.h"
 
 #define LOG_W "steer[warn] xsteer: "
 #define LOG_I "steer[info] xsteer: "

@@ -59,6 +59,7 @@
 #include "xsroute.h"
 #include "tun.h"
 #include "reality.h"
+#include "run.h"
 
 #define LOG_W "steer[warn] hub: "
 #define LOG_I "steer[info] hub: "
@@ -185,8 +186,6 @@
 #define XSH_MTU_CEIL     XS_MTU_DEF
 #define XSH_MAX_SEG_CEIL (XSH_MTU_CEIL + XS_OVERHEAD - 40)
 XS_STATIC_ASSERT(XS_IP_HDR + XS_TCP_HDR + XSH_MAX_SEG_CEIL == XS_LINK_MAX, hub_seg_fits);
-
-int run_quiet(const char *const argv[]);
 
 /* ---- ВРЕМЕННЫЕ МЕТКИ, КОТОРЫЕ ЧИТАЕТ ЧУЖОЙ ПОТОК, — ТРИДЦАТИДВУХБИТНЫЕ -------
  *

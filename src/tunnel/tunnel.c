@@ -46,6 +46,7 @@
 #include "tunnel.h"
 #include "spec.h"
 #include "jsonw.h"
+#include "run.h"
 
 /* ---- журнал с уровнем --------------------------------------------------------
  *
@@ -2200,8 +2201,6 @@ static void flush_acks(const struct tun_dev *tun) {
         if (al) tun_write_ctl(tun, ackp, al);
     }
 }
-
-int run_quiet(const char *const argv[]);   /* из steer.c */
 
 /* Поднять устройство и дать ему адрес.
  *

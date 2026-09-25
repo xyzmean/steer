@@ -71,12 +71,10 @@
 #include <sys/socket.h>
 #include <sys/types.h>
 #include "obfs.h"
+#include "run.h"
 
 #define LOG_W "steer[warn] obfs: "
 #define LOG_I "steer[info] obfs: "
-
-/* Живёт в failover.c: запуск внешней команды без оболочки (argv массивом, не строкой). */
-int run_quiet(const char *const argv[]);
 
 /* ---- заголовки на проводе -------------------------------------------------
  *

@@ -38,6 +38,7 @@
 #include <sys/stat.h>
 #include "spec.h"
 #include "awg.h"
+#include "run.h"
 
 /* Уровень в журнале приписывается КАЖДОЙ строке — это контракт, по которому управляющий
  * слой (splify2) раскрашивает журнал, и он разбирает именно префикс, а не текст. Базовый
@@ -57,7 +58,6 @@
  * этом туннеле, и тогда здоровый путь выглядел бы мёртвым. */
 static const char *PROBE_TARGETS[] = { "1.1.1.1", "8.8.8.8", NULL };
 
-int run_quiet(const char *const argv[]);   /* из steer.c */
 /* Чтение вывода команды — определено ниже, у сверки состояния; нужно и привязке таблицы. */
 static void ip_show(const char *cmd, char *out, size_t n);
 
