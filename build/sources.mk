@@ -31,13 +31,20 @@ INC_DIRS  := $(CORE_DIRS) $(EXT_DIRS)
 MODEL_SRC := src/lib/jsonr.c src/lib/tmpfile.c src/model/parse.c src/model/registry.c \
              src/model/probe.c src/compile/nftcompat.c
 
+# Резолвер: src/dnsd/dnsd.c был один файл, теперь — DNSD_SRC. lib/sindex.c, lib/nftnl.c,
+# lib/ctnl.c родились из того же файла (хеш-индекс строк, транзакции nf_tables по netlink,
+# разговор с conntrack) и собираются только вместе с резолвером — CORE_SRC берёт весь список.
+DNSD_SRC := src/lib/sindex.c src/lib/nftnl.c src/lib/ctnl.c \
+            src/dnsd/rules.c src/dnsd/wire.c src/dnsd/fakeip.c src/dnsd/table.c src/dnsd/dlog.c \
+            src/dnsd/proxy.c src/dnsd/main.c
+
 # src/daemon/steer.c нарезан на модули (docs/architecture.md, раздел 2, «Слои и каталоги»):
 # компиляция спеки в правила — в src/compile, остальное ядро — в src/daemon, порядок ниже
 # такой же, как был в steer.c (lib/run.c раньше всех — на него ссылаются и compile, и daemon).
 CORE_SRC := src/lib/run.c src/compile/groups.c src/compile/generate.c src/daemon/fwcheck.c \
             src/daemon/apply.c src/daemon/status.c src/daemon/nftquery.c src/daemon/diag.c \
             src/daemon/explain.c src/daemon/supervise.c src/daemon/watch.c src/daemon/main.c \
-            $(MODEL_SRC) src/dnsd/dnsd.c src/daemon/failover.c src/tools/aggregate.c src/proto/obfs/obfs.c \
+            $(MODEL_SRC) $(DNSD_SRC) src/daemon/failover.c src/tools/aggregate.c src/proto/obfs/obfs.c \
             src/cli/cli.c src/tools/srs.c src/tools/puff.c src/tools/hwid.c src/daemon/ctl.c src/kinds/awg.c
 
 # Общее для обеих ролей: формат кадра, конфигурация, маршрутизация, рукопожатие, соединение

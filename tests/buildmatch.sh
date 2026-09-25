@@ -115,7 +115,7 @@ done
 # Голое «steer: » законно ровно в двух случаях: die() — отказ вызывающему, и разбор
 # аргументов. Оба заканчиваются кодом 2 и до журнала не доходят, о чём сказано в контракте.
 bare=""
-for f in src/daemon/main.c src/daemon/failover.c src/dnsd/dnsd.c src/proto/obfs/obfs.c src/tools/srs.c; do
+for f in src/daemon/main.c src/daemon/failover.c src/lib/sindex.c src/lib/nftnl.c src/lib/ctnl.c src/dnsd/rules.c src/dnsd/wire.c src/dnsd/fakeip.c src/dnsd/table.c src/dnsd/dlog.c src/dnsd/proxy.c src/dnsd/main.c src/proto/obfs/obfs.c src/tools/srs.c; do
     # grep -c печатает 0 и выходит с кодом 1, когда совпадений нет, — поэтому «|| echo 0»
     # добавлял бы вторую строку и ломал сравнение числа.
     n=$(grep -c 'fprintf(stderr, "steer: ' "$f" 2>/dev/null); [ -n "$n" ] || n=0
@@ -143,9 +143,10 @@ check "и голым «steer: » про IPv6 не пишется" "0" \
     "$(grep -c 'fprintf(stderr, "steer: srs: в наборе' src/tools/srs.c)"
 
 # Старое имя проекта в журнале: строка с ним не содержит подстроки steer, а rpcd собирает
-# журнал как `logread | grep steer` — значит в интерфейс она не попадала никогда.
+# журнал как `logread | grep steer` — значит в интерфейс она не попадала никогда. Резолвер —
+# теперь несколько файлов src/dnsd (дьявол раньше жил в одном dnsd.c), проверяются все.
 check "имени splify-dnsd в сообщениях журнала нет" "0" \
-    "$(grep -c 'fprintf(stderr, "splify-dnsd' src/dnsd/dnsd.c; true)"
+    "$(grep -c 'fprintf(stderr, "splify-dnsd' src/dnsd/*.c | awk -F: '{s+=$2} END{print s+0}')"
 
 # ---- барьер релиза ловит все виды отказа сборки ------------------------------
 # build.sh печатает про отказ и ИДЁТ ДАЛЬШЕ — это верно для локальной работы, а в релизе
