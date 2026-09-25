@@ -16,7 +16,12 @@ table inet steer {
 
     chain output_mark {
         type filter hook output priority mangle + 1; policy accept;
-        meta skuid 10123 ct direction original ip daddr @vpn_ip_c0 meta mark set mark and 0xf03fffff or 0x00400000 ct mark set mark meta mark set mark or 0x00200000 counter return comment "steer:vpn_ip_c0"
+        meta mark and 0x0fc00000 == 0x00000000 meta skuid 10123 ct direction original ip daddr @vpn_ip_c0 meta mark set mark and 0xf03fffff or 0x00400000 ct mark set mark meta mark set mark or 0x00200000 counter return comment "steer:vpn_ip_c0"
+    }
+
+    chain input_down {
+        type filter hook input priority filter + 10; policy accept;
+        ct direction reply ct mark and 0x0fc00000 == 0x00400000 ip saddr @vpn_ip_c0 counter comment "steer-down:vpn_ip_c0"
     }
 
     chain postrouting_down {

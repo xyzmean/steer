@@ -227,8 +227,20 @@ static void emit_local_dns(const struct spec *sp, FILE *f, const char *dnat_kw) 
  *
  * `ct direction original` — только соединения, которые приложение ОТКРЫЛО само. Ответы на
  * входящие (беспроводной adb, сервер в приложении) обязаны уйти тем же путём, каким пришёл
- * запрос, а не в туннель. */
+ * запрос, а не в туннель.
+ *
+ * `meta mark and <поле движка> == 0` — пакет, у которого поле метки движка уже заполнено, не
+ * наш клиент, а собственный трафик туннеля, и перемечать его нельзя. Найдено на телефоне:
+ * WireGuard (и AmneziaWG) в ядре шифрует пакет приложения на месте и отправляет внешний UDP
+ * с тем же skb->sk — от сокета отвязывает (skb_orphan) только пока ждёт рукопожатия. Хук
+ * OUTPUT видит у внешнего пакета uid приложения, группа «весь трафик» метила его меткой
+ * выхода, и он уходил в тот же туннель: петля, сотни мегабайт исходящих за секунды при почти
+ * нулевом входящем и ни одного рабочего соединения. Внешний пакет туннель метит сам
+ * (WGDEVICE_A_FWMARK) — STEER_SELF_MARK, а при via меткой цели, — то есть поле движка у него
+ * всегда не пустое; у пакета приложения до нашего правила в слове метки только биты netd
+ * (0-19), поле движка пустое. Так же пропускается и переспрос резолвера (STEER_SELF_MARK). */
 static int emit_local_who(FILE *f, const struct group *g, struct err *e) {
+    fprintf(f, "meta mark and 0x%08x == 0x00000000 ", STEER_MARK_MASK);
     if (!strcmp(g->from[0], "self")) {
         fprintf(f, "meta skuid >= %u ct direction original ", STEER_APP_UID_MIN);
         return 0;
@@ -411,10 +423,18 @@ void counters_load(void) {
      * а нашей ленью. */
     /* Таблица — своя у каждой сборки (nft_table): у мини-сборки моста это inet stgws, и с
      * жёстким «inet steer» её счётчики через apply не переносились. */
-    char cmd[256];
+    /* Каналы на сам телефон считаются в своих цепочках: отданное — в output_mark (правило
+     * разметки на хуке output), скачанное — в input_down (см. emit_output_mark). Без них
+     * status не отдавал для таких каналов ни одного байта, и экран приложения показывал
+     * пустой «трафик по правилам» при живом туннеле. На роутере этих цепочек нет, и nft
+     * просто молчит об отсутствующей. */
+    char cmd[512];
     snprintf(cmd, sizeof(cmd),
              "nft -a list chain inet %s prerouting_mark 2>/dev/null; "
-             "nft -a list chain inet %s postrouting_down 2>/dev/null", nft_table(), nft_table());
+             "nft -a list chain inet %s postrouting_down 2>/dev/null; "
+             "nft -a list chain inet %s output_mark 2>/dev/null; "
+             "nft -a list chain inet %s input_down 2>/dev/null",
+             nft_table(), nft_table(), nft_table(), nft_table());
     FILE *nft = popen(cmd, "r");
     if (!nft) return;
     char line[1024];
@@ -629,6 +649,37 @@ static int emit_output_mark(const struct spec *sp, FILE *f, struct err *e) {
             if (h == 0) emit_counter(f, g->name, 0);
             else fprintf(f, "counter ");
             fprintf(f, "return comment \"steer:%s\"\n", g->name);
+        }
+    }
+    fprintf(f, "    }\n");
+
+    /* Скачанное каналами на сам телефон. Ответ приходит сокету телефона и идёт через input, а
+     * не через postrouting — postrouting_down его не видит (см. там). Узнаётся по метке
+     * соединения: правило разметки выше пишет в ct mark метку выхода, и у ответных пакетов
+     * того же соединения она та же. Канал со списком дополнительно сужается адресом
+     * источника ответа — это адрес сервера из его набора, — чтобы два канала на один выход
+     * не считали трафик друг друга; у канала «весь трафик» набора нет, и два таких канала на
+     * одном выходе покажут одно и то же скачанное. Цепочка ничего не решает: policy accept,
+     * правила без вердикта. */
+    fprintf(f, "\n    chain input_down {\n"
+               "        type filter hook input priority filter + 10; policy accept;\n");
+    for (size_t i = 0; i < g_grp_n; i++) {
+        struct group *g = &g_grp[i];
+        if (!group_is_local(g)) continue;
+        struct output *o = out_by_name(sp, g->out);
+        if (!o || !out_needs_mark(o) || !out_needs_ctmark(o)) continue;
+        int halves = legacy_has_static(g) ? 2 : 1;
+        for (int h = 0; h < halves; h++) {
+            char sn[80];
+            const char *set = g->name;
+            if (halves == 2 && h == 0) { nft_static_set_name(sn, sizeof(sn), g->name); set = sn; }
+            fprintf(f, "        ct direction reply ct mark and 0x%08x == 0x%08x ",
+                    STEER_MARK_MASK, o->mark);
+            emit_l4(f, g->l4, 1);
+            if (g->files_n || g->domains || g->emptied) fprintf(f, "ip saddr @%s ", set);
+            if (h == 0) emit_counter(f, g->name, 1);
+            else fprintf(f, "counter ");
+            fprintf(f, "comment \"steer-down:%s\"\n", g->name);
         }
     }
     fprintf(f, "    }\n");

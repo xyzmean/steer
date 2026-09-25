@@ -19,10 +19,17 @@ table inet steer {
 
     chain output_mark {
         type route hook output priority mangle + 1; policy accept;
-        meta skuid >= 10000 ct direction original meta nfproto ipv6 meta l4proto udp th dport 50000-65535 oifname != "lo" ip6 daddr != { fe80::/10, fc00::/7, ff00::/8 } counter reject comment "steer-v6:vpn_all_c0_p1"
-        meta skuid >= 10000 ct direction original meta nfproto ipv4 ip daddr != { 10.0.0.0/8, 127.0.0.0/8, 169.254.0.0/16, 172.16.0.0/12, 192.168.0.0/16, 224.0.0.0/4, 255.255.255.255 } meta l4proto udp th dport 50000-65535 meta mark set mark and 0xf03fffff or 0x00400000 ct mark set mark counter return comment "steer:vpn_all_c0_p1"
-        meta skuid { 10123, 1010200-1010300 } ct direction original ip daddr @vpn_ip_c1 meta mark set mark and 0xf03fffff or 0x00400000 ct mark set mark counter return comment "steer:vpn_ip_c1"
-        meta skuid 10124 ct direction original ip daddr @vpn_dom_c2 meta mark set mark and 0xf03fffff or 0x00400000 ct mark set mark counter return comment "steer:vpn_dom_c2"
+        meta mark and 0x0fc00000 == 0x00000000 meta skuid >= 10000 ct direction original meta nfproto ipv6 meta l4proto udp th dport 50000-65535 oifname != "lo" ip6 daddr != { fe80::/10, fc00::/7, ff00::/8 } counter reject comment "steer-v6:vpn_all_c0_p1"
+        meta mark and 0x0fc00000 == 0x00000000 meta skuid >= 10000 ct direction original meta nfproto ipv4 ip daddr != { 10.0.0.0/8, 127.0.0.0/8, 169.254.0.0/16, 172.16.0.0/12, 192.168.0.0/16, 224.0.0.0/4, 255.255.255.255 } meta l4proto udp th dport 50000-65535 meta mark set mark and 0xf03fffff or 0x00400000 ct mark set mark counter return comment "steer:vpn_all_c0_p1"
+        meta mark and 0x0fc00000 == 0x00000000 meta skuid { 10123, 1010200-1010300 } ct direction original ip daddr @vpn_ip_c1 meta mark set mark and 0xf03fffff or 0x00400000 ct mark set mark counter return comment "steer:vpn_ip_c1"
+        meta mark and 0x0fc00000 == 0x00000000 meta skuid 10124 ct direction original ip daddr @vpn_dom_c2 meta mark set mark and 0xf03fffff or 0x00400000 ct mark set mark counter return comment "steer:vpn_dom_c2"
+    }
+
+    chain input_down {
+        type filter hook input priority filter + 10; policy accept;
+        ct direction reply ct mark and 0x0fc00000 == 0x00400000 meta l4proto udp th sport 50000-65535 counter comment "steer-down:vpn_all_c0_p1"
+        ct direction reply ct mark and 0x0fc00000 == 0x00400000 ip saddr @vpn_ip_c1 counter comment "steer-down:vpn_ip_c1"
+        ct direction reply ct mark and 0x0fc00000 == 0x00400000 ip saddr @vpn_dom_c2 counter comment "steer-down:vpn_dom_c2"
     }
 
     chain postrouting_down {
