@@ -57,7 +57,7 @@ int run_quiet(const char *const argv[]) {
 /* Привязку таблицы делает failover.c; сюда он не входит — на этом стенде его не зовут. */
 void bind_device(struct output *o, const char *dev) { (void)o; (void)dev; }
 
-#include "../src/lib/jsonw.c"
+#include "jsonw.h"
 #include "../src/tunnel/tunnel.c"
 
 /* ---- перехват журнала --------------------------------------------------------- */

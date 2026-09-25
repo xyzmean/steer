@@ -272,7 +272,7 @@ $CC -O2 -w $STEER_INC $MBED_INC "$PRIV" -o "$BUILD/hubmatch" tests/hubmatch.c \
 echo "ext-test: собираю и прогоняю devupmatch..."
 $CC -O2 -w $STEER_INC $MBED_INC "$PRIV" -o "$BUILD/devupmatch" tests/devupmatch.c \
 	src/proto/vless/client.c src/proto/vless/vless_proto.c src/proto/vless/vision.c src/proto/tls/tls13.c src/proto/tls/certverify.c \
-	src/proto/tls/reality.c src/proto/tls/h2.c src/tunnel/tun.c src/tunnel/rtx.c src/proto/vless/sub.c \
+	src/proto/tls/reality.c src/proto/tls/h2.c src/tunnel/tun.c src/tunnel/rtx.c src/proto/vless/sub.c src/lib/jsonw.c \
 	src/lib/err.c src/lib/jsonr.c src/lib/tmpfile.c src/model/parse.c src/model/registry.c src/model/probe.c src/compile/nftcompat.c $MBED_LIB -lpthread
 "$BUILD/devupmatch"
 

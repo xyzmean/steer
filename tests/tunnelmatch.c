@@ -86,7 +86,7 @@ int run_quiet(const char *const argv[]) {
 #include "../src/model/spec.h"
 void bind_device(struct output *o, const char *dev) { (void)o; (void)dev; }
 
-#include "../src/lib/jsonw.c"
+#include "jsonw.h"
 #include "../src/tunnel/tunnel.c"
 
 /* ---- подменённый клиент VLESS -------------------------------------------------- */

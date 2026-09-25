@@ -285,10 +285,10 @@ $(BUILD)/submatch: tests/submatch.c src/proto/vless/sub.c src/proto/vless/vless.
 # docker он не требует и входит в обычный make test — при том что до переноса вся эта работа
 # жила в оболочке объекта rpcd и не проверялась ничем.
 $(BUILD)/subfetchmatch: tests/subfetchmatch.c src/proto/vless/subfetch.c src/proto/vless/subfetch.h \
-                  src/tools/hwid.c src/tools/hwid.h \
+                  src/tools/hwid.c src/tools/hwid.h src/lib/jsonw.c src/lib/jsonw.h \
                   src/proto/vless/sub.c src/proto/vless/vless.h src/proto/vless/vless_proto.c src/proto/vless/vless_proto.h
 	@mkdir -p $(BUILD)
-	$(CC) $(CFLAGS) -Itests/stub -o $@ tests/subfetchmatch.c
+	$(CC) $(CFLAGS) -Itests/stub -o $@ tests/subfetchmatch.c src/lib/jsonw.c
 
 # Арифметика провода xsteer: заголовок записи, вывод nonce, окно приёма, пределы
 # соединения. Всё, что она считает, ломается МОЛЧА — пакет отбрасывается стеком той
@@ -327,7 +327,7 @@ $(BUILD)/tungromatch: tests/tungromatch.c src/tunnel/tun.c src/tunnel/tun.h
 # включается целиком, client.c подменён, поэтому mbedtls не нужна — заголовки из tests/stub,
 # как у ext-syntax. Подробности — в шапке стенда.
 TUNNELMATCH_SRC = src/tunnel/tun.c src/tunnel/rtx.c src/proto/vless/vless_proto.c src/proto/vless/vision.c \
-                  src/proto/vless/sub.c $(MODEL_SRC)
+                  src/proto/vless/sub.c src/lib/jsonw.c $(MODEL_SRC)
 $(BUILD)/tunnelmatch: tests/tunnelmatch.c src/tunnel/tunnel.c $(TUNNELMATCH_SRC)
 	@mkdir -p $(BUILD)
 	$(CC) $(CFLAGS) -Itests/stub -DSTEER_EXTENDED -o $@ tests/tunnelmatch.c \
