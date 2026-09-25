@@ -16,8 +16,7 @@
 #include <stdlib.h>
 
 #include "../src/proto/xsteer/xswire.c"
-
-static int fails;
+#include "unit.h"
 
 /* Приёмник кадров пачки: обратный вызов, потому что разбор отдаёт кадры по одному и не
  * выделяет памяти. */
@@ -28,14 +27,6 @@ static void collect(void *ctx, const uint8_t *frame, size_t flen) {
     (void)frame;
     got_n++;
     got_bytes += flen;
-}
-
-static void check(const char *what, long want, long got) {
-    printf("%-62s %s\n", what, want == got ? "ok" : "ПРОВАЛ");
-    if (want != got) {
-        printf("     хочу: %ld\n     есть:  %ld\n", want, got);
-        fails++;
-    }
 }
 
 /* Независимая реализация того же вывода nonce, что в src/proto/tls/tls13.c (aead_nonce): номер
@@ -656,6 +647,5 @@ int main(void) {
         check("склейка с обрывом: ничего не выброшено", 0, (long)r.dropped);
     }
 
-    printf("\n%s\n", fails ? "ЕСТЬ ПРОВАЛЫ" : "все проверки прошли");
-    return fails ? 1 : 0;
+    return unit_done("xswirematch");
 }

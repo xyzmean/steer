@@ -24,16 +24,7 @@
 #include "../src/proto/xsteer/xswire.h"
 #include "../src/proto/tls/chello.h"
 #include "../src/proto/tls/reality.h"
-
-static int fails;
-
-static void check(const char *what, long want, long got) {
-    printf("%-62s %s\n", what, want == got ? "ok" : "ПРОВАЛ");
-    if (want != got) {
-        printf("     хочу: %ld\n     есть:  %ld\n", want, got);
-        fails++;
-    }
-}
+#include "unit.h"
 
 static uint32_t rnd_state = 0x5EED1234u;
 static uint32_t rnd(void) {
@@ -317,6 +308,5 @@ int main(void) {
     }
 
     pair_free(&p);
-    printf("\n%s\n", fails ? "ЕСТЬ ПРОВАЛЫ" : "все проверки прошли");
-    return fails ? 1 : 0;
+    return unit_done("xsloop");
 }

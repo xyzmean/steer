@@ -28,20 +28,11 @@
 #include <string.h>
 
 #include "../src/proto/xsteer/xsclient.c"
+#include "unit.h"
 
 /* Заглушки того, что живёт в src/daemon/steer.c: ни команд, ни устройств стенду не нужно. */
 int run_quiet(const char *const argv[]) { (void)argv; return 0; }
 void bind_device(struct output *o, const char *dev) { (void)o; (void)dev; }
-
-static int fails;
-
-static void check(const char *what, long want, long got) {
-    printf("%-62s %s\n", what, want == got ? "ok" : "ПРОВАЛ");
-    if (want != got) {
-        printf("     хочу: %ld\n     есть:  %ld\n", want, got);
-        fails++;
-    }
-}
 
 /* Ключи в том виде, в каком их оставляет split_keys: AES-128, контекст развёрнут.
  * Именно AES, а не ChaCha: в куче лежит контекст только у AES внутри GCM. */
@@ -126,6 +117,5 @@ int main(void) {
         check("двадцать попыток: контекст не остался развёрнутым", 0, s.tx.ctx_ready);
     }
 
-    printf("\n%s\n", fails ? "ЕСТЬ ПРОВАЛЫ" : "все проверки прошли");
-    return fails ? 1 : 0;
+    return unit_done("spokematch");
 }

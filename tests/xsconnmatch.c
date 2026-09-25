@@ -24,22 +24,13 @@
 #include <string.h>
 
 #include "../src/proto/xsteer/xsconn.c"
+#include "unit.h"
 
 /* Заглушки внешних символов. Стенд не зовёт ни подъём соединения (ему нужен xc_random), ни
  * настройку интерфейсов (run_quiet), но линковщик обязан их найти: xsconn.c и obfs.c подключены
  * целиком. Так же поступает obfsmatch. */
 int run_quiet(const char *const argv[]) { (void)argv; return 0; }
 int xc_random(unsigned char *out, size_t n) { memset(out, 0x5A, n); return 0; }
-
-static int fails;
-
-static void check(const char *what, long want, long got) {
-    printf("%-62s %s\n", what, want == got ? "ok" : "ПРОВАЛ");
-    if (want != got) {
-        printf("     хочу: %ld\n     есть:  %ld\n", want, got);
-        fails++;
-    }
-}
 
 /* Соединение в рабочем состоянии, без настоящего сокета: fd = -1, отправка не удаётся, а нас
  * интересуют только решения по времени. */
@@ -338,6 +329,5 @@ int main(void) {
               xs_conn_need_keepalive(&c, 0, t0 + 1000000));
     }
 
-    printf(fails ? "\nПРОВАЛОВ: %d\n" : "\nвсё сошлось\n", fails);
-    return fails ? 1 : 0;
+    return unit_done("xsconnmatch");
 }

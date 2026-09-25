@@ -12,16 +12,7 @@
 #include <stdlib.h>
 
 #include "../src/proto/xsteer/xsroute.c"
-
-static int fails;
-
-static void check(const char *what, long want, long got) {
-    printf("%-62s %s\n", what, want == got ? "ok" : "ПРОВАЛ");
-    if (want != got) {
-        printf("     хочу: %ld\n     есть:  %ld\n", want, got);
-        fails++;
-    }
-}
+#include "unit.h"
 
 /* Независимый подсчёт суммы TCP: 0 означает «сошлась». */
 static int tcpsum_ref(const uint8_t *ip, size_t total) {
@@ -434,6 +425,5 @@ int main(void) {
         }
     }
 
-    printf("\n%s\n", fails ? "ЕСТЬ ПРОВАЛЫ" : "все проверки прошли");
-    return fails ? 1 : 0;
+    return unit_done("xsroutematch");
 }

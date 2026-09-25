@@ -20,20 +20,11 @@
 #include <unistd.h>
 
 #include "../src/proto/xsteer/xsstream.c"
-
-static int fails;
-
-static void check(const char *what, long want, long got) {
-    printf("%-62s %s\n", what, want == got ? "ok" : "ПРОВАЛ");
-    if (want != got) {
-        printf("     хочу: %ld\n     есть:  %ld\n", want, got);
-        fails++;
-    }
-}
+#include "unit.h"
 
 static void ok(const char *what, int good) {
     printf("%-62s %s\n", what, good ? "ok" : "ПРОВАЛ");
-    if (!good) fails++;
+    if (!good) unit_fail++; else unit_pass++;
 }
 
 /* Пара сокетов: a — наша сторона, b — «та». Оба неблокирующие, как требует xsstream.h. */
@@ -246,6 +237,5 @@ int main(void) {
           xs_stream_recv(&st, &hdr, &body, &bn, &rel));
     check("после обрыва отправка тоже отказывает", -1, xs_stream_send(&st, buf, 21));
 
-    printf(fails ? "\nПРОВАЛОВ: %d\n" : "\nвсе проверки прошли\n", fails);
-    return fails ? 1 : 0;
+    return unit_done("xsstreammatch");
 }

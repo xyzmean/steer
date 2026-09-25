@@ -15,24 +15,7 @@
 
 #include "../src/proto/tls/chello.c"
 #include "chello-frozen.h"
-
-static int fails;
-
-static void check(const char *what, long want, long got) {
-    printf("%-62s %s\n", what, want == got ? "ok" : "ПРОВАЛ");
-    if (want != got) {
-        printf("     хочу: %ld\n     есть:  %ld\n", want, got);
-        fails++;
-    }
-}
-
-static void check_str(const char *what, const char *want, const char *got) {
-    printf("%-62s %s\n", what, strcmp(want, got) == 0 ? "ok" : "ПРОВАЛ");
-    if (strcmp(want, got) != 0) {
-        printf("     хочу: \"%s\"\n     есть:  \"%s\"\n", want, got);
-        fails++;
-    }
-}
+#include "unit.h"
 
 int main(void) {
     const uint8_t *aes = (const uint8_t *)FROZEN_AES;
@@ -133,7 +116,7 @@ int main(void) {
         for (size_t cut = 6; cut < FROZEN_N; cut += 7)
             if (chello_parse(aes, cut, &r) == 0) {
                 printf("     обрезанный до %zu байт принят — это чтение за концом\n", cut);
-                fails++;
+                unit_fail++;
             }
         printf("%-62s %s\n", "брак: ни один обрезанный Hello не принят", "ok");
     }
@@ -233,6 +216,5 @@ int main(void) {
     check("GREASE: 0x1301 не GREASE", 0, chello_is_grease(0x1301));
     check("GREASE: 0x0A1A не GREASE (байты разные)", 0, chello_is_grease(0x0A1A));
 
-    printf("\n%s\n", fails ? "ЕСТЬ ПРОВАЛЫ" : "все проверки прошли");
-    return fails ? 1 : 0;
+    return unit_done("chellomatch");
 }

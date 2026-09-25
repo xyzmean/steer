@@ -19,24 +19,7 @@
 #include <stdlib.h>
 
 #include "../src/proto/xsteer/xsconf.c"
-
-static int fails;
-
-static void check(const char *what, long want, long got) {
-    printf("%-62s %s\n", what, want == got ? "ok" : "ПРОВАЛ");
-    if (want != got) {
-        printf("     хочу: %ld\n     есть:  %ld\n", want, got);
-        fails++;
-    }
-}
-
-static void check_str(const char *what, const char *want, const char *got) {
-    printf("%-62s %s\n", what, strcmp(want, got) == 0 ? "ok" : "ПРОВАЛ");
-    if (strcmp(want, got) != 0) {
-        printf("     хочу: \"%s\"\n     есть:  \"%s\"\n", want, got);
-        fails++;
-    }
-}
+#include "unit.h"
 
 /* Настоящие 44-символьные ключи: base64 от 32 байт. Берутся из xs_key_encode, чтобы стенд
  * не зависел от того, что кто-то правильно набрал их руками. */
@@ -59,8 +42,10 @@ static void refuses(const char *what, const char *text, enum xs_role role) {
     printf("%-62s %s\n", what, ok ? "ok" : "ПРОВАЛ");
     if (!ok) {
         printf("     код: %d, объяснение: \"%s\"\n", rc, g_err);
-        fails++;
+        unit_fail++;
+        return;
     }
+    unit_pass++;
 }
 
 int main(void) {
@@ -664,6 +649,5 @@ int main(void) {
         check("и подсказан MTU", 1, strstr(g_err, "возможно, MTU") != NULL);
     }
 
-    printf("\n%s\n", fails ? "ЕСТЬ ПРОВАЛЫ" : "все проверки прошли");
-    return fails ? 1 : 0;
+    return unit_done("xsconfmatch");
 }

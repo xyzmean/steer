@@ -29,20 +29,11 @@
 #include <unistd.h>
 
 #include "../src/tunnel/tun.c"
-
-static int fails;
-
-static void check(const char *what, long want, long got) {
-    printf("%-62s %s\n", what, want == got ? "ok" : "ПРОВАЛ");
-    if (want != got) {
-        printf("     хочу: %ld\n     есть:  %ld\n", want, got);
-        fails++;
-    }
-}
+#include "unit.h"
 
 static void ok(const char *what, int good) {
     printf("%-62s %s\n", what, good ? "ok" : "ПРОВАЛ");
-    if (!good) fails++;
+    if (!good) unit_fail++; else unit_pass++;
 }
 
 /* ---- обстановка ------------------------------------------------------------- */
@@ -578,7 +569,7 @@ int main(void) {
                 printf("     ядро не дало IFF_VNET_HDR — приём склеенного невозможен в принципе\n");
             } else if (!d[0].rx_gso) {
                 printf("     TUNSETOFFLOAD не прошёл: работает прежний путь по одному пакету\n");
-                fails++;
+                unit_fail++;
             } else {
                 check("живьём: ядро согласилось отдавать склеенное", 1, d[0].rx_gso);
                 /* Читать здесь НЕЛЬЗЯ: дескриптор устройства блокирующий (ожиданием распоряжается
@@ -591,6 +582,5 @@ int main(void) {
         }
     }
 
-    printf(fails ? "\nПРОВАЛОВ: %d\n" : "\nвсе проверки прошли\n", fails);
-    return fails ? 1 : 0;
+    return unit_done("tungromatch");
 }
