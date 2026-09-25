@@ -998,10 +998,18 @@ static void counters_load(void) {
      * а нашей ленью. */
     /* Таблица — своя у каждой сборки (nft_table): у мини-сборки моста это inet stgws, и с
      * жёстким «inet steer» её счётчики через apply не переносились. */
-    char cmd[256];
+    /* Каналы на сам телефон считаются в своих цепочках: отданное — в output_mark (правило
+     * разметки на хуке output), скачанное — в input_down (см. emit_output_mark). Без них
+     * status не отдавал для таких каналов ни одного байта, и экран приложения показывал
+     * пустой «трафик по правилам» при живом туннеле. На роутере этих цепочек нет, и nft
+     * просто молчит об отсутствующей. */
+    char cmd[512];
     snprintf(cmd, sizeof(cmd),
              "nft -a list chain inet %s prerouting_mark 2>/dev/null; "
-             "nft -a list chain inet %s postrouting_down 2>/dev/null", nft_table(), nft_table());
+             "nft -a list chain inet %s postrouting_down 2>/dev/null; "
+             "nft -a list chain inet %s output_mark 2>/dev/null; "
+             "nft -a list chain inet %s input_down 2>/dev/null",
+             nft_table(), nft_table(), nft_table(), nft_table());
     FILE *nft = popen(cmd, "r");
     if (!nft) return;
     char line[1024];
@@ -1216,6 +1224,37 @@ static void emit_output_mark(FILE *f) {
             if (h == 0) emit_counter(f, g->name, 0);
             else fprintf(f, "counter ");
             fprintf(f, "return comment \"steer:%s\"\n", g->name);
+        }
+    }
+    fprintf(f, "    }\n");
+
+    /* Скачанное каналами на сам телефон. Ответ приходит сокету телефона и идёт через input, а
+     * не через postrouting — postrouting_down его не видит (см. там). Узнаётся по метке
+     * соединения: правило разметки выше пишет в ct mark метку выхода, и у ответных пакетов
+     * того же соединения она та же. Канал со списком дополнительно сужается адресом
+     * источника ответа — это адрес сервера из его набора, — чтобы два канала на один выход
+     * не считали трафик друг друга; у канала «весь трафик» набора нет, и два таких канала на
+     * одном выходе покажут одно и то же скачанное. Цепочка ничего не решает: policy accept,
+     * правила без вердикта. */
+    fprintf(f, "\n    chain input_down {\n"
+               "        type filter hook input priority filter + 10; policy accept;\n");
+    for (size_t i = 0; i < g_grp_n; i++) {
+        struct group *g = &g_grp[i];
+        if (!group_is_local(g)) continue;
+        struct output *o = out_by_name(g->out);
+        if (!o || !out_needs_mark(o) || !out_needs_ctmark(o)) continue;
+        int halves = legacy_has_static(g) ? 2 : 1;
+        for (int h = 0; h < halves; h++) {
+            char sn[80];
+            const char *set = g->name;
+            if (halves == 2 && h == 0) { nft_static_set_name(sn, sizeof(sn), g->name); set = sn; }
+            fprintf(f, "        ct direction reply ct mark and 0x%08x == 0x%08x ",
+                    STEER_MARK_MASK, o->mark);
+            emit_l4(f, g->l4, 1);
+            if (g->files_n || g->domains || g->emptied) fprintf(f, "ip saddr @%s ", set);
+            if (h == 0) emit_counter(f, g->name, 1);
+            else fprintf(f, "counter ");
+            fprintf(f, "comment \"steer-down:%s\"\n", g->name);
         }
     }
     fprintf(f, "    }\n");
