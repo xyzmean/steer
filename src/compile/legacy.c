@@ -50,7 +50,7 @@ int g_nftc;
  * ответ из дерева. */
 static int has_ip(const struct spec *sp, int nftc) {
     if (!(nftc & NFTC_LEGACY)) return 0;
-    if (has_tgws(sp)) return 1;
+    if (tgws_present(sp)) return 1;
 #ifdef STEER_TGWS
     return 0;
 #else
