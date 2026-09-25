@@ -235,7 +235,8 @@ $(BUILD)/failovermatch: tests/failovermatch.c src/daemon/failover.c
 # подменяет popen на чтение из памяти — см. tests/fwmatch.c.
 $(BUILD)/fwmatch: tests/fwmatch.c $(CORE_SRC) $(CORE_HDR)
 	@mkdir -p $(BUILD)
-	$(CC) $(CFLAGS) -o $@ tests/fwmatch.c $(filter-out src/daemon/steer.c,$(CORE_SRC))
+	$(CC) $(CFLAGS) -o $@ tests/fwmatch.c \
+		$(filter-out src/daemon/fwcheck.c src/daemon/explain.c src/daemon/main.c,$(CORE_SRC))
 
 # Управление потоком HTTP/2 проверяется в памяти: h2.c общается с сетью только через
 # struct h2_io, поэтому стенд подменяет его целиком. -Itests/stub нужен, чтобы не тянуть

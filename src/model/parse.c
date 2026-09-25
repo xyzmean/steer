@@ -596,7 +596,7 @@ static void parse_outputs(struct js *j) {
             /* Отказываем СРАЗУ и по той же причине, что у vless выше: иначе спека
              * применяется, правила и метки встают, а устройства не создаст никто —
              * человек видит рабочую конфигурацию, из которой не выходит ни один пакет.
-             * Подстроку «steer-extended» здесь читают снаружи (см. src/daemon/steer.c). */
+             * Подстроку «steer-extended» здесь читают снаружи (см. src/daemon/main.c). */
             die("outputs.%s: kind xsteer требует пакет steer-extended", o.name);
 #endif
             o.kind = OUT_XSTEER;

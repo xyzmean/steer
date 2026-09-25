@@ -325,7 +325,7 @@ static uint64_t collapse_level(struct list *l, unsigned level, size_t min_count)
  *
  * Замер на 441 451 выписанной строке: snprintf+fprintf стоили 347 нс на строку в сборке
  * с musl (186 нс с glibc), свой форматтер в свой буфер — 10 нс. Тридцать пять раз, и
- * причина ровно та, которую src/daemon/steer.c:466 уже назвал для emit_elements («fputs, а не
+ * причина ровно та, которую src/compile/generate.c:350 уже назвал для emit_elements («fputs, а не
  * fprintf: на списке в сотни тысяч элементов разбор форматной строки на каждый — это
  * заметная доля времени apply»). Здесь этот вывод просто не был донесён.
  *
