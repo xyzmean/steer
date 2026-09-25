@@ -148,9 +148,9 @@ ext-test:
 # Подбор доменного правила проверяется отдельной программой, а не через движок: сам подбор
 # статический внутри dnsd.c, и дотянуться до него иначе значило бы добавить в движок
 # подкоманду ради теста. Файл включает исходник резолвера — см. tests/dnsmatch.c.
-$(BUILD)/dnsmatch: tests/dnsmatch.c src/dnsd/dnsd.c src/model/spec.c src/model/spec.h
+$(BUILD)/dnsmatch: tests/dnsmatch.c src/dnsd/dnsd.c $(MODEL_SRC) src/model/spec.h
 	@mkdir -p $(BUILD)
-	$(CC) $(CFLAGS) -o $@ tests/dnsmatch.c src/model/spec.c
+	$(CC) $(CFLAGS) -o $@ tests/dnsmatch.c $(MODEL_SRC)
 
 # Парсер конфигурации проверяется отдельной программой по той же причине: load_spec
 # читает файл и зовёт die()/exit(2) на неверной спеке — перехватить это через подкоманду
@@ -194,7 +194,7 @@ $(BUILD)/tgwsfailmatch: tests/tgwsfailmatch.c src/proto/tgws/tgws.c
 	@mkdir -p $(BUILD)
 	$(CC) $(CFLAGS) -Itests/stub -o $@ tests/tgwsfailmatch.c
 
-$(BUILD)/specmatch: tests/specmatch.c src/model/spec.c src/model/spec.h
+$(BUILD)/specmatch: tests/specmatch.c $(MODEL_SRC) src/model/spec.h
 	@mkdir -p $(BUILD)
 	$(CC) $(CFLAGS) -o $@ tests/specmatch.c
 
@@ -204,25 +204,25 @@ $(BUILD)/specmatch: tests/specmatch.c src/model/spec.c src/model/spec.h
 # бинарника kind=vless не проверялся здесь ни одной строкой, только комментарием.
 # Прецедент тот же, что у build/diagsim: один исходник, два бинарника, ветки внутри под
 # #ifdef — так «базовая отказывает» и «расширенная разбирает» проверяются одним файлом.
-$(BUILD)/specmatch-ext: tests/specmatch.c src/model/spec.c src/model/spec.h
+$(BUILD)/specmatch-ext: tests/specmatch.c $(MODEL_SRC) src/model/spec.h
 	@mkdir -p $(BUILD)
 	$(CC) $(CFLAGS) -DSTEER_EXTENDED -o $@ tests/specmatch.c
 
 # Поддельный TCP проверяется в памяти: сборка и разбор сегмента, контрольные суммы и
 # арифметика номеров — чистые функции без сокетов, поэтому стенд не требует ни сети, ни
 # прав root. Циклы клиента и сервера сюда не входят намеренно — см. заголовок файла.
-$(BUILD)/obfsmatch: tests/obfsmatch.c src/proto/obfs/obfs.c src/proto/obfs/obfs.h src/model/spec.c src/model/spec.h
+$(BUILD)/obfsmatch: tests/obfsmatch.c src/proto/obfs/obfs.c src/proto/obfs/obfs.h $(MODEL_SRC) src/model/spec.h
 	@mkdir -p $(BUILD)
-	$(CC) $(CFLAGS) -o $@ tests/obfsmatch.c src/model/spec.c
+	$(CC) $(CFLAGS) -o $@ tests/obfsmatch.c $(MODEL_SRC)
 
 # Выход kind=awg без ядра: разбор файла awg-quick, спека, побайтная сборка сообщений netlink
 # (tests/awgmatch.c включает spec.c и awg.c). Дважды — роутерная и Android-сборка: у них разная
 # метка сокета туннеля без via (0 против STEER_SELF_MARK). С ядром — tests/awgns.sh.
-$(BUILD)/awgmatch: tests/awgmatch.c src/kinds/awg.c src/kinds/awg.h src/lib/nlbuf.h src/model/spec.c src/model/spec.h
+$(BUILD)/awgmatch: tests/awgmatch.c src/kinds/awg.c src/kinds/awg.h src/lib/nlbuf.h $(MODEL_SRC) src/model/spec.h
 	@mkdir -p $(BUILD)
 	$(CC) $(CFLAGS) -o $@ tests/awgmatch.c
 
-$(BUILD)/awgmatch-android: tests/awgmatch.c src/kinds/awg.c src/kinds/awg.h src/lib/nlbuf.h src/model/spec.c src/model/spec.h
+$(BUILD)/awgmatch-android: tests/awgmatch.c src/kinds/awg.c src/kinds/awg.h src/lib/nlbuf.h $(MODEL_SRC) src/model/spec.h
 	@mkdir -p $(BUILD)
 	$(CC) $(CFLAGS) -DSTEER_ANDROID -o $@ tests/awgmatch.c
 
@@ -298,7 +298,7 @@ $(BUILD)/xswirematch: tests/xswirematch.c src/proto/xsteer/xswire.c src/proto/xs
 # а сокета у соединения в стенде нет вовсе.
 $(BUILD)/xsconnmatch: tests/xsconnmatch.c src/proto/xsteer/xsconn.c src/proto/xsteer/xsconn.h src/proto/obfs/obfs.c src/proto/obfs/obfs.h
 	@mkdir -p $(BUILD)
-	$(CC) $(CFLAGS) -o $@ tests/xsconnmatch.c src/proto/obfs/obfs.c src/model/spec.c
+	$(CC) $(CFLAGS) -o $@ tests/xsconnmatch.c src/proto/obfs/obfs.c $(MODEL_SRC)
 
 # Рамка записей по настоящему потоку TCP: границы записей, смещения (они же nonce) и досылка
 # недописанного хвоста. Стенд входит в обычный make test по той же причине, что xswirematch:
@@ -321,7 +321,7 @@ $(BUILD)/tungromatch: tests/tungromatch.c src/tunnel/tun.c src/tunnel/tun.h
 # включается целиком, client.c подменён, поэтому mbedtls не нужна — заголовки из tests/stub,
 # как у ext-syntax. Подробности — в шапке стенда.
 TUNNELMATCH_SRC = src/tunnel/tun.c src/tunnel/rtx.c src/proto/vless/vless_proto.c src/proto/vless/vision.c \
-                  src/proto/vless/sub.c src/model/spec.c
+                  src/proto/vless/sub.c $(MODEL_SRC)
 $(BUILD)/tunnelmatch: tests/tunnelmatch.c src/tunnel/tunnel.c $(TUNNELMATCH_SRC)
 	@mkdir -p $(BUILD)
 	$(CC) $(CFLAGS) -Itests/stub -DSTEER_EXTENDED -o $@ tests/tunnelmatch.c \

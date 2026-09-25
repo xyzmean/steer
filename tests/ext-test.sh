@@ -206,7 +206,7 @@ $CC -O1 -g -w $STEER_INC $ASAN $MBED_INC "$PRIV" -o "$BUILD/spokematch" \
 	src/proto/xsteer/xsconn.c src/proto/xsteer/xswire.c src/proto/xsteer/xsepoch.c src/proto/xsteer/xsroute.c \
 	src/proto/xsteer/xsconf.c src/proto/xsteer/xslink.c src/proto/xsteer/xsstream.c src/proto/xsteer/xshake.c src/proto/tls/chello.c \
 	src/proto/tls/reality.c src/proto/tls/tls13.c src/proto/tls/certverify.c src/proto/tls/h2.c src/tunnel/tun.c src/proto/obfs/obfs.c \
-	src/model/spec.c $MBED_LIB -lpthread
+	src/lib/jsonr.c src/lib/tmpfile.c src/model/parse.c src/model/registry.c src/model/probe.c src/compile/nftcompat.c $MBED_LIB -lpthread
 "$BUILD/spokematch"
 
 # vlessmatch — ветви отказа vless_connect, под тем же AddressSanitizer.
@@ -247,7 +247,7 @@ echo "ext-test: собираю и прогоняю vlessmatch (ASan: ${ASAN:-н�
 $CC -O1 -g -w $STEER_INC $ASAN $MBED_INC "$PRIV" $X509W -o "$BUILD/vlessmatch" tests/vlessmatch.c \
 	src/proto/vless/vless_proto.c src/proto/vless/vision.c src/proto/tls/tls13.c src/proto/tls/certverify.c \
 	src/proto/tls/reality.c src/proto/tls/h2.c src/tunnel/tun.c src/tunnel/rtx.c src/proto/vless/sub.c \
-	src/model/spec.c $MBED_LIB -lpthread
+	src/lib/jsonr.c src/lib/tmpfile.c src/model/parse.c src/model/registry.c src/model/probe.c src/compile/nftcompat.c $MBED_LIB -lpthread
 "$BUILD/vlessmatch"
 
 # androidroots — склейка каталога корней Android в файл для certverify (cert_roots в
@@ -256,7 +256,7 @@ echo "ext-test: собираю и прогоняю androidroots..."
 $CC -O1 -g -w $STEER_INC $MBED_INC "$PRIV" $X509W -o "$BUILD/androidroots" tests/androidroots.c \
 	src/proto/vless/vless_proto.c src/proto/vless/vision.c src/proto/tls/tls13.c src/proto/tls/certverify.c \
 	src/proto/tls/reality.c src/proto/tls/h2.c src/tunnel/tun.c src/tunnel/rtx.c src/proto/vless/sub.c \
-	src/model/spec.c $MBED_LIB -lpthread
+	src/lib/jsonr.c src/lib/tmpfile.c src/model/parse.c src/model/registry.c src/model/probe.c src/compile/nftcompat.c $MBED_LIB -lpthread
 "$BUILD/androidroots"
 
 # hubmatch — согласие правила набора пачки с размером строки воркера.
@@ -265,7 +265,7 @@ $CC -O2 -w $STEER_INC $MBED_INC "$PRIV" -o "$BUILD/hubmatch" tests/hubmatch.c \
 	src/proto/xsteer/xsconn.c src/proto/xsteer/xswire.c src/proto/xsteer/xsepoch.c src/proto/xsteer/xsroute.c \
 	src/proto/xsteer/xsconf.c src/proto/xsteer/xslink.c src/proto/xsteer/xsstream.c src/proto/xsteer/xshake.c src/proto/tls/chello.c \
 	src/proto/tls/reality.c src/proto/tls/tls13.c src/proto/tls/certverify.c src/proto/tls/h2.c src/tunnel/tun.c src/proto/obfs/obfs.c \
-	src/model/spec.c $MBED_LIB -lpthread
+	src/lib/jsonr.c src/lib/tmpfile.c src/model/parse.c src/model/registry.c src/model/probe.c src/compile/nftcompat.c $MBED_LIB -lpthread
 "$BUILD/hubmatch"
 
 # devupmatch — подъём устройства туннеля называет свои отказы (I-114).
@@ -273,7 +273,7 @@ echo "ext-test: собираю и прогоняю devupmatch..."
 $CC -O2 -w $STEER_INC $MBED_INC "$PRIV" -o "$BUILD/devupmatch" tests/devupmatch.c \
 	src/proto/vless/client.c src/proto/vless/vless_proto.c src/proto/vless/vision.c src/proto/tls/tls13.c src/proto/tls/certverify.c \
 	src/proto/tls/reality.c src/proto/tls/h2.c src/tunnel/tun.c src/tunnel/rtx.c src/proto/vless/sub.c \
-	src/model/spec.c $MBED_LIB -lpthread
+	src/lib/jsonr.c src/lib/tmpfile.c src/model/parse.c src/model/registry.c src/model/probe.c src/compile/nftcompat.c $MBED_LIB -lpthread
 "$BUILD/devupmatch"
 
 # probe — активное зондирование настоящим openssl s_client. Здесь, а не отдельной целью
@@ -293,7 +293,7 @@ $CC -O2 -w $STEER_INC $MBED_INC "$PRIV" -o "$BUILD/devupmatch" tests/devupmatch.
 # test`. Урок ровно про это: барьер, который нужно ЗАПУСТИТЬ РУКАМИ, не барьер.
 echo "ext-test: собираю серверный бинарник для стенда зондирования..."
 $CC -O1 -w $STEER_INC $MBED_INC "$PRIV" -DSTEER_SERVER -o "$BUILD/steer-hub-native" \
-	src/daemon/steer.c src/model/spec.c src/dnsd/dnsd.c src/daemon/failover.c src/tools/aggregate.c src/proto/obfs/obfs.c src/cli/cli.c \
+	src/daemon/steer.c src/lib/jsonr.c src/lib/tmpfile.c src/model/parse.c src/model/registry.c src/model/probe.c src/compile/nftcompat.c src/dnsd/dnsd.c src/daemon/failover.c src/tools/aggregate.c src/proto/obfs/obfs.c src/cli/cli.c \
 	src/tools/srs.c src/tools/puff.c src/tools/hwid.c src/daemon/ctl.c src/kinds/awg.c \
 	src/proto/xsteer/xswire.c src/proto/xsteer/xsconf.c src/proto/xsteer/xslink.c src/proto/xsteer/xsroute.c src/proto/tls/chello.c src/proto/xsteer/xshake.c \
 	src/proto/xsteer/xsconn.c src/proto/xsteer/xsstream.c src/proto/xsteer/xsepoch.c src/proto/tls/tls13.c src/proto/tls/certverify.c src/proto/tls/reality.c \

@@ -39,7 +39,12 @@ static int g_exit_code;          /* код, с которым die/exit пыта�
  * что -Wall не выдаёт ложных предупреждений о падении сквозь конец функции. */
 #define exit(code) (g_exit_code = (code), longjmp(g_jmp, 1))
 
-#include "../src/model/spec.c"
+#include "../src/lib/jsonr.c"
+#include "../src/lib/tmpfile.c"
+#include "../src/model/parse.c"
+#include "../src/model/registry.c"
+#include "../src/model/probe.c"
+#include "../src/compile/nftcompat.c"
 
 #undef exit
 
