@@ -76,14 +76,16 @@ struct group {
 extern struct group g_grp[MAX_CHANNELS];
 extern size_t g_grp_n;
 
-void build_groups(void);
+/* build_groups/check_address_lists возвращают код ошибки, а не завершают процесс — правило 5,
+ * docs/architecture.md, раздел 2. 0 — успех; -1 — отказ, текст в e->msg. */
+int build_groups(struct err *e);
 int has_domains(void);
 int has_zapret(void);
 int has_tgws(void);
 int has_fakeip(void);
 int is_mac(const char *s);
 int group_is_local(const struct group *g);
-void check_address_lists(void);
+int check_address_lists(struct err *e);
 
 #ifdef STEER_ANDROID
 int has_local(void);

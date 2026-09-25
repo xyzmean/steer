@@ -13,25 +13,21 @@
  * tests/awgns.sh (свежее ядро, модуль wireguard, без AmneziaWG — там же отказ без модуля) и
  * tests/awg49e.sh (ядро 4.9 с модулем AmneziaWG).
  *
- * Стенд включает исходники spec.c и awg.c целиком: die() в spec.c зовёт exit(2), и отказ
- * спеки ловится тем же приёмом, что в specmatch.c (exit подменён longjmp). run_quiet — заглушка:
- * до команд ip стенд не доходит. */
-#include <setjmp.h>
+ * Стенд включает исходники spec.c и awg.c целиком: load_spec() возвращает отказ, а не зовёт
+ * exit() сама (правило 5, docs/architecture.md, раздел 2), и spec_str ниже читает код возврата
+ * напрямую — перехватывать больше нечего. run_quiet — заглушка: до команд ip стенд не доходит. */
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
 #include <unistd.h>
 
-static jmp_buf g_jmp;
-static int g_exit_code;
-#define exit(code) (g_exit_code = (code), longjmp(g_jmp, 1))
+#include "../src/lib/err.c"
 #include "../src/lib/jsonr.c"
 #include "../src/lib/tmpfile.c"
 #include "../src/model/parse.c"
 #include "../src/model/registry.c"
 #include "../src/model/probe.c"
 #include "../src/compile/nftcompat.c"
-#undef exit
 
 int run_quiet(const char *const argv[]) { (void)argv; return 0; }
 
@@ -119,9 +115,8 @@ static int spec_str(const char *body) {
     fclose(f);
     g_out_n = 0; g_ch_n = 0;
     memset(g_out, 0, sizeof g_out);
-    int rc;
-    if (setjmp(g_jmp) == 0) { load_spec(path); rc = 0; }
-    else rc = g_exit_code;
+    struct err e = {0};
+    int rc = load_spec(path, &e) < 0 ? 2 : 0;
     unlink(path);
     return rc;
 }

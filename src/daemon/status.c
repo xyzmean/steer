@@ -284,9 +284,12 @@ int cmd_status(const char *spec, int fast) {
      * отвечает тем, что было применено, пока она была годной. */
     if (fast && status_from_snapshot() == 0) return 0;
 
-    load_spec(spec);
-    registry_assign();
-    build_groups();
+    /* Правило 5, docs/architecture.md, раздел 2: err_die здесь довершает то, что раньше делал
+     * die() изнутри load_spec/build_groups. */
+    struct err e = {0};
+    if (load_spec(spec, &e) < 0) err_die(&e);
+    if (registry_assign(&e) < 0) err_die(&e);
+    if (build_groups(&e) < 0) err_die(&e);
     /* О том же устройстве, к которому apply привязал таблицу, — см. outputs_adopt_active.
      * Без этого пул, уведённый сторожем на запасное устройство, отдавался бы интерфейсу
      * основным устройством с `up: false`: рабочий выход, нарисованный сломанным. */

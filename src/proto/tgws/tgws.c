@@ -2880,8 +2880,11 @@ bad:
 
 int cmd_tgws(const char *spec, const char *name) {
     if (!name || !*name) { fprintf(stderr, LOG_W "нужно имя выхода\n"); return 2; }
-    load_spec(spec);
-    registry_assign();
+    /* Правило 5, docs/architecture.md, раздел 2: err_die здесь довершает то, что раньше делал
+     * die() изнутри load_spec/registry_assign. */
+    struct err e = {0};
+    if (load_spec(spec, &e) < 0) err_die(&e);
+    if (registry_assign(&e) < 0) err_die(&e);
 
     const struct output *o = NULL;
     for (size_t i = 0; i < g_out_n; i++)

@@ -15,6 +15,11 @@
 #include <string.h>
 
 #include "paths.h"
+/* Раньше остальных заголовков: struct err нужен объявлениям load_spec/registry_assign ниже, а
+ * заголовок, введённый ПОСЛЕ первого упоминания `struct err *` в списке параметров, создал бы
+ * второй, несвязанный тег с той же областью видимости в один прототип (6.2.1p2 в терминах
+ * стандарта C) — и определение в parse.c/registry.c не совпало бы с этим прототипом типом. */
+#include "err.h"
 
 #define MAX_CHANNELS 64
 #define MAX_OUTPUTS  16
@@ -555,7 +560,6 @@ int from_uid_range(const char *s, unsigned *lo, unsigned *hi);
 const char *out_kind_name(enum out_kind k);
 int out_kind_known(const char *s);
 
-void die(const char *fmt, const char *a);
 /* Годен ли идентификатор из спеки к подстановке в командную строку и в имя набора.
  * Проверяется парсером при загрузке — см. развёрнутое объяснение у определения. */
 int name_ok(const char *s);
@@ -576,7 +580,11 @@ void group_set_name(char *dst, size_t n, const char *out, const char *kind,
 /* Одно ли сужение у двух каналов. Нужна компилятору: протокол и порты входят в ключ
  * слияния групп наравне с выходом и списком клиентов — см. build_groups в steer.c. */
 int l4match_same(const struct l4match *a, const struct l4match *b);
-void load_spec(const char *path);
+/* Разбор спеки — правило 5 (docs/architecture.md, раздел 2): модель ошибку ВОЗВРАЩАЕТ, а не
+ * завершает процесс сама. 0 — разобрано, глобальные массивы (g_out, g_ch, …) заполнены; -1 —
+ * отказ, текст в e->msg. Завершает процесс только вызывающий, дошедший до точки входа:
+ * `struct err e; if (load_spec(path, &e) < 0) err_die(&e);`. */
+int load_spec(const char *path, struct err *e);
 struct output *out_by_name(const char *n);
 
 /* Кому ПРИНАДЛЕЖИТ устройство: выход, чей процесс его создал (vless, xsteer). NULL, если

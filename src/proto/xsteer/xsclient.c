@@ -682,7 +682,10 @@ int cmd_xsteer(const char *spec_path, const char *out_name, const char *conf_pat
 
 static int cmd_xsteer_spec(const char *spec_path, const char *out_name, const char *conf_path,
                            int stream, int stream_port) {
-    load_spec(spec_path);
+    /* Правило 5, docs/architecture.md, раздел 2: err_die здесь довершает то, что раньше делал
+     * die() изнутри load_spec/registry_assign. */
+    struct err e = {0};
+    if (load_spec(spec_path, &e) < 0) err_die(&e);
     struct output *o = out_by_name(out_name);
     if (!o) die("нет такого выхода: %s", out_name);
     if (o->kind != OUT_XSTEER) die("выход %s не kind=xsteer", out_name);
@@ -690,7 +693,7 @@ static int cmd_xsteer_spec(const char *spec_path, const char *out_name, const ch
      * устройству — работа этого процесса (см. bind_device ниже). Вызов идемпотентен и с apply
      * не спорит: тот же файл, те же номера. Без него метка была бы нулевой, и правило
      * `ip rule fwmark 0x0` поймало бы весь трафик роутера. */
-    registry_assign();
+    if (registry_assign(&e) < 0) err_die(&e);
     /* Метка соединения с хабом — out_underlay_mark: метка выхода-цели при `via`, иначе обычное
      * «мимо каналов» (см. «вложенные выходы» в spec.h). После registry_assign — у цели метка
      * появляется там. Ставят её obfs_raw_open (поддельный TCP) и stream_dial (поток). */
@@ -1816,7 +1819,10 @@ static void *worker_main(void *arg) {
 /* ---- пиры и ключи ----------------------------------------------------------- */
 
 int cmd_xsteer_peers(const char *spec_path, const char *out_name, const char *conf_path) {
-    load_spec(spec_path);
+    /* Правило 5, docs/architecture.md, раздел 2: err_die здесь довершает то, что раньше делал
+     * die() изнутри load_spec. */
+    struct err e = {0};
+    if (load_spec(spec_path, &e) < 0) err_die(&e);
     struct output *o = out_by_name(out_name);
     if (!o) die("нет такого выхода: %s", out_name);
     if (o->kind != OUT_XSTEER) die("выход %s не kind=xsteer", out_name);

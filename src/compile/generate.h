@@ -12,7 +12,9 @@
 extern int g_nftc;
 #define NFT_LEGACY (g_nftc & NFTC_LEGACY)
 
-void generate(FILE *f);
+/* 0 — успех, текст ruleset записан в f; -1 — отказ (недостижимо на разобранной спеке, см.
+ * определение), текст в e->msg — см. правило 5, docs/architecture.md, раздел 2. */
+int generate(FILE *f, struct err *e);
 void counters_load(void);
 int counter_find(const char *name, int down, unsigned long *p, unsigned long *b);
 void l4_describe(const struct l4match *m, char *dst, size_t n);

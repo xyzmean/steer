@@ -114,8 +114,8 @@ static unsigned test_sleep(unsigned n) { (void)n; g_slept++; return 0; }
 size_t g_out_n = 0;
 struct output g_out[MAX_OUTPUTS];
 const char *g_state_dir = "/tmp";
-void load_spec(const char *path) { (void)path; }
-void registry_assign(void) {}
+int load_spec(const char *path, struct err *e) { (void)path; (void)e; return 0; }
+int registry_assign(struct err *e) { (void)e; return 0; }
 
 /* Ход подъёма выхода читается из файла в state_dir (src/model/spec.c). Здесь он задаётся прямо:
  * стенду нужен не разбор файла — его проверяет specmatch, — а поведение сторожа при каждом

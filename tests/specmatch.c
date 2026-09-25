@@ -16,37 +16,25 @@
  *     «any без списков в туннель»), обязана вызвать die() и exit(2) — молчаливое
  *     применение такой спеки и есть тот класс бага, ради которого die существует.
  *
- * die() в spec.c зовёт exit(2) напрямую, и перехватить его через подкоманду движка
- * нельзя — пришлось бы добавить в движок код ради теста. Поэтому тест включает ИСХОДНИК
- * парсера (#include "../src/model/spec.c") и перехватывает exit через setjmp/longjmp поверх
- * макроса: die() остаётся noreturn-функцией (longjmp не возвращается), а тест видит
- * код завершения, не порождая дочерних процессов. Тот же приём, что в dnsmatch.c для
- * доступа к статике, плюс jmp_buf для контроля «должен отказаться». Сообщение die()
- * уходит в stderr и видно в выводе make test — перехватывать его ради тишины не нужно,
- * поведение проверяется по коду возврата. */
-#include <setjmp.h>
+ * load_spec() ошибку ВОЗВРАЩАЕТ, а не завершает процесс сама (правило 5, docs/architecture.md,
+ * раздел 2) — код 2 ниже не результат перехваченного exit(), а то же число, каким точка входа
+ * (err_die) отвечает на -1 от load_spec. Перехватывать здесь больше нечего: тест включает
+ * ИСХОДНИК парсера (#include "../src/model/parse.c" и соседей) и читает код возврата
+ * load_spec напрямую. Текст отказа кладётся в struct err, а не идёт в stderr сам — в этом
+ * стенде он не проверяется (проверяется код), а сверяет его текст снимок apply --dry-run
+ * (tests/snapshot.sh), который гоняет настоящий бинарник. */
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
 #include <unistd.h>
 
-static jmp_buf g_jmp;
-static int g_exit_code;          /* код, с которым die/exit пытались завершить тест */
-
-/* Перехват exit: die() в spec.c вызывает exit(2) последним выражением. Подменяя exit
- * макросом ДО подключения spec.c, мы заменяем этот вызов на longjmp, не возвращаясь.
- * Компилятор по-прежнему считает die() noreturn-путём (longjmp не возвращается), так
- * что -Wall не выдаёт ложных предупреждений о падении сквозь конец функции. */
-#define exit(code) (g_exit_code = (code), longjmp(g_jmp, 1))
-
+#include "../src/lib/err.c"
 #include "../src/lib/jsonr.c"
 #include "../src/lib/tmpfile.c"
 #include "../src/model/parse.c"
 #include "../src/model/registry.c"
 #include "../src/model/probe.c"
 #include "../src/compile/nftcompat.c"
-
-#undef exit
 
 static int fails;
 
@@ -87,13 +75,13 @@ static void reset_globals(void) {
  * явно во всех спеках: иначе load_spec зовёт popen("ip ..."), которого в окружении
  * теста нет, и автоопределение LAN молча оставляет g_from_default_n == 0.
  *
- * Сообщение die() пишется в stderr напрямую; мы его не перехватываем намеренно.
- * Поведение проверяется по коду возврата, а гонять stderr через pipe ради тишины —
- * лишний платформозависимый код (pipe/dup2) ради косметики. При провале конкретный
- * текст виден в выводе make test и сам по себе помогает разобраться. */
+ * Текст отказа load_spec кладёт в struct err, а не в stderr сам — этот стенд его не печатает
+ * и не проверяет (проверяется код), ровно как раньше не перехватывалось и не проверялось
+ * сообщение die(). При провале конкретный текст, если он нужен для разбора, видно на
+ * снимке apply --dry-run (tests/snapshot.sh). Код 2 — то же число, каким точка входа отвечает
+ * на -1 от load_spec (err_die), а 0 — успешный разбор. */
 static int load_from_str(const char *spec) {
     reset_globals();
-    g_exit_code = -1;
     /* Относительное имя во временной директории ОС: работает и на Linux (/tmp), и в
      * любой другой среде сборки. PID гарантирует уникальность, unlink — очистку.
      * Файл обязателен: load_spec читает путь, а не буфер. */
@@ -104,13 +92,8 @@ static int load_from_str(const char *spec) {
     FILE *f = fopen(tmp, "w");
     if (f) { fputs(spec, f); fclose(f); }
 
-    int rc;
-    if (setjmp(g_jmp) == 0) {
-        load_spec(tmp);
-        rc = 0;                     /* нормальное завершение */
-    } else {
-        rc = g_exit_code;           /* вышли через die/exit */
-    }
+    struct err e = {0};
+    int rc = load_spec(tmp, &e) < 0 ? 2 : 0;
     unlink(tmp);
     return rc;
 }
@@ -132,6 +115,10 @@ static int load_from_str(const char *spec) {
     "{\"schema\":2,\"from_default\":[\"192.168.1.0/24\"]," body "}"
 
 int main(void) {
+    /* Общий на все проверки ниже: registry_assign и прямые вызовы js_str не проверяют этот
+     * стенд на отказ (тесты правила 5 — про load_spec, см. load_from_str), им нужен просто
+     * struct err, чтобы позвать функцию новой сигнатуры. */
+    struct err e = {0};
     {
         /* Минимальная валидная спека: один прямой выход, один доменный канал.
          * Заполняет g_out_n=1, g_ch_n=1; выход — OUT_DIRECT, канал смотрит на «direct». */
@@ -1005,7 +992,7 @@ int main(void) {
             "\"alt\":{\"kind\":\"interface\",\"device\":\"wg1\"}},"
             "\"channels\":[]}");
         check("спека с двумя туннелями загрузилась", 0, load_from_str(s2));
-        registry_assign();
+        registry_assign(&e);
 
         char path[512];
         snprintf(path, sizeof(path), "%s/steer.conf", rdir);
@@ -1025,7 +1012,7 @@ int main(void) {
         /* Повторный вызов при том же составе выходов файл трогать не должен. */
         struct stat st1, st2;
         stat(path, &st1);
-        registry_assign();
+        registry_assign(&e);
         stat(path, &st2);
         check("повторный вызов файл не перезаписывает",
               1, st1.st_mtime == st2.st_mtime && st1.st_size == st2.st_size);
@@ -1037,7 +1024,7 @@ int main(void) {
             "\"outputs\":{\"vpn\":{\"kind\":\"interface\",\"device\":\"wg0\"}},"
             "\"channels\":[]}");
         check("спека с одним туннелем загрузилась", 0, load_from_str(s3));
-        registry_assign();
+        registry_assign(&e);
         memset(have, 0, sizeof(have));
         f = fopen(path, "r");
         hn = f ? fread(have, 1, sizeof(have) - 1, f) : 0;
@@ -1080,7 +1067,7 @@ int main(void) {
                            i ? "," : "", i, i);
         snprintf(many + mn, sizeof(many) - (size_t)mn, "},\"channels\":[]}");
         check("спека на все MAX_OUTPUTS туннелей загрузилась", 0, load_from_str(many));
-        registry_assign();
+        registry_assign(&e);
 
         int no_mark = 0, off_mask = 0, dup_mark = 0, dup_table = 0, dup_queue = 0;
         int bad_table = 0;
@@ -1118,7 +1105,7 @@ int main(void) {
             "\"fresh\":{\"kind\":\"interface\",\"device\":\"wg1\"}},"
             "\"channels\":[]}");
         check("спека со старым и новым выходом загрузилась", 0, load_from_str(s4));
-        registry_assign();
+        registry_assign(&e);
         unsigned old_mark = 0, fresh_mark = 0;
         int old_table = 0, fresh_table = 0;
         for (size_t i = 0; i < g_out_n; i++) {
@@ -1311,22 +1298,22 @@ int main(void) {
         char b[64];
         struct js j;
         j.p = "\"a\\u0022b\"";
-        check("\\u0022 читается кавычкой", 0, js_str(&j, b, sizeof b));
+        check("\\u0022 читается кавычкой", 0, js_str(&j, b, sizeof b, &e));
         check_str("\\u0022 читается кавычкой: значение", "a\"b", b);
         j.p = "\"\\u0431\\u0443\"";
-        js_str(&j, b, sizeof b);
+        js_str(&j, b, sizeof b, &e);
         check_str("\\u0431\\u0443 — кириллица в UTF-8", "\xd0\xb1\xd1\x83", b);
         j.p = "\"\\ud83d\\ude00\"";
-        js_str(&j, b, sizeof b);
+        js_str(&j, b, sizeof b, &e);
         check_str("суррогатная пара — один знак в четыре байта", "\xf0\x9f\x98\x80", b);
         j.p = "\"x\\u000ay\"";
-        js_str(&j, b, sizeof b);
+        js_str(&j, b, sizeof b, &e);
         check_str("управляющий \\u000a — как прежде, не раскодирован", "xu000ay", b);
         j.p = "\"x\\u00zy\"";
-        js_str(&j, b, sizeof b);
+        js_str(&j, b, sizeof b, &e);
         check_str("недописанное \\u — как прежде", "xu00zy", b);
         j.p = "\"a\\\"b\\\\c\"";
-        js_str(&j, b, sizeof b);
+        js_str(&j, b, sizeof b, &e);
         check_str("\\\" и \\\\ — как прежде", "a\"b\\c", b);
     }
 

@@ -406,7 +406,8 @@ int main(void) {
                         "]}\n", lst);
                 fclose(ws);
 
-                load_spec(sp);
+                struct err e = {0};
+                if (load_spec(sp, &e) < 0) err_die(&e);
                 dch_build();
                 check("выключенное: канала у резолвера нет", 0, (int)g_dch_n);
                 unlink(sp);

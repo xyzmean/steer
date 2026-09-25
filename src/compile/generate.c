@@ -228,21 +228,22 @@ static void emit_local_dns(FILE *f, const char *dnat_kw) {
  * `ct direction original` — только соединения, которые приложение ОТКРЫЛО само. Ответы на
  * входящие (беспроводной adb, сервер в приложении) обязаны уйти тем же путём, каким пришёл
  * запрос, а не в туннель. */
-static void emit_local_who(FILE *f, const struct group *g) {
+static int emit_local_who(FILE *f, const struct group *g, struct err *e) {
     if (!strcmp(g->from[0], "self")) {
         fprintf(f, "meta skuid >= %u ct direction original ", STEER_APP_UID_MIN);
-        return;
+        return 0;
     }
     int one = g->from_n == 1 && !strchr(g->from[0], '-');
     fprintf(f, one ? "meta skuid " : "meta skuid { ");
     for (size_t i = 0; i < g->from_n; i++) {
         unsigned lo, hi;
         if (from_uid_range(g->from[i], &lo, &hi) != 0)
-            die("группа %s: негодный UID", g->name);   /* спека это уже отвергла */
+            return err_set(e, "группа %s: негодный UID", g->name);   /* спека это уже отвергла */
         if (lo == hi) fprintf(f, "%s%u", i ? ", " : "", lo);
         else fprintf(f, "%s%u-%u", i ? ", " : "", lo, hi);
     }
     fprintf(f, one ? " ct direction original " : " } ct direction original ");
+    return 0;
 }
 
 #endif
@@ -581,7 +582,7 @@ int legacy_has_ip6(void) {
  * трафик» набора нет, и её IPv6 ушёл бы мимо туннеля: маршруты выхода движок ставит только
  * для IPv4. Поэтому такой группе IPv6 отвечается отказом — приложения переходят на IPv4 (так
  * устроен выбор адреса у любого клиента с двумя стеками), и ничего не утекает напрямую. */
-static void emit_output_mark(FILE *f) {
+static int emit_output_mark(FILE *f, struct err *e) {
     fprintf(f, "\n    chain output_mark {\n"
                "        type %s hook output priority mangle + 1; policy accept;\n",
             NFT_LEGACY ? "filter" : "route");
@@ -589,13 +590,13 @@ static void emit_output_mark(FILE *f) {
         struct group *g = &g_grp[i];
         if (!group_is_local(g)) continue;
         struct output *o = out_by_name(g->out);
-        if (!o) die("channel group %s points at a missing output", g->name);
+        if (!o) return err_set(e, "channel group %s points at a missing output", g->name);
         if (g->all && out_needs_mark(o)) {
             /* С тем же сужением по протоколу и портам, что и канал: канал «UDP 50000-65535»
              * не вправе отнимать у приложения весь IPv6. Своя сеть (петля, link-local, ULA,
              * мультикаст) — не наружу и не мимо туннеля, её не трогаем. */
             fprintf(f, "        ");
-            emit_local_who(f, g);
+            if (emit_local_who(f, g, e) != 0) return -1;
             fprintf(f, "meta nfproto ipv6 ");
             emit_l4(f, g->l4, 0);
             fprintf(f, "oifname != \"lo\" ip6 daddr != { fe80::/10, fc00::/7, ff00::/8 } "
@@ -607,7 +608,7 @@ static void emit_output_mark(FILE *f) {
             const char *set = g->name;
             if (halves == 2 && h == 0) { nft_static_set_name(sn, sizeof(sn), g->name); set = sn; }
             fprintf(f, "        ");
-            emit_local_who(f, g);
+            if (emit_local_who(f, g, e) != 0) return -1;
             /* «Весь трафик» — это интернет, а не своя сеть: принтер, NAS и Chromecast в Wi-Fi
              * через туннель не видны. Только IPv4 — IPv6 такой группы отвергнут строкой выше. */
             if (g->all)
@@ -631,6 +632,7 @@ static void emit_output_mark(FILE *f) {
         }
     }
     fprintf(f, "    }\n");
+    return 0;
 }
 
 #endif
@@ -762,7 +764,7 @@ static void generate_legacy_tail(FILE *f) {
     }
 }
 
-void generate(FILE *f) {
+int generate(FILE *f, struct err *e) {
     fprintf(f, "table inet %s {\n", nft_table());
     for (size_t i = 0; i < g_grp_n; i++) {
         struct group *g = &g_grp[i];
@@ -836,7 +838,7 @@ void generate(FILE *f) {
     for (size_t i = 0; i < g_grp_n; i++) {
         struct group *g = &g_grp[i];
         struct output *o = out_by_name(g->out);
-        if (!o) die("channel group %s points at a missing output", g->name);
+        if (!o) return err_set(e, "channel group %s points at a missing output", g->name);
         /* Каналы на сам телефон — на хуке output, см. emit_output_mark. */
         if (group_is_local(g)) continue;
         /* ПРАВИЛ У ГРУППЫ ОБЫЧНО ОДНО, в старой раскладке у доменной группы с префиксами — два:
@@ -902,7 +904,7 @@ void generate(FILE *f) {
     fprintf(f, "    }\n");
 
 #ifdef STEER_ANDROID
-    if (has_local()) emit_output_mark(f);
+    if (has_local() && emit_output_mark(f, e) != 0) return -1;
 #endif
 
     /* ВЫХОД УПАЛ И ПУЩЕН НАПРЯМУЮ — бит «не для zapret» снимается. Правило разметки выше
@@ -1158,7 +1160,7 @@ void generate(FILE *f) {
     /* Всё, что ниже, — nat и то, что стоит рядом с ним. В старой раскладке оно устроено
      * иначе целиком (другие таблицы, одна цепочка nat), и смешивать две раскладки строками
      * через одну значило бы читать каждую строку дважды. Поэтому отдельная функция. */
-    if (NFT_LEGACY) { generate_legacy_tail(f); return; }
+    if (NFT_LEGACY) { generate_legacy_tail(f); return 0; }
 
     /* ---- перехват Telegram у выходов kind=tgws ------------------------------------
      *
@@ -1315,5 +1317,6 @@ void generate(FILE *f) {
          */
     }
     fprintf(f, "}\n");
+    return 0;
 }
 

@@ -28,7 +28,12 @@ INC_DIRS  := $(CORE_DIRS) $(EXT_DIRS)
 # Модель спеки — то, во что нарезан прежний src/model/spec.c (docs/architecture.md, «Слои и
 # каталоги»): JSON-ридер, сам разбор спеки, реестр меток/таблиц, ход перебора узлов подписки и
 # раскладка правил старого ядра. Порядок — тот, в котором они шли в неразрезанном файле.
-MODEL_SRC := src/lib/jsonr.c src/lib/tmpfile.c src/model/parse.c src/model/registry.c \
+#
+# lib/err.c — тоже сюда: правило 5 (раздел 2) требует, чтобы модель и компилятор возвращали
+# отказ, а не звали die() сами, а err_set/err_prop/err_die и сам die() (для точек входа) живут
+# в этом файле. Стенды, собирающие модель отдельным списком (dnsmatch, specmatch, obfsmatch,
+# awgmatch — см. Makefile), берут его отсюда же, а не include'ом err.c по одному разу на файл.
+MODEL_SRC := src/lib/err.c src/lib/jsonr.c src/lib/tmpfile.c src/model/parse.c src/model/registry.c \
              src/model/probe.c src/compile/nftcompat.c
 
 # Резолвер: src/dnsd/dnsd.c был один файл, теперь — DNSD_SRC. lib/sindex.c, lib/nftnl.c,

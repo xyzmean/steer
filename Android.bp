@@ -24,6 +24,7 @@ cc_defaults {
     srcs: [
         "src/lib/run.c",
         "src/lib/jsonw.c",
+        "src/lib/err.c",
         "src/compile/groups.c",
         "src/compile/generate.c",
         "src/daemon/fwcheck.c",

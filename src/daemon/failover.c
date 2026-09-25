@@ -1559,8 +1559,12 @@ int cmd_failover(const char *spec, int verbose) {
      * того, как умер предыдущий процесс, и идемпотентна — нет правила, нет дела. */
     cleanup_probe_rule();
 
-    load_spec(spec);
-    registry_assign();
+    /* Правило 5, docs/architecture.md, раздел 2: err_die здесь довершает то, что раньше делал
+     * die() изнутри load_spec/registry_assign — «конец одного прохода», как и сказано в шапке
+     * watch.c, только теперь через явную проверку возврата, а не exit() из глубины разбора. */
+    struct err e = {0};
+    if (load_spec(spec, &e) < 0) err_die(&e);
+    if (registry_assign(&e) < 0) err_die(&e);
 
     int changed = 0;
     /* ПОРЯДОК ОБХОДА — ПО ЗАВИСИМОСТЯМ `via`, а не по спеке.

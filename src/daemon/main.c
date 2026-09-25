@@ -267,6 +267,10 @@ int main(int argc, char **argv) {
     }
 
     struct cli_args a;
+    /* Разбор спеки и раздача меток реестра возвращают отказ, а не завершают процесс сами
+     * (правило 5, docs/architecture.md, раздел 2) — здесь, в точке входа, err_die довершает
+     * то же самое: код 2, тот же текст, что раньше печатал die() изнутри load_spec. */
+    struct err e = {0};
     cli_parse(c, argc, argv, 2, &a);
     if (a.state_dir) g_state_dir = a.state_dir;
     const char *spec = a.spec, *arg = a.npos ? a.pos[0] : NULL;
@@ -295,7 +299,7 @@ int main(int argc, char **argv) {
          * единой строки о причине. */
         if (a.kind && !out_kind_known(a.kind))
             die("--kind: нужен interface, vless, xsteer, zapret или direct, а не %s", a.kind);
-        load_spec(spec);
+        if (load_spec(spec, &e) < 0) err_die(&e);
         for (size_t i = 0; i < g_out_n; i++) {
             const char *k = out_kind_name(g_out[i].kind);
             if (a.kind && strcmp(a.kind, k) != 0) continue;
@@ -355,8 +359,8 @@ int main(int argc, char **argv) {
      *
      * Код возврата — как у needs-dnsd: 0, если поднимать есть что. */
     if (!strcmp(cmd, "zapret-instances")) {
-        load_spec(spec);
-        registry_assign();
+        if (load_spec(spec, &e) < 0) err_die(&e);
+        if (registry_assign(&e) < 0) err_die(&e);
         int n = 0;
         for (size_t i = 0; i < g_out_n; i++) {
             if (g_out[i].kind != OUT_ZAPRET) continue;
@@ -382,8 +386,8 @@ int main(int argc, char **argv) {
      * не считает init-скрипт — второй расчёт того же в shell разошёлся бы при первой
      * правке, и мост слушал бы порт, на который ядро ничего не заворачивает. */
     if (!strcmp(cmd, "tgws-instances")) {
-        load_spec(spec);
-        registry_assign();
+        if (load_spec(spec, &e) < 0) err_die(&e);
+        if (registry_assign(&e) < 0) err_die(&e);
         int n = 0;
         for (size_t i = 0; i < g_out_n; i++) {
             if (g_out[i].kind != OUT_TGWS) continue;
@@ -418,9 +422,9 @@ int main(int argc, char **argv) {
          * зависеть от содержимого файлов списков (домен и подсеть лежат в одном), то есть
          * могла бы перевернуться ночным обновлением. Раньше этот код отвечал на вопрос
          * «нужен ли», теперь — «поднимаем», и переворачиваться нечему. */
-        load_spec(spec);
-        registry_assign();
-        build_groups();
+        if (load_spec(spec, &e) < 0) err_die(&e);
+        if (registry_assign(&e) < 0) err_die(&e);
+        if (build_groups(&e) < 0) err_die(&e);
         /* В мини-сборке — «поднимать нечего», и это тот же ответ, что даёт генератор
          * правил: он там перенаправления DNS не ставит. Два ответа обязаны совпадать,
          * иначе init-скрипт однажды поднимет резолвер без правила или, хуже, правило
@@ -476,7 +480,7 @@ int main(int argc, char **argv) {
     if (!strcmp(cmd, "dev-id")) return cmd_dev_id();
     if (!strcmp(cmd, "srs-read")) return srs_dump(arg, a.out_file, a.prefixes_out, a.meta_out);
     if (!strcmp(cmd, "obfs")) {
-        load_spec(spec);
+        if (load_spec(spec, &e) < 0) err_die(&e);
         struct output *o = out_by_name(arg);
         if (!o) die("нет такого выхода: %s", arg);
         if (!o->obfs.on) die("у выхода %s не настроен obfs", arg);
@@ -484,7 +488,7 @@ int main(int argc, char **argv) {
          * spec.h). При via она — метка выхода-цели, а та появляется только в реестре: без
          * registry_assign функция вернула бы ноль, то есть «напрямую», молча. Без via реестр
          * не нужен и не трогается — у этого процесса его прежде не было. */
-        if (o->via[0]) registry_assign();
+        if (o->via[0] && registry_assign(&e) < 0) err_die(&e);
         obfs_set_sock_mark(out_underlay_mark(o), o->via[0] != 0);
         return obfs_client(o->name, o->obfs.server, o->obfs.server_port,
                            o->obfs.listen, o->obfs.listen_port);

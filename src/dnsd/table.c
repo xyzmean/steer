@@ -91,7 +91,10 @@ void dch_sig_write(void) {
 /* Команда `dnsd-sig`: подпись по спеке, без запуска резолвера. Её печать и есть весь ответ
  * на вопрос «хватит ли HUP». */
 int dnsd_sig_print(const char *spec, FILE *out) {
-    load_spec(spec);
+    /* Правило 5, docs/architecture.md, раздел 2: err_die здесь довершает то, что раньше делал
+     * die() изнутри load_spec. */
+    struct err e = {0};
+    if (load_spec(spec, &e) < 0) err_die(&e);
     dch_build();
     dch_signature(out);
     return 0;

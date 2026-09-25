@@ -28,7 +28,7 @@
  * and the symptom is traffic silently taking someone else's path. */
 static void rt_tables_write(void);
 
-void registry_assign(void) {
+int registry_assign(struct err *e) {
     char path[512];
     snprintf(path, sizeof(path), "%s/registry", g_state_dir);
     FILE *f = fopen(path, "r");
@@ -98,7 +98,7 @@ void registry_assign(void) {
                 if (!taken[k]) { slot = k; found = 1; break; }
         }
         if (!found)
-            die("out of mark slots for output %s", g_out[i].name);
+            return err_set(e, "out of mark slots for output %s", g_out[i].name);
         taken[slot] = 1;
         g_out[i].mark = MARK_BASE * (slot + 1);
         g_out[i].table = TABLE_BASE + (int)slot;
@@ -123,14 +123,15 @@ void registry_assign(void) {
         char have[sizeof(want) + 1];
         size_t hn = fread(have, 1, sizeof(have), f);
         fclose(f);
-        if (hn == wn && memcmp(have, want, wn) == 0) return;
+        if (hn == wn && memcmp(have, want, wn) == 0) return 0;
     }
     mkdir(g_state_dir, 0755);
     f = fopen(path, "w");
-    if (!f) return;             /* best effort: apply still works, next boot re-assigns */
+    if (!f) return 0;           /* best effort: apply still works, next boot re-assigns */
     fwrite(want, 1, wn, f);
     fclose(f);
     rt_tables_write();
+    return 0;
 }
 
 /* Объявить имена таблиц маршрутизации системе.

@@ -382,13 +382,17 @@ static int nfqueue_supported(void) {
 }
 
 int cmd_apply(const char *spec, int dry) {
-    load_spec(spec);
+    /* Разбор спеки и компиляция возвращают отказ, а не завершают процесс сами (правило 5,
+     * docs/architecture.md, раздел 2) — err_die здесь, в точке входа, довершает то же самое:
+     * код 2, тот же текст, что раньше печатал die() изнутри load_spec/build_groups/generate. */
+    struct err e = {0};
+    if (load_spec(spec, &e) < 0) err_die(&e);
     /* Снимок реестра — строго до registry_assign: тот перезапишет файл текущими
      * выходами, и метки удалённых/переименованных будут потеряны вместе с
      * единственным способом снять их правила из ядра. */
     registry_snapshot();
-    registry_assign();
-    build_groups();
+    if (registry_assign(&e) < 0) err_die(&e);
+    if (build_groups(&e) < 0) err_die(&e);
     /* ДОМЕННЫЙ КАНАЛ В МИНИ-СБОРКЕ — ОТКАЗ, А НЕ ПРЕДУПРЕЖДЕНИЕ.
      *
      * Домены маршрутизируются через резолвер движка, а мини-сборка его не поднимает и
@@ -413,7 +417,7 @@ int cmd_apply(const char *spec, int dry) {
      * До dry-run намеренно: интерфейс проверяет спеку именно им, перед записью на диск.
      * Значит человек узнает про не тот список сразу при сохранении, а не потом, когда
      * apply молча не подействует. */
-    check_address_lists();
+    if (check_address_lists(&e) < 0) err_die(&e);
     /* Раскладка набора правил — до генерации и до dry-run: интерфейс проверяет спеку именно
      * dry-run'ом, и печатать ему надо то, что реально встанет на этом ядре. */
     g_nftc = nft_compat();
@@ -428,7 +432,11 @@ int cmd_apply(const char *spec, int dry) {
     /* Файлы выходов kind=awg — проверяются и при --dry-run: им интерфейс проверяет спеку
      * перед записью, и ошибка в файле туннеля должна быть видна тогда же, а не после
      * применения. Предупреждением в stderr: набор правил от файла туннеля не зависит. */
-    if (dry) { awg_check_all(); generate(stdout); return 0; }
+    if (dry) {
+        awg_check_all();
+        if (generate(stdout, &e) < 0) err_die(&e);
+        return 0;
+    }
 
     /* Отказываем ДО транзакции и НАЗЫВАЕМ причину: иначе человек получит отказ всей
      * маршрутизации с сообщением про несуществующий файл. Пакет назван прямо — его же
@@ -499,7 +507,7 @@ int cmd_apply(const char *spec, int dry) {
                 fprintf(f, "delete table %s %s\n", fams[k], nft_table());
         }
     }
-    generate(f);
+    if (generate(f, &e) < 0) err_die(&e);
     fclose(f);
 
     const char *load[] = { "nft", "-f", tmp, NULL };

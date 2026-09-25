@@ -64,8 +64,8 @@ int mbedtls_aes_crypt_ctr(mbedtls_aes_context *c, size_t n, size_t *off, unsigne
                           unsigned char *sb, const unsigned char *in, unsigned char *out)
                                         { (void)c; (void)off; (void)nc; (void)sb;
                                           memcpy(out, in, n); return 0; }
-void load_spec(const char *path) { (void)path; }
-void registry_assign(void) { }
+int load_spec(const char *path, struct err *e) { (void)path; (void)e; return 0; }
+int registry_assign(struct err *e) { (void)e; return 0; }
 struct output g_out[MAX_OUTPUTS];
 size_t g_out_n;
 

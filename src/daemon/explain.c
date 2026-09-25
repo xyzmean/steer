@@ -207,9 +207,12 @@ static int set_lookup(const char *set, const char *elem, const char *addr) {
 }
 
 int cmd_explain(const char *spec, const char *what) {
-    load_spec(spec);
-    registry_assign();
-    build_groups();
+    /* Правило 5, docs/architecture.md, раздел 2: err_die здесь довершает то, что раньше делал
+     * die() изнутри load_spec/build_groups. */
+    struct err e = {0};
+    if (load_spec(spec, &e) < 0) err_die(&e);
+    if (registry_assign(&e) < 0) err_die(&e);
+    if (build_groups(&e) < 0) err_die(&e);
     g_nftc = nft_compat();
 
     /* Имя сначала превращаем в адрес — и печатаем, во что именно. Без этой строки человек

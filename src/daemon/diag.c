@@ -227,9 +227,12 @@ static int bridge_nf_on(void) {
 #endif
 
 int cmd_diag(const char *spec) {
-    load_spec(spec);
-    registry_assign();
-    build_groups();
+    /* Правило 5, docs/architecture.md, раздел 2: err_die здесь довершает то, что раньше делал
+     * die() изнутри load_spec/build_groups. */
+    struct err e = {0};
+    if (load_spec(spec, &e) < 0) err_die(&e);
+    if (registry_assign(&e) < 0) err_die(&e);
+    if (build_groups(&e) < 0) err_die(&e);
     /* Приговор выносится тому устройству, которое несёт трафик, — тому же, о котором
      * рассказывает status и к которому привязал таблицу apply (outputs_adopt_active). */
     outputs_adopt_active();

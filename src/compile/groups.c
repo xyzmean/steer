@@ -31,16 +31,18 @@
 struct group g_grp[MAX_CHANNELS];
 
 /* Дописать адресный список в группу, растя вектор вдвое. Отказ памяти здесь — это «правила
- * не собрать», поэтому громкий: тихо потерянный список превратил бы узкий канал в широкий. */
-static void group_add_file(struct group *g, const char *path) {
+ * не собрать», поэтому громкий (в struct err, а не в stderr — см. правило 5, раздел 2
+ * docs/architecture.md): тихо потерянный список превратил бы узкий канал в широкий. */
+static int group_add_file(struct group *g, const char *path, struct err *e) {
     if (g->files_n == g->files_cap) {
         size_t cap = g->files_cap ? g->files_cap * 2 : 8;
         const char **p = realloc(g->files, cap * sizeof(*p));
-        if (!p) die("out of memory building channel groups", NULL);
+        if (!p) return err_set(e, "out of memory building channel groups", NULL);
         g->files = p;
         g->files_cap = cap;
     }
     g->files[g->files_n++] = path;
+    return 0;
 }
 size_t g_grp_n;
 
@@ -68,7 +70,7 @@ static int same_from(const struct channel *c, const struct group *g) {
  *
  * Внутри каждой из двух групп порядок спеки сохраняется: два правила на разные устройства
  * или два глобальных по-прежнему читаются сверху вниз, как и раньше. */
-void build_groups(void) {
+int build_groups(struct err *e) {
     g_grp_n = 0;
     for (int pass = 0; pass < 2; pass++)
     for (size_t i = 0; i < g_ch_n; i++) {
@@ -133,7 +135,8 @@ void build_groups(void) {
             g->domains = 1;
             g->dfiles_n += c->domains_n;
         }
-        for (size_t f = 0; f < c->prefixes_n; f++) group_add_file(g, c->prefixes_files[f]);
+        for (size_t f = 0; f < c->prefixes_n; f++)
+            if (group_add_file(g, c->prefixes_files[f], e) != 0) return -1;
         if (g->members_n < MAX_CHANNELS) g->members[g->members_n++] = c->name;
     }
     /* Окончательные имена. Группа с доменами — всегда _dom, потому что имя набора резолвер
@@ -153,8 +156,9 @@ void build_groups(void) {
     for (size_t i = 0; i < g_grp_n; i++)
         for (size_t k = i + 1; k < g_grp_n; k++)
             if (!strcmp(g_grp[i].name, g_grp[k].name))
-                die("два разных набора каналов получили одно имя %s — "
+                return err_set(e, "два разных набора каналов получили одно имя %s — "
                     "укоротите или разведите имена выходов", g_grp[i].name);
+    return 0;
 }
 
 int has_domains(void) {
@@ -244,10 +248,15 @@ int has_via(void) {
  *
  * Отдельным проходом, до генерации: сообщение об ошибке должно появиться раньше, чем
  * мы начнём собирать набор, и раньше, чем что-либо будет применено. */
-static void count_list(const char *path, size_t *total, size_t *bad,
-                       char *first_bad, size_t first_bad_n, size_t *first_bad_line) {
+static int count_list(const char *path, size_t *total, size_t *bad,
+                      char *first_bad, size_t first_bad_n, size_t *first_bad_line,
+                      struct err *e) {
     FILE *in = fopen(path, "r");
-    if (!in) die("%s: cannot read a channel's list", path);
+    /* Отказ здесь — почти всегда гонка: readability уже проверена вызывающим мгновением
+     * раньше (см. check_address_lists), и попасть сюда можно только если список исчез
+     * между той проверкой и этим чтением. Редкость причины не повод оставить die() — правило
+     * 5 касается любого пути, даже маловероятного. */
+    if (!in) return err_set(e, "%s: cannot read a channel's list", path);
     char line[512];
     size_t lineno = 0;
     *total = *bad = 0;
@@ -269,6 +278,7 @@ static void count_list(const char *path, size_t *total, size_t *bad,
         }
     }
     fclose(in);
+    return 0;
 }
 
 /* Проверить списки адресных каналов ДО того, как что-то применится.
@@ -284,7 +294,7 @@ static void count_list(const char *path, size_t *total, size_t *bad,
  *   весь список не адреса  — это НЕ ТОТ список, отказываемся и говорим, что делать;
  *   несколько строк плохие — это мусор в файле, предупреждаем и пропускаем их, потому что
  *                            ронять канал из 19 тысяч префиксов из-за одной строки хуже. */
-void check_address_lists(void) {
+int check_address_lists(struct err *e) {
     for (size_t i = 0; i < g_grp_n; i++) {
         struct group *g = &g_grp[i];
         /* Непрочитанный файл выбрасывается из группы ЗДЕСЬ, до подсчёта и до генерации:
@@ -313,7 +323,8 @@ void check_address_lists(void) {
         for (size_t k = 0; k < g->files_n; k++) {
             size_t total = 0, bad = 0, bad_line = 0;
             char sample[128];
-            count_list(g->files[k], &total, &bad, sample, sizeof(sample), &bad_line);
+            if (count_list(g->files[k], &total, &bad, sample, sizeof(sample), &bad_line, e) != 0)
+                return -1;
             g->addrs += total - bad;
             if (!total) {
                 fprintf(stderr, LOG_W "%s: список пуст — канал «%s» ничего не поймает\n",
@@ -368,5 +379,6 @@ void check_address_lists(void) {
                         g->files[k], bad, total, bad_line, sample);
         }
     }
+    return 0;
 }
 

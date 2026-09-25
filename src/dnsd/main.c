@@ -230,7 +230,10 @@ int dnsd_main(int argc, char **argv) {
     /* Channels come from the spec, in spec order — the same file and the same
      * parser the compiler used, so the sets named here are exactly the sets it
      * generated. */
-    load_spec(spec);
+    /* Правило 5, docs/architecture.md, раздел 2: err_die здесь довершает то, что раньше делал
+     * die() изнутри load_spec. */
+    struct err e = {0};
+    if (load_spec(spec, &e) < 0) err_die(&e);
     dch_build();
     /* Раскладка — та же проба, что у apply, и тем же ответом: наборы и карту резолвер находит
      * по именам, и искать их не в той таблице значило бы наполнять пустоту. Спрашивается у

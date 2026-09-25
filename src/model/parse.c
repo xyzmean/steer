@@ -33,13 +33,6 @@ const char *g_state_dir = STEER_STATE_DIR;
  * и дописывать в него значило бы править чужое; rt_tables.d для этого и существует. */
 const char *g_rt_tables_d = "/etc/iproute2/rt_tables.d";
 
-void die(const char *fmt, const char *a) {
-    fprintf(stderr, "steer: ");
-    fprintf(stderr, fmt, a);
-    fputc('\n', stderr);
-    exit(2);
-}
-
 /* Состав идентификатора, пришедшего из спеки: имя выхода, имя устройства, имя канала,
  * записи lan_devices.
  *
@@ -264,8 +257,11 @@ static int port_range_parse(const char *s, struct port_range *r) {
  *
  * Пересечения тоже отвергаются здесь: множество nftables с накладывающимися интервалами
  * (`{ 1-100, 50-60 }`) ядро не принимает, а повтор (`{ 443, 443 }`) — тем более. Отказать
- * при загрузке дешевле, чем при применении: при загрузке ничего ещё не изменено. */
-static size_t port_list(struct js *j, const char *chan, struct port_range *dst, size_t max) {
+ * при загрузке дешевле, чем при применении: при загрузке ничего ещё не изменено.
+ *
+ * 0 — разобрано, *out_n заполнен; -1 — отказ, текст уже в e->msg (см. правило 5). */
+static int port_list(struct js *j, const char *chan, struct port_range *dst, size_t max,
+                     size_t *out_n, struct err *e) {
     /* Буфер с запасом: строки русские, в UTF-8 это два байта на букву, и обрезка по границе
      * буфера разрубила бы букву посередине — на этом ломался вывод при первом прогоне
      * стенда однажды уже (см. I-029). */
@@ -273,28 +269,30 @@ static size_t port_list(struct js *j, const char *chan, struct port_range *dst, 
     if (js_lit(j, '[') != 0) {
         snprintf(msg, sizeof(msg), "channels.%.24s: ports — массив строк вида "
                  "[\"443\", \"50000-65535\"]", chan);
-        die("%s", msg);
+        return err_set(e, "%s", msg);
     }
     size_t n = 0;
     js_ws(j);
-    if (*j->p == ']') { j->p++; return 0; }
+    if (*j->p == ']') { j->p++; *out_n = 0; return 0; }
     for (;;) {
         char t[32];
-        if (js_str(j, t, sizeof(t)) != 0) {
+        int r = js_str(j, t, sizeof(t), e);
+        if (r != 0) {
+            if (e->msg[0]) return -1;
             snprintf(msg, sizeof(msg), "channels.%.24s: ports: диапазон пишется СТРОКОЙ "
                      "(\"443\", а не 443)", chan);
-            die("%s", msg);
+            return err_set(e, "%s", msg);
         }
         if (n >= max) {
             snprintf(msg, sizeof(msg), "channels.%.24s: слишком много диапазонов портов "
                      "(предел %zu)", chan, max);
-            die("%s", msg);
+            return err_set(e, "%s", msg);
         }
         if (port_range_parse(t, &dst[n]) != 0) {
             snprintf(msg, sizeof(msg), "channels.%.24s: ports: негодная запись «%.20s» — "
                      "нужно «443» или «50000-65535», числа от 1 до 65535, начало не больше "
                      "конца", chan, t);
-            die("%s", msg);
+            return err_set(e, "%s", msg);
         }
         /* Пересечение с уже прочитанным. Квадрат по шестнадцати записям — это дешевле, чем
          * сортировка, и сообщение остаётся про ту пару, которую человек написал. */
@@ -303,7 +301,7 @@ static size_t port_list(struct js *j, const char *chan, struct port_range *dst, 
                 snprintf(msg, sizeof(msg), "channels.%.24s: ports: диапазоны %u-%u и %u-%u "
                          "пересекаются — сложите их в один", chan,
                          dst[k].lo, dst[k].hi, dst[n].lo, dst[n].hi);
-                die("%s", msg);
+                return err_set(e, "%s", msg);
             }
         n++;
         js_ws(j);
@@ -315,14 +313,15 @@ static size_t port_list(struct js *j, const char *chan, struct port_range *dst, 
             if (*j->p == ']') {
                 snprintf(msg, sizeof(msg), "channels.%.24s: ports: висящая запятая "
                          "(ожидалась строка)", chan);
-                die("%s", msg);
+                return err_set(e, "%s", msg);
             }
             continue;
         }
         break;
     }
     js_lit(j, ']');
-    return n;
+    *out_n = n;
+    return 0;
 }
 
 /* «адрес:порт» → адрес и порт. Живёт здесь, а не в obfs.c, потому что нужен обоим:
@@ -352,18 +351,19 @@ int obfs_split_hostport(const char *s, char *host, size_t hn, int *port) {
  * единственное место, где две настройки обязаны знать друг о друге, и вывести одну из
  * другой движок не может — ключи и пиры не его. Несовпадение молчаливо: WireGuard шлёт
  * в никуда, туннель не поднимается, и причина не видна ниоткуда, кроме tcpdump. */
-static void parse_obfs(struct js *j, struct output *o) {
-    if (js_lit(j, '{') != 0) die("outputs.%s: obfs должен быть объектом", o->name);
+static int parse_obfs(struct js *j, struct output *o, struct err *e) {
+    if (js_lit(j, '{') != 0) return err_set(e, "outputs.%s: obfs должен быть объектом", o->name);
     char mode[32] = "", server[80] = "", listen[80] = "";
     js_ws(j);
     while (*j->p != '}') {
         char key[32];
-        if (js_str(j, key, sizeof(key)) != 0) die("outputs.%s: плохой ключ в obfs", o->name);
-        if (js_lit(j, ':') != 0) die("outputs.%s: в obfs после ключа нет двоеточия", o->name);
-        if (!strcmp(key, "mode")) js_str(j, mode, sizeof(mode));
-        else if (!strcmp(key, "server")) js_str(j, server, sizeof(server));
-        else if (!strcmp(key, "listen")) js_str(j, listen, sizeof(listen));
-        else js_skip(j);
+        if (js_str(j, key, sizeof(key), e) != 0)
+            return err_prop(e, "outputs.%s: плохой ключ в obfs", o->name);
+        if (js_lit(j, ':') != 0) return err_set(e, "outputs.%s: в obfs после ключа нет двоеточия", o->name);
+        if (!strcmp(key, "mode")) { if (js_str(j, mode, sizeof(mode), e) != 0 && e->msg[0]) return -1; }
+        else if (!strcmp(key, "server")) { if (js_str(j, server, sizeof(server), e) != 0 && e->msg[0]) return -1; }
+        else if (!strcmp(key, "listen")) { if (js_str(j, listen, sizeof(listen), e) != 0 && e->msg[0]) return -1; }
+        else { if (js_skip(j, e) != 0) return -1; }
         js_ws(j);
         if (*j->p == ',') { j->p++; js_ws(j); }
     }
@@ -374,27 +374,28 @@ static void parse_obfs(struct js *j, struct output *o) {
      * молчаливое «наверное, тот самый»: обфускация, которой нет, выглядит как рабочий
      * выход, из которого не выходит ни один пакет. */
     if (mode[0] && strcmp(mode, "wg-over-tcp") != 0)
-        die("outputs.%s: неизвестный obfs.mode (сейчас есть только wg-over-tcp)", o->name);
-    if (!server[0]) die("outputs.%s: obfs нужен server вида адрес:порт", o->name);
+        return err_set(e, "outputs.%s: неизвестный obfs.mode (сейчас есть только wg-over-tcp)", o->name);
+    if (!server[0]) return err_set(e, "outputs.%s: obfs нужен server вида адрес:порт", o->name);
     if (obfs_split_hostport(server, o->obfs.server, sizeof(o->obfs.server),
                             &o->obfs.server_port) != 0)
-        die("outputs.%s: obfs.server должен быть вида адрес:порт", o->name);
+        return err_set(e, "outputs.%s: obfs.server должен быть вида адрес:порт", o->name);
     /* Имя, а не адрес — отказ. Имя пришлось бы разрешать, и разрешать его через тот
      * самый DNS, который может идти в туннель, который поднимается через этот самый
      * сервер. Управляющий слой резолвит один раз и кладёт сюда адрес — то же правило,
      * что со списками: движок читает то, что ему положили. */
     struct in_addr tmp;
     if (inet_pton(AF_INET, o->obfs.server, &tmp) != 1)
-        die("outputs.%s: obfs.server должен быть адресом, а не именем", o->name);
+        return err_set(e, "outputs.%s: obfs.server должен быть адресом, а не именем", o->name);
 
-    if (!listen[0]) die("outputs.%s: obfs нужен listen — тот же адрес и порт, что в "
+    if (!listen[0]) return err_set(e, "outputs.%s: obfs нужен listen — тот же адрес и порт, что в "
                         "Endpoint пира WireGuard", o->name);
     if (obfs_split_hostport(listen, o->obfs.listen, sizeof(o->obfs.listen),
                             &o->obfs.listen_port) != 0)
-        die("outputs.%s: obfs.listen должен быть вида адрес:порт", o->name);
+        return err_set(e, "outputs.%s: obfs.listen должен быть вида адрес:порт", o->name);
     if (inet_pton(AF_INET, o->obfs.listen, &tmp) != 1)
-        die("outputs.%s: obfs.listen должен быть адресом, а не именем", o->name);
+        return err_set(e, "outputs.%s: obfs.listen должен быть адресом, а не именем", o->name);
     o->obfs.on = 1;
+    return 0;
 }
 
 /* Виды выходов ОДНИМ списком: из него и печать (out_kind_name), и проверка флага
@@ -426,10 +427,10 @@ int out_kind_known(const char *s) {
     return 0;
 }
 
-static void parse_outputs(struct js *j) {
-    if (js_lit(j, '{') != 0) die("outputs: expected an object", NULL);
+static int parse_outputs(struct js *j, struct err *e) {
+    if (js_lit(j, '{') != 0) return err_set(e, "outputs: expected an object", NULL);
     js_ws(j);
-    if (*j->p == '}') { j->p++; return; }
+    if (*j->p == '}') { j->p++; return 0; }
     for (;;) {
         struct output o = {0};
         /* Какой из двух форм записан выбор узлов. Нужно, чтобы отличить «поля нет» от «поле
@@ -437,24 +438,25 @@ static void parse_outputs(struct js *j) {
          * написанного человеком не действует, и понять это было бы нечем (тот же приём, что
          * у lan_device/lan_devices в load_spec). */
         int node_one = 0, node_many = 0;
-        if (js_str(j, o.name, sizeof(o.name)) != 0) die("outputs: expected a name", NULL);
+        if (js_str(j, o.name, sizeof(o.name), e) != 0)
+            return err_prop(e, "outputs: expected a name", NULL);
         /* Состав имени — см. name_ok(). Оно уходит в командную строку через diag и в имя
          * набора, поэтому проверяется здесь, один раз, а не у каждого вызова. */
         if (!name_ok(o.name))
-            die("outputs.%s: в имени выхода можно только буквы, цифры, _ - и точку", o.name);
-        if (js_lit(j, ':') != 0) die("outputs.%s: expected ':'", o.name);
-        if (js_lit(j, '{') != 0) die("outputs.%s: expected an object", o.name);
+            return err_set(e, "outputs.%s: в имени выхода можно только буквы, цифры, _ - и точку", o.name);
+        if (js_lit(j, ':') != 0) return err_set(e, "outputs.%s: expected ':'", o.name);
+        if (js_lit(j, '{') != 0) return err_set(e, "outputs.%s: expected an object", o.name);
         char kind[32] = "";
         js_ws(j);
         while (*j->p != '}') {
             char key[32];
-            if (js_str(j, key, sizeof(key)) != 0) die("outputs.%s: bad key", o.name);
-            if (js_lit(j, ':') != 0) die("outputs.%s: после ключа нет двоеточия", o.name);
-            if (!strcmp(key, "kind")) js_str(j, kind, sizeof(kind));
+            if (js_str(j, key, sizeof(key), e) != 0) return err_prop(e, "outputs.%s: bad key", o.name);
+            if (js_lit(j, ':') != 0) return err_set(e, "outputs.%s: после ключа нет двоеточия", o.name);
+            if (!strcmp(key, "kind")) { if (js_str(j, kind, sizeof(kind), e) != 0 && e->msg[0]) return -1; }
             else if (!strcmp(key, "device")) {
-                js_str(j, o.device, sizeof(o.device));
+                if (js_str(j, o.device, sizeof(o.device), e) != 0 && e->msg[0]) return -1;
                 if (!name_ok(o.device))
-                    die("outputs.%s: имя устройства негодного состава", o.name);
+                    return err_set(e, "outputs.%s: имя устройства негодного состава", o.name);
             }
             else if (!strcmp(key, "devices")) {
                 /* Кандидаты в порядке предпочтения. Единственное число остаётся
@@ -464,9 +466,10 @@ static void parse_outputs(struct js *j) {
                     if (*j->p == ']') j->p++;
                     else for (;;) {
                         char t[32];
-                        if (js_str(j, t, sizeof(t)) != 0) break;
-                        if (o.devices_n >= MAX_DEVICES) die("outputs.%s: too many devices", o.name);
-                        if (!name_ok(t)) die("outputs.%s: имя устройства негодного состава", o.name);
+                        int r = js_str(j, t, sizeof(t), e);
+                        if (r != 0) { if (e->msg[0]) return -1; break; }
+                        if (o.devices_n >= MAX_DEVICES) return err_set(e, "outputs.%s: too many devices", o.name);
+                        if (!name_ok(t)) return err_set(e, "outputs.%s: имя устройства негодного состава", o.name);
                         snprintf(o.devices[o.devices_n++], 32, "%s", t);
                         js_ws(j);
                         if (*j->p == ',') {
@@ -474,7 +477,7 @@ static void parse_outputs(struct js *j) {
                              * риск зависания parse_outputs на несъеденной скобке. */
                             j->p++;
                             js_ws(j);
-                            if (*j->p == ']') die("outputs.%s: trailing comma in devices", o.name);
+                            if (*j->p == ']') return err_set(e, "outputs.%s: trailing comma in devices", o.name);
                             continue;
                         }
                         js_lit(j, ']');
@@ -482,15 +485,15 @@ static void parse_outputs(struct js *j) {
                     }
                 }
             }
-            else if (!strcmp(key, "obfs")) parse_obfs(j, &o);
-            else if (!strcmp(key, "sub_file")) js_str(j, o.sub_file, sizeof(o.sub_file));
-            else if (!strcmp(key, "conf")) js_str(j, o.xs_conf, sizeof(o.xs_conf));
+            else if (!strcmp(key, "obfs")) { if (parse_obfs(j, &o, e) != 0) return -1; }
+            else if (!strcmp(key, "sub_file")) { if (js_str(j, o.sub_file, sizeof(o.sub_file), e) != 0 && e->msg[0]) return -1; }
+            else if (!strcmp(key, "conf")) { if (js_str(j, o.xs_conf, sizeof(o.xs_conf), e) != 0 && e->msg[0]) return -1; }
             /* Файл ключей nfqws у kind=zapret. Отдельным ключом, а не переиспользованным
              * `conf`: у xsteer там конфигурация в стиле wg с приватным ключом, здесь —
              * список ключей командной строки, и одно имя для двух разных вещей однажды
              * привело бы к попытке поднять туннель по стратегии обхода. */
-            else if (!strcmp(key, "opts_file")) js_str(j, o.zp_opts, sizeof(o.zp_opts));
-            else if (!strcmp(key, "domain")) js_str(j, o.tg_domain, sizeof(o.tg_domain));
+            else if (!strcmp(key, "opts_file")) { if (js_str(j, o.zp_opts, sizeof(o.zp_opts), e) != 0 && e->msg[0]) return -1; }
+            else if (!strcmp(key, "domain")) { if (js_str(j, o.tg_domain, sizeof(o.tg_domain), e) != 0 && e->msg[0]) return -1; }
             /* Через какой выход идёт трафик самого туннеля — см. блок «вложенные выходы» в
              * spec.h. Состав имени проверяется тем же name_ok, что имя выхода: строка уходит в
              * status и в подпись помощника, а годное имя выхода по-другому и не выглядит.
@@ -499,9 +502,9 @@ static void parse_outputs(struct js *j) {
             else if (!strcmp(key, "via")) {
                 /* Пустая строка — «напрямую», как отсутствие ключа: так поле очищает
                  * интерфейс, который держит его в форме, и отказ на ней был бы придиркой. */
-                js_str(j, o.via, sizeof(o.via));
+                if (js_str(j, o.via, sizeof(o.via), e) != 0 && e->msg[0]) return -1;
                 if (o.via[0] && !name_ok(o.via))
-                    die("outputs.%s: via — имя другого выхода (буквы, цифры, _ - и точка)",
+                    return err_set(e, "outputs.%s: via — имя другого выхода (буквы, цифры, _ - и точка)",
                         o.name);
             }
             /* Транспорт выхода xsteer. Полем спеки, а не только ключом командной строки,
@@ -509,67 +512,74 @@ static void parse_outputs(struct js *j) {
              * обязана переживать перезагрузку. */
             /* Проверяем на 't', как соседнее `enabled` проверяется на 'f': значение здесь
              * либо true, либо false, и разбирать его полноценным разбором JSON незачем. */
-            else if (!strcmp(key, "stream")) { js_ws(j); o.xs_stream = (*j->p == 't'); js_skip(j); }
-            else if (!strcmp(key, "stream_port")) o.xs_stream_port = (int)js_num(j);
+            else if (!strcmp(key, "stream")) { js_ws(j); o.xs_stream = (*j->p == 't'); if (js_skip(j, e) != 0) return -1; }
+            else if (!strcmp(key, "stream_port")) {
+                long v = 0;
+                if (js_num(j, &v, e) != 0) return -1;
+                o.xs_stream_port = (int)v;
+            }
             /* `node` — сокращение для списка из одного узла, `nodes` — сам список. Дальше по
              * коду путь один, ровно как у `device`/`devices`. Прежнее `-1` («первый рабочий»)
              * записывается пустым списком: это то же самое умолчание, только выраженное
              * отсутствием кандидатов, а не отрицательным номером. */
             else if (!strcmp(key, "node")) {
-                long v = js_num(j);
+                long v = 0;
+                if (js_num(j, &v, e) != 0) return -1;
                 node_one = 1;
                 if (v >= 0) { o.nodes[0] = (int)v; o.nodes_n = 1; }
                 else o.nodes_n = 0;
             }
             else if (!strcmp(key, "nodes")) {
-                if (num_array(j, o.nodes, MAX_NODE_SEL, &o.nodes_n) != 0)
-                    die("outputs.%s: nodes — массив номеров узлов подписки", o.name);
+                if (num_array(j, o.nodes, MAX_NODE_SEL, &o.nodes_n, e) != 0)
+                    return err_prop(e, "outputs.%s: nodes — массив номеров узлов подписки", o.name);
                 node_many = 1;
             }
             else if (!strcmp(key, "on_fail")) {
                 char m[16];
-                js_str(j, m, sizeof(m));
+                if (js_str(j, m, sizeof(m), e) != 0 && e->msg[0]) return -1;
                 if (!strcmp(m, "drop")) o.on_fail = FAIL_DROP;
                 else if (!strcmp(m, "direct")) o.on_fail = FAIL_DIRECT;
 #ifdef STEER_ANDROID
                 /* zapret в сборке под Android нет — см. out_skips_zapret в spec.h. */
                 else if (!strcmp(m, "zapret"))
-                    die("outputs.%s: on_fail zapret — в сборке под Android zapret нет "
+                    return err_set(e, "outputs.%s: on_fail zapret — в сборке под Android zapret нет "
                         "(want drop or direct)", o.name);
-                else die("outputs.%s: unknown on_fail (want drop or direct)", o.name);
+                else return err_set(e, "outputs.%s: unknown on_fail (want drop or direct)", o.name);
 #else
                 else if (!strcmp(m, "zapret")) o.on_fail = FAIL_ZAPRET;
-                else die("outputs.%s: unknown on_fail (want drop, direct or zapret)", o.name);
+                else return err_set(e, "outputs.%s: unknown on_fail (want drop, direct or zapret)", o.name);
 #endif
             }
             /* Вторая ось сторожа. Значение по умолчанию — `order`, то есть сегодняшнее
              * поведение; см. рассуждение у поля prefer_latency в spec.h. */
             else if (!strcmp(key, "prefer")) {
                 char m[16];
-                js_str(j, m, sizeof(m));
+                if (js_str(j, m, sizeof(m), e) != 0 && e->msg[0]) return -1;
                 if (!strcmp(m, "latency")) o.prefer_latency = 1;
                 else if (strcmp(m, "order") != 0)
-                    die("outputs.%s: unknown prefer (want order or latency)", o.name);
+                    return err_set(e, "outputs.%s: unknown prefer (want order or latency)", o.name);
             }
             else if (!strcmp(key, "latency_tolerance_ms")) {
-                long v = js_num(j);
+                long v = 0;
+                if (js_num(j, &v, e) != 0) return -1;
                 /* Ноль законен и означает «переключаться на любое улучшение». Отрицательное
                  * — нет: оно означало бы «переключаться на ухудшение», и это не настройка, а
                  * опечатка, которую надо назвать. */
                 if (v < 0 || v > 60000)
-                    die("outputs.%s: latency_tolerance_ms — от 0 до 60000", o.name);
+                    return err_set(e, "outputs.%s: latency_tolerance_ms — от 0 до 60000", o.name);
                 o.lat_tolerance_ms = (int)v;
             }
             else if (!strcmp(key, "latency_interval_s")) {
-                long v = js_num(j);
+                long v = 0;
+                if (js_num(j, &v, e) != 0) return -1;
                 /* Нижний предел не косметика: замер опрашивает ВСЕХ кандидатов, и интервал
                  * короче тика сторожа означал бы замер на каждом тике — то есть таймаут за
                  * каждого мёртвого кандидата каждую минуту. */
                 if (v < 30 || v > 86400)
-                    die("outputs.%s: latency_interval_s — от 30 до 86400", o.name);
+                    return err_set(e, "outputs.%s: latency_interval_s — от 30 до 86400", o.name);
                 o.lat_interval_s = (int)v;
             }
-            else js_skip(j);
+            else { if (js_skip(j, e) != 0) return -1; }
             js_ws(j);
             if (*j->p == ',') { j->p++; js_ws(j); }
         }
@@ -580,11 +590,11 @@ static void parse_outputs(struct js *j) {
             /* Отказываем СРАЗУ, а не при подъёме: иначе спека применяется, правила
              * встают, и выход молча никуда не ведёт — то есть человек видит рабочую
              * конфигурацию, в которой трафик пропадает. */
-            die("outputs.%s: kind vless требует пакет steer-extended", o.name);
+            return err_set(e, "outputs.%s: kind vless требует пакет steer-extended", o.name);
 #endif
             o.kind = OUT_VLESS;
             if (!o.sub_file[0])
-                die("outputs.%s: kind vless нужен sub_file с подпиской", o.name);
+                return err_set(e, "outputs.%s: kind vless нужен sub_file с подпиской", o.name);
             /* Имя устройства выводится из имени выхода: держать его отдельным полем
              * значило бы дать двум именам расходиться, а никакой пользы от их различия
              * нет. Ограничение в 15 символов — предел IFNAMSIZ. */
@@ -597,7 +607,7 @@ static void parse_outputs(struct js *j) {
              * применяется, правила и метки встают, а устройства не создаст никто —
              * человек видит рабочую конфигурацию, из которой не выходит ни один пакет.
              * Подстроку «steer-extended» здесь читают снаружи (см. src/daemon/main.c). */
-            die("outputs.%s: kind xsteer требует пакет steer-extended", o.name);
+            return err_set(e, "outputs.%s: kind xsteer требует пакет steer-extended", o.name);
 #endif
             o.kind = OUT_XSTEER;
             /* Имя устройства и путь к конфигурации выводятся из имени выхода — тот же
@@ -612,18 +622,18 @@ static void parse_outputs(struct js *j) {
              * наша оболочка, — относительный «работал бы из шелла» и не работал у
              * сервиса. Годность к JSON: путь печатается в status, diag и xsteer-peers. */
             else if (o.xs_conf[0] != '/' || !label_ok(o.xs_conf))
-                die("outputs.%s: conf должен быть абсолютным путём без кавычек", o.name);
+                return err_set(e, "outputs.%s: conf должен быть абсолютным путём без кавычек", o.name);
             if (o.xs_stream_port && (o.xs_stream_port < 1 || o.xs_stream_port > 65535))
-                die("outputs.%s: stream_port вне 1..65535", o.name);
+                return err_set(e, "outputs.%s: stream_port вне 1..65535", o.name);
             /* Порт без режима — это настройка, которая ничего не делает: сказать «настроено»,
              * не настроив, хуже, чем отказать. Тот же довод, что у obfs при чужом kind. */
             if (o.xs_stream_port && !o.xs_stream)
-                die("outputs.%s: stream_port без stream: транспорт остался бы поддельным TCP",
+                return err_set(e, "outputs.%s: stream_port без stream: транспорт остался бы поддельным TCP",
                     o.name);
         }
         else if (!strcmp(kind, "zapret")) {
 #ifdef STEER_ANDROID
-            die("outputs.%s: kind zapret — в сборке под Android zapret нет", o.name);
+            return err_set(e, "outputs.%s: kind zapret — в сборке под Android zapret нет", o.name);
 #endif
             o.kind = OUT_ZAPRET;
             /* Устройства нет и не будет: трафик уходит обычным маршрутом, а выход меняет
@@ -631,7 +641,7 @@ static void parse_outputs(struct js *j) {
              * почти наверняка описка (человек копировал выход-туннель), и принять его
              * молча значило бы обещать маршрутизацию, которой не будет. */
             if (o.device[0] || o.devices_n)
-                die("outputs.%s: у kind zapret нет устройства — трафик идёт обычным путём",
+                return err_set(e, "outputs.%s: у kind zapret нет устройства — трафик идёт обычным путём",
                     o.name);
             /* Путь выводится из имени выхода — тот же довод, что у conf у xsteer: два
              * имени, которым позволено разойтись, пользы не приносят. Имя уже проверено
@@ -642,7 +652,7 @@ static void parse_outputs(struct js *j) {
              * запускает процесс procd со своим рабочим каталогом — относительный «работал
              * бы из шелла» и не работал бы у службы. Тот же барьер, что у conf. */
             else if (o.zp_opts[0] != '/' || !label_ok(o.zp_opts))
-                die("outputs.%s: opts_file должен быть абсолютным путём без кавычек", o.name);
+                return err_set(e, "outputs.%s: opts_file должен быть абсолютным путём без кавычек", o.name);
         }
         else if (!strcmp(kind, "tgws")) {
             o.kind = OUT_TGWS;
@@ -652,7 +662,7 @@ static void parse_outputs(struct js *j) {
              * нужен домен за Cloudflare, и подставить вместо него web.telegram.org молча
              * значило бы завести выход, у которого эти дата-центры не работают никогда. */
             if (!o.tg_domain[0])
-                die("outputs.%s: kind tgws нужен domain — имя за Cloudflare, у которого "
+                return err_set(e, "outputs.%s: kind tgws нужен domain — имя за Cloudflare, у которого "
                     "kwsN.<domain> ведёт на веб-точку Telegram: web.telegram.org обслуживает "
                     "только ДЦ2 и ДЦ4", o.name);
             /* Устройства нет по той же причине, что у zapret: маршрут не меняется, меняется
@@ -660,7 +670,7 @@ static void parse_outputs(struct js *j) {
              * наверняка описка, и принять её молча значило бы обещать маршрутизацию,
              * которой не будет. */
             if (o.device[0] || o.devices_n)
-                die("outputs.%s: у kind tgws нет устройства — соединение перехватывается",
+                return err_set(e, "outputs.%s: у kind tgws нет устройства — соединение перехватывается",
                     o.name);
         }
         else if (!strcmp(kind, "awg")) {
@@ -672,7 +682,7 @@ static void parse_outputs(struct js *j) {
              * список здесь означал бы устройства, которые никто не создаст. */
             if (o.devices_n > 1 ||
                 (o.devices_n == 1 && o.device[0] && strcmp(o.device, o.devices[0]) != 0))
-                die("outputs.%s: у kind awg одно устройство — его заводит движок; пул "
+                return err_set(e, "outputs.%s: у kind awg одно устройство — его заводит движок; пул "
                     "собирается выходом kind=interface", o.name);
             if (o.devices_n == 1 && !o.device[0])
                 snprintf(o.device, sizeof(o.device), "%s", o.devices[0]);
@@ -682,9 +692,9 @@ static void parse_outputs(struct js *j) {
              * владелец просил не оставлять. */
             if (o.device[0]) {
                 if (strlen(o.device) > 15)
-                    die("outputs.%s: имя устройства длиннее 15 символов", o.name);
+                    return err_set(e, "outputs.%s: имя устройства длиннее 15 символов", o.name);
                 if (awg_ifname_conspicuous(o.device))
-                    die("outputs.%s: имя устройства выдаёт туннель (tun, wg, awg, ppp, vpn…) — "
+                    return err_set(e, "outputs.%s: имя устройства выдаёт туннель (tun, wg, awg, ppp, vpn…) — "
                         "уберите device, и движок выберет имя сам", o.name);
             } else awg_default_ifname(o.name, o.device, sizeof(o.device));
             o.devices_n = 0;
@@ -694,7 +704,7 @@ static void parse_outputs(struct js *j) {
             if (!o.xs_conf[0])
                 snprintf(o.xs_conf, sizeof(o.xs_conf), STEER_ETC_DIR "/awg/%.200s.conf", o.name);
             else if (o.xs_conf[0] != '/' || !label_ok(o.xs_conf))
-                die("outputs.%s: conf должен быть абсолютным путём без кавычек", o.name);
+                return err_set(e, "outputs.%s: conf должен быть абсолютным путём без кавычек", o.name);
         }
         else if (!strcmp(kind, "interface")) {
             o.kind = OUT_INTERFACE;
@@ -703,8 +713,8 @@ static void parse_outputs(struct js *j) {
              * второй, чтобы дальше по коду не было двух путей. */
             if (!o.devices_n && o.device[0]) snprintf(o.devices[o.devices_n++], 32, "%s", o.device);
             if (!o.device[0] && o.devices_n) snprintf(o.device, sizeof(o.device), "%s", o.devices[0]);
-            if (!o.device[0]) die("outputs.%s: kind interface needs a device", o.name);
-        } else die("outputs.%s: неизвестный kind "
+            if (!o.device[0]) return err_set(e, "outputs.%s: kind interface needs a device", o.name);
+        } else return err_set(e, "outputs.%s: неизвестный kind "
                    "(нужен direct, interface, vless, xsteer, zapret, tgws или awg)", o.name);
         /* Обфускация осмысленна только там, где транспорт — чужой UDP, до которого
          * движку не дотянуться иначе. У vless свой транспорт внутри движка (и свои
@@ -712,52 +722,52 @@ static void parse_outputs(struct js *j) {
          * него, у direct транспорта нет вовсе. Принять поле молча значило бы сказать
          * «настроено», не настроив ничего. */
         if (o.obfs.on && o.kind != OUT_INTERFACE)
-            die("outputs.%s: obfs есть только у kind=interface", o.name);
+            return err_set(e, "outputs.%s: obfs есть только у kind=interface", o.name);
         /* Режим потока — свойство транспорта xsteer, и у прочих видов выхода его нет. Принять
          * поле молча значило бы сказать «настроено», не настроив ничего. */
         if ((o.xs_stream || o.xs_stream_port) && o.kind != OUT_XSTEER)
-            die("outputs.%s: stream есть только у kind=xsteer", o.name);
+            return err_set(e, "outputs.%s: stream есть только у kind=xsteer", o.name);
         /* Тот же довод, что у obfs и stream: поле, принятое молча у чужого вида выхода, —
          * это «настроено», сказанное о том, что не настроено. Проверка стоит ПОСЛЕ разбора
          * kind, потому что у своего вида это поле выставляет умолчание. */
         if (o.zp_opts[0] && o.kind != OUT_ZAPRET)
-            die("outputs.%s: opts_file есть только у kind=zapret", o.name);
+            return err_set(e, "outputs.%s: opts_file есть только у kind=zapret", o.name);
         if (o.tg_domain[0] && o.kind != OUT_TGWS)
-            die("outputs.%s: domain есть только у kind=tgws", o.name);
+            return err_set(e, "outputs.%s: domain есть только у kind=tgws", o.name);
         /* on_fail=zapret у выхода kind=zapret — это «при отказе обхода включить обход».
          * Молча принять значило бы записать в настройку круг, который ничего не значит. */
         if (o.kind == OUT_ZAPRET && o.on_fail == FAIL_ZAPRET)
-            die("outputs.%s: on_fail zapret у выхода kind zapret ничего не значит "
+            return err_set(e, "outputs.%s: on_fail zapret у выхода kind zapret ничего не значит "
                 "(нужен drop или direct)", o.name);
         /* У tgws on_fail не выражается вовсе, и молчать об этом нельзя. Перехват — это
          * правило nat, оно стоит в ядре всегда; когда моста нет, ядро отвечает отказом на
          * соединение, то есть ведёт себя как drop, и никаким полем это не переключить.
          * Обещать direct и не сделать его хуже, чем отказать сразу. */
         if (o.kind == OUT_TGWS && o.on_fail != FAIL_DROP)
-            die("outputs.%s: у kind tgws on_fail только drop: перехват стоит в ядре, и без "
+            return err_set(e, "outputs.%s: у kind tgws on_fail только drop: перехват стоит в ядре, и без "
                 "моста соединение отвергается — обойти это правилом нечем", o.name);
         if (node_one && node_many)
-            die("outputs.%s: задано и node, и nodes — оставьте одно", o.name);
+            return err_set(e, "outputs.%s: задано и node, и nodes — оставьте одно", o.name);
         /* Выбор узлов есть только у подписки. Отвергается ТОЛЬКО новая форма: `nodes` не
          * может стоять в спеке, написанной до этой версии, а `node` там стоять мог — и у
          * чужого вида выхода он и раньше ничего не делал. Отказать на нём сейчас значило бы
          * сломать применение спеки, которая работала, ради поля, которое ничего не меняет. */
         if (node_many && o.kind != OUT_VLESS)
-            die("outputs.%s: nodes есть только у kind=vless — это номера узлов подписки",
+            return err_set(e, "outputs.%s: nodes есть только у kind=vless — это номера узлов подписки",
                 o.name);
         /* Дубликат номера делает перебор бессмысленным ровно так же, как дубликат устройства
          * в devices: второй кандидат ничем не отличается от первого. */
         for (size_t a = 0; a < o.nodes_n; a++)
             for (size_t b = a + 1; b < o.nodes_n; b++)
                 if (o.nodes[a] == o.nodes[b])
-                    die("outputs.%s: узел подписки указан в nodes дважды", o.name);
-        if (g_out_n >= MAX_OUTPUTS) die("too many outputs", NULL);
+                    return err_set(e, "outputs.%s: узел подписки указан в nodes дважды", o.name);
+        if (g_out_n >= MAX_OUTPUTS) return err_set(e, "too many outputs", NULL);
         /* Два выхода с одним именем: реестр раздаст две метки, init поднимет два процесса
          * на одно имя, а out_by_name всегда возьмёт первый — как у devices и nodes, это
          * отказ, не молчаливая победа одного из двух. */
         for (size_t a = 0; a < g_out_n; a++)
             if (!strcmp(g_out[a].name, o.name))
-                die("outputs.%s: имя выхода повторяется", o.name);
+                return err_set(e, "outputs.%s: имя выхода повторяется", o.name);
         g_out[g_out_n++] = o;
         js_ws(j);
         if (*j->p == ',') { j->p++; continue; }
@@ -765,37 +775,38 @@ static void parse_outputs(struct js *j) {
     }
     /* Закрывающая скобка обязательна: без неё это оборванный файл (питание пропало посреди
      * записи), и половина спеки применялась бы без единой жалобы. */
-    if (js_lit(j, '}') != 0) die("outputs: нет закрывающей скобки — спека оборвана?", NULL);
+    if (js_lit(j, '}') != 0) return err_set(e, "outputs: нет закрывающей скобки — спека оборвана?", NULL);
+    return 0;
 }
 
-static void parse_channels(struct js *j) {
-    if (js_lit(j, '[') != 0) die("channels: expected an array", NULL);
+static int parse_channels(struct js *j, struct err *e) {
+    if (js_lit(j, '[') != 0) return err_set(e, "channels: expected an array", NULL);
     js_ws(j);
-    if (*j->p == ']') { j->p++; return; }
+    if (*j->p == ']') { j->p++; return 0; }
     for (;;) {
         struct channel c = {0};
         /* Какой из двух форм записаны списки совпадения — как у device/devices: заданы обе
          * значит половина написанного человеком молча не действует. */
         int pf_one = 0, pf_many = 0, df_one = 0, df_many = 0;
-        if (js_lit(j, '{') != 0) die("channels: expected an object", NULL);
+        if (js_lit(j, '{') != 0) return err_set(e, "channels: expected an object", NULL);
         js_ws(j);
         while (*j->p != '}') {
             char key[32];
-            if (js_str(j, key, sizeof(key)) != 0) die("channels: bad key", NULL);
-            if (js_lit(j, ':') != 0) die("channels: после ключа «%s» нет двоеточия", key);
-            if (!strcmp(key, "name")) js_str(j, c.name, sizeof(c.name));
-            else if (!strcmp(key, "out")) js_str(j, c.out, sizeof(c.out));
-            else if (!strcmp(key, "from")) str_array(j, c.from, MAX_FROM, &c.from_n);
+            if (js_str(j, key, sizeof(key), e) != 0) return err_prop(e, "channels: bad key", NULL);
+            if (js_lit(j, ':') != 0) return err_set(e, "channels: после ключа «%s» нет двоеточия", key);
+            if (!strcmp(key, "name")) { if (js_str(j, c.name, sizeof(c.name), e) != 0 && e->msg[0]) return -1; }
+            else if (!strcmp(key, "out")) { if (js_str(j, c.out, sizeof(c.out), e) != 0 && e->msg[0]) return -1; }
+            else if (!strcmp(key, "from")) { if (str_array(j, c.from, MAX_FROM, &c.from_n, e) != 0 && e->msg[0]) return -1; }
             /* СХЕМА 2: правило на одно устройство, старше глобальных по построению.
              * Разрешено только при `schema: 2` — проверяется ниже, вместе с proto/ports, и
              * по той же причине: движок постарше ключ пропустит и положит правило в порядке
              * спеки, то есть исключение для телефона проиграет глобальному правилу молча. */
             else if (!strcmp(key, "scope")) {
                 char sc[16];
-                js_str(j, sc, sizeof(sc));
+                if (js_str(j, sc, sizeof(sc), e) != 0 && e->msg[0]) return -1;
                 if (!strcmp(sc, "device")) { c.dev_scope = 1; c.l4_written = 1; }
                 else if (strcmp(sc, "global") != 0)
-                    die("channels.%s: unknown scope (want device or global)", c.name);
+                    return err_set(e, "channels.%s: unknown scope (want device or global)", c.name);
             }
             /* Отсутствие поля и `true` значат одно: правило работает, — спека без этого
              * поля обязана вести себя как прежде. «Нет» — и `false`, и `0`: jshn пишет
@@ -805,7 +816,7 @@ static void parse_channels(struct js *j) {
             else if (!strcmp(key, "enabled")) {
                 js_ws(j);
                 const char *v = j->p;
-                js_skip(j);
+                if (js_skip(j, e) != 0) return -1;
                 size_t vl = (size_t)(j->p - v);
                 while (vl && (v[vl - 1] == ' ' || v[vl - 1] == '\t' ||
                               v[vl - 1] == '\n' || v[vl - 1] == '\r')) vl--;
@@ -817,7 +828,7 @@ static void parse_channels(struct js *j) {
                             c.name[0] ? c.name : "?", (int)(vl > 16 ? 16 : vl), v);
             }
             else if (!strcmp(key, "match")) {
-                if (js_lit(j, '{') != 0) die("channels.%s: match must be an object", c.name);
+                if (js_lit(j, '{') != 0) return err_set(e, "channels.%s: match must be an object", c.name);
                 js_ws(j);
                 while (*j->p != '}') {
                     char mk[32];
@@ -829,39 +840,52 @@ static void parse_channels(struct js *j) {
                      * 100% CPU, а его опрашивает rpcd каждые пять секунд: каждый опрос
                      * плодил ещё один вечный процесс на единственном ядре роутера.
                      * Контракт обещает громкий отказ на битой спеке — вот он. */
-                    if (js_str(j, mk, sizeof(mk)) != 0)
-                        die("channels.%s: match: expected a key", c.name);
+                    if (js_str(j, mk, sizeof(mk), e) != 0)
+                        return err_prop(e, "channels.%s: match: expected a key", c.name);
                     if (js_lit(j, ':') != 0)
-                        die("channels.%s: match: expected ':'", c.name);
+                        return err_set(e, "channels.%s: match: expected ':'", c.name);
                     /* Singular is shorthand for a one-element list, so a spec written
                      * before this stayed valid. */
                     if (!strcmp(mk, "prefixes_file")) {
-                        if (pf_many) die("channels.%s: prefixes_file рядом с prefixes_files", c.name);
+                        if (pf_many) return err_set(e, "channels.%s: prefixes_file рядом с prefixes_files", c.name);
                         pf_one = 1;
                         char one[256];
-                        if (js_str(j, one, sizeof(one)) == 0) {
-                            c.prefixes_files[0] = keep(one);
+                        int r = js_str(j, one, sizeof(one), e);
+                        if (r != 0 && e->msg[0]) return -1;
+                        if (r == 0) {
+                            const char *kept = keep(one, e);
+                            if (!kept) return -1;
+                            c.prefixes_files[0] = kept;
                             c.prefixes_n = 1;
                         }
                     } else if (!strcmp(mk, "domains_file")) {
-                        if (df_many) die("channels.%s: domains_file рядом с domains_files", c.name);
+                        if (df_many) return err_set(e, "channels.%s: domains_file рядом с domains_files", c.name);
                         df_one = 1;
                         char one[256];
-                        if (js_str(j, one, sizeof(one)) == 0) {
-                            c.domains_files[0] = keep(one);
+                        int r = js_str(j, one, sizeof(one), e);
+                        if (r != 0 && e->msg[0]) return -1;
+                        if (r == 0) {
+                            const char *kept = keep(one, e);
+                            if (!kept) return -1;
+                            c.domains_files[0] = kept;
                             c.domains_n = 1;
                         }
                     } else if (!strcmp(mk, "prefixes_files")) {
-                        if (pf_one) die("channels.%s: prefixes_files рядом с prefixes_file", c.name);
+                        if (pf_one) return err_set(e, "channels.%s: prefixes_files рядом с prefixes_file", c.name);
                         pf_many = 1;
-                        c.prefixes_n = str_list(j, c.prefixes_files, MAX_FILES);
+                        size_t sl = str_list(j, c.prefixes_files, MAX_FILES, e);
+                        if (sl == (size_t)-1) return -1;
+                        c.prefixes_n = sl;
                     } else if (!strcmp(mk, "domains_files")) {
-                        if (df_one) die("channels.%s: domains_files рядом с domains_file", c.name);
+                        if (df_one) return err_set(e, "channels.%s: domains_files рядом с domains_file", c.name);
                         df_many = 1;
-                        c.domains_n = str_list(j, c.domains_files, MAX_FILES);
+                        size_t sl = str_list(j, c.domains_files, MAX_FILES, e);
+                        if (sl == (size_t)-1) return -1;
+                        c.domains_n = sl;
                     }
                     else if (!strcmp(mk, "mode")) {
-                        char m[16]; js_str(j, m, sizeof(m));
+                        char m[16];
+                        if (js_str(j, m, sizeof(m), e) != 0 && e->msg[0]) return -1;
                         if (!strcmp(m, "realip")) {
                             c.realip = 1;
                             /* РЕЖИМ УХОДИТ (решение владельца, запуск 65), но принимается
@@ -882,7 +906,7 @@ static void parse_channels(struct js *j) {
                                     "движка — переведите канал на fakeip; сейчас режим ещё "
                                     "работает\n", c.name);
                         }
-                        else if (strcmp(m, "fakeip") != 0) die("channels: unknown mode %s (want fakeip or realip)", m);
+                        else if (strcmp(m, "fakeip") != 0) return err_set(e, "channels: unknown mode %s (want fakeip or realip)", m);
                     }
                     /* ---- СХЕМА 2: протокол и порты назначения ----------------------
                      *
@@ -892,8 +916,8 @@ static void parse_channels(struct js *j) {
                      * когда прочитан весь документ. */
                     else if (!strcmp(mk, "proto")) {
                         char pr[16] = "";
-                        if (js_str(j, pr, sizeof(pr)) != 0)
-                            die("channels.%s: proto — строка: tcp, udp или both", c.name);
+                        if (js_str(j, pr, sizeof(pr), e) != 0)
+                            return err_prop(e, "channels.%s: proto — строка: tcp, udp или both", c.name);
                         c.l4_written = 1;
                         if (!strcmp(pr, "tcp")) c.l4.proto = CH_PROTO_TCP;
                         else if (!strcmp(pr, "udp")) c.l4.proto = CH_PROTO_UDP;
@@ -905,42 +929,42 @@ static void parse_channels(struct js *j) {
                             char msg[160];
                             snprintf(msg, sizeof(msg), "channels.%.24s: неизвестный proto "
                                      "«%.12s» (нужен tcp, udp или both)", c.name, pr);
-                            die("%s", msg);
+                            return err_set(e, "%s", msg);
                         }
                     }
                     else if (!strcmp(mk, "ports")) {
                         c.l4_written = 1;
-                        c.l4.ports_n = port_list(j, c.name, c.l4.ports, MAX_PORTS);
+                        if (port_list(j, c.name, c.l4.ports, MAX_PORTS, &c.l4.ports_n, e) != 0) return -1;
                     }
                     /* «Да» — и `true`, и `1`. Спеку пишет не только человек: jshn у OpenWrt
                      * в разных сборках выдаёт логическое значение то словом, то единицей, а
                      * канал, чьё `any` не понято, объявляется «не подходящим ни к чему» и
                      * роняет всю спеку. Ошибка при этом выглядит как «сплошной канал не
                      * работает», хотя написан он верно. */
-                    else if (!strcmp(mk, "any")) { js_ws(j); c.any = (*j->p == 't' || *j->p == '1'); js_skip(j); }
-                    else if (!strcmp(mk, "allow_all")) { js_ws(j); c.allow_all = (*j->p == 't' || *j->p == '1'); js_skip(j); }
-                    else js_skip(j);
+                    else if (!strcmp(mk, "any")) { js_ws(j); c.any = (*j->p == 't' || *j->p == '1'); if (js_skip(j, e) != 0) return -1; }
+                    else if (!strcmp(mk, "allow_all")) { js_ws(j); c.allow_all = (*j->p == 't' || *j->p == '1'); if (js_skip(j, e) != 0) return -1; }
+                    else { if (js_skip(j, e) != 0) return -1; }
                     js_ws(j);
                     if (*j->p == ',') { j->p++; js_ws(j); }
                 }
                 j->p++;
             }
-            else js_skip(j);
+            else { if (js_skip(j, e) != 0) return -1; }
             js_ws(j);
             if (*j->p == ',') { j->p++; js_ws(j); }
         }
         j->p++;
-        if (!c.name[0]) die("a channel has no name", NULL);
+        if (!c.name[0]) return err_set(e, "a channel has no name", NULL);
         /* Подпись, а не идентификатор: по-русски — можно, кавычкой — нельзя (см. label_ok). */
         if (!label_ok(c.name))
-            die("channel %s: в имени нельзя кавычку, обратную косую и управляющие символы", c.name);
-        if (!c.out[0]) die("channel %s has no out", c.name);
+            return err_set(e, "channel %s: в имени нельзя кавычку, обратную косую и управляющие символы", c.name);
+        if (!c.out[0]) return err_set(e, "channel %s has no out", c.name);
         /* ПОРТЫ ИСТОЧНИКОМ СОВПАДЕНИЯ НЕ ЯВЛЯЮТСЯ, и в это условие они не входят
          * намеренно. «Канал ловит по портам» выразить нечем: правило без `ip daddr @набор`
          * безусловно, то есть udp 50000-65535 ко ВСЕМУ интернету уехало бы в туннель. Порты
          * без списка адресов — это недописанная настройка, и отказ на ней прежний. */
         if (!c.prefixes_n && !c.domains_n && !c.any)
-            die("channel %s matches nothing (want prefixes_files, domains_files or any)", c.name);
+            return err_set(e, "channel %s matches nothing (want prefixes_files, domains_files or any)", c.name);
         /* Адреса и домены в одном правиле — МОЖНО.
          *
          * Раньше запрещалось: набор один, а заполняются они по-разному — адреса читаются из
@@ -951,13 +975,14 @@ static void parse_channels(struct js *j) {
          * Ограничение оказалось нашим, а не ядра: набор с `flags interval,timeout` держит и
          * постоянные элементы из файла, и временные от резолвера — проверено опытом на живом
          * nft. Поэтому запрет снят, а набор такой группы объявляется с timeout. */
-        if (g_ch_n >= MAX_CHANNELS) die("too many channels", NULL);
+        if (g_ch_n >= MAX_CHANNELS) return err_set(e, "too many channels", NULL);
         g_ch[g_ch_n++] = c;
         js_ws(j);
         if (*j->p == ',') { j->p++; continue; }
         break;
     }
-    if (js_lit(j, ']') != 0) die("channels: нет закрывающей скобки — спека оборвана?", NULL);
+    if (js_lit(j, ']') != 0) return err_set(e, "channels: нет закрывающей скобки — спека оборвана?", NULL);
+    return 0;
 }
 
 /* ---- вложенные выходы: проверка `via` --------------------------------------------------
@@ -992,7 +1017,7 @@ static const struct output *via_dev_owner(const char *dev, const struct output *
     return NULL;
 }
 
-static void via_check(void) {
+static int via_check(struct err *e) {
     static char msg[512];
     for (size_t i = 0; i < g_out_n; i++) {
         const struct output *o = &g_out[i];
@@ -1003,23 +1028,23 @@ static void via_check(void) {
                      "vless, xsteer, awg и interface с obfs; у kind=%s соединение открывает не движок, "
                      "и пустить его через другой выход нечем", o->name,
                      o->kind == OUT_INTERFACE ? "interface без obfs" : out_kind_name(o->kind));
-            die("%s", msg);
+            return err_set(e, "%s", msg);
         }
         if (!strcmp(o->via, o->name))
-            die("выход %s: via указывает на него самого — туннель не может идти внутри себя",
+            return err_set(e, "выход %s: via указывает на него самого — туннель не может идти внутри себя",
                 o->name);
         const struct output *v = out_via(o);
         if (!v) {
             snprintf(msg, sizeof(msg), "выход %.31s: via «%.31s» — такого выхода в спеке нет",
                      o->name, o->via);
-            die("%s", msg);
+            return err_set(e, "%s", msg);
         }
         if (!out_via_target_ok(v)) {
             snprintf(msg, sizeof(msg),
                      "выход %.31s: via «%.31s» — это kind=%s, у него нет устройства, в которое "
                      "можно пустить туннель (нужен выход с устройством: interface, vless, xsteer, awg)",
                      o->name, v->name, out_kind_name(v->kind));
-            die("%s", msg);
+            return err_set(e, "%s", msg);
         }
 
         /* Цепочка по одним via: круг и глубина. Путь печатается целиком — по одному имени
@@ -1036,13 +1061,13 @@ static void via_check(void) {
             if (on_path[via_idx(n)]) {
                 snprintf(msg, sizeof(msg), "выход %.31s: via замыкается в круг (%s) — туннели "
                          "заворачивались бы друг в друга, и не встал бы ни один", o->name, path);
-                die("%s", msg);
+                return err_set(e, "%s", msg);
             }
             on_path[via_idx(n)] = 1;
             if (hops > MAX_VIA_DEPTH) {
                 snprintf(msg, sizeof(msg), "выход %.31s: цепочка via длиннее %d переходов (%s)",
                          o->name, MAX_VIA_DEPTH, path);
-                die("%s", msg);
+                return err_set(e, "%s", msg);
             }
         }
 
@@ -1059,7 +1084,7 @@ static void via_check(void) {
             if (t == o) {
                 snprintf(msg, sizeof(msg), "выход %.31s: via замыкается в круг через устройства "
                          "пула — туннель однажды пошёл бы внутрь себя", o->name);
-                die("%s", msg);
+                return err_set(e, "%s", msg);
             }
             for (size_t d = 0; d < t->devices_n; d++) {
                 for (size_t k = 0; k < o->devices_n; k++)
@@ -1067,7 +1092,7 @@ static void via_check(void) {
                         snprintf(msg, sizeof(msg), "выход %.31s: via ведёт в %.31s, а среди его "
                                  "устройств %.31s — устройство самого выхода, туннель пошёл бы "
                                  "внутрь себя", o->name, t->name, t->devices[d]);
-                        die("%s", msg);
+                        return err_set(e, "%s", msg);
                     }
                 const struct output *w = via_dev_owner(t->devices[d], t);
                 if (w && !seen[via_idx(w)]) stack[sp++] = via_idx(w);
@@ -1076,16 +1101,20 @@ static void via_check(void) {
             if (n && !seen[via_idx(n)]) stack[sp++] = via_idx(n);
         }
     }
+    return 0;
 }
 
-void load_spec(const char *path) {
+int load_spec(const char *path, struct err *e) {
     FILE *f = strcmp(path, "-") ? fopen(path, "r") : stdin;
-    if (!f) die("%s: cannot open", path);
+    if (!f) return err_set(e, "%s: cannot open", path);
     static char buf[262144];
     size_t n = fread(buf, 1, sizeof(buf) - 1, f);
     if (n == sizeof(buf) - 1) {
         int c = fgetc(f);
-        if (c != EOF) die("spec too large (max 256 KiB)", NULL);
+        if (c != EOF) {
+            if (f != stdin) fclose(f);
+            return err_set(e, "spec too large (max 256 KiB)", NULL);
+        }
     }
     buf[n] = '\0';
     if (f != stdin) fclose(f);
@@ -1096,33 +1125,39 @@ void load_spec(const char *path) {
      * «поле задано» и поймать спеку, где заданы обе: молча взять одну значило бы, что
      * половина написанного человеком не действует, и понять это было бы нечем. */
     int lan_one = 0, lan_many = 0;
-    if (js_lit(&j, '{') != 0) die("spec: expected an object", NULL);
+    if (js_lit(&j, '{') != 0) return err_set(e, "spec: expected an object", NULL);
     js_ws(&j);
     while (*j.p && *j.p != '}') {
         char key[64];
-        if (js_str(&j, key, sizeof(key)) != 0) die("spec: bad key", NULL);
+        if (js_str(&j, key, sizeof(key), e) != 0) return err_prop(e, "spec: bad key", NULL);
         /* Возврат проверяется, как в цикле match: без этого {"kind" "direct"} читался как
          * {"kind":"direct"} — не JSON, который интерфейс не разберёт, а движок молча принимал
          * (I-315). То же в циклах выходов, каналов и obfs. */
-        if (js_lit(&j, ':') != 0) die("spec: после ключа «%s» нет двоеточия", key);
-        if (!strcmp(key, "schema")) schema = js_num(&j);
-        else if (!strcmp(key, "outputs")) parse_outputs(&j);
-        else if (!strcmp(key, "channels")) parse_channels(&j);
-        else if (!strcmp(key, "from_default")) str_array(&j, g_from_default, MAX_FROM, &g_from_default_n);
+        if (js_lit(&j, ':') != 0) return err_set(e, "spec: после ключа «%s» нет двоеточия", key);
+        if (!strcmp(key, "schema")) {
+            long v = 0;
+            if (js_num(&j, &v, e) != 0) return -1;
+            schema = v;
+        }
+        else if (!strcmp(key, "outputs")) { if (parse_outputs(&j, e) != 0) return -1; }
+        else if (!strcmp(key, "channels")) { if (parse_channels(&j, e) != 0) return -1; }
+        else if (!strcmp(key, "from_default")) {
+            if (str_array(&j, g_from_default, MAX_FROM, &g_from_default_n, e) != 0 && e->msg[0]) return -1;
+        }
         else if (!strcmp(key, "lan_device")) {
             /* Одиночная форма — сокращение для списка из одного элемента, ровно как
              * `device` у выхода. Дальше по коду путь один. */
-            js_str(&j, g_lan_dev[0], sizeof(g_lan_dev[0]));
+            if (js_str(&j, g_lan_dev[0], sizeof(g_lan_dev[0]), e) != 0 && e->msg[0]) return -1;
             g_lan_dev_n = 1;
             lan_one = 1;
         }
         else if (!strcmp(key, "lan_devices")) {
-            if (str_array(&j, g_lan_dev, MAX_LAN_DEV, &g_lan_dev_n) != 0)
-                die("lan_devices: ожидался массив строк", NULL);
+            if (str_array(&j, g_lan_dev, MAX_LAN_DEV, &g_lan_dev_n, e) != 0)
+                return err_prop(e, "lan_devices: ожидался массив строк", NULL);
             lan_many = 1;
         }
-        else if (!strcmp(key, "traceroute_hops")) { js_ws(&j); g_traceroute_hops = (*j.p == 't'); js_skip(&j); }
-        else js_skip(&j);
+        else if (!strcmp(key, "traceroute_hops")) { js_ws(&j); g_traceroute_hops = (*j.p == 't'); if (js_skip(&j, e) != 0) return -1; }
+        else { if (js_skip(&j, e) != 0) return -1; }
         js_ws(&j);
         if (*j.p == ',') { j.p++; js_ws(&j); }
     }
@@ -1131,22 +1166,22 @@ void load_spec(const char *path) {
      * громкий отказ на битой спеке; до этой правки он был только при обрыве внутри строки.
      * Текст ПОСЛЕ скобки по-прежнему не читается и не мешает: так было всегда, и на это
      * опираются стенды. */
-    if (js_lit(&j, '}') != 0) die("spec: нет закрывающей скобки — файл оборван?", NULL);
+    if (js_lit(&j, '}') != 0) return err_set(e, "spec: нет закрывающей скобки — файл оборван?", NULL);
     if (lan_one && lan_many)
-        die("задано и lan_device, и lan_devices — оставьте одно", NULL);
+        return err_set(e, "задано и lan_device, и lan_devices — оставьте одно", NULL);
     /* Пустой список — это «клиентов нет», а правило без условия «кто» забирает ВЕСЬ транзит
      * роутера, включая путь из интернета внутрь. Отказ дешевле такой находки на живом
      * роутере. */
     if (!g_lan_dev_n)
-        die("lan_devices: пустой список — некому адресовать правила", NULL);
+        return err_set(e, "lan_devices: пустой список — некому адресовать правила", NULL);
     for (size_t i = 0; i < g_lan_dev_n; i++) {
         /* Самая дорогая из проверок этого набора: имя уходит и в текст правил nftables, и
          * в командные строки popen у любой команды, читающей спеку. */
         if (!name_ok(g_lan_dev[i]))
-            die("lan_devices: негодный состав имени (%s)", g_lan_dev[i]);
+            return err_set(e, "lan_devices: негодный состав имени (%s)", g_lan_dev[i]);
         for (size_t k = i + 1; k < g_lan_dev_n; k++)
             if (!strcmp(g_lan_dev[i], g_lan_dev[k]))
-                die("lan_devices: устройство %s указано дважды", g_lan_dev[i]);
+                return err_set(e, "lan_devices: устройство %s указано дважды", g_lan_dev[i]);
     }
     /* Клиентов по умолчанию описывают ЛИБО подсети, либо устройства. Оба сразу — не
      * обогащение, а противоречие, и молчаливого разрешения у него нет ни в одну сторону.
@@ -1163,7 +1198,7 @@ void load_spec(const char *path) {
      * до появления перечня, и она обязана значить ровно то, что значила. Отвергается только
      * НОВАЯ возможность, применённая вместе со старой. */
     if (g_from_default_n && g_lan_dev_n > 1)
-        die("клиенты описаны дважды: и from_default, и несколько lan_devices. "
+        return err_set(e, "клиенты описаны дважды: и from_default, и несколько lan_devices. "
             "Уберите from_default — устройства опишут клиентов точнее", NULL);
     /* Refusing an unknown major is the whole point of having the field: guessing
      * would mean compiling a config we do not understand into firewall rules. */
@@ -1185,13 +1220,15 @@ void load_spec(const char *path) {
      *
      * ПОЧЕМУ ЭТО НЕ ЛОМАЕТ РОУТЕР со старым движком. Управляющий слой (splify2, метод
      * spec_set) проверяет спеку компилятором — `apply --dry-run` — ДО записи на диск.
-     * Старая сборка ответит на `schema: 2` вот этим самым exit(2), метод скажет человеку
-     * «обновите движок», а на роутере останутся прежние правила. Отказ громкий и заранее —
-     * ровно то, ради чего поле существует; понятая наполовину спека такого шанса не даёт. */
+     * Старая сборка ответит на `schema: 2` тем же отказом кодом 2 (раньше — прямым exit
+     * отсюда, теперь — через err_die у точки входа: сообщение то же), метод скажет
+     * человеку «обновите движок», а на роутере останутся прежние правила. Отказ громкий и
+     * заранее — ровно то, ради чего поле существует; понятая наполовину спека такого шанса
+     * не даёт. */
     if (schema != 1 && schema != 2) {
-        fprintf(stderr, "steer: spec schema %ld is not supported (this build speaks 1 and 2)\n",
-                schema);
-        exit(2);
+        char msg[96];
+        snprintf(msg, sizeof(msg), "spec schema %ld is not supported (this build speaks 1 and 2)", schema);
+        return err_set(e, "%s", msg);
     }
     /* Поля схемы 2 в спеке схемы 1 — ОТКАЗ, а не молчаливое игнорирование.
      *
@@ -1214,7 +1251,7 @@ void load_spec(const char *path) {
                          "schema 1. Поднимите \"schema\": 2 — иначе движок постарше поймёт "
                          "спеку наполовину и канал заберёт больше, чем вы написали",
                          g_ch[i].name);
-                die("%s", msg);
+                return err_set(e, "%s", msg);
             }
     /* ЗДЕСЬ БЫЛО АВТООПРЕДЕЛЕНИЕ ПОДСЕТИ. Движок читал адрес lan_device через popen и
      * выводил из него `from_default`, когда тот не задан. Нужно это было ради одной вещи:
@@ -1240,7 +1277,7 @@ void load_spec(const char *path) {
     for (size_t i = 0; i < g_ch_n; i++) {
         size_t k = 0;
         for (; k < g_out_n; k++) if (!strcmp(g_ch[i].out, g_out[k].name)) break;
-        if (k == g_out_n) die("channel %s points at an output that does not exist", g_ch[i].name);
+        if (k == g_out_n) return err_set(e, "channel %s points at an output that does not exist", g_ch[i].name);
     }
 
     /* ---- защита от конфигураций, которые отрежут доступ к роутеру -----------
@@ -1264,7 +1301,7 @@ void load_spec(const char *path) {
                 snprintf(msg, sizeof(msg),
                          "выход %s ведёт в %s — это локальная сеть, трафик закольцуется",
                          o->name, g_lan_dev[d]);
-                die("%s", msg);
+                return err_set(e, "%s", msg);
             }
 
         /* Дубликат устройства внутри одного выхода делает failover бессмысленным:
@@ -1275,11 +1312,11 @@ void load_spec(const char *path) {
                     char msg[160];
                     snprintf(msg, sizeof(msg), "выход %s: устройство %s указано дважды",
                              o->name, o->devices[a]);
-                    die("%s", msg);
+                    return err_set(e, "%s", msg);
                 }
     }
 
-    via_check();
+    if (via_check(e) != 0) return -1;
 
     /* from_default — это клиенты раздачи; сам телефон называет канал, а не умолчание для всех
      * каналов. Проверка вне цикла по каналам: from_default уходит в правило заворота DNS и
@@ -1287,7 +1324,7 @@ void load_spec(const char *path) {
      * ошибкой вместо слова о спеке. */
     for (size_t k = 0; k < g_from_default_n; k++)
         if (from_is_local(g_from_default[k]))
-            die("from_default: «%s» — сам телефон, а не клиенты; укажите его в from канала",
+            return err_set(e, "from_default: «%s» — сам телефон, а не клиенты; укажите его в from канала",
                 g_from_default[k]);
     for (size_t i = 0; i < g_ch_n; i++) {
         struct channel *c = &g_ch[i];
@@ -1325,7 +1362,7 @@ void load_spec(const char *path) {
         } else {
             for (size_t k = 0; k < g_from_default_n; k++)
                 if (!g_from_default[k][0])
-                    die("канал %s берёт «кому» из from_default, а в нём пустая строка — "
+                    return err_set(e, "канал %s берёт «кому» из from_default, а в нём пустая строка — "
                         "уберите её", c->name);
         }
 
@@ -1344,16 +1381,16 @@ void load_spec(const char *path) {
         for (size_t k = 0; k < c->from_n; k++) if (from_is_local(c->from[k])) local++;
         if (local) {
 #ifndef STEER_ANDROID
-            die("канал %s: «self» и «uid:» в from — только в сборке под Android", c->name);
+            return err_set(e, "канал %s: «self» и «uid:» в from — только в сборке под Android", c->name);
 #endif
             if (local != c->from_n)
-                die("канал %s: в «кому» смешаны сам телефон и клиенты раздачи — это разные "
+                return err_set(e, "канал %s: в «кому» смешаны сам телефон и клиенты раздачи — это разные "
                     "пути пакета, разделите на два канала", c->name);
             for (size_t k = 0; k < c->from_n; k++) {
                 unsigned lo, hi;
                 if (!strcmp(c->from[k], "self")) {
                     if (c->from_n > 1)
-                        die("канал %s: «self» уже включает все приложения — уберите из "
+                        return err_set(e, "канал %s: «self» уже включает все приложения — уберите из "
                             "«кому» остальное", c->name);
                     continue;
                 }
@@ -1361,24 +1398,24 @@ void load_spec(const char *path) {
                 if (from_uid_range(c->from[k], &lo, &hi) != 0) {
                     snprintf(msg, sizeof(msg), "канал %.40s: «%.40s» — не UID приложения "
                              "(want uid:N or uid:N-M)", c->name, c->from[k]);
-                    die("%s", msg);
+                    return err_set(e, "%s", msg);
                 }
                 if (lo == 0)
-                    die("канал %s: uid:0 — это root, то есть сам движок и системные демоны; "
+                    return err_set(e, "канал %s: uid:0 — это root, то есть сам движок и системные демоны; "
                         "их трафик каналом не маршрутизируется", c->name);
                 /* Правило на устройство — на ОДНО приложение, диапазон тут был бы тем же
                  * «приоритет получила половина сети», что и подсеть у адресов. */
                 if (c->dev_scope && lo != hi) {
                     snprintf(msg, sizeof(msg), "канал %.40s: правило на устройство принимает "
                              "одно приложение, а «%.40s» — диапазон", c->name, c->from[k]);
-                    die("%s", msg);
+                    return err_set(e, "%s", msg);
                 }
             }
         }
 
         if (c->dev_scope && !local) {
             if (!c->from_n)
-                die("канал %s объявлен правилом на устройство, но в нём нет ни одного "
+                return err_set(e, "канал %s объявлен правилом на устройство, но в нём нет ни одного "
                     "хозяина: добавьте адрес или MAC в \"from\"", c->name);
             for (size_t k = 0; k < c->from_n; k++)
                 if (!spec_one_host(c->from[k])) {
@@ -1388,7 +1425,7 @@ void load_spec(const char *path) {
                              "хозяев, а «%.40s» — подсеть. Приоритет достался бы не одному "
                              "устройству, а всем в ней",
                              c->name, c->from[k]);
-                    die("%s", msg);
+                    return err_set(e, "%s", msg);
                 }
         }
 
@@ -1396,7 +1433,7 @@ void load_spec(const char *path) {
             int macs = 0;
             for (size_t k = 0; k < c->from_n; k++) if (strchr(c->from[k], ':')) macs++;
             if (macs && macs != (int)c->from_n)
-                die("канал %s: в «кому» смешаны адреса и MAC-адреса. nft не умеет «или» внутри "
+                return err_set(e, "канал %s: в «кому» смешаны адреса и MAC-адреса. nft не умеет «или» внутри "
                     "правила — разделите на два канала", c->name);
         }
         /* КАНАЛ `any` БЕЗ СПИСКОВ ЗАБИРАЕТ ВЕСЬ ТРАФИК КЛИЕНТОВ — и проверять это надо
@@ -1419,7 +1456,7 @@ void load_spec(const char *path) {
          * же её заметит. Ровно эта пара («весь трафик телефона в туннель» и «этот ноутбук не
          * маршрутизируем») и просилась. */
         if (c->any && !c->prefixes_n && !c->domains_n && !c->allow_all && !c->dev_scope)
-            die("канал %s забирает ВЕСЬ трафик в туннель. Если это правда нужно, "
+            return err_set(e, "канал %s забирает ВЕСЬ трафик в туннель. Если это правда нужно, "
                 "добавьте \"allow_all\": true — иначе выберите список", c->name);
 
         struct output *o = out_by_name(c->out);
@@ -1427,7 +1464,7 @@ void load_spec(const char *path) {
          * телефона такого заворота нет, и канал «приложение → tgws» стоял бы применённым, не
          * делая ничего. */
         if (local && o && o->kind == OUT_TGWS)
-            die("канал %s: выход kind=tgws работает только для клиентов раздачи — у трафика "
+            return err_set(e, "канал %s: выход kind=tgws работает только для клиентов раздачи — у трафика "
                 "самого телефона моста нет", c->name);
         /* Дальше — проверки, которым нужен выход С УСТРОЙСТВОМ. Через out_has_device, а не
          * сравнением с OUT_INTERFACE: у выхода kind=vless последствие ровно то же — весь
@@ -1436,6 +1473,7 @@ void load_spec(const char *path) {
          * «защита от дурака», работающая через раз, хуже отсутствующей: на неё рассчитывают. */
         if (!o || !out_has_device(o)) continue;
     }
+    return 0;
 }
 
 struct output *out_by_name(const char *n) {
