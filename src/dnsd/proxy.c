@@ -12,6 +12,17 @@
  * (без static) tests/dnsmatch.c. */
 
 struct pending g_pending[MAX_PENDING];
+
+/* ЕСТЬ ЛИ ЧТО СТОРОЖИТЬ ПО ВРЕМЕНИ: ожидания в пути, соединения TCP, снятый с epoll слушающий
+ * сокет. Когда ничего этого нет, цикл событий спит без таймаута, а не просыпается раз в
+ * секунду впустую: на телефоне это было 60 пробуждений в минуту при выключенном экране и
+ * полной тишине, а требование к фоновой работе там — нормальный сон и ничего лишнего.
+ *
+ * Пересчитывается секундным тиком (pending_reap/tcp_reap и так обходят свои таблицы), а
+ * ставится сразу там, где появляется то, что надо будет снять по сроку: занятый слот
+ * ожидания и принятое соединение. Считать заново на каждом витке нельзя — обход таблицы
+ * ожиданий на каждую пачку пакетов и есть то, от чего pending_reap унесли на тик. */
+static int g_live;
 int g_epfd = -1;
 static int g_listen_fd = -1;
 /* Единственный сокет к апстриму, живёт всё время работы процесса. Апстрим — это
@@ -339,11 +350,14 @@ static void reload_rules(void) {
  * правил, и таблицу fake-IP. Тик же заодно закрывает случай, который прежний
  * реап «по дороге» не закрывал вовсе: на тихой сети слот запроса, чей upstream
  * так и не ответил, висел с открытым fd до следующего чужого запроса. */
-static void pending_reap(time_t now) {
+static int pending_reap(time_t now) {
+    int live = 0;
     for (int i = 0; i < MAX_PENDING; i++) {
         if (g_pending[i].in_use && g_pending[i].expire < now)
             g_pending[i].in_use = 0;      /* сокета за слотом больше нет — закрывать нечего */
+        live |= g_pending[i].in_use;
     }
+    return live;
 }
 
 static struct pending *pending_alloc(void) {
@@ -577,6 +591,7 @@ static int dns_query(uint8_t *buf, ssize_t n, struct sockaddr_storage from, sock
     p->qsec_end = (uint16_t)((p->qfp) ? qend : 0);
 
     p->in_use = 1;
+    g_live = 1;
     p->tcp_up = tcpu;
     p->quiet = quiet;
     p->hit = hit;
@@ -1318,6 +1333,7 @@ static void tcp_accept(void) {
         uint32_t gen = c->gen + 1;
         memset(c, 0, offsetof(struct tcpc, in));
         c->fd = fd;
+        g_live = 1;
         c->gen = gen;
         c->peer = peer;
         c->peer_len = pl;
@@ -1389,16 +1405,21 @@ static int tcp_event(void *ptr, uint32_t evs) {
 
 /* Секундный тик: запросы наверх, чьё ожидание протухло, — SERVFAIL и закрыть; соединения
  * клиентов без дела дольше TCP_IDLE_SEC — закрыть. */
-static void tcp_reap(time_t now) {
+static int tcp_reap(time_t now) {
+    int live = 0;
     /* Место могло стать вытесняемым без закрытия (соединение отмолчало секунду) — пусть
      * следующий приём проверит заново; мест нет — tcp_accept снимет сокет снова. */
     tcp_listen_pause(0);
-    for (int i = 0; i < TCP_MAX_UP; i++)
+    for (int i = 0; i < TCP_MAX_UP; i++) {
         if (g_tcpu[i].fd >= 0 && !tcpu_pending(&g_tcpu[i])) tcpu_fail(&g_tcpu[i]);
+        live |= g_tcpu[i].fd >= 0;
+    }
     for (int i = 0; i < TCP_MAX_CONN; i++) {
         struct tcpc *c = &g_tcpc[i];
         if (c->fd >= 0 && !c->inflight && now - c->last >= TCP_IDLE_SEC) tcpc_close(c);
+        live |= c->fd >= 0;
     }
+    return live | g_tcp_paused;
 }
 
 /* Слушать TCP на том же порту, что и UDP, двойным стеком так же. Не вышло — не отказ: UDP
@@ -1652,8 +1673,7 @@ int run_proxy(int listen_port, int upstream_port) {
         time_t now = time(NULL);
         if (now != last_reap) {
             /* Секундный тик: снять протухшие ожидания (см. pending_reap). */
-            pending_reap(now);
-            tcp_reap(now);
+            g_live = pending_reap(now) | tcp_reap(now);
             last_reap = now;
         }
         if (g_fakeip_dirty) {
@@ -1669,7 +1689,15 @@ int run_proxy(int listen_port, int upstream_port) {
                 g_fakeip_last_rewrite = now;
             }
         }
-        int n = epoll_wait(g_epfd, events, 32, 1000);
+        /* Тишина — спать до события: сигнал перезагрузки или остановки будит epoll_wait
+         * через EINTR. Грязная таблица fake-IP — проснуться к сроку её перезаписи. */
+        int timeout = -1;
+        if (g_live) timeout = 1000;
+        else if (g_fakeip_dirty) {
+            time_t left = g_fakeip_last_rewrite + FAKEIP_ANSWER_TTL - now;
+            timeout = left > 0 ? (int)left * 1000 : 0;
+        }
+        int n = epoll_wait(g_epfd, events, 32, timeout);
         if (n < 0) {
             if (errno == EINTR) continue;
             break;

@@ -222,6 +222,17 @@ tcp_big="$(python3 "$tmp/tcpclient.py" "$LPORT" big 2>&1)"
 tcp_slow="$(python3 "$tmp/tcpclient.py" "$LPORT" slow 2>&1)"
 wait "$IDLE"
 tcp_idle="$(cat "$tmp/idle.txt")"
+# Тишина: ожиданий в пути нет, соединения TCP закрыты по простою — резолверу не на что
+# просыпаться. Раньше он всё равно просыпался раз в секунду (epoll_wait с таймаутом 1000 мс
+# ради тика), и на телефоне это было 60 пробуждений в минуту при выключенном экране.
+# Меряется счётчиком добровольных переключений контекста самого процесса; одно лишнее
+# допускается — последний тик, который и обнаружил, что всё затихло.
+sleep 2
+cs0=$(awk '/^voluntary_ctxt_switches/{print $2}' "/proc/$DPID/status")
+sleep 3
+cs1=$(awk '/^voluntary_ctxt_switches/{print $2}' "/proc/$DPID/status")
+quiet=$(( cs1 - cs0 ))
+[ "$quiet" -le 1 ] && quiet=ok
 kill "$DPID" 2>/dev/null; wait "$DPID" 2>/dev/null
 sleep 1
 kill "$UPID" 2>/dev/null; wait "$UPID" 2>/dev/null
@@ -252,6 +263,8 @@ check "TCP: конвейер из трёх запросов одной запи�
 check "TCP: ответ больше 4 КБ (300 записей) пришёл целиком" "4826 300" "$tcp_big"
 check "TCP: медленный клиент не держит цикл — UDP и другое соединение отвечают" "1 1" "$tcp_slow"
 check "TCP: соединение без запросов закрыто по простою" "closed" "$tcp_idle"
+check "в тишине резолвер не просыпается (добровольных переключений за 3 с не больше одного)" \
+    "ok" "$quiet"
 check "TCP: наверх по TCP ушли ровно вопросы клиентов TCP" "10" \
     "$(cat "$tmp/up.txt.tcp" 2>/dev/null | wc -l | tr -d ' ')"
 
