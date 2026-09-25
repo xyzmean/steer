@@ -64,10 +64,12 @@ int mbedtls_aes_crypt_ctr(mbedtls_aes_context *c, size_t n, size_t *off, unsigne
                           unsigned char *sb, const unsigned char *in, unsigned char *out)
                                         { (void)c; (void)off; (void)nc; (void)sb;
                                           memcpy(out, in, n); return 0; }
-int load_spec(const char *path, struct err *e) { (void)path; (void)e; return 0; }
-int registry_assign(struct err *e) { (void)e; return 0; }
-struct output g_out[MAX_OUTPUTS];
-size_t g_out_n;
+/* Мосту (cmd_tgws) эти две функции нужны на этапе разбора спеки — этот стенд его не зовёт, но
+ * символы обязаны разрешиться на линковке: спека — значение, а не глобалы (правило 6,
+ * docs/architecture.md, раздел 2), поэтому здесь больше нет и мока g_out/g_out_n — cmd_tgws с
+ * этого шага держит свой static struct spec сам. */
+int load_spec(const char *path, struct spec *s, struct err *e) { (void)path; (void)s; (void)e; return 0; }
+int registry_assign(struct spec *s, struct err *e) { (void)s; (void)e; return 0; }
 
 static int fails;
 

@@ -85,7 +85,7 @@ static void sup_fnv(unsigned long long *h, const void *p, size_t n) {
     for (size_t i = 0; i < n; i++) { *h ^= b[i]; *h *= 1099511628211ULL; }
     *h ^= 0xff; *h *= 1099511628211ULL;   /* граница поля: «ab»+«c» не равно «a»+«bc» */
 }
-static unsigned long long sup_sig(const char *cmd, const struct output *o) {
+static unsigned long long sup_sig(const struct spec *sp, const char *cmd, const struct output *o) {
     unsigned long long h = 14695981039346656037ULL;
     if (!strcmp(cmd, "vless")) {
         sup_fnv(&h, o->sub_file, strlen(o->sub_file));
@@ -115,7 +115,7 @@ static unsigned long long sup_sig(const char *cmd, const struct output *o) {
      * то значение, что помощник поставит на сокет (с битом туннеля на телефоне). */
     if (o->via[0]) {
         sup_fnv(&h, o->via, strlen(o->via));
-        uint32_t um = out_underlay_mark(o);
+        uint32_t um = out_underlay_mark(sp, o);
         sup_fnv(&h, &um, sizeof(um));
     }
     return h;
@@ -139,33 +139,38 @@ static int sup_list(const char *spec, struct sup_helper *out, size_t *n) {
         if (!w) _exit(1);
         /* Разбор спеки возвращает отказ, а не завершает процесс сам (правило 5,
          * docs/architecture.md, раздел 2); err_die здесь, в этом форкнутом ребёнке, делает
-         * ровно то же, что раньше делал die() изнутри load_spec — код 2, тот же текст. */
+         * ровно то же, что раньше делал die() изнутри load_spec — код 2, тот же текст.
+         *
+         * Спека — значение (правило 6): свой экземпляр у этого форкнутого ребёнка, который
+         * и есть отдельная точка входа — он живёт в своём адресном пространстве и больше
+         * ничего с родителем не делит. */
+        static struct spec cfg;
         struct err e = {0};
-        if (load_spec(spec, &e) < 0) err_die(&e);
+        if (load_spec(spec, &cfg, &e) < 0) err_die(&e);
         /* Метки выходов — из реестра: без них out_underlay_mark в подписи (sup_sig) вернул бы
          * «мимо каналов» при любой цели, и смена метки цели не была бы видна. Только при via —
          * у спеки без него реестр здесь не нужен, и супервизор его не трогает (registry_assign
          * пишет файл, лишь когда тот расходится с назначением, — как у помощников при старте). */
-        for (size_t i = 0; i < g_out_n; i++)
-            if (g_out[i].via[0]) { if (registry_assign(&e) < 0) err_die(&e); break; }
+        for (size_t i = 0; i < cfg.out_n; i++)
+            if (cfg.out[i].via[0]) { if (registry_assign(&cfg, &e) < 0) err_die(&e); break; }
         /* В порядке зависимостей via: цель поднимается раньше того, чей туннель через неё
          * идёт, — иначе первый подъём внутреннего перебирал бы узлы через ещё не созданное
          * устройство и уходил в паузу перезапуска. Гарантии готовности это не даёт (цель
          * поднимается секунды), но у спеки без via порядок прежний, спековый. */
         for (int depth = 0; depth <= MAX_VIA_DEPTH; depth++) {
-            for (size_t i = 0; i < g_out_n; i++) {
-                const struct output *o = &g_out[i];
-                if (out_via_depth(o) != depth) continue;
+            for (size_t i = 0; i < cfg.out_n; i++) {
+                const struct output *o = &cfg.out[i];
+                if (out_via_depth(&cfg, o) != depth) continue;
 #if defined(STEER_EXTENDED)
                 if (o->kind == OUT_VLESS)
-                    fprintf(w, "vless %s %llx\n", o->name, sup_sig("vless", o));
+                    fprintf(w, "vless %s %llx\n", o->name, sup_sig(&cfg, "vless", o));
                 if (o->kind == OUT_XSTEER)
-                    fprintf(w, "xsteer %s %llx\n", o->name, sup_sig("xsteer", o));
+                    fprintf(w, "xsteer %s %llx\n", o->name, sup_sig(&cfg, "xsteer", o));
                 if (o->kind == OUT_TGWS)
-                    fprintf(w, "tgws %s %llx\n", o->name, sup_sig("tgws", o));
+                    fprintf(w, "tgws %s %llx\n", o->name, sup_sig(&cfg, "tgws", o));
 #endif
                 if (o->obfs.on)
-                    fprintf(w, "obfs %s %llx\n", o->name, sup_sig("obfs", o));
+                    fprintf(w, "obfs %s %llx\n", o->name, sup_sig(&cfg, "obfs", o));
             }
         }
         fclose(w);

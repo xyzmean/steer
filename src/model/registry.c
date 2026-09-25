@@ -26,9 +26,9 @@
 /* Persisted, because an output must keep its mark across restarts: a reboot that
  * reshuffles marks leaves stale `ip rule` entries pointing at the wrong table,
  * and the symptom is traffic silently taking someone else's path. */
-static void rt_tables_write(void);
+static void rt_tables_write(const struct spec *s);
 
-int registry_assign(struct err *e) {
+int registry_assign(struct spec *s, struct err *e) {
     char path[512];
     snprintf(path, sizeof(path), "%s/registry", g_state_dir);
     FILE *f = fopen(path, "r");
@@ -43,10 +43,10 @@ int registry_assign(struct err *e) {
              * `mark and маска == метка` не увидит никогда, — то есть правило стоит, а не
              * срабатывает. Такой выход получает метку заново, как новый. */
             if (!mark || (mark & ~STEER_MARK_MASK)) continue;
-            for (size_t i = 0; i < g_out_n; i++)
-                if (!strcmp(g_out[i].name, name) && g_out[i].kind != OUT_DIRECT) {
-                    g_out[i].mark = mark;
-                    g_out[i].table = table;
+            for (size_t i = 0; i < s->out_n; i++)
+                if (!strcmp(s->out[i].name, name) && s->out[i].kind != OUT_DIRECT) {
+                    s->out[i].mark = mark;
+                    s->out[i].table = table;
                 }
         }
         fclose(f);
@@ -66,17 +66,17 @@ int registry_assign(struct err *e) {
      * пакетах и правилах, а новые выходы просто садятся на свободные места. */
     unsigned char taken[STEER_MARK_SLOTS];
     memset(taken, 0, sizeof(taken));
-    for (size_t i = 0; i < g_out_n; i++) {
-        if (!g_out[i].mark) continue;
-        unsigned m = g_out[i].mark / MARK_BASE;
-        if (m && g_out[i].mark % MARK_BASE == 0 && m - 1 < STEER_MARK_SLOTS)
+    for (size_t i = 0; i < s->out_n; i++) {
+        if (!s->out[i].mark) continue;
+        unsigned m = s->out[i].mark / MARK_BASE;
+        if (m && s->out[i].mark % MARK_BASE == 0 && m - 1 < STEER_MARK_SLOTS)
             taken[m - 1] = 1;
-        int t = g_out[i].table - TABLE_BASE;
+        int t = s->out[i].table - TABLE_BASE;
         if (t >= 0 && (unsigned)t < STEER_MARK_SLOTS) taken[t] = 1;
     }
 
-    for (size_t i = 0; i < g_out_n; i++) {
-        if (g_out[i].kind == OUT_DIRECT || g_out[i].mark) continue;
+    for (size_t i = 0; i < s->out_n; i++) {
+        if (s->out[i].kind == OUT_DIRECT || s->out[i].mark) continue;
         /* СВЕРХУ ИЛИ СНИЗУ. Обычно места раздаются снизу: первый выход получает нулевое,
          * второй первое и так далее. Но на роутере движок бывает не один — рядом с полным
          * ставится микропакет tgws со своей спекой и своим состоянием, — и оба, начав с
@@ -98,10 +98,10 @@ int registry_assign(struct err *e) {
                 if (!taken[k]) { slot = k; found = 1; break; }
         }
         if (!found)
-            return err_set(e, "out of mark slots for output %s", g_out[i].name);
+            return err_set(e, "out of mark slots for output %s", s->out[i].name);
         taken[slot] = 1;
-        g_out[i].mark = MARK_BASE * (slot + 1);
-        g_out[i].table = TABLE_BASE + (int)slot;
+        s->out[i].mark = MARK_BASE * (slot + 1);
+        s->out[i].table = TABLE_BASE + (int)slot;
     }
     /* Прежде чем писать — сравнить с тем, что уже на диске. registry_assign
      * зовут все подкоманды, включая status, который интерфейс опрашивает каждые
@@ -111,10 +111,10 @@ int registry_assign(struct err *e) {
      * и пропускать её можно только когда файл уже дословно совпадает. */
     char want[1024]; /* 16 выходов по ≤53 байта строки — влезает с запасом */
     size_t wn = 0;
-    for (size_t i = 0; i < g_out_n && wn < sizeof(want); i++)
-        if (g_out[i].kind != OUT_DIRECT) {
+    for (size_t i = 0; i < s->out_n && wn < sizeof(want); i++)
+        if (s->out[i].kind != OUT_DIRECT) {
             int w = snprintf(want + wn, sizeof(want) - wn, "%s %x %d\n",
-                             g_out[i].name, g_out[i].mark, g_out[i].table);
+                             s->out[i].name, s->out[i].mark, s->out[i].table);
             if (w < 0 || (size_t)w >= sizeof(want) - wn) break; /* не бывает, но не рвём буфер */
             wn += (size_t)w;
         }
@@ -130,7 +130,7 @@ int registry_assign(struct err *e) {
     if (!f) return 0;           /* best effort: apply still works, next boot re-assigns */
     fwrite(want, 1, wn, f);
     fclose(f);
-    rt_tables_write();
+    rt_tables_write(s);
     return 0;
 }
 
@@ -154,7 +154,7 @@ int registry_assign(struct err *e) {
  * Отказ здесь ничего не ломает: имена — удобство диагностики, номера работают и без них.
  * Поэтому молча, без предупреждений: на busybox-ip имён нет вовсе, и жаловаться было бы не
  * на что. */
-static void rt_tables_write(void) {
+static void rt_tables_write(const struct spec *s) {
 #ifdef STEER_ANDROID
     /* На телефоне каталога iproute2 в /etc нет и быть не может: /etc там — ссылка в системный
      * раздел только для чтения. Имена таблиц — удобство диагностики (см. выше), и отказ записи
@@ -173,12 +173,12 @@ static void rt_tables_write(void) {
 
     char want[1024];
     size_t wn = 0;
-    for (size_t i = 0; i < g_out_n && wn < sizeof(want); i++) {
-        if (g_out[i].kind == OUT_DIRECT || !g_out[i].table) continue;
+    for (size_t i = 0; i < s->out_n && wn < sizeof(want); i++) {
+        if (s->out[i].kind == OUT_DIRECT || !s->out[i].table) continue;
         /* Имя с приставкой: таблица принадлежит выходу, но пространство имён общее для всей
          * коробки, и «vpn» там заняли бы и mwan3, и человек руками. */
         int w = snprintf(want + wn, sizeof(want) - wn, "%d steer_%s\n",
-                         g_out[i].table, g_out[i].name);
+                         s->out[i].table, s->out[i].name);
         if (w < 0 || (size_t)w >= sizeof(want) - wn) break;
         wn += (size_t)w;
     }

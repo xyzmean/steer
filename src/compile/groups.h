@@ -77,11 +77,11 @@ extern struct group g_grp[MAX_CHANNELS];
 extern size_t g_grp_n;
 
 /* build_groups/check_address_lists возвращают код ошибки, а не завершают процесс — правило 5,
- * docs/architecture.md, раздел 2. 0 — успех; -1 — отказ, текст в e->msg. */
-int build_groups(struct err *e);
+ * docs/architecture.md, раздел 2. 0 — успех; -1 — отказ, текст в e->msg. Читают спеку sp — правило 6. */
+int build_groups(const struct spec *sp, struct err *e);
 int has_domains(void);
-int has_zapret(void);
-int has_tgws(void);
+int has_zapret(const struct spec *sp);
+int has_tgws(const struct spec *sp);
 int has_fakeip(void);
 int is_mac(const char *s);
 int group_is_local(const struct group *g);
@@ -90,7 +90,7 @@ int check_address_lists(struct err *e);
 #ifdef STEER_ANDROID
 int has_local(void);
 int has_local_domains(void);
-int has_via(void);
+int has_via(const struct spec *sp);
 #endif
 
 #endif

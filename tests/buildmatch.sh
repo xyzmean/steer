@@ -637,6 +637,29 @@ done
 check "src/proto/obfs/obfs.c: оба SYN с OBFS_SYN_OPTS" "2" "$(grep -c 'TH_SYN, NULL, 0, OBFS_SYN_OPTS)' src/proto/obfs/obfs.c)"
 check "src/proto/obfs/obfs.c: SYN с голым MSS не осталось" "0" "$(grep -c 'TH_SYN, NULL, 0, 1)' src/proto/obfs/obfs.c)"
 
+# ---- правило 6 (docs/architecture.md, раздел 2): спека — значение, а не глобалы ------------
+#
+# Решение владельца: разобранная спека передаётся параметром (struct spec *), а не лежит в
+# глобальных массивах. До этого шага пять групп полей были глобалами g_out/g_ch/g_from_default/
+# g_lan_dev/g_traceroute_hops (жили в src/model/parse.c), и читало их полтора десятка файлов без
+# единого объявления в сигнатуре — то есть без способа увидеть по одной функции, что она вообще
+# трогает спеку, не читая её тело. Теперь это поля struct spec, а функции получают её
+# параметром; новое упоминание старых имён в src — знак, что кто-то завёл глобал заново (или
+# скопировал старый пример вместо того, чтобы протащить параметр).
+#
+# Комментарии не в счёт — тот же приём, что у правила 5 выше: `*`/`//`/`/*` в начале строки
+# после обрезки пробелов считаются прозой. Совпадения по слову, а не по подстроке: иначе
+# g_outbuf в src/tools/aggregate.c (буфер печати диапазонов, к спеке отношения не имеющий) тоже
+# попал бы в список — этим же заходом он и переименован из g_out, чтобы имя не путало.
+rule6bad=""
+for f in $(find src \( -name '*.c' -o -name '*.h' \)); do
+    n=$(grep -vE '^[[:space:]]*(\*|//|/\*)' "$f" | \
+        grep -cE '\<(g_out|g_ch|g_from_default|g_lan_dev|g_traceroute_hops)\>')
+    [ -n "$n" ] || n=0
+    [ "$n" -gt 0 ] && rule6bad="$rule6bad$f:$n "
+done
+check "в src нет g_out/g_ch/g_from_default/g_lan_dev/g_traceroute_hops (правило 6)" "" "$rule6bad"
+
 printf '\n%d проверок пройдено' "$pass"
 if [ "$fail" -gt 0 ]; then printf ', %d ПРОВАЛЕНО\n' "$fail"; exit 1; fi
 printf '\nвсе проверки прошли\n'

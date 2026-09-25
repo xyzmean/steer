@@ -207,12 +207,13 @@ static int set_lookup(const char *set, const char *elem, const char *addr) {
 }
 
 int cmd_explain(const char *spec, const char *what) {
+    static struct spec cfg;
     /* Правило 5, docs/architecture.md, раздел 2: err_die здесь довершает то, что раньше делал
      * die() изнутри load_spec/build_groups. */
     struct err e = {0};
-    if (load_spec(spec, &e) < 0) err_die(&e);
-    if (registry_assign(&e) < 0) err_die(&e);
-    if (build_groups(&e) < 0) err_die(&e);
+    if (load_spec(spec, &cfg, &e) < 0) err_die(&e);
+    if (registry_assign(&cfg, &e) < 0) err_die(&e);
+    if (build_groups(&cfg, &e) < 0) err_die(&e);
     g_nftc = nft_compat();
 
     /* Имя сначала превращаем в адрес — и печатаем, во что именно. Без этой строки человек
@@ -268,7 +269,7 @@ int cmd_explain(const char *spec, const char *what) {
             }
         }
         if (!hit) continue;
-        struct output *o = out_by_name(g_grp[i].out);
+        struct output *o = out_by_name(&cfg, g_grp[i].out);
         if (!o) die("group %s points at a missing output", g_grp[i].name);
         printf("%s -> %s \"%s\" -> output \"%s\"", addr,
                explain_set_phrase(addr, g_grp[i].files_n > 0, g_grp[i].domains),

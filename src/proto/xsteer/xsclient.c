@@ -683,21 +683,24 @@ int cmd_xsteer(const char *spec_path, const char *out_name, const char *conf_pat
 static int cmd_xsteer_spec(const char *spec_path, const char *out_name, const char *conf_path,
                            int stream, int stream_port) {
     /* Правило 5, docs/architecture.md, раздел 2: err_die здесь довершает то, что раньше делал
-     * die() изнутри load_spec/registry_assign. */
+     * die() изнутри load_spec/registry_assign.
+     *
+     * Спека — значение (правило 6, раздел 2): свой экземпляр у этой точки входа. */
+    static struct spec cfg;
     struct err e = {0};
-    if (load_spec(spec_path, &e) < 0) err_die(&e);
-    struct output *o = out_by_name(out_name);
+    if (load_spec(spec_path, &cfg, &e) < 0) err_die(&e);
+    struct output *o = out_by_name(&cfg, out_name);
     if (!o) die("нет такого выхода: %s", out_name);
     if (o->kind != OUT_XSTEER) die("выход %s не kind=xsteer", out_name);
     /* Реестр нужен ДО подъёма: из него берутся метка и номер таблицы выхода, а их привязка к
      * устройству — работа этого процесса (см. bind_device ниже). Вызов идемпотентен и с apply
      * не спорит: тот же файл, те же номера. Без него метка была бы нулевой, и правило
      * `ip rule fwmark 0x0` поймало бы весь трафик роутера. */
-    if (registry_assign(&e) < 0) err_die(&e);
+    if (registry_assign(&cfg, &e) < 0) err_die(&e);
     /* Метка соединения с хабом — out_underlay_mark: метка выхода-цели при `via`, иначе обычное
      * «мимо каналов» (см. «вложенные выходы» в spec.h). После registry_assign — у цели метка
      * появляется там. Ставят её obfs_raw_open (поддельный TCP) и stream_dial (поток). */
-    obfs_set_sock_mark(out_underlay_mark(o), o->via[0] != 0);
+    obfs_set_sock_mark(out_underlay_mark(&cfg, o), o->via[0] != 0);
 
     static struct spoke s;
     s.out_name = o->name;
@@ -1820,10 +1823,13 @@ static void *worker_main(void *arg) {
 
 int cmd_xsteer_peers(const char *spec_path, const char *out_name, const char *conf_path) {
     /* Правило 5, docs/architecture.md, раздел 2: err_die здесь довершает то, что раньше делал
-     * die() изнутри load_spec. */
+     * die() изнутри load_spec.
+     *
+     * Спека — значение (правило 6, раздел 2): свой экземпляр у этой точки входа. */
+    static struct spec cfg;
     struct err e = {0};
-    if (load_spec(spec_path, &e) < 0) err_die(&e);
-    struct output *o = out_by_name(out_name);
+    if (load_spec(spec_path, &cfg, &e) < 0) err_die(&e);
+    struct output *o = out_by_name(&cfg, out_name);
     if (!o) die("нет такого выхода: %s", out_name);
     if (o->kind != OUT_XSTEER) die("выход %s не kind=xsteer", out_name);
     struct xs_conf c;

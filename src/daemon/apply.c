@@ -75,11 +75,11 @@ static void registry_snapshot(void) {
     fclose(f);
 }
 
-static void cleanup_stale_routing(void) {
+static void cleanup_stale_routing(const struct spec *sp) {
     for (size_t i = 0; i < g_oldreg_n; i++) {
         int live = 0;
-        for (size_t k = 0; k < g_out_n; k++)
-            if (g_out[k].kind != OUT_DIRECT && g_out[k].mark == g_oldreg[i].mark) {
+        for (size_t k = 0; k < sp->out_n; k++)
+            if (sp->out[k].kind != OUT_DIRECT && sp->out[k].mark == g_oldreg[i].mark) {
                 live = 1;
                 break;
             }
@@ -190,9 +190,9 @@ static void android_masq_drop_all(void) {
 /* Вернуть недостающие правила masquerade, не трогая стоящие. Зовёт сторож после каждого
  * прохода: netd при (пере)запуске перестраивает iptables и наши правила пропадают, а apply
  * после этого случится, только если его позовёт init (см. steerd.rc). */
-void android_masq_ensure(void) {
-    for (size_t i = 0; i < g_out_n; i++) {
-        const struct output *o = &g_out[i];
+void android_masq_ensure(const struct spec *sp) {
+    for (size_t i = 0; i < sp->out_n; i++) {
+        const struct output *o = &sp->out[i];
         if (o->kind != OUT_INTERFACE && o->kind != OUT_AWG) continue;
         char mk[32];
         snprintf(mk, sizeof(mk), "0x%x/0x%x", o->mark, STEER_MARK_MASK);
@@ -211,10 +211,10 @@ void android_masq_ensure(void) {
     }
 }
 
-static void android_masq_sync(void) {
+static void android_masq_sync(const struct spec *sp) {
     android_masq_drop_all();
-    for (size_t i = 0; i < g_out_n; i++) {
-        const struct output *o = &g_out[i];
+    for (size_t i = 0; i < sp->out_n; i++) {
+        const struct output *o = &sp->out[i];
         if (o->kind != OUT_INTERFACE && o->kind != OUT_AWG) continue;
         char mk[32];
         snprintf(mk, sizeof(mk), "0x%x/0x%x", o->mark, STEER_MARK_MASK);
@@ -230,30 +230,31 @@ static void android_masq_sync(void) {
 }
 #endif
 
-static void apply_routing(void) {
-    for (size_t i = 0; i < g_out_n; i++) {
-        if (!out_has_device(&g_out[i])) continue;
+static void apply_routing(const struct spec *sp) {
+    for (size_t i = 0; i < sp->out_n; i++) {
+        const struct output *o = &sp->out[i];
+        if (!out_has_device(o)) continue;
         char table[16];
-        snprintf(table, sizeof(table), "%d", g_out[i].table);
+        snprintf(table, sizeof(table), "%d", o->table);
         /* Маршрут — заменой, правило — не снимая стоящего (table_bind и rule_ensure в
          * failover.c). Прежде здесь были `rule_drop` + `rule_add` и `flush` + `add`, и на
          * каждом apply помеченный трафик выхода на миг оставался без правила и без маршрута,
          * то есть уходил напрямую, мимо туннеля, — подробно у table_bind. Маршрут первым: если
          * правила не было, появившееся должно найти в таблице устройство, а не пустоту. */
-        int rc = table_bind(&g_out[i], g_out[i].device);
-        rule_ensure(g_out[i].mark, g_out[i].table);
+        int rc = table_bind(o, o->device);
+        rule_ensure(o->mark, o->table);
         if (rc != 0) {
             fprintf(stderr, LOG_W "output %s: cannot route via %s — is the device up?\n",
-                    g_out[i].name, g_out[i].device);
+                    o->name, o->device);
             /* Пустая таблица — это не «нет маршрута», а «ищи дальше»: помеченный
              * пакет провалится в следующую таблицу и уйдёт напрямую, то есть ровно
              * туда, куда его не пускали. При on_fail=drop окно между apply и первым
              * тиком failover обязано быть закрыто, иначе защита работает не всегда,
              * а это хуже, чем не работает вовсе. */
-            if (g_out[i].on_fail == FAIL_DROP) {
-                table_bind(&g_out[i], NULL);
+            if (o->on_fail == FAIL_DROP) {
+                table_bind(o, NULL);
                 fprintf(stderr, LOG_W "output %s: трафик остановлен до появления "
-                                "рабочего устройства (on_fail=drop)\n", g_out[i].name);
+                                "рабочего устройства (on_fail=drop)\n", o->name);
             } else {
                 /* direct/zapret: таблица пуста, пакет уйдёт напрямую — значит и через общий
                  * обход, как обычный (см. out_failopen_capable в spec.h). Таблица правил к
@@ -261,7 +262,7 @@ static void apply_routing(void) {
                  * прошла и в таблице могло остаться прежнее устройство. */
                 const char *flush[] = { "ip", "route", "flush", "table", table, NULL };
                 run(flush);
-                failopen_mark(&g_out[i], 1);
+                failopen_mark(o, 1);
             }
         }
     }
@@ -297,17 +298,17 @@ static int nft_table_exists(const char *fam) {
  * выбросить правило значило бы, что человек узнает о нём по симптому, — поэтому каждое
  * выброшенное называется здесь вместе с последствием. Строки идут в stderr и в журнал, как
  * остальные предупреждения apply. */
-static void report_legacy_gaps(void) {
+static void report_legacy_gaps(const struct spec *sp) {
     if (!NFT_LEGACY) return;
     fprintf(stderr, "steer[info] apply: ядро без nat в семействе inet — правила собраны для "
                     "nftables старого ядра: таблицы inet и ip%s\n",
             legacy_has_ip6() ? " и ip6" : "");
-    if (has_zapret() && !(g_nftc & NFTC_NOTRACK))
+    if (has_zapret(sp) && !(g_nftc & NFTC_NOTRACK))
         fprintf(stderr, LOG_W "ядро не знает notrack: порождённые обработчиком zapret пакеты "
                         "(подделки, куски разрезанного) остаются на учёте conntrack. Где "
                         "firewall отбрасывает ct state invalid, обход выходов kind=zapret "
                         "может не срабатывать\n");
-    if (g_traceroute_hops && has_domains() && !(g_nftc & NFTC_NOTRACK))
+    if (sp->traceroute_hops && has_domains() && !(g_nftc & NFTC_NOTRACK))
         fprintf(stderr, LOG_W "ядро не знает notrack: traceroute_hops на нём не действует, "
                         "промежуточные узлы будут видны как прежде\n");
 #ifndef STEER_TGWS
@@ -384,15 +385,19 @@ static int nfqueue_supported(void) {
 int cmd_apply(const char *spec, int dry) {
     /* Разбор спеки и компиляция возвращают отказ, а не завершают процесс сами (правило 5,
      * docs/architecture.md, раздел 2) — err_die здесь, в точке входа, довершает то же самое:
-     * код 2, тот же текст, что раньше печатал die() изнутри load_spec/build_groups/generate. */
+     * код 2, тот же текст, что раньше печатал die() изнутри load_spec/build_groups/generate.
+     *
+     * Спека — значение, а не глобалы (правило 6): свой экземпляр у точки входа, static —
+     * держать struct spec на стеке нельзя, он большой (g_ch один под 200 КБ). */
+    static struct spec cfg;
     struct err e = {0};
-    if (load_spec(spec, &e) < 0) err_die(&e);
+    if (load_spec(spec, &cfg, &e) < 0) err_die(&e);
     /* Снимок реестра — строго до registry_assign: тот перезапишет файл текущими
      * выходами, и метки удалённых/переименованных будут потеряны вместе с
      * единственным способом снять их правила из ядра. */
     registry_snapshot();
-    if (registry_assign(&e) < 0) err_die(&e);
-    if (build_groups(&e) < 0) err_die(&e);
+    if (registry_assign(&cfg, &e) < 0) err_die(&e);
+    if (build_groups(&cfg, &e) < 0) err_die(&e);
     /* ДОМЕННЫЙ КАНАЛ В МИНИ-СБОРКЕ — ОТКАЗ, А НЕ ПРЕДУПРЕЖДЕНИЕ.
      *
      * Домены маршрутизируются через резолвер движка, а мини-сборка его не поднимает и
@@ -411,7 +416,7 @@ int cmd_apply(const char *spec, int dry) {
      * Иначе применение настройки уводило бы таблицу с работающего запасного устройства на
      * неработающее основное, а при on_fail=drop ещё и ставило запрет — то есть каждое
      * сохранение в интерфейсе роняло бы пул до следующего прохода сторожа (до минуты). */
-    outputs_adopt_active();
+    outputs_adopt_active(&cfg);
     /* Проверка списков — ДО генерации и до dry-run.
      *
      * До dry-run намеренно: интерфейс проверяет спеку именно им, перед записью на диск.
@@ -421,7 +426,7 @@ int cmd_apply(const char *spec, int dry) {
     /* Раскладка набора правил — до генерации и до dry-run: интерфейс проверяет спеку именно
      * dry-run'ом, и печатать ему надо то, что реально встанет на этом ядре. */
     g_nftc = nft_compat();
-    report_legacy_gaps();
+    report_legacy_gaps(&cfg);
     /* Снять накопленное ДО генерации: она вписывает эти значения в новые правила, иначе
      * каждый apply обнулял бы объёмы. Читаем и при --dry-run — так печатаемый текст остаётся
      * тем, что реально применится, а на машине без таблицы вывод не меняется вовсе. */
@@ -433,15 +438,15 @@ int cmd_apply(const char *spec, int dry) {
      * перед записью, и ошибка в файле туннеля должна быть видна тогда же, а не после
      * применения. Предупреждением в stderr: набор правил от файла туннеля не зависит. */
     if (dry) {
-        awg_check_all();
-        if (generate(stdout, &e) < 0) err_die(&e);
+        awg_check_all(&cfg);
+        if (generate(&cfg, stdout, &e) < 0) err_die(&e);
         return 0;
     }
 
     /* Отказываем ДО транзакции и НАЗЫВАЕМ причину: иначе человек получит отказ всей
      * маршрутизации с сообщением про несуществующий файл. Пакет назван прямо — его же
      * тянет за собой zapret, поэтому у тех, кто обходом уже пользуется, он стоит. */
-    if (has_zapret() && !nfqueue_supported())
+    if (has_zapret(&cfg) && !nfqueue_supported())
         die("в спеке есть выход kind=zapret, а ядро не принимает правило queue — "
             "нужен пакет kmod-nft-queue (его ставит и сам zapret). Правила НЕ применены: "
             "nft грузит набор целиком, и отказ на очереди снял бы заодно наборы, метки и "
@@ -498,7 +503,7 @@ int cmd_apply(const char *spec, int dry) {
      * раскладки не было никогда, файл остаётся прежним, байт в байт. */
     {
         static const char *const fams[2] = { "ip", "ip6" };
-        int want[2] = { legacy_has_ip(), legacy_has_ip6() };
+        int want[2] = { legacy_has_ip(&cfg), legacy_has_ip6() };
         for (int k = 0; k < 2; k++) {
             if (want[k])
                 fprintf(f, "table %s %s\ndelete table %s %s\n",
@@ -507,7 +512,7 @@ int cmd_apply(const char *spec, int dry) {
                 fprintf(f, "delete table %s %s\n", fams[k], nft_table());
         }
     }
-    if (generate(f, &e) < 0) err_die(&e);
+    if (generate(&cfg, f, &e) < 0) err_die(&e);
     fclose(f);
 
     const char *load[] = { "nft", "-f", tmp, NULL };
@@ -524,12 +529,12 @@ int cmd_apply(const char *spec, int dry) {
      * устройство, и устройства к этому мгновению обязаны быть (см. src/kinds/awg.c). Отказ одного
      * туннеля не отменяет применённых правил: его таблица получит то же, что у любого выхода
      * без устройства (blackhole при on_fail=drop), а причина уже названа в журнале. */
-    awg_apply_all();
-    apply_routing();
+    awg_apply_all(&cfg);
+    apply_routing(&cfg);
 #ifdef STEER_ANDROID
-    android_masq_sync();
+    android_masq_sync(&cfg);
 #endif
-    cleanup_stale_routing();
+    cleanup_stale_routing(&cfg);
     /* Снимок состояния СНИМАЕТСЯ: он описывает то, что было применено до этой транзакции, и
      * `status --fast` отдавал бы его как нынешнее — то есть прежние выходы и прежние каналы
      * ровно в тот момент, когда человек нажал «Применить» и смотрит, подействовало ли.
@@ -544,10 +549,10 @@ int cmd_apply(const char *spec, int dry) {
      * эти проверки говорили бы «устройство не упомянуто в firewall» и «нет masquerade» на
      * каждом apply — ложные тревоги, после которых настоящим перестают верить. */
 #ifndef STEER_ANDROID
-    report_output_deps();
-    report_traceroute_dep();
+    report_output_deps(&cfg);
+    report_traceroute_dep(&cfg);
 #endif
     report_mark_overlap();
-    printf("steer: applied %zu channel(s), %zu output(s)\n", g_ch_n, g_out_n);
+    printf("steer: applied %zu channel(s), %zu output(s)\n", cfg.ch_n, cfg.out_n);
     return 0;
 }

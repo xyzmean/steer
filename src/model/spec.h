@@ -344,28 +344,52 @@ struct channel {
     int disabled;
 };
 
-extern struct output g_out[MAX_OUTPUTS];
-extern size_t g_out_n;
-extern struct channel g_ch[MAX_CHANNELS];
-extern size_t g_ch_n;
-extern char g_from_default[MAX_FROM][64];
-extern size_t g_from_default_n;
-/* Локальные устройства: те, с которых движок забирает трафик клиентов.
+/* СПЕКА — ЗНАЧЕНИЕ, А НЕ ГЛОБАЛЫ (docs/architecture.md, раздел 2, правило 6).
  *
- * СПИСОК, А НЕ СТРОКА, потому что роутер бывает выходной точкой не только для своего моста:
- * у splify2 просили маршрутизировать ещё и хостов из Tailscale/ZeroTier, для которых он
- * шлюз (splify2#16). В спеке это `lan_devices`; прежнее `lan_device` осталось сокращением
- * для списка из одного элемента — той же парой, что `device`/`devices` у выхода.
+ * Раньше разобранная спека жила в пяти глобальных массивах (g_out, g_ch, g_from_default,
+ * g_lan_dev, g_traceroute_hops): один экземпляр на процесс, доступный отовсюду без
+ * объявления. Решение владельца — отказаться от этого в пользу явной передачи параметром:
+ * struct spec собирает те же пять групп полей в одно значение, load_spec заполняет его, а
+ * каждая функция, которой нужна спека, получает указатель на него параметром.
  *
- * ПОЧЕМУ ВЫБОР ПО УСТРОЙСТВУ, А НЕ ПО ПОДСЕТИ. Раньше движок выводил подсеть клиентов из
- * адреса единственного устройства. Для Tailscale это не работает в принципе: у tailscale0
- * на роутере адрес обычно /32, и выведенная из него «подсеть» — сам роутер. Имя устройства
- * отвечает на тот же вопрос точнее и там, где адрес не отвечает вовсе: заодно в правило
- * попадают клиенты за вторым роутером в LAN, у которых адреса чужой подсети, а интерфейс
- * тот же. */
-extern char g_lan_dev[MAX_LAN_DEV][64];
-extern size_t g_lan_dev_n;
-extern int g_traceroute_hops;
+ * ПОЧЕМУ НЕ ОДИН ОБЩИЙ ЭКЗЕМПЛЯР ВМЕСТО ПЯТИ ГЛОБАЛОВ. Это был бы тот же порок под другим
+ * именем: g_spec вместо g_out теряет ту же информацию — кто читает спеку, а кто нет, — и
+ * даёт любой функции доступ к ней без спроса. Стенд, собирающий failover.c без парсера
+ * (failovermatch), или два процесса с разными спеками в одном тесте оказались бы вынуждены
+ * либо делить один экземпляр, либо снова заводить глобал под другим именем. Явный параметр
+ * делает то же самое видимым в сигнатуре: функция, которая спеку не получает, спеку не
+ * читает — это проверяет компилятор, а не память того, кто её писал.
+ *
+ * ГДЕ ЖИВЁТ ЭКЗЕМПЛЯР. struct spec большой (g_ch один — под 200 КБ при MAX_CHANNELS=64), и
+ * на стеке его не держат: каждая точка входа (cmd_* в daemon/, dnsd, tgws, vless-команды,
+ * awg-команды) заводит свой `static struct spec` и передаёт указатель вниз по вызовам. Один
+ * процесс — один экземпляр за время своей жизни, но эти экземпляры не делят состояние между
+ * собой, и это и есть разница со старыми глобалами: явную, а не подразумеваемую. */
+struct spec {
+    struct output out[MAX_OUTPUTS];
+    size_t out_n;
+    struct channel ch[MAX_CHANNELS];
+    size_t ch_n;
+    char from_default[MAX_FROM][64];
+    size_t from_default_n;
+    /* Локальные устройства: те, с которых движок забирает трафик клиентов.
+     *
+     * СПИСОК, А НЕ СТРОКА, потому что роутер бывает выходной точкой не только для своего
+     * моста: у splify2 просили маршрутизировать ещё и хостов из Tailscale/ZeroTier, для
+     * которых он шлюз (splify2#16). В спеке это `lan_devices`; прежнее `lan_device` осталось
+     * сокращением для списка из одного элемента — той же парой, что `device`/`devices` у
+     * выхода.
+     *
+     * ПОЧЕМУ ВЫБОР ПО УСТРОЙСТВУ, А НЕ ПО ПОДСЕТИ. Раньше движок выводил подсеть клиентов из
+     * адреса единственного устройства. Для Tailscale это не работает в принципе: у
+     * tailscale0 на роутере адрес обычно /32, и выведенная из него «подсеть» — сам роутер.
+     * Имя устройства отвечает на тот же вопрос точнее и там, где адрес не отвечает вовсе:
+     * заодно в правило попадают клиенты за вторым роутером в LAN, у которых адреса чужой
+     * подсети, а интерфейс тот же. Умолчание — один "br-lan", выставляется в load_spec. */
+    char lan_dev[MAX_LAN_DEV][64];
+    size_t lan_dev_n;
+    int traceroute_hops;
+};
 extern const char *g_state_dir;
 /* Каталог, куда пишутся ИМЕНА таблиц маршрутизации для iproute2. Швом, а не литералом, по
  * той же причине, что g_state_dir: стенду нужно писать в свой каталог, а не в системный. */
@@ -574,18 +598,18 @@ int label_ok(const char *s);
  * l4 в списке параметров по той же причине, по которой там уже стоят from и realip: это
  * ещё один признак, по которому компилятор РАЗДЕЛЯЕТ группы, а значит и наборы. NULL —
  * «сужения нет», и тогда имя получается прежним, байт в байт. */
-void group_set_name(char *dst, size_t n, const char *out, const char *kind,
+void group_set_name(const struct spec *sp, char *dst, size_t n, const char *out, const char *kind,
                     const char (*from)[64], size_t from_n, int realip,
                     const struct l4match *l4);
 /* Одно ли сужение у двух каналов. Нужна компилятору: протокол и порты входят в ключ
  * слияния групп наравне с выходом и списком клиентов — см. build_groups в steer.c. */
 int l4match_same(const struct l4match *a, const struct l4match *b);
 /* Разбор спеки — правило 5 (docs/architecture.md, раздел 2): модель ошибку ВОЗВРАЩАЕТ, а не
- * завершает процесс сама. 0 — разобрано, глобальные массивы (g_out, g_ch, …) заполнены; -1 —
+ * завершает процесс сама. 0 — разобрано, *s заполнен (см. правило 6 у struct spec выше); -1 —
  * отказ, текст в e->msg. Завершает процесс только вызывающий, дошедший до точки входа:
- * `struct err e; if (load_spec(path, &e) < 0) err_die(&e);`. */
-int load_spec(const char *path, struct err *e);
-struct output *out_by_name(const char *n);
+ * `static struct spec spec; struct err e; if (load_spec(path, &spec, &e) < 0) err_die(&e);`. */
+int load_spec(const char *path, struct spec *s, struct err *e);
+struct output *out_by_name(const struct spec *sp, const char *n);
 
 /* Кому ПРИНАДЛЕЖИТ устройство: выход, чей процесс его создал (vless, xsteer). NULL, если
  * такого нет, — тогда устройством владеет система, и отвечает за него сам выход.
@@ -611,11 +635,11 @@ struct output *out_by_name(const char *n);
  * нельзя без потерь: стенд failovermatch компилирует failover.c со своими выходами и без
  * парсера, и копия функции в стенде стала бы вторым источником правды, который разойдётся с
  * первым молча. */
-const struct output *device_owner(const char *dev);
+const struct output *device_owner(const struct spec *sp, const char *dev);
 /* Тот же вопрос с готовым запасным ответом: владелец устройства, а если владельца нет — сам
  * выход. Отдельно от device_owner, потому что все три места зовут именно эту форму, и
  * `owner ? owner : o` в каждом из них — три шанса забыть его в одном. */
-const struct output *out_for_device(const struct output *o, const char *dev);
+const struct output *out_for_device(const struct spec *sp, const struct output *o, const char *dev);
 
 /* Заполнить `device` каждого выхода тем устройством, через которое трафик идёт СЕЙЧАС.
  *
@@ -623,7 +647,7 @@ const struct output *out_for_device(const struct output *o, const char *dev);
  * и diag — перед тем, как рассказывать о выходе. Без неё `device` у них означает первого
  * кандидата, то есть предпочтение, а не факт, и пул с рабочим запасным устройством
  * выглядит сломанным. Порядок выбора и его доводы — у определения в failover.c. */
-void outputs_adopt_active(void);
+void outputs_adopt_active(struct spec *sp);
 
 /* Развернуть выбор узлов выхода в порядок перебора при подписке из `usable` пригодных узлов.
  * Пишет в dst номера кандидатов по предпочтению и возвращает, сколько написал.
@@ -723,12 +747,12 @@ static inline int out_via_target_ok(const struct output *o) {
     return out_has_device(o);
 }
 
-/* Выход-цель `via` или NULL, если его нет. Поиск по g_out, а не out_by_name: этот заголовок
- * включают стенды без парсера (failovermatch), и функция из spec.c у них не собралась бы. */
-static inline const struct output *out_via(const struct output *o) {
+/* Выход-цель `via` или NULL, если его нет. Поиск по sp->out, а не out_by_name: этот заголовок
+ * включают стенды без парсера (failovermatch), и функция из parse.c у них не собралась бы. */
+static inline const struct output *out_via(const struct spec *sp, const struct output *o) {
     if (!o->via[0]) return NULL;
-    for (size_t i = 0; i < g_out_n; i++)
-        if (!strcmp(g_out[i].name, o->via)) return &g_out[i];
+    for (size_t i = 0; i < sp->out_n; i++)
+        if (!strcmp(sp->out[i].name, o->via)) return &sp->out[i];
     return NULL;
 }
 
@@ -736,9 +760,9 @@ static inline const struct output *out_via(const struct output *o) {
  * обходит выходы в порядке зависимостей (сторож, супервизор помощников): цель — раньше
  * зависящего. Спека круги и цепочки длиннее MAX_VIA_DEPTH отвергает (via_check в spec.c);
  * предел здесь — только чтобы стенд, собирающий выходы в обход парсера, не зациклился. */
-static inline int out_via_depth(const struct output *o) {
+static inline int out_via_depth(const struct spec *sp, const struct output *o) {
     int d = 0;
-    for (const struct output *t = out_via(o); t && d < MAX_VIA_DEPTH; t = out_via(t)) d++;
+    for (const struct output *t = out_via(sp, o); t && d < MAX_VIA_DEPTH; t = out_via(sp, t)) d++;
     return d;
 }
 

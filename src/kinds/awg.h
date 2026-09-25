@@ -170,7 +170,7 @@ size_t awg_build_getfamily(uint8_t *buf, size_t cap, const char *name, uint32_t 
 /* Метка сокета туннеля (WGDEVICE_A_FWMARK). via — имя выхода, через который должен идти UDP
  * туннеля, или NULL: тогда метка «мимо каналов движка». -1 — выхода via нет; 0 — годна, метка
  * в *mark. Подробности — у определения. */
-int awg_sock_mark(const char *via, uint32_t *mark);
+int awg_sock_mark(const struct spec *sp, const char *via, uint32_t *mark);
 
 /* Годится ли файл для туннеля, который идёт через via: 0 — да; -1 — нет, причина в err (без
  * ключей). Сейчас одна причина — Endpoint с адресом IPv6: таблица выхода-цели и её ip rule
@@ -181,17 +181,17 @@ int awg_via_check(const struct awg_conf *c, const char *via, char *err, size_t n
 
 /* Поднять и настроить устройства всех выходов kind=awg, снять устройства выходов, которых в
  * спеке больше нет. Возврат — сколько выходов не поднялось (о каждом — строка в журнале). */
-int awg_apply_all(void);
+int awg_apply_all(const struct spec *sp);
 /* Проверить файлы выходов kind=awg без касания ядра (apply --dry-run): ошибки — строками
  * steer[warn] в stderr. Возврат — сколько файлов негодны. */
-int awg_check_all(void);
+int awg_check_all(const struct spec *sp);
 /* Снять все устройства, которые движок заводил (по реестру в каталоге состояния). */
 void awg_down_all(void);
 /* Здоровье устройства по свежести рукопожатия, без проб. 1 — живо или сказать нечего. */
 int awg_healthy(const struct output *o, const char *dev);
 /* Починка молчащего туннеля: заново разрешить Endpoint и перенастроить (создать, если
  * устройства нет). Возврат — как у awg_healthy после починки. */
-int awg_revive(const struct output *o, const char *dev);
+int awg_revive(const struct spec *sp, const struct output *o, const char *dev);
 /* ПАМЯТЬ СТОРОЖА: замеры счётчиков между проходами (см. «здоровье» в awg.c) — в памяти, а не в
  * файле <state>/awg-<устройство>.hs. Зовёт `failover --loop` (steer.c): on=1 — проход берёт и
  * кладёт замеры в память процесса; дочерний проход получает её копией при fork, а свои новые

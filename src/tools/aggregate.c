@@ -342,17 +342,17 @@ static void fmt_addr(uint32_t a, char *buf, size_t n) {
 }
 
 #define OUTBUF_SZ (64 * 1024)
-static char g_out[OUTBUF_SZ];
-static size_t g_out_n;
+static char g_outbuf[OUTBUF_SZ];
+static size_t g_outbuf_n;
 
 static void out_flush(FILE *f) {
-    if (g_out_n) { fwrite(g_out, 1, g_out_n, f); g_out_n = 0; }
+    if (g_outbuf_n) { fwrite(g_outbuf, 1, g_outbuf_n, f); g_outbuf_n = 0; }
 }
 
 /* Место под самую длинную строку: два адреса, дефис и перевод строки — 32 байта с
  * запасом. Сброс делается ДО записи, а не после, чтобы в буфере всегда было место. */
 static void out_reserve(FILE *f) {
-    if (g_out_n + 32 > OUTBUF_SZ) out_flush(f);
+    if (g_outbuf_n + 32 > OUTBUF_SZ) out_flush(f);
 }
 
 static char *put_addr(char *p, uint32_t a) {
@@ -380,7 +380,7 @@ static char *put_uint(char *p, unsigned v) {
  * memory for looks. */
 static void emit_range(FILE *f, uint32_t lo, uint32_t hi) {
     out_reserve(f);
-    char *p = g_out + g_out_n;
+    char *p = g_outbuf + g_outbuf_n;
     uint64_t size = (uint64_t)hi - lo + 1;
     if ((size & (size - 1)) == 0 && (lo & (uint32_t)(size - 1)) == 0) {
         unsigned len = 32;
@@ -393,7 +393,7 @@ static void emit_range(FILE *f, uint32_t lo, uint32_t hi) {
         p = put_addr(p, hi);
     }
     *p++ = '\n';
-    g_out_n = (size_t)(p - g_out);
+    g_outbuf_n = (size_t)(p - g_outbuf);
 }
 
 static void read_file(const char *path, struct list *l, unsigned long *bad) {

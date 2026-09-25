@@ -106,6 +106,9 @@ static uint16_t u16of(const struct nlattr *a) { uint16_t v = 0; if (a) memcpy(&v
 static uint64_t u64of(const struct nlattr *a) { uint64_t v = 0; if (a) memcpy(&v, NLA_DATA(a), 8); return v; }
 
 /* ---- спека -------------------------------------------------------------------------- */
+/* Спека — значение, а не глобалы (правило 6, docs/architecture.md, раздел 2): один экземпляр
+ * на весь стенд, load_spec заполняет его заново на каждый вызов. */
+static struct spec g_spec;
 static int spec_str(const char *body) {
     char path[] = "/tmp/awgmatch-spec-XXXXXX";
     int fd = mkstemp(path);
@@ -113,10 +116,8 @@ static int spec_str(const char *body) {
     FILE *f = fdopen(fd, "w");
     fprintf(f, "{\"schema\":1,%s}", body);
     fclose(f);
-    g_out_n = 0; g_ch_n = 0;
-    memset(g_out, 0, sizeof g_out);
     struct err e = {0};
-    int rc = load_spec(path, &e) < 0 ? 2 : 0;
+    int rc = load_spec(path, &g_spec, &e) < 0 ? 2 : 0;
     unlink(path);
     return rc;
 }
@@ -396,20 +397,20 @@ int main(void) {
     /* ---- 8. спека ------------------------------------------------------------------------- */
     check("kind awg без conf — годен", 0,
           spec_str("\"outputs\":{\"nl\":{\"kind\":\"awg\",\"on_fail\":\"drop\"}},\"channels\":[]"));
-    check_str("  устройство — имя выхода", "nl", g_out[0].device);
-    check_str("  conf по умолчанию из имени выхода", STEER_ETC_DIR "/awg/nl.conf", g_out[0].xs_conf);
-    check("  выход с устройством и меткой", 1, out_has_device(&g_out[0]) && out_needs_mark(&g_out[0]));
-    check("  устройство заводит движок", 1, out_engine_managed(&g_out[0]));
-    check("  masquerade ему нужен (не self_natting)", 0, out_self_natting(&g_out[0]));
-    check_str("  вид печатается как awg", "awg", out_kind_name(g_out[0].kind));
+    check_str("  устройство — имя выхода", "nl", g_spec.out[0].device);
+    check_str("  conf по умолчанию из имени выхода", STEER_ETC_DIR "/awg/nl.conf", g_spec.out[0].xs_conf);
+    check("  выход с устройством и меткой", 1, out_has_device(&g_spec.out[0]) && out_needs_mark(&g_spec.out[0]));
+    check("  устройство заводит движок", 1, out_engine_managed(&g_spec.out[0]));
+    check("  masquerade ему нужен (не self_natting)", 0, out_self_natting(&g_spec.out[0]));
+    check_str("  вид печатается как awg", "awg", out_kind_name(g_spec.out[0].kind));
     check("kind awg c именем wg0 — годен", 0,
           spec_str("\"outputs\":{\"wg0\":{\"kind\":\"awg\",\"conf\":\"/data/misc/steer/awg/a.conf\"}},\"channels\":[]"));
-    check("  устройство не «wg0»", 1, strcmp(g_out[0].device, "wg0") != 0 && !strncmp(g_out[0].device, "if", 2));
+    check("  устройство не «wg0»", 1, strcmp(g_spec.out[0].device, "wg0") != 0 && !strncmp(g_spec.out[0].device, "if", 2));
     check("device «tun1» явно — отказ", 2,
           spec_str("\"outputs\":{\"nl\":{\"kind\":\"awg\",\"device\":\"tun1\"}},\"channels\":[]"));
     check("device нейтральный явно — годен", 0,
           spec_str("\"outputs\":{\"nl\":{\"kind\":\"awg\",\"device\":\"rt5\"}},\"channels\":[]"));
-    check_str("  взят как есть", "rt5", g_out[0].device);
+    check_str("  взят как есть", "rt5", g_spec.out[0].device);
     check("devices списком из двух — отказ", 2,
           spec_str("\"outputs\":{\"nl\":{\"kind\":\"awg\",\"devices\":[\"a1\",\"a2\"]}},\"channels\":[]"));
     check("conf относительный — отказ", 2,
@@ -424,24 +425,24 @@ int main(void) {
     {
         spec_str("\"outputs\":{\"nl\":{\"kind\":\"awg\"},\"up\":{\"kind\":\"interface\",\"device\":\"eth9\"},"
                  "\"d\":{\"kind\":\"direct\"}},\"channels\":[]");
-        g_out[1].mark = 0x00300000;
+        g_spec.out[1].mark = 0x00300000;
         uint32_t mk = 0xdead;
 #ifdef STEER_SELF_MARK
         uint32_t self = STEER_SELF_MARK;
 #else
         uint32_t self = 0;
 #endif
-        check("без via — метка «сам движок» (на роутере 0)", 0, awg_sock_mark(NULL, &mk));
+        check("без via — метка «сам движок» (на роутере 0)", 0, awg_sock_mark(&g_spec, NULL, &mk));
         check("  значение", (long)self, (long)mk);
-        check("via на выход с меткой — его метка", 0, awg_sock_mark("up", &mk));
+        check("via на выход с меткой — его метка", 0, awg_sock_mark(&g_spec, "up", &mk));
 #ifdef STEER_TUNNEL_BIT
         /* Телефон: к метке цели — бит «собственный трафик туннеля» (заворот DNS его пропускает). */
         check("  значение (с битом туннеля)", 0x10300000, (long)mk);
 #else
         check("  значение", 0x00300000, (long)mk);
 #endif
-        check("via на direct — как без via", 0, (awg_sock_mark("d", &mk), (long)(mk != self)));
-        check("via на несуществующий выход — отказ", -1, awg_sock_mark("nope", &mk));
+        check("via на direct — как без via", 0, (awg_sock_mark(&g_spec, "d", &mk), (long)(mk != self)));
+        check("via на несуществующий выход — отказ", -1, awg_sock_mark(&g_spec, "nope", &mk));
     }
 
     /* ---- 10. туннель через via — только IPv4 -------------------------------------------

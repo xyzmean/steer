@@ -92,10 +92,13 @@ void dch_sig_write(void) {
  * на вопрос «хватит ли HUP». */
 int dnsd_sig_print(const char *spec, FILE *out) {
     /* Правило 5, docs/architecture.md, раздел 2: err_die здесь довершает то, что раньше делал
-     * die() изнутри load_spec. */
+     * die() изнутри load_spec.
+     *
+     * Спека — значение (правило 6): свой экземпляр у этой точки входа. */
+    static struct spec cfg;
     struct err e = {0};
-    if (load_spec(spec, &e) < 0) err_die(&e);
-    dch_build();
+    if (load_spec(spec, &cfg, &e) < 0) err_die(&e);
+    dch_build(&cfg);
     dch_signature(out);
     return 0;
 }
@@ -106,10 +109,10 @@ int dnsd_sig_print(const char *spec, FILE *out) {
  * и слияние каналов в один набор — решения о смысле, и проверять их надо прямо, а не
  * через запуск резолвера с сетью и netlink. */
 /* Имя доменного набора канала `c`, если бы у него был режим `realip`. */
-static void dch_name(char *dst, size_t n, const struct channel *c, int realip) {
-    size_t fn = c->from_n ? c->from_n : g_from_default_n;
-    const char (*fr)[64] = c->from_n ? c->from : g_from_default;
-    group_set_name(dst, n, c->out, "dom", fr, fn, realip, &c->l4);
+static void dch_name(const struct spec *sp, char *dst, size_t n, const struct channel *c, int realip) {
+    size_t fn = c->from_n ? c->from_n : sp->from_default_n;
+    const char (*fr)[64] = c->from_n ? c->from : sp->from_default;
+    group_set_name(sp, dst, n, c->out, "dom", fr, fn, realip, &c->l4);
 }
 
 /* В какой доменный набор компилятор кладёт канал БЕЗ доменных списков. 1 — в набор `set`
@@ -129,15 +132,16 @@ static void dch_name(char *dst, size_t n, const struct channel *c, int realip) {
  * имя набора; режим группы — у первого такого доменного канала в порядке компилятора
  * (сначала правила на устройство, потом остальные). Поэтому имя адресного канала считается
  * с режимом каждого кандидата и сравнивается с именем кандидата: совпало — это его группа. */
-static int dch_join_domain_group(const struct channel *c, char *set, size_t n, int *realip) {
+static int dch_join_domain_group(const struct spec *sp, const struct channel *c, char *set,
+                                 size_t n, int *realip) {
     for (int pass = 0; pass < 2; pass++)
-        for (size_t j = 0; j < g_ch_n; j++) {
-            const struct channel *d = &g_ch[j];
+        for (size_t j = 0; j < sp->ch_n; j++) {
+            const struct channel *d = &sp->ch[j];
             if ((pass == 0) != (d->dev_scope != 0)) continue;
             if (d->disabled || !d->domains_n) continue;
             char want[64], mine[64];
-            dch_name(want, sizeof(want), d, d->realip);
-            dch_name(mine, sizeof(mine), c, d->realip);
+            dch_name(sp, want, sizeof(want), d, d->realip);
+            dch_name(sp, mine, sizeof(mine), c, d->realip);
             if (strcmp(want, mine)) continue;
             snprintf(set, n, "%s", want);
             *realip = d->realip;
@@ -146,7 +150,7 @@ static int dch_join_domain_group(const struct channel *c, char *set, size_t n, i
     return 0;
 }
 
-void dch_build(void) {
+void dch_build(const struct spec *sp) {
     g_dch_n = 0;
     /* Same coalescing the compiler does, and it must agree with it exactly: the set
      * names here ARE the sets it generated. Domain channels that share an output, the
@@ -168,7 +172,7 @@ void dch_build(void) {
      * Разбирается он, впрочем, не в один механизм, а в два: `8.8.8.0/24` ляжет в набор
      * настоящим префиксом, а `youtube.com` — поддельным адресом плюс правилом DNAT. Набор
      * с `flags interval,timeout` держит и то и то (проверено опытом, см. spec.c). */
-    for (size_t i = 0; i < g_ch_n; i++) {
+    for (size_t i = 0; i < sp->ch_n; i++) {
         /* ВЫКЛЮЧЕННОЕ ПРАВИЛО РЕЗОЛВЕР НЕ БЕРЁТ. Компилятор набора его уже не берёт
          * (steer.c), а здесь брал — и это худший из возможных исходов, потому что «не
          * действует» превращалось в «ломает».
@@ -183,10 +187,10 @@ void dch_build(void) {
          * Снаружи это выглядело так, что выключатель не действует: «отключить правило —
          * ничего не меняется, надо именно удалить» (обратка, два роутера с одинаковым
          * набором правил). Ровно та же строка, что в steer.c, и по той же причине. */
-        if (g_ch[i].disabled) continue;
-        if (!g_ch[i].domains_n && !g_ch[i].prefixes_n) continue;
+        if (sp->ch[i].disabled) continue;
+        if (!sp->ch[i].domains_n && !sp->ch[i].prefixes_n) continue;
         char set[64];
-        int realip = g_ch[i].realip;
+        int realip = sp->ch[i].realip;
         /* Имя считает ОБЩАЯ функция, та же, что у компилятора: своя формула здесь была
          * `%.24s_dom` и не знала ни про список клиентов, ни про режим, поэтому доменные
          * каналы одного выхода с разными from сливались в один набор, а fakeip и realip
@@ -198,8 +202,8 @@ void dch_build(void) {
          *
          * Канал без доменных списков доменной части не получает, если только компилятор не
          * положил его в доменную группу соседа, — см. dch_join_domain_group. */
-        if (g_ch[i].domains_n) dch_name(set, sizeof(set), &g_ch[i], realip);
-        else if (!dch_join_domain_group(&g_ch[i], set, sizeof(set), &realip)) continue;
+        if (sp->ch[i].domains_n) dch_name(sp, set, sizeof(set), &sp->ch[i], realip);
+        else if (!dch_join_domain_group(sp, &sp->ch[i], set, sizeof(set), &realip)) continue;
         size_t k = 0;
         for (; k < g_dch_n; k++)
             if (!strcmp(g_dch[k].set, set) && g_dch[k].realip == realip) break;
@@ -207,20 +211,20 @@ void dch_build(void) {
             if (g_dch_n >= MAX_CHANNELS) break;
             memset(&g_dch[g_dch_n], 0, sizeof(g_dch[g_dch_n]));
             snprintf(g_dch[g_dch_n].set, sizeof(g_dch[g_dch_n].set), "%s", set);
-            snprintf(g_dch[g_dch_n].out, sizeof(g_dch[g_dch_n].out), "%.31s", g_ch[i].out);
+            snprintf(g_dch[g_dch_n].out, sizeof(g_dch[g_dch_n].out), "%.31s", sp->ch[i].out);
             g_dch[g_dch_n].realip = realip;
             k = g_dch_n++;
         }
-        if (!g_dch[k].chan[0] || (!g_dch[k].chan_dom && g_ch[i].domains_n)) {
-            snprintf(g_dch[k].chan, sizeof(g_dch[k].chan), "%.31s", g_ch[i].name);
-            g_dch[k].chan_dom = g_ch[i].domains_n > 0;
+        if (!g_dch[k].chan[0] || (!g_dch[k].chan_dom && sp->ch[i].domains_n)) {
+            snprintf(g_dch[k].chan, sizeof(g_dch[k].chan), "%.31s", sp->ch[i].name);
+            g_dch[k].chan_dom = sp->ch[i].domains_n > 0;
         }
-        for (size_t f = 0; f < g_ch[i].domains_n && g_dch[k].rules_n < MAX_FILES; f++)
-            g_dch[k].rules_path[g_dch[k].rules_n++] = g_ch[i].domains_files[f];
+        for (size_t f = 0; f < sp->ch[i].domains_n && g_dch[k].rules_n < MAX_FILES; f++)
+            g_dch[k].rules_path[g_dch[k].rules_n++] = sp->ch[i].domains_files[f];
         /* Адресные файлы того же канала — сюда же: доменные строки в них есть у половины
          * категорий издателя (список «Хостинги и CDN» лежит в адресных и целиком состоит
          * из имён), и раньше они пропадали с предупреждением. */
-        for (size_t f = 0; f < g_ch[i].prefixes_n && g_dch[k].rules_n < MAX_FILES; f++)
-            g_dch[k].rules_path[g_dch[k].rules_n++] = g_ch[i].prefixes_files[f];
+        for (size_t f = 0; f < sp->ch[i].prefixes_n && g_dch[k].rules_n < MAX_FILES; f++)
+            g_dch[k].rules_path[g_dch[k].rules_n++] = sp->ch[i].prefixes_files[f];
     }
 }

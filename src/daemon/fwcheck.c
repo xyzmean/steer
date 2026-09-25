@@ -196,18 +196,18 @@ struct fwcheck fw_check(const char *device) {
 }
 
 #ifndef STEER_ANDROID   /* на телефоне не зовётся — см. конец cmd_apply */
-void report_traceroute_dep(void) {
-    if (!g_traceroute_hops) return;
+void report_traceroute_dep(const struct spec *sp) {
+    if (!sp->traceroute_hops) return;
     /* Say the useless case out loud rather than leaving the operator to discover it
      * as a column of asterisks. */
-    for (size_t i = 0; i < g_out_n; i++) {
-        if (!out_has_device(&g_out[i])) continue;
-        if (fw_check(g_out[i].device).masqueraded) {
+    for (size_t i = 0; i < sp->out_n; i++) {
+        if (!out_has_device(&sp->out[i])) continue;
+        if (fw_check(sp->out[i].device).masqueraded) {
             fprintf(stderr, LOG_W "traceroute_hops cannot work for output %s: %s "
                             "masquerades, so ICMP errors come addressed to the router "
                             "and only conntrack can route them to the client — "
                             "untracking them drops the hops entirely\n",
-                    g_out[i].name, g_out[i].device);
+                    sp->out[i].name, sp->out[i].device);
             return;
         }
     }
@@ -222,7 +222,7 @@ void report_traceroute_dep(void) {
                         "packets was found — ICMP time-exceeded will be dropped by the "
                         "firewall and hops will show as asterisks. Needed once, in the "
                         "firewall (not here): accept ct state untracked icmp type "
-                        "time-exceeded towards %s\n", g_lan_dev[0]);
+                        "time-exceeded towards %s\n", sp->lan_dev[0]);
 }
 #endif
 
@@ -295,14 +295,14 @@ int report_mark_overlap(void) {
 }
 
 #ifndef STEER_ANDROID   /* на телефоне не зовётся — см. конец cmd_apply */
-void report_output_deps(void) {
-    for (size_t i = 0; i < g_out_n; i++) {
-        if (!out_has_device(&g_out[i])) continue;
-        struct fwcheck c = fw_check(g_out[i].device);
+void report_output_deps(const struct spec *sp) {
+    for (size_t i = 0; i < sp->out_n; i++) {
+        if (!out_has_device(&sp->out[i])) continue;
+        struct fwcheck c = fw_check(sp->out[i].device);
         if (!c.in_firewall)
             fprintf(stderr, LOG_W "output %s: %s is not mentioned by the firewall at all — "
                             "traffic steered there will not come back until it is in a zone\n",
-                    g_out[i].name, g_out[i].device);
+                    sp->out[i].name, sp->out[i].device);
         /* Выходу vless NAT не нужен, и предупреждать о нём — значит посылать человека
          * настраивать то, чему нечего транслировать: клиент завершает TCP у себя и
          * соединяется с сервером обычным сокетом, поэтому адрес клиента наружу не уезжает
@@ -321,14 +321,14 @@ void report_output_deps(void) {
          * в пуле kind=interface активным может быть устройство VLESS-туннеля, и вопрос «нужен
          * ли ему masquerade» решает то, чем устройство является, а не то, кто его перечислил.
          * Иначе — постоянная жалоба на исправной настройке. */
-        else if (out_self_natting(out_for_device(&g_out[i], g_out[i].device))) {
+        else if (out_self_natting(out_for_device(sp, &sp->out[i], sp->out[i].device))) {
             /* нечего проверять */
         }
         else if (!c.masqueraded)
             fprintf(stderr, LOG_W "output %s: no masquerade/snat rule found for %s — "
                             "if that path needs NAT, packets leave with LAN addresses and "
                             "the channel goes quiet while its counter still rises\n",
-                    g_out[i].name, g_out[i].device);
+                    sp->out[i].name, sp->out[i].device);
     }
 }
 #endif

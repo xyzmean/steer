@@ -2881,6 +2881,10 @@ int tunnel_run(struct output *o, const struct vless_node *node) {
  */
 #define MAX_NODES 128
 static struct vless_node g_nodes[MAX_NODES];
+/* Спека — значение, а не глобалы (правило 6, docs/architecture.md, раздел 2): один экземпляр
+ * на подкоманды vless (nodes/probe/подъём) — их всегда ровно одна на процесс, и load_nodes,
+ * общий для всех трёх, это единственное место, где спека разбирается. */
+static struct spec g_spec;
 
 /* Найти выход и разобрать его подписку. Одно место на все три команды: иначе «как
  * читается подписка» разошлось бы между подъёмом, списком и проверкой — а расхождение
@@ -2909,8 +2913,8 @@ static int load_nodes(const char *spec_path, const char *out_name, struct output
     /* Правило 5, docs/architecture.md, раздел 2: err_die здесь довершает то, что раньше делал
      * die() изнутри load_spec. */
     struct err e = {0};
-    if (load_spec(spec_path, &e) < 0) err_die(&e);
-    struct output *o = out_by_name(out_name);
+    if (load_spec(spec_path, &g_spec, &e) < 0) err_die(&e);
+    struct output *o = out_by_name(&g_spec, out_name);
     if (!o) { fprintf(stderr, LOG_W2 "выхода %s нет в спеке\n", out_name); return 2; }
     if (o->kind != OUT_VLESS) {
         fprintf(stderr, LOG_W2 "выход %s не vless (kind другой)\n", out_name);
@@ -2932,9 +2936,9 @@ static void underlay_setup(const struct output *o) {
     static const struct output none;
     if (o && o->via[0]) {
         struct err e = {0};
-        if (registry_assign(&e) < 0) err_die(&e);
+        if (registry_assign(&g_spec, &e) < 0) err_die(&e);
     }
-    vless_set_sock_mark(out_underlay_mark(o ? o : &none), o && o->via[0]);
+    vless_set_sock_mark(out_underlay_mark(&g_spec, o ? o : &none), o && o->via[0]);
 }
 
 static void node_json(const struct vless_node *n, int index) {
@@ -3187,6 +3191,6 @@ int cmd_vless(const char *spec_path, const char *out_name) {
      * docs/architecture.md, раздел 2: err_die здесь довершает то, что раньше делал die()
      * изнутри registry_assign. */
     struct err e = {0};
-    if (registry_assign(&e) < 0) err_die(&e);
+    if (registry_assign(&g_spec, &e) < 0) err_die(&e);
     return tunnel_run(o, &nodes[chosen]);
 }

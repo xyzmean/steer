@@ -2881,14 +2881,17 @@ bad:
 int cmd_tgws(const char *spec, const char *name) {
     if (!name || !*name) { fprintf(stderr, LOG_W "нужно имя выхода\n"); return 2; }
     /* Правило 5, docs/architecture.md, раздел 2: err_die здесь довершает то, что раньше делал
-     * die() изнутри load_spec/registry_assign. */
+     * die() изнутри load_spec/registry_assign.
+     *
+     * Спека — значение (правило 6, раздел 2): свой экземпляр у этой точки входа. */
+    static struct spec cfg;
     struct err e = {0};
-    if (load_spec(spec, &e) < 0) err_die(&e);
-    if (registry_assign(&e) < 0) err_die(&e);
+    if (load_spec(spec, &cfg, &e) < 0) err_die(&e);
+    if (registry_assign(&cfg, &e) < 0) err_die(&e);
 
     const struct output *o = NULL;
-    for (size_t i = 0; i < g_out_n; i++)
-        if (!strcmp(g_out[i].name, name)) { o = &g_out[i]; break; }
+    for (size_t i = 0; i < cfg.out_n; i++)
+        if (!strcmp(cfg.out[i].name, name)) { o = &cfg.out[i]; break; }
     if (!o) { fprintf(stderr, LOG_W "нет выхода %s\n", name); return 2; }
     if (o->kind != OUT_TGWS) {
         fprintf(stderr, LOG_W "выход %s не kind=tgws\n", name);

@@ -232,9 +232,10 @@ int dnsd_main(int argc, char **argv) {
      * generated. */
     /* Правило 5, docs/architecture.md, раздел 2: err_die здесь довершает то, что раньше делал
      * die() изнутри load_spec. */
+    static struct spec cfg;
     struct err e = {0};
-    if (load_spec(spec, &e) < 0) err_die(&e);
-    dch_build();
+    if (load_spec(spec, &cfg, &e) < 0) err_die(&e);
+    dch_build(&cfg);
     /* Раскладка — та же проба, что у apply, и тем же ответом: наборы и карту резолвер находит
      * по именам, и искать их не в той таблице значило бы наполнять пустоту. Спрашивается у
      * ядра, а не у файла, который оставил apply: резолвер поднимается и раньше первого apply

@@ -199,8 +199,8 @@
  * телефоне при via к метке цели добавлен STEER_TUNNEL_BIT (он вне поля и маршрутизации не
  * касается). Сокет, которому ставят метку целиком, других битов не несёт, а кто ставит её поверх
  * своей (netd), тот сам сохраняет свои поля. */
-static inline uint32_t out_underlay_mark(const struct output *o) {
-    const struct output *v = out_via(o);
+static inline uint32_t out_underlay_mark(const struct spec *sp, const struct output *o) {
+    const struct output *v = out_via(sp, o);
     /* Цель без метки (реестр ещё не прочитан) — «напрямую»: метка 0 значила бы ровно то же, но
      * на телефоне «мимо каналов» — это значение «сам движок», а не ноль. */
 #ifdef STEER_ANDROID

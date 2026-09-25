@@ -258,7 +258,7 @@ static int xs_state_read(const char *dev, int *up, int *fresh) {
 
 /* Шов замера — симметрично шву здоровья и по той же причине: стенду нужно задавать
  * задержки кандидатов, не поднимая сокетов. В бою указатель NULL и меряет device_latency. */
-static int (*g_latency_probe)(const struct output *, const char *);
+static int (*g_latency_probe)(const struct spec *, const struct output *, const char *);
 
 /* ЗАДЕРЖКА КАНДИДАТА в миллисекундах, -1 — не измерилась.
  *
@@ -275,10 +275,10 @@ static int (*g_latency_probe)(const struct output *, const char *);
  * проверка интернета У ХАБА, а хаб полной звезды имеет право маршрутизировать только между
  * пирами. Замер дал бы -1 на исправном туннеле, то есть выбросил бы его из сравнения.
  * Возврат -1 честнее: вызывающий на нём откатывается к порядку. */
-static int device_latency(const struct output *o, const char *dev) {
-    if (g_latency_probe) return g_latency_probe(o, dev);
+static int device_latency(const struct spec *sp, const struct output *o, const char *dev) {
+    if (g_latency_probe) return g_latency_probe(sp, o, dev);
     if (!device_present(dev)) return -1;
-    o = out_for_device(o, dev);
+    o = out_for_device(sp, o, dev);
     /* И тот же туннель, поднятый netifd, — по тому же доводу: мерить его нечем, а число
      * из пробы наружу означало бы не задержку туннеля, а наличие интернета у хаба. */
     if (o->kind == OUT_XSTEER || xs_state_read(dev, NULL, NULL)) return -1;
@@ -294,9 +294,9 @@ static int device_latency(const struct output *o, const char *dev) {
 
 /* Владелец устройства. Объяснение — у объявления в spec.h; там же сказано, почему функция
  * объявлена рядом со спекой, а живёт здесь (тот же случай, что bind_device). */
-const struct output *device_owner(const char *dev) {
-    for (size_t i = 0; i < g_out_n; i++) {
-        const struct output *c = &g_out[i];
+const struct output *device_owner(const struct spec *sp, const char *dev) {
+    for (size_t i = 0; i < sp->out_n; i++) {
+        const struct output *c = &sp->out[i];
         if (!out_engine_managed(c)) continue;
         if (!strcmp(c->device, dev)) return c;
         for (size_t k = 0; k < c->devices_n; k++)
@@ -305,27 +305,27 @@ const struct output *device_owner(const char *dev) {
     return NULL;
 }
 
-const struct output *out_for_device(const struct output *o, const char *dev) {
-    const struct output *owner = device_owner(dev);
+const struct output *out_for_device(const struct spec *sp, const struct output *o, const char *dev) {
+    const struct output *owner = device_owner(sp, dev);
     return owner ? owner : o;
 }
 
-static int device_healthy_for(const struct output *o, const char *dev);
+static int device_healthy_for(const struct spec *sp, const struct output *o, const char *dev);
 /* Проба здоровья вызывается через указатель, а не напрямую, ровно ради одного: стенд
  * гистерезиса задаёт здоровье устройств по тику, не создавая интерфейсов в /sys и не открывая
  * сокетов. В бою указатель НИКОГДА не меняется и всегда ссылается на device_healthy_for —
  * ветка предсказуемая, той же природы, что швы путей для стендов в остальном коде. */
-static int (*g_health_probe)(const struct output *, const char *);
-static int health_of(const struct output *o, const char *dev) {
-    return g_health_probe ? g_health_probe(o, dev) : device_healthy_for(o, dev);
+static int (*g_health_probe)(const struct spec *, const struct output *, const char *);
+static int health_of(const struct spec *sp, const struct output *o, const char *dev) {
+    return g_health_probe ? g_health_probe(sp, o, dev) : device_healthy_for(sp, o, dev);
 }
 
-static int device_healthy_for(const struct output *o, const char *dev) {
+static int device_healthy_for(const struct spec *sp, const struct output *o, const char *dev) {
     if (!device_present(dev)) return 0;
     /* Мера здоровья принадлежит УСТРОЙСТВУ, а не виду выхода, который его назвал: у
      * устройства с владельцем спрашиваем так, как спросил бы владелец. Для выхода,
      * владеющего своим устройством сам, это тот же ответ, что и раньше. */
-    o = out_for_device(o, dev);
+    o = out_for_device(sp, o, dev);
     /* xsteer НЕ проверяется ни PROBE_TARGETS, ни пробой TCP, и это не недоделка.
      *
      * PROBE_TARGETS — публичные адреса, то есть проверка интернета У ХАБА. Хаб полной
@@ -1307,13 +1307,13 @@ static void active_get(const char *out, char *dev, size_t n) {
  *
  * Через временный файл и rename: status и apply читают этот файл в любой момент, и половина
  * строк означала бы для них «сторож не проходил» у половины выходов. */
-static void active_save(void) {
+static void active_save(const struct spec *sp) {
     char want[MAX_OUTPUTS * 80 + 1];
     size_t wn = 0;
-    for (size_t i = 0; i < g_out_n; i++) {
-        if (!out_has_device(&g_out[i])) continue;
-        int w = snprintf(want + wn, sizeof(want) - wn, "%s %s %d\n", g_out[i].name,
-                         g_out[i].device[0] ? g_out[i].device : "-", g_streak[i]);
+    for (size_t i = 0; i < sp->out_n; i++) {
+        if (!out_has_device(&sp->out[i])) continue;
+        int w = snprintf(want + wn, sizeof(want) - wn, "%s %s %d\n", sp->out[i].name,
+                         sp->out[i].device[0] ? sp->out[i].device : "-", g_streak[i]);
         if (w < 0 || (size_t)w >= sizeof(want) - wn) break;
         wn += (size_t)w;
     }
@@ -1357,9 +1357,9 @@ static void active_save(void) {
  * Одна функция на apply и на отчёты не ради краткости: apply ПРИВЯЗЫВАЕТ таблицу к тому,
  * что вернули здесь, а status и diag рассказывают о том же самом. Разойдись они — и
  * интерфейс снова показывал бы не то, что применено. */
-void outputs_adopt_active(void) {
-    for (size_t i = 0; i < g_out_n; i++) {
-        struct output *o = &g_out[i];
+void outputs_adopt_active(struct spec *sp) {
+    for (size_t i = 0; i < sp->out_n; i++) {
+        struct output *o = &sp->out[i];
         if (!out_has_device(o)) continue;
 
         char rec[32];
@@ -1404,7 +1404,7 @@ static int restart_allowed(const char *dev) {
     return 1;
 }
 
-static int revive(const struct output *o, const char *dev, int verbose) {
+static int revive(const struct spec *sp, const struct output *o, const char *dev, int verbose) {
     if (!restart_allowed(dev)) {
         if (verbose)
             fprintf(stderr, LOG_I "%s: перезапуск был недавно, пропускаю\n", dev);
@@ -1421,7 +1421,7 @@ static int revive(const struct output *o, const char *dev, int verbose) {
                         "сети; жду\n", dev);
         for (int i = 0; i < 10; i++) {
             sleep(1);
-            if (device_healthy_for(o, dev)) return 1;
+            if (device_healthy_for(sp, o, dev)) return 1;
         }
         return 0;
     }
@@ -1444,10 +1444,10 @@ static int revive(const struct output *o, const char *dev, int verbose) {
      * разрешается заново (переезд сервера по DNS), настройка ложится заново, а пропавшее
      * устройство создаётся. Частоту уже ограничил restart_allowed выше. */
     {
-        const struct output *aw = out_for_device(o, dev);
-        if (aw->kind == OUT_AWG) return awg_revive(aw, dev);
+        const struct output *aw = out_for_device(sp, o, dev);
+        if (aw->kind == OUT_AWG) return awg_revive(sp, aw, dev);
     }
-    if (out_engine_managed(o) || device_owner(dev)) {
+    if (out_engine_managed(o) || device_owner(sp, dev)) {
         /* СНАЧАЛА спрашиваем, не известна ли уже причина, по которой ждать бессмысленно.
          *
          * Снято с живого роутера: у выхода с `node: 31` при двадцати девяти узлах в подписке
@@ -1460,7 +1460,7 @@ static int revive(const struct output *o, const char *dev, int verbose) {
          * выводят заново, а читают. Спрашивается у ВЛАДЕЛЬЦА устройства — по той же причине,
          * что и проба здоровья: в пуле разнородных туннелей запись пишет клиент под своим
          * именем, а не выход, который его назвал. */
-        const struct output *pr_own = device_owner(dev);
+        const struct output *pr_own = device_owner(sp, dev);
         struct probe_status pr = probe_read(pr_own ? pr_own->name : o->name);
         if (pr.state == PROBE_NO_SUCH_NODE) {
             fprintf(stderr, LOG_W "%s: выбран узел %d, а пригодных в подписке %d — сам не "
@@ -1471,7 +1471,7 @@ static int revive(const struct output *o, const char *dev, int verbose) {
                         "заново через procd; жду\n", dev);
         for (int i = 0; i < 10; i++) {
             sleep(1);
-            if (device_healthy_for(o, dev)) return 1;
+            if (device_healthy_for(sp, o, dev)) return 1;
         }
         return 0;
     }
@@ -1484,7 +1484,7 @@ static int revive(const struct output *o, const char *dev, int verbose) {
     fprintf(stderr, LOG_W "%s: не отвечает — жду, не поднимется ли\n", dev);
     for (int i = 0; i < 10; i++) {
         sleep(1);
-        if (device_healthy_for(o, dev)) return 1;
+        if (device_healthy_for(sp, o, dev)) return 1;
     }
     return 0;
 #endif
@@ -1519,7 +1519,7 @@ static int revive(const struct output *o, const char *dev, int verbose) {
      * ещё поднимается. Ждём короткими шагами, чтобы не держать проход дольше нужного. */
     for (int i = 0; i < 10; i++) {
         sleep(1);
-        if (device_healthy_for(o, dev)) return 1;
+        if (device_healthy_for(sp, o, dev)) return 1;
     }
     return 0;
 }
@@ -1549,6 +1549,8 @@ static void sig_cleanup(int sig) {
 }
 
 int cmd_failover(const char *spec, int verbose) {
+    /* Спека — значение, а не глобалы (правило 6): свой экземпляр у точки входа. */
+    static struct spec cfg;
     atexit(cleanup_probe_rule);
     signal(SIGINT, sig_cleanup);
     signal(SIGTERM, sig_cleanup);
@@ -1563,8 +1565,8 @@ int cmd_failover(const char *spec, int verbose) {
      * die() изнутри load_spec/registry_assign — «конец одного прохода», как и сказано в шапке
      * watch.c, только теперь через явную проверку возврата, а не exit() из глубины разбора. */
     struct err e = {0};
-    if (load_spec(spec, &e) < 0) err_die(&e);
-    if (registry_assign(&e) < 0) err_die(&e);
+    if (load_spec(spec, &cfg, &e) < 0) err_die(&e);
+    if (registry_assign(&cfg, &e) < 0) err_die(&e);
 
     int changed = 0;
     /* ПОРЯДОК ОБХОДА — ПО ЗАВИСИМОСТЯМ `via`, а не по спеке.
@@ -1583,13 +1585,13 @@ int cmd_failover(const char *spec, int verbose) {
     size_t ord[MAX_OUTPUTS];
     size_t ord_n = 0;
     for (int depth = 0; depth <= MAX_VIA_DEPTH; depth++)
-        for (size_t i = 0; i < g_out_n; i++)
-            if (out_via_depth(&g_out[i]) == depth) ord[ord_n++] = i;
+        for (size_t i = 0; i < cfg.out_n; i++)
+            if (out_via_depth(&cfg, &cfg.out[i]) == depth) ord[ord_n++] = i;
     /* Кто в ЭТОМ проходе нашёл живое устройство. */
     int alive[MAX_OUTPUTS] = {0};
     for (size_t oi = 0; oi < ord_n; oi++) {
         size_t i = ord[oi];
-        struct output *o = &g_out[i];
+        struct output *o = &cfg.out[i];
         if (!out_has_device(o)) continue;
 
         /* Цель via лежит — внутренний выход нерабочий, что бы ни говорила его собственная проба.
@@ -1597,8 +1599,8 @@ int cmd_failover(const char *spec, int verbose) {
          * процесс, а до сервера его соединение через мёртвую цель не доедет. И пробовать, и
          * оживлять его бесполезно — поэтому ни того, ни другого, сразу ветка отказа с ЕГО
          * on_fail: каналы внутреннего выхода получают то, что человек для них выбрал. */
-        const struct output *via = out_via(o);
-        int via_down = via && !alive[via - g_out];
+        const struct output *via = out_via(&cfg, o);
+        int via_down = via && !alive[via - cfg.out];
 
         char was[32];
         active_get(o->name, was, sizeof(was));
@@ -1614,7 +1616,7 @@ int cmd_failover(const char *spec, int verbose) {
          * запас на каждом тике. Здоровье устройств 0..first_h тем самым известно. */
         int first_h = -1;
         for (size_t k = 0; k < o->devices_n && !via_down; k++) {
-            if (health_of(o, o->devices[k])) { first_h = (int)k; break; }
+            if (health_of(&cfg, o, o->devices[k])) { first_h = (int)k; break; }
             if (verbose)
                 fprintf(stderr, LOG_W "%s: %s не отвечает\n", o->name, o->devices[k]);
         }
@@ -1659,7 +1661,7 @@ int cmd_failover(const char *spec, int verbose) {
                 /* Меряем ВСЕХ, включая тех, что ниже first_h: смысл режима ровно в том,
                  * чтобы узнать про них. */
                 for (size_t k = 0; k < o->devices_n; k++)
-                    ms[k] = device_latency(o, o->devices[k]);
+                    ms[k] = device_latency(&cfg, o, o->devices[k]);
                 lat_put(o->name, o->devices, ms, o->devices_n);
             }
             for (size_t k = 0; k < o->devices_n; k++) if (ms[k] >= 0) have++;
@@ -1674,9 +1676,9 @@ int cmd_failover(const char *spec, int verbose) {
                     /* Уходить с ЖИВОГО текущего только если выигрыш больше допуска. Мёртвое
                      * текущее уступает сразу: здоровье старше замера. */
                     if (cur >= 0 && cur != pick && ms[cur] >= 0 &&
-                        health_of(o, o->devices[cur]) && ms[cur] - ms[pick] <= tol)
+                        health_of(&cfg, o, o->devices[cur]) && ms[cur] - ms[pick] <= tol)
                         pick = cur;
-                    if (!health_of(o, o->devices[pick])) pick = -1;
+                    if (!health_of(&cfg, o, o->devices[pick])) pick = -1;
                 }
                 if (pick >= 0) {
                     chosen = o->devices[pick];
@@ -1701,7 +1703,7 @@ int cmd_failover(const char *spec, int verbose) {
                  * нельзя — это и есть мелькание. Держим его, пока верхнее не подтвердит
                  * здоровье STEER_FAILOVER_HYST тиков подряд. Мёртвое текущее — сразу вниз. */
                 int hyst = failover_hyst();
-                if (health_of(o, o->devices[cur])) {
+                if (health_of(&cfg, o, o->devices[cur])) {
                     int s = streak + 1;
                     if (hyst > 0 && s < hyst) { chosen = o->devices[cur]; new_streak = s; }
                     else chosen = o->devices[first_h];
@@ -1720,7 +1722,7 @@ int cmd_failover(const char *spec, int verbose) {
          * тот же, поэтому основной туннель получает попытку первым. */
         if (!chosen && !via_down)
             for (size_t k = 0; k < o->devices_n; k++)
-                if (revive(o, o->devices[k], verbose)) { chosen = o->devices[k]; break; }
+                if (revive(&cfg, o, o->devices[k], verbose)) { chosen = o->devices[k]; break; }
         g_streak[i] = new_streak;
         alive[i] = chosen != NULL;
         /* Причину назвать надо: иначе «живых устройств нет» стоит у выхода, чьё устройство на
@@ -1796,7 +1798,7 @@ int cmd_failover(const char *spec, int verbose) {
             }
         }
     }
-    active_save();
+    active_save(&cfg);
     if (!changed && verbose) fprintf(stderr, LOG_I "изменений нет\n");
     return 0;
 }

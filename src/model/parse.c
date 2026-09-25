@@ -8,26 +8,6 @@
 #include "awg.h"   /* имя устройства kind=awg — static inline, без awg.c */
 #include "obfs.h"
 
-struct output g_out[MAX_OUTPUTS];
-size_t g_out_n;
-struct channel g_ch[MAX_CHANNELS];
-size_t g_ch_n;
-char g_from_default[MAX_FROM][64];
-size_t g_from_default_n;
-
-/* Устройства, с которых движок забирает трафик клиентов. Умолчание — один `br-lan`: спека,
- * написанная до появления списка, обязана значить ровно то же, что значила.
- *
- * Именем, а не адресом, по двум причинам сразу. У локального префикса IPv6 стабильного
- * адреса нет (ULA плюс делегированный глобальный, который меняется), поэтому писать
- * `ip6 saddr` не во что. А у туннельных устройств вроде tailscale0 адрес на роутере обычно
- * /32, и подсеть пиров из него не выводится — там имя устройства единственный ответ. */
-char g_lan_dev[MAX_LAN_DEV][64] = { "br-lan" };
-size_t g_lan_dev_n = 1;
-/* Opt-in, because it cannot work without a firewall rule the engine does not own —
- * see the comment on the generated chain in steer.c. Defaulting it on would turn
- * legible-but-wrong hops into no hops at all. */
-int g_traceroute_hops;
 const char *g_state_dir = STEER_STATE_DIR;
 /* Имена таблиц для iproute2. Каталог, а не сам rt_tables: файл принадлежит пакету iproute2,
  * и дописывать в него значило бы править чужое; rt_tables.d для этого и существует. */
@@ -92,7 +72,7 @@ int label_ok(const char *s) {
  *
  * Различитель — порядковый номер списка клиентов в спеке, а не хэш: номер точен, а хэш
  * мог бы совпасть у двух разных списков и вернуть ту же беду тихо. Номер считается по
- * g_ch в порядке спеки, поэтому оба вызывающих получают одно и то же число, не
+ * sp->ch в порядке спеки, поэтому оба вызывающих получают одно и то же число, не
  * сговариваясь.
  *
  * Умолчания суффикса не получают: `vpn_ip` у обычной конфигурации остаётся `vpn_ip`, и
@@ -106,26 +86,26 @@ static int from_same(const char (*a)[64], size_t an, const char (*b)[64], size_t
 
 /* Действующий список клиентов канала: свой, а если его нет — общий по умолчанию. Правило
  * то же, что у компилятора при сборке групп, и записано один раз здесь. */
-static const char (*chan_from(const struct channel *c, size_t *n))[64] {
+static const char (*chan_from(const struct spec *sp, const struct channel *c, size_t *n))[64] {
     if (c->from_n) { *n = c->from_n; return c->from; }
-    *n = g_from_default_n;
-    return g_from_default;
+    *n = sp->from_default_n;
+    return sp->from_default;
 }
 
 /* Номер списка клиентов среди РАЗЛИЧНЫХ списков, встреченных в спеке, в порядке первого
  * появления. Список по умолчанию участвует в нумерации наравне с прочими: он всё равно
  * попадает в ветку без суффикса, кроме случая realip. */
-static int from_disc(const char (*from)[64], size_t from_n) {
+static int from_disc(const struct spec *sp, const char (*from)[64], size_t from_n) {
     int idx = 0;
-    for (size_t i = 0; i < g_ch_n; i++) {
+    for (size_t i = 0; i < sp->ch_n; i++) {
         size_t cn;
-        const char (*cf)[64] = chan_from(&g_ch[i], &cn);
+        const char (*cf)[64] = chan_from(sp, &sp->ch[i], &cn);
         if (from_same(cf, cn, from, from_n)) return idx;
         /* Считаем только первое появление каждого списка. */
         int seen = 0;
         for (size_t k = 0; k < i && !seen; k++) {
             size_t kn;
-            const char (*kf)[64] = chan_from(&g_ch[k], &kn);
+            const char (*kf)[64] = chan_from(sp, &sp->ch[k], &kn);
             seen = from_same(kf, kn, cf, cn);
         }
         if (!seen) idx++;
@@ -157,17 +137,17 @@ int l4match_same(const struct l4match *a, const struct l4match *b) {
  * того, чьё правило встанет первым. Номер, а не хэш: номер точен, а хэш мог бы совпасть у
  * двух разных сужений и вернуть ту же беду тихо.
  *
- * Считается по g_ch в порядке спеки, поэтому компилятор и резолвер получают одно и то же
+ * Считается по sp->ch в порядке спеки, поэтому компилятор и резолвер получают одно и то же
  * число, не сговариваясь. */
-static int l4_disc(const struct l4match *m) {
+static int l4_disc(const struct spec *sp, const struct l4match *m) {
     if (l4match_empty(m)) return 0;
     int idx = 0;
-    for (size_t i = 0; i < g_ch_n; i++) {
-        const struct l4match *c = &g_ch[i].l4;
+    for (size_t i = 0; i < sp->ch_n; i++) {
+        const struct l4match *c = &sp->ch[i].l4;
         if (l4match_empty(c)) continue;
         int seen = 0;
         for (size_t k = 0; k < i && !seen; k++)
-            seen = l4match_same(&g_ch[k].l4, c);
+            seen = l4match_same(&sp->ch[k].l4, c);
         if (seen) continue;                 /* посчитан при первом появлении */
         idx++;
         if (l4match_same(c, m)) return idx;
@@ -178,28 +158,28 @@ static int l4_disc(const struct l4match *m) {
     return idx + 1;
 }
 
-void group_set_name(char *dst, size_t n, const char *out, const char *kind,
+void group_set_name(const struct spec *sp, char *dst, size_t n, const char *out, const char *kind,
                     const char (*from)[64], size_t from_n, int realip,
                     const struct l4match *l4) {
     /* realip различает только доменные группы: у адресных резолвер не участвует. */
     int rip = realip && !strcmp(kind, "dom");
-    int pd = l4_disc(l4);
+    int pd = l4_disc(sp, l4);
     /* Ветки без сужения оставлены КАК БЫЛИ, до последнего символа формата. От имени набора
      * зависит перенос счётчиков между применениями (см. counter_find в steer.c), и
      * переименование стоило бы обнулённых объёмов у каждого канала на каждом установленном
      * роутере — при обновлении движка, которое для человека выглядит как «ничего не менял». */
     if (!pd) {
-        if (!rip && from_same(from, from_n, g_from_default, g_from_default_n)) {
+        if (!rip && from_same(from, from_n, sp->from_default, sp->from_default_n)) {
             snprintf(dst, n, "%.24s_%s", out, kind);
             return;
         }
         /* Выход обрезается сильнее, чтобы имя с суффиксом осталось коротким: у наборов
          * nftables на старых ядрах предел длины 32 символа. */
-        snprintf(dst, n, "%.18s_%s_c%d%s", out, kind, from_disc(from, from_n), rip ? "r" : "");
+        snprintf(dst, n, "%.18s_%s_c%d%s", out, kind, from_disc(sp, from, from_n), rip ? "r" : "");
         return;
     }
     /* Выход обрезается ещё сильнее: суффиксов теперь два, а предел в 32 символа тот же. */
-    snprintf(dst, n, "%.14s_%s_c%d%s_p%d", out, kind, from_disc(from, from_n),
+    snprintf(dst, n, "%.14s_%s_c%d%s_p%d", out, kind, from_disc(sp, from, from_n),
              rip ? "r" : "", pd);
 }
 
@@ -427,7 +407,7 @@ int out_kind_known(const char *s) {
     return 0;
 }
 
-static int parse_outputs(struct js *j, struct err *e) {
+static int parse_outputs(struct js *j, struct spec *s, struct err *e) {
     if (js_lit(j, '{') != 0) return err_set(e, "outputs: expected an object", NULL);
     js_ws(j);
     if (*j->p == '}') { j->p++; return 0; }
@@ -761,14 +741,14 @@ static int parse_outputs(struct js *j, struct err *e) {
             for (size_t b = a + 1; b < o.nodes_n; b++)
                 if (o.nodes[a] == o.nodes[b])
                     return err_set(e, "outputs.%s: узел подписки указан в nodes дважды", o.name);
-        if (g_out_n >= MAX_OUTPUTS) return err_set(e, "too many outputs", NULL);
+        if (s->out_n >= MAX_OUTPUTS) return err_set(e, "too many outputs", NULL);
         /* Два выхода с одним именем: реестр раздаст две метки, init поднимет два процесса
          * на одно имя, а out_by_name всегда возьмёт первый — как у devices и nodes, это
          * отказ, не молчаливая победа одного из двух. */
-        for (size_t a = 0; a < g_out_n; a++)
-            if (!strcmp(g_out[a].name, o.name))
+        for (size_t a = 0; a < s->out_n; a++)
+            if (!strcmp(s->out[a].name, o.name))
                 return err_set(e, "outputs.%s: имя выхода повторяется", o.name);
-        g_out[g_out_n++] = o;
+        s->out[s->out_n++] = o;
         js_ws(j);
         if (*j->p == ',') { j->p++; continue; }
         break;
@@ -779,7 +759,7 @@ static int parse_outputs(struct js *j, struct err *e) {
     return 0;
 }
 
-static int parse_channels(struct js *j, struct err *e) {
+static int parse_channels(struct js *j, struct spec *s, struct err *e) {
     if (js_lit(j, '[') != 0) return err_set(e, "channels: expected an array", NULL);
     js_ws(j);
     if (*j->p == ']') { j->p++; return 0; }
@@ -975,8 +955,8 @@ static int parse_channels(struct js *j, struct err *e) {
          * Ограничение оказалось нашим, а не ядра: набор с `flags interval,timeout` держит и
          * постоянные элементы из файла, и временные от резолвера — проверено опытом на живом
          * nft. Поэтому запрет снят, а набор такой группы объявляется с timeout. */
-        if (g_ch_n >= MAX_CHANNELS) return err_set(e, "too many channels", NULL);
-        g_ch[g_ch_n++] = c;
+        if (s->ch_n >= MAX_CHANNELS) return err_set(e, "too many channels", NULL);
+        s->ch[s->ch_n++] = c;
         js_ws(j);
         if (*j->p == ',') { j->p++; continue; }
         break;
@@ -1004,23 +984,23 @@ static int parse_channels(struct js *j, struct err *e) {
  *   - цепочка длиннее MAX_VIA_DEPTH переходов — скорее описка, чем замысел (см. spec.h).
  *
  * Проверяется ПОСЛЕ разбора всех выходов: цель может стоять ниже того, кто на неё ссылается. */
-static int via_idx(const struct output *o) { return (int)(o - g_out); }
+static int via_idx(const struct spec *sp, const struct output *o) { return (int)(o - sp->out); }
 
 /* Выход, которому принадлежит устройство пула, — тот же ответ, что device_owner в failover.c
  * (владелец — выход, чей процесс устройство создаёт). Своя копия, а не вызов: specmatch
  * собирает этот файл без failover.c. Отвечает она на узкий вопрос этой проверки и расходиться
  * с той функцией ей негде — обе смотрят на out_engine_managed и имя устройства. */
-static const struct output *via_dev_owner(const char *dev, const struct output *not) {
-    for (size_t i = 0; i < g_out_n; i++)
-        if (&g_out[i] != not && out_engine_managed(&g_out[i]) && !strcmp(g_out[i].device, dev))
-            return &g_out[i];
+static const struct output *via_dev_owner(const struct spec *sp, const char *dev, const struct output *not) {
+    for (size_t i = 0; i < sp->out_n; i++)
+        if (&sp->out[i] != not && out_engine_managed(&sp->out[i]) && !strcmp(sp->out[i].device, dev))
+            return &sp->out[i];
     return NULL;
 }
 
-static int via_check(struct err *e) {
+static int via_check(const struct spec *sp, struct err *e) {
     static char msg[512];
-    for (size_t i = 0; i < g_out_n; i++) {
-        const struct output *o = &g_out[i];
+    for (size_t i = 0; i < sp->out_n; i++) {
+        const struct output *o = &sp->out[i];
         if (!o->via[0]) continue;
         if (!out_via_capable(o)) {
             snprintf(msg, sizeof(msg),
@@ -1033,7 +1013,7 @@ static int via_check(struct err *e) {
         if (!strcmp(o->via, o->name))
             return err_set(e, "выход %s: via указывает на него самого — туннель не может идти внутри себя",
                 o->name);
-        const struct output *v = out_via(o);
+        const struct output *v = out_via(sp, o);
         if (!v) {
             snprintf(msg, sizeof(msg), "выход %.31s: via «%.31s» — такого выхода в спеке нет",
                      o->name, o->via);
@@ -1052,18 +1032,18 @@ static int via_check(struct err *e) {
         char path[256];
         int on_path[MAX_OUTPUTS] = {0};
         size_t pl = (size_t)snprintf(path, sizeof(path), "%s", o->name);
-        on_path[via_idx(o)] = 1;
+        on_path[via_idx(sp, o)] = 1;
         int hops = 0;
-        for (const struct output *t = o, *n; (n = out_via(t)); t = n) {
+        for (const struct output *t = o, *n; (n = out_via(sp, t)); t = n) {
             hops++;
             if (pl < sizeof(path))
                 pl += (size_t)snprintf(path + pl, sizeof(path) - pl, " → %s", n->name);
-            if (on_path[via_idx(n)]) {
+            if (on_path[via_idx(sp, n)]) {
                 snprintf(msg, sizeof(msg), "выход %.31s: via замыкается в круг (%s) — туннели "
                          "заворачивались бы друг в друга, и не встал бы ни один", o->name, path);
                 return err_set(e, "%s", msg);
             }
-            on_path[via_idx(n)] = 1;
+            on_path[via_idx(sp, n)] = 1;
             if (hops > MAX_VIA_DEPTH) {
                 snprintf(msg, sizeof(msg), "выход %.31s: цепочка via длиннее %d переходов (%s)",
                          o->name, MAX_VIA_DEPTH, path);
@@ -1075,12 +1055,13 @@ static int via_check(struct err *e) {
          * владельцев устройств в пулах целей. Встретить устройство самого o или сам o — круг. */
         int seen[MAX_OUTPUTS] = {0};
         int stack[MAX_OUTPUTS * (MAX_DEVICES + 1)];
-        int sp = 0;
-        stack[sp++] = via_idx(v);
-        while (sp) {
-            const struct output *t = &g_out[stack[--sp]];
-            if (seen[via_idx(t)]) continue;
-            seen[via_idx(t)] = 1;
+        /* Не "sp": имя занято параметром const struct spec *sp этой функции. */
+        int top = 0;
+        stack[top++] = via_idx(sp, v);
+        while (top) {
+            const struct output *t = &sp->out[stack[--top]];
+            if (seen[via_idx(sp, t)]) continue;
+            seen[via_idx(sp, t)] = 1;
             if (t == o) {
                 snprintf(msg, sizeof(msg), "выход %.31s: via замыкается в круг через устройства "
                          "пула — туннель однажды пошёл бы внутрь себя", o->name);
@@ -1094,17 +1075,23 @@ static int via_check(struct err *e) {
                                  "внутрь себя", o->name, t->name, t->devices[d]);
                         return err_set(e, "%s", msg);
                     }
-                const struct output *w = via_dev_owner(t->devices[d], t);
-                if (w && !seen[via_idx(w)]) stack[sp++] = via_idx(w);
+                const struct output *w = via_dev_owner(sp, t->devices[d], t);
+                if (w && !seen[via_idx(sp, w)]) stack[top++] = via_idx(sp, w);
             }
-            const struct output *n = out_via(t);
-            if (n && !seen[via_idx(n)]) stack[sp++] = via_idx(n);
+            const struct output *n = out_via(sp, t);
+            if (n && !seen[via_idx(sp, n)]) stack[top++] = via_idx(sp, n);
         }
     }
     return 0;
 }
 
-int load_spec(const char *path, struct err *e) {
+int load_spec(const char *path, struct spec *s, struct err *e) {
+    /* Спека — значение (правило 6): экземпляр обнуляется здесь, а не оставляется на
+     * совести вызывающего, и получает те же умолчания, что раньше стояли инициализаторами
+     * глобалов — один br-lan клиентским устройством, всё остальное пусто/нуль. */
+    memset(s, 0, sizeof(*s));
+    snprintf(s->lan_dev[0], sizeof(s->lan_dev[0]), "br-lan");
+    s->lan_dev_n = 1;
     FILE *f = strcmp(path, "-") ? fopen(path, "r") : stdin;
     if (!f) return err_set(e, "%s: cannot open", path);
     static char buf[262144];
@@ -1139,24 +1126,24 @@ int load_spec(const char *path, struct err *e) {
             if (js_num(&j, &v, e) != 0) return -1;
             schema = v;
         }
-        else if (!strcmp(key, "outputs")) { if (parse_outputs(&j, e) != 0) return -1; }
-        else if (!strcmp(key, "channels")) { if (parse_channels(&j, e) != 0) return -1; }
+        else if (!strcmp(key, "outputs")) { if (parse_outputs(&j, s, e) != 0) return -1; }
+        else if (!strcmp(key, "channels")) { if (parse_channels(&j, s, e) != 0) return -1; }
         else if (!strcmp(key, "from_default")) {
-            if (str_array(&j, g_from_default, MAX_FROM, &g_from_default_n, e) != 0 && e->msg[0]) return -1;
+            if (str_array(&j, s->from_default, MAX_FROM, &s->from_default_n, e) != 0 && e->msg[0]) return -1;
         }
         else if (!strcmp(key, "lan_device")) {
             /* Одиночная форма — сокращение для списка из одного элемента, ровно как
              * `device` у выхода. Дальше по коду путь один. */
-            if (js_str(&j, g_lan_dev[0], sizeof(g_lan_dev[0]), e) != 0 && e->msg[0]) return -1;
-            g_lan_dev_n = 1;
+            if (js_str(&j, s->lan_dev[0], sizeof(s->lan_dev[0]), e) != 0 && e->msg[0]) return -1;
+            s->lan_dev_n = 1;
             lan_one = 1;
         }
         else if (!strcmp(key, "lan_devices")) {
-            if (str_array(&j, g_lan_dev, MAX_LAN_DEV, &g_lan_dev_n, e) != 0)
+            if (str_array(&j, s->lan_dev, MAX_LAN_DEV, &s->lan_dev_n, e) != 0)
                 return err_prop(e, "lan_devices: ожидался массив строк", NULL);
             lan_many = 1;
         }
-        else if (!strcmp(key, "traceroute_hops")) { js_ws(&j); g_traceroute_hops = (*j.p == 't'); if (js_skip(&j, e) != 0) return -1; }
+        else if (!strcmp(key, "traceroute_hops")) { js_ws(&j); s->traceroute_hops = (*j.p == 't'); if (js_skip(&j, e) != 0) return -1; }
         else { if (js_skip(&j, e) != 0) return -1; }
         js_ws(&j);
         if (*j.p == ',') { j.p++; js_ws(&j); }
@@ -1172,16 +1159,16 @@ int load_spec(const char *path, struct err *e) {
     /* Пустой список — это «клиентов нет», а правило без условия «кто» забирает ВЕСЬ транзит
      * роутера, включая путь из интернета внутрь. Отказ дешевле такой находки на живом
      * роутере. */
-    if (!g_lan_dev_n)
+    if (!s->lan_dev_n)
         return err_set(e, "lan_devices: пустой список — некому адресовать правила", NULL);
-    for (size_t i = 0; i < g_lan_dev_n; i++) {
+    for (size_t i = 0; i < s->lan_dev_n; i++) {
         /* Самая дорогая из проверок этого набора: имя уходит и в текст правил nftables, и
          * в командные строки popen у любой команды, читающей спеку. */
-        if (!name_ok(g_lan_dev[i]))
-            return err_set(e, "lan_devices: негодный состав имени (%s)", g_lan_dev[i]);
-        for (size_t k = i + 1; k < g_lan_dev_n; k++)
-            if (!strcmp(g_lan_dev[i], g_lan_dev[k]))
-                return err_set(e, "lan_devices: устройство %s указано дважды", g_lan_dev[i]);
+        if (!name_ok(s->lan_dev[i]))
+            return err_set(e, "lan_devices: негодный состав имени (%s)", s->lan_dev[i]);
+        for (size_t k = i + 1; k < s->lan_dev_n; k++)
+            if (!strcmp(s->lan_dev[i], s->lan_dev[k]))
+                return err_set(e, "lan_devices: устройство %s указано дважды", s->lan_dev[i]);
     }
     /* Клиентов по умолчанию описывают ЛИБО подсети, либо устройства. Оба сразу — не
      * обогащение, а противоречие, и молчаливого разрешения у него нет ни в одну сторону.
@@ -1197,7 +1184,7 @@ int load_spec(const char *path, struct err *e) {
      * Отказ узкий намеренно: одно устройство рядом с `from_default` — это спека, написанная
      * до появления перечня, и она обязана значить ровно то, что значила. Отвергается только
      * НОВАЯ возможность, применённая вместе со старой. */
-    if (g_from_default_n && g_lan_dev_n > 1)
+    if (s->from_default_n && s->lan_dev_n > 1)
         return err_set(e, "клиенты описаны дважды: и from_default, и несколько lan_devices. "
             "Уберите from_default — устройства опишут клиентов точнее", NULL);
     /* Refusing an unknown major is the whole point of having the field: guessing
@@ -1241,8 +1228,8 @@ int load_spec(const char *path, struct err *e) {
      * только удалить; здесь же чинить надо не правило, а число схемы у всей спеки, и
      * выключенный канал этому ничуть не мешает. */
     if (schema == 1)
-        for (size_t i = 0; i < g_ch_n; i++)
-            if (g_ch[i].l4_written) {
+        for (size_t i = 0; i < s->ch_n; i++)
+            if (s->ch[i].l4_written) {
                 /* Буфер с запасом: строка русская, в UTF-8 это два байта на букву, и
                  * обрезка по границе буфера разрубила бы букву посередине. */
                 char msg[400];
@@ -1250,7 +1237,7 @@ int load_spec(const char *path, struct err *e) {
                          "канал %.24s: proto и ports появились в schema 2, а в спеке "
                          "schema 1. Поднимите \"schema\": 2 — иначе движок постарше поймёт "
                          "спеку наполовину и канал заберёт больше, чем вы написали",
-                         g_ch[i].name);
+                         s->ch[i].name);
                 return err_set(e, "%s", msg);
             }
     /* ЗДЕСЬ БЫЛО АВТООПРЕДЕЛЕНИЕ ПОДСЕТИ. Движок читал адрес lan_device через popen и
@@ -1274,10 +1261,10 @@ int load_spec(const char *path, struct err *e) {
      * "Выходы есть, каналов нет" — это осмысленное состояние: steer настроен, но
      * ничего не направляет. Оно же и правильное начальное: угадывать, какие списки
      * человеку нужны, хуже, чем не направлять ничего. */
-    for (size_t i = 0; i < g_ch_n; i++) {
+    for (size_t i = 0; i < s->ch_n; i++) {
         size_t k = 0;
-        for (; k < g_out_n; k++) if (!strcmp(g_ch[i].out, g_out[k].name)) break;
-        if (k == g_out_n) return err_set(e, "channel %s points at an output that does not exist", g_ch[i].name);
+        for (; k < s->out_n; k++) if (!strcmp(s->ch[i].out, s->out[k].name)) break;
+        if (k == s->out_n) return err_set(e, "channel %s points at an output that does not exist", s->ch[i].name);
     }
 
     /* ---- защита от конфигураций, которые отрежут доступ к роутеру -----------
@@ -1287,20 +1274,25 @@ int load_spec(const char *path, struct err *e) {
      * потом объяснять, как чинить коробку, до которой уже не достучаться.
      * Каждая проверка отвечает на «что человек сделает случайно», а не на
      * «что запрещено стандартом». */
-    for (size_t i = 0; i < g_out_n; i++) {
-        struct output *o = &g_out[i];
+    for (size_t i = 0; i < s->out_n; i++) {
+        struct output *o = &s->out[i];
         if (!out_has_device(o)) continue;
 
         /* Выход в локальное устройство — это петля: помеченный пакет получает маршрут
          * обратно в ту же сеть, откуда пришёл. Проверяется ВЕСЬ список: выход в
          * tailscale0, с которого мы забираем клиентов, закольцуется ровно так же, как
          * выход в br-lan, и отличать одно от другого нечем. */
-        for (size_t d = 0; d < g_lan_dev_n; d++)
-            if (!strcmp(o->device, g_lan_dev[d])) {
-                char msg[160];
+        for (size_t d = 0; d < s->lan_dev_n; d++)
+            if (!strcmp(o->device, s->lan_dev[d])) {
+                /* 256, не 160: через указатель на struct spec gcc считает границы имени и
+                 * устройства не так точно, как считал их у прежних глобальных массивов, и
+                 * -Wformat-truncation видит в этом реальный риск (-Werror с ним не собрался
+                 * бы). Значения по-прежнему ограничены name[32] и lan_dev[64] — 256 просто
+                 * достаточно, чтобы gcc в этом убедился тоже. */
+                char msg[256];
                 snprintf(msg, sizeof(msg),
                          "выход %s ведёт в %s — это локальная сеть, трафик закольцуется",
-                         o->name, g_lan_dev[d]);
+                         o->name, s->lan_dev[d]);
                 return err_set(e, "%s", msg);
             }
 
@@ -1316,18 +1308,18 @@ int load_spec(const char *path, struct err *e) {
                 }
     }
 
-    if (via_check(e) != 0) return -1;
+    if (via_check(s, e) != 0) return -1;
 
     /* from_default — это клиенты раздачи; сам телефон называет канал, а не умолчание для всех
      * каналов. Проверка вне цикла по каналам: from_default уходит в правило заворота DNS и
      * тогда, когда у каждого канала свой from, — и «ip saddr self» nft отверг бы синтаксической
      * ошибкой вместо слова о спеке. */
-    for (size_t k = 0; k < g_from_default_n; k++)
-        if (from_is_local(g_from_default[k]))
+    for (size_t k = 0; k < s->from_default_n; k++)
+        if (from_is_local(s->from_default[k]))
             return err_set(e, "from_default: «%s» — сам телефон, а не клиенты; укажите его в from канала",
-                g_from_default[k]);
-    for (size_t i = 0; i < g_ch_n; i++) {
-        struct channel *c = &g_ch[i];
+                s->from_default[k]);
+    for (size_t i = 0; i < s->ch_n; i++) {
+        struct channel *c = &s->ch[i];
         /* Выключенное правило не проверяем: оно не действует, а отказ применить спеку из-за
          * него означал бы, что выключить сломанное правило нельзя — только удалить. */
         if (c->disabled) continue;
@@ -1360,8 +1352,8 @@ int load_spec(const char *path, struct err *e) {
                         c->name);
             }
         } else {
-            for (size_t k = 0; k < g_from_default_n; k++)
-                if (!g_from_default[k][0])
+            for (size_t k = 0; k < s->from_default_n; k++)
+                if (!s->from_default[k][0])
                     return err_set(e, "канал %s берёт «кому» из from_default, а в нём пустая строка — "
                         "уберите её", c->name);
         }
@@ -1459,7 +1451,7 @@ int load_spec(const char *path, struct err *e) {
             return err_set(e, "канал %s забирает ВЕСЬ трафик в туннель. Если это правда нужно, "
                 "добавьте \"allow_all\": true — иначе выберите список", c->name);
 
-        struct output *o = out_by_name(c->out);
+        struct output *o = out_by_name(s, c->out);
         /* Мост Telegram перехватывает соединения только в prerouting (раздача): у трафика самого
          * телефона такого заворота нет, и канал «приложение → tgws» стоял бы применённым, не
          * делая ничего. */
@@ -1476,8 +1468,14 @@ int load_spec(const char *path, struct err *e) {
     return 0;
 }
 
-struct output *out_by_name(const char *n) {
-    for (size_t i = 0; i < g_out_n; i++) if (!strcmp(g_out[i].name, n)) return &g_out[i];
+struct output *out_by_name(const struct spec *sp, const char *n) {
+    /* Возврат — НЕ const: правило 6 просит sp константным параметром (эта функция только
+     * ищет), а вызывающие с изменяемой спекой (load_spec, registry_assign) правят найденный
+     * выход дальше — тем же способом, каким это делал g_out[i] до перехода на struct spec.
+     * Приведение снимает константность указателя, а не массива за ним: массив мутабелен
+     * ровно тогда, когда мутабелен *sp у вызывающего. */
+    for (size_t i = 0; i < sp->out_n; i++)
+        if (!strcmp(sp->out[i].name, n)) return (struct output *)&sp->out[i];
     return NULL;
 }
 

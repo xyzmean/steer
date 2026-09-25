@@ -7,10 +7,10 @@
  * со своим пониманием конфигурации, и понять «почему трафик идёт не туда» потом
  * нечем. Поэтому проверяются граничные случаи, а не пара примеров:
  *
- *   - валидная спека заполняет g_out[]/g_ch[] ровно тем, что в ней написано;
+ *   - валидная спека заполняет g_spec.out[]/g_spec.ch[] ровно тем, что в ней написано;
  *   - пустые каналы законны (состояние «настроен, но ничего не направляет») и не
  *     должны отвергаться — иначе первичная настройка запирается наглухо;
- *   - выключенный канал остаётся в g_ch[], но не режет применение спеки проверками;
+ *   - выключенный канал остаётся в g_spec.ch[], но не режет применение спеки проверками;
  *   - каждая конфигурация, «которая отрежет доступ к роутеру» или которая не имеет
  *     смысла (несуществующий выход, смешанные MAC/IP, дубликат устройства в failover,
  *     «any без списков в туннель»), обязана вызвать die() и exit(2) — молчаливое
@@ -38,6 +38,10 @@
 
 static int fails;
 
+/* Спека — значение, а не глобалы (правило 6, docs/architecture.md, раздел 2): один экземпляр
+ * на весь стенд, заполняется load_spec/load_from_str заново перед каждым случаем. */
+static struct spec g_spec;
+
 static void check(const char *what, int want, int got) {
     printf("%-62s %s\n", what, want == got ? "ok" : "ПРОВАЛ");
     if (want != got) fails++;
@@ -53,27 +57,20 @@ static void check_str(const char *what, const char *want, const char *got) {
     }
 }
 
-/* Полный сброс глобалов парсера. g_out_n/g_ch_n нарастают между вызовами load_spec
- * (g_out[g_out_n++] = o), и без сброса второй тест увидит выходы первого. Список локальных
- * устройств возвращается к умолчанию «один br-lan», g_traceroute_hops — к 0. g_state_dir
+/* Полный сброс глобалов парсера. g_spec.out_n/g_spec.ch_n нарастают между вызовами load_spec
+ * (g_spec.out[g_spec.out_n++] = o), и без сброса второй тест увидит выходы первого. Список локальных
+ * устройств возвращается к умолчанию «один br-lan», g_spec.traceroute_hops — к 0. g_state_dir
  * оставляем как есть: registry_assign в этих тестах не вызывается. */
 static void reset_globals(void) {
-    g_out_n = 0;
-    g_ch_n = 0;
-    g_from_default_n = 0;
-    memset(g_out, 0, sizeof(g_out));
-    memset(g_ch, 0, sizeof(g_ch));
-    memset(g_from_default, 0, sizeof(g_from_default));
-    memset(g_lan_dev, 0, sizeof(g_lan_dev));
-    strcpy(g_lan_dev[0], "br-lan");
-    g_lan_dev_n = 1;
-    g_traceroute_hops = 0;
+    memset(&g_spec, 0, sizeof(g_spec));
+    strcpy(g_spec.lan_dev[0], "br-lan");
+    g_spec.lan_dev_n = 1;
 }
 
 /* Записать спеку во временный файл и скормить load_spec. Возвращает 0, если load_spec
  * завершилась нормально, или код exit, если отказала через die(). from_default задаём
  * явно во всех спеках: иначе load_spec зовёт popen("ip ..."), которого в окружении
- * теста нет, и автоопределение LAN молча оставляет g_from_default_n == 0.
+ * теста нет, и автоопределение LAN молча оставляет g_spec.from_default_n == 0.
  *
  * Текст отказа load_spec кладёт в struct err, а не в stderr сам — этот стенд его не печатает
  * и не проверяет (проверяется код), ровно как раньше не перехватывалось и не проверялось
@@ -93,7 +90,7 @@ static int load_from_str(const char *spec) {
     if (f) { fputs(spec, f); fclose(f); }
 
     struct err e = {0};
-    int rc = load_spec(tmp, &e) < 0 ? 2 : 0;
+    int rc = load_spec(tmp, &g_spec, &e) < 0 ? 2 : 0;
     unlink(tmp);
     return rc;
 }
@@ -121,20 +118,20 @@ int main(void) {
     struct err e = {0};
     {
         /* Минимальная валидная спека: один прямой выход, один доменный канал.
-         * Заполняет g_out_n=1, g_ch_n=1; выход — OUT_DIRECT, канал смотрит на «direct». */
+         * Заполняет g_spec.out_n=1, g_spec.ch_n=1; выход — OUT_DIRECT, канал смотрит на «direct». */
         const char *s = SPEC(
             "\"outputs\":{\"direct\":{\"kind\":\"direct\"}},"
             "\"channels\":[{\"name\":\"yt\",\"out\":\"direct\","
             "\"match\":{\"domains_file\":\"/tmp/yt.lst\"}}]}");
         check("минимальная спека: load_spec не отказывает", 0, load_from_str(s));
-        check("минимальная спека: один выход", 1, (int)g_out_n);
-        check("минимальная спека: один канал", 1, (int)g_ch_n);
-        check_str("минимальная спека: имя выхода", "direct", g_out[0].name);
-        check("минимальная спека: kind direct", OUT_DIRECT, g_out[0].kind);
-        check_str("минимальная спека: имя канала", "yt", g_ch[0].name);
-        check_str("минимальная спека: канал → direct", "direct", g_ch[0].out);
-        check("минимальная спека: domains_n", 1, (int)g_ch[0].domains_n);
-        check_str("минимальная спека: domains_file", "/tmp/yt.lst", g_ch[0].domains_files[0]);
+        check("минимальная спека: один выход", 1, (int)g_spec.out_n);
+        check("минимальная спека: один канал", 1, (int)g_spec.ch_n);
+        check_str("минимальная спека: имя выхода", "direct", g_spec.out[0].name);
+        check("минимальная спека: kind direct", OUT_DIRECT, g_spec.out[0].kind);
+        check_str("минимальная спека: имя канала", "yt", g_spec.ch[0].name);
+        check_str("минимальная спека: канал → direct", "direct", g_spec.ch[0].out);
+        check("минимальная спека: domains_n", 1, (int)g_spec.ch[0].domains_n);
+        check_str("минимальная спека: domains_file", "/tmp/yt.lst", g_spec.ch[0].domains_files[0]);
     }
     {
         /* Выходы без каналов законны: steer настроен, но ничего не направляет. Это
@@ -142,14 +139,14 @@ int main(void) {
          * настройку (см. комментарий в load_spec, строки 366-372). */
         const char *s = SPEC("\"outputs\":{\"direct\":{\"kind\":\"direct\"}}");
         check("только outputs, без channels: не отказывает", 0, load_from_str(s));
-        check("только outputs: один выход", 1, (int)g_out_n);
-        check("только outputs: ноль каналов", 0, (int)g_ch_n);
+        check("только outputs: один выход", 1, (int)g_spec.out_n);
+        check("только outputs: ноль каналов", 0, (int)g_spec.ch_n);
     }
     {
         /* Пустая секция channels: [] — то же состояние, что и отсутствие секции. */
         const char *s = SPEC("\"outputs\":{\"direct\":{\"kind\":\"direct\"}},\"channels\":[]");
         check("channels: [] — не отказывает", 0, load_from_str(s));
-        check("channels: [] — ноль каналов", 0, (int)g_ch_n);
+        check("channels: [] — ноль каналов", 0, (int)g_spec.ch_n);
     }
     {
         /* Interface-выход с устройством и failover-списком devices. Проверяем, что
@@ -161,11 +158,11 @@ int main(void) {
             "\"channels\":[{\"name\":\"all\",\"out\":\"wg\","
             "\"match\":{\"prefixes_file\":\"/tmp/all.lst\"}}]}");
         check("interface с devices: не отказывает", 0, load_from_str(s));
-        check("interface: devices_n=2", 2, (int)g_out[0].devices_n);
-        check_str("interface: device выведен из devices[0]", "wg0", g_out[0].device);
+        check("interface: devices_n=2", 2, (int)g_spec.out[0].devices_n);
+        check_str("interface: device выведен из devices[0]", "wg0", g_spec.out[0].device);
     }
     {
-        /* Выключенный канал остаётся в g_ch[], но проходит проверку «matches nothing»,
+        /* Выключенный канал остаётся в g_spec.ch[], но проходит проверку «matches nothing»,
          * потому что проверка отключённых пропускается (строки 416). Без этого
          * выключить сломанное правило было бы нельзя — только удалить. */
         const char *s = SPEC(
@@ -173,8 +170,8 @@ int main(void) {
             "\"channels\":[{\"name\":\"off\",\"out\":\"direct\",\"enabled\":false,"
             "\"match\":{\"any\":true}}]}");
         check("выключенный any-канал: не отказывает", 0, load_from_str(s));
-        check("выключенный канал: в g_ch[]", 1, (int)g_ch_n);
-        check("выключенный канал: disabled=1", 1, g_ch[0].disabled);
+        check("выключенный канал: в g_spec.ch[]", 1, (int)g_spec.ch_n);
+        check("выключенный канал: disabled=1", 1, g_spec.ch[0].disabled);
     }
     {
         /* ---- schema 2: протокол и порты назначения ---------------------------------
@@ -195,12 +192,12 @@ int main(void) {
                                   "\"channels\":[{\"name\":\"dc\",\"out\":\"wg\",\"match\":{"
                                   "\"prefixes_file\":\"/tmp/dc.lst\",\"proto\":\"udp\","
                                   "\"ports\":[\"50000-65535\",\"19000-20000\"]}}]}")));
-        check("proto udp", CH_PROTO_UDP, g_ch[0].l4.proto);
-        check("диапазонов два", 2, (int)g_ch[0].l4.ports_n);
-        check("первый диапазон: начало", 50000, g_ch[0].l4.ports[0].lo);
-        check("первый диапазон: конец", 65535, g_ch[0].l4.ports[0].hi);
-        check("второй диапазон: начало", 19000, g_ch[0].l4.ports[1].lo);
-        check("второй диапазон: конец", 20000, g_ch[0].l4.ports[1].hi);
+        check("proto udp", CH_PROTO_UDP, g_spec.ch[0].l4.proto);
+        check("диапазонов два", 2, (int)g_spec.ch[0].l4.ports_n);
+        check("первый диапазон: начало", 50000, g_spec.ch[0].l4.ports[0].lo);
+        check("первый диапазон: конец", 65535, g_spec.ch[0].l4.ports[0].hi);
+        check("второй диапазон: начало", 19000, g_spec.ch[0].l4.ports[1].lo);
+        check("второй диапазон: конец", 20000, g_spec.ch[0].l4.ports[1].hi);
 
         /* Одиночный порт — это диапазон из одного: одна форма во внутреннем виде избавляет
          * и разбор, и генератор от ветки «а это порт или диапазон». */
@@ -209,18 +206,18 @@ int main(void) {
                                   "\"channels\":[{\"name\":\"p\",\"out\":\"wg\",\"match\":{"
                                   "\"prefixes_file\":\"/tmp/p.lst\",\"ports\":[\"443\"]}}]}")));
         check("одиночный порт: lo == hi", 1,
-              g_ch[0].l4.ports[0].lo == 443 && g_ch[0].l4.ports[0].hi == 443);
+              g_spec.ch[0].l4.ports[0].lo == 443 && g_spec.ch[0].l4.ports[0].hi == 443);
         /* Протокол не назван — сужения по протоколу нет, и это не то же самое, что «оба
          * протокола вместо всех»: генератор допишет `meta l4proto { tcp, udp }` только как
          * носитель для чтения порта (см. emit_l4 в steer.c). */
-        check("порты без proto: протокол не выдуман", CH_PROTO_ANY, g_ch[0].l4.proto);
+        check("порты без proto: протокол не выдуман", CH_PROTO_ANY, g_spec.ch[0].l4.proto);
 
         /* `both` — это ЗАПИСАННОЕ умолчание, а не третье поведение. */
         check("proto both принимается", 0,
               load_from_str(SPEC2("\"outputs\":{\"wg\":{\"kind\":\"interface\",\"device\":\"wg0\"}},"
                                   "\"channels\":[{\"name\":\"p\",\"out\":\"wg\",\"match\":{"
                                   "\"prefixes_file\":\"/tmp/p.lst\",\"proto\":\"both\"}}]}")));
-        check("proto both значит «не критерий»", CH_PROTO_ANY, g_ch[0].l4.proto);
+        check("proto both значит «не критерий»", CH_PROTO_ANY, g_spec.ch[0].l4.proto);
         /* ...но ключ схемы 2 при этом ЗАПИСАН, и в спеке schema 1 он обязан быть отказом:
          * иначе «both» проходил бы там, где «udp» отвергается, а человек читал бы это как
          * «порты в первой схеме работают». */
@@ -290,7 +287,7 @@ int main(void) {
         /* Пустой массив — это «портов не задано», а не отказ: так интерфейс, у которого
          * поле портов не заполнено, пишет его без особого случая. */
         check("пустой массив портов: принимается", 0, load_from_str(PORTS("[]")));
-        check("пустой массив: ноль диапазонов", 0, (int)g_ch[0].l4.ports_n);
+        check("пустой массив: ноль диапазонов", 0, (int)g_spec.ch[0].l4.ports_n);
 
         /* Границы предела. Числа берутся из MAX_PORTS, а не вписаны: следующий, кто его
          * подвинет, не должен править ещё и стенд. */
@@ -304,7 +301,7 @@ int main(void) {
                 q += sprintf(q, "%s\"%zu\"", i ? "," : "", 1000 + i * 2);
             q += sprintf(q, "]}}]}");
             check("ровно MAX_PORTS диапазонов: принимается", 0, load_from_str(big));
-            check("ровно MAX_PORTS: сосчитаны все", (int)MAX_PORTS, (int)g_ch[0].l4.ports_n);
+            check("ровно MAX_PORTS: сосчитаны все", (int)MAX_PORTS, (int)g_spec.ch[0].l4.ports_n);
         }
         {
             char big[4096], *q = big;
@@ -340,10 +337,10 @@ int main(void) {
                                   "\"ports\":[\"50000-65535\"]}}]}")));
         {
             char n0[64], n1[64];
-            group_set_name(n0, sizeof(n0), "wg", "ip", g_from_default, g_from_default_n, 0,
-                           &g_ch[0].l4);
-            group_set_name(n1, sizeof(n1), "wg", "ip", g_from_default, g_from_default_n, 0,
-                           &g_ch[1].l4);
+            group_set_name(&g_spec, n0, sizeof(n0), "wg", "ip", g_spec.from_default, g_spec.from_default_n, 0,
+                           &g_spec.ch[0].l4);
+            group_set_name(&g_spec, n1, sizeof(n1), "wg", "ip", g_spec.from_default, g_spec.from_default_n, 0,
+                           &g_spec.ch[1].l4);
             /* Канал без сужения обязан сохранить ПРЕЖНЕЕ имя: на установленных роутерах от
              * имени набора зависит перенос счётчиков, и переименование стоило бы обнулённых
              * объёмов у каждого канала при обновлении движка. */
@@ -470,7 +467,7 @@ int main(void) {
         }
         p += sprintf(p, "]}}]}");
         check("ровно MAX_FILES domains_files: принимается", 0, load_from_str(big));
-        check("ровно MAX_FILES domains_files: сосчитаны все", (int)MAX_FILES, (int)g_ch[0].domains_n);
+        check("ровно MAX_FILES domains_files: сосчитаны все", (int)MAX_FILES, (int)g_spec.ch[0].domains_n);
     }
     {
         /* I-001: на один больше — отказ, а не тихое обрезание. Тихое обрезание здесь хуже
@@ -566,11 +563,11 @@ int main(void) {
             "\"listen\":\"127.0.0.1:51820\"}}},"
             "\"channels\":[]}");
         check("obfs: спека принята", 0, load_from_str(s));
-        check("obfs: признак включён", 1, g_out[0].obfs.on);
-        check_str("obfs: адрес сервера", "203.0.113.10", g_out[0].obfs.server);
-        check("obfs: порт сервера", 4567, g_out[0].obfs.server_port);
-        check_str("obfs: локальный адрес", "127.0.0.1", g_out[0].obfs.listen);
-        check("obfs: локальный порт", 51820, g_out[0].obfs.listen_port);
+        check("obfs: признак включён", 1, g_spec.out[0].obfs.on);
+        check_str("obfs: адрес сервера", "203.0.113.10", g_spec.out[0].obfs.server);
+        check("obfs: порт сервера", 4567, g_spec.out[0].obfs.server_port);
+        check_str("obfs: локальный адрес", "127.0.0.1", g_spec.out[0].obfs.listen);
+        check("obfs: локальный порт", 51820, g_spec.out[0].obfs.listen_port);
     }
     {
         /* Умолчание по режиму: спека без mode обязана значить сегодняшний
@@ -580,7 +577,7 @@ int main(void) {
             "\"obfs\":{\"server\":\"203.0.113.10:4567\",\"listen\":\"127.0.0.1:51820\"}}},"
             "\"channels\":[]}");
         check("obfs: без mode — тот же режим", 0, load_from_str(s));
-        check("obfs: без mode — признак включён", 1, g_out[0].obfs.on);
+        check("obfs: без mode — признак включён", 1, g_spec.out[0].obfs.on);
     }
     {
         const char *s = SPEC(
@@ -629,7 +626,7 @@ int main(void) {
             "\"outputs\":{\"wg\":{\"kind\":\"interface\",\"device\":\"wg0\"}},"
             "\"channels\":[]}");
         check("без obfs: спека принята", 0, load_from_str(s));
-        check("без obfs: признак выключен", 0, g_out[0].obfs.on);
+        check("без obfs: признак выключен", 0, g_spec.out[0].obfs.on);
     }
 
     /* ---- kind=zapret: выход без устройства, но с меткой -------------------------
@@ -642,25 +639,25 @@ int main(void) {
             "\"outputs\":{\"yt\":{\"kind\":\"zapret\"}},"
             "\"channels\":[]}");
         check("zapret: спека принята", 0, load_from_str(s));
-        check("zapret: вид OUT_ZAPRET", OUT_ZAPRET, g_out[0].kind);
+        check("zapret: вид OUT_ZAPRET", OUT_ZAPRET, g_spec.out[0].kind);
         /* Главное различие этого вида: устройства нет, а метка есть. Пока условие было
          * одно на две надобности, такой выход получил бы правило канала и не получил
          * метки — то есть в очередь не попал бы ни один пакет. */
-        check("zapret: устройства нет", 0, out_has_device(&g_out[0]));
-        check("zapret: метка нужна", 1, out_needs_mark(&g_out[0]));
-        check("zapret: устройство не названо", 0, g_out[0].device[0]);
+        check("zapret: устройства нет", 0, out_has_device(&g_spec.out[0]));
+        check("zapret: метка нужна", 1, out_needs_mark(&g_spec.out[0]));
+        check("zapret: устройство не названо", 0, g_spec.out[0].device[0]);
         check_str("zapret: opts_file по умолчанию из имени выхода",
-                  "/etc/steer/zapret/yt.opts", g_out[0].zp_opts);
+                  "/etc/steer/zapret/yt.opts", g_spec.out[0].zp_opts);
         /* Умолчание on_fail общее для всех выходов — drop, и здесь оно значит «нет обхода
          * — нет трафика», то есть очередь без bypass. */
-        check("zapret: on_fail по умолчанию drop", FAIL_DROP, g_out[0].on_fail);
+        check("zapret: on_fail по умолчанию drop", FAIL_DROP, g_spec.out[0].on_fail);
     }
     {
         const char *s = SPEC(
             "\"outputs\":{\"yt\":{\"kind\":\"zapret\",\"opts_file\":\"/etc/y.opts\"}},"
             "\"channels\":[]}");
         check("zapret: явный opts_file принят", 0, load_from_str(s));
-        check_str("zapret: явный opts_file сохранён", "/etc/y.opts", g_out[0].zp_opts);
+        check_str("zapret: явный opts_file сохранён", "/etc/y.opts", g_spec.out[0].zp_opts);
     }
     {
         /* Относительный путь «работал бы из шелла» и не работал бы у службы: процесс
@@ -702,12 +699,12 @@ int main(void) {
             "\"outputs\":{\"a\":{\"kind\":\"zapret\"},\"b\":{\"kind\":\"zapret\"}},"
             "\"channels\":[]}");
         check("zapret: две очереди, спека принята", 0, load_from_str(s));
-        g_out[0].mark = STEER_MARK_BASE;
-        g_out[1].mark = STEER_MARK_BASE << 1;
+        g_spec.out[0].mark = STEER_MARK_BASE;
+        g_spec.out[1].mark = STEER_MARK_BASE << 1;
         check("zapret: очередь первого выхода", ZAPRET_QUEUE_BASE,
-              out_zapret_queue(&g_out[0]));
+              out_zapret_queue(&g_spec.out[0]));
         check("zapret: очередь второго выхода", ZAPRET_QUEUE_BASE + 1,
-              out_zapret_queue(&g_out[1]));
+              out_zapret_queue(&g_spec.out[1]));
     }
 
     /* ---- виды выходов, существующие только в расширенной сборке ------------------
@@ -723,15 +720,15 @@ int main(void) {
             "\"channels\":[]}");
 #ifdef STEER_EXTENDED
         check("xsteer: спека принята", 0, load_from_str(s));
-        check("xsteer: вид OUT_XSTEER", OUT_XSTEER, g_out[0].kind);
+        check("xsteer: вид OUT_XSTEER", OUT_XSTEER, g_spec.out[0].kind);
         /* Устройство и путь к конфигурации выводятся из имени выхода: держать их
          * отдельными полями значило бы позволить двум именам разойтись. */
-        check_str("xsteer: устройство из имени выхода", "vpn", g_out[0].device);
-        check("xsteer: один кандидат в devices", 1, (int)g_out[0].devices_n);
-        check_str("xsteer: conf по умолчанию", "/etc/steer/xsteer/vpn.conf", g_out[0].xs_conf);
-        check("xsteer: считается выходом с устройством", 1, out_has_device(&g_out[0]));
-        check("xsteer: устройство создаёт наш процесс", 1, out_engine_managed(&g_out[0]));
-        check("xsteer: masquerade не нужен", 1, out_self_natting(&g_out[0]));
+        check_str("xsteer: устройство из имени выхода", "vpn", g_spec.out[0].device);
+        check("xsteer: один кандидат в devices", 1, (int)g_spec.out[0].devices_n);
+        check_str("xsteer: conf по умолчанию", "/etc/steer/xsteer/vpn.conf", g_spec.out[0].xs_conf);
+        check("xsteer: считается выходом с устройством", 1, out_has_device(&g_spec.out[0]));
+        check("xsteer: устройство создаёт наш процесс", 1, out_engine_managed(&g_spec.out[0]));
+        check("xsteer: masquerade не нужен", 1, out_self_natting(&g_spec.out[0]));
 #else
         /* Базовая сборка обязана отказать ПАРСЕРОМ, а не при подъёме: иначе правила и
          * метки встают, устройства не создаёт никто, и человек видит рабочую с виду
@@ -746,8 +743,8 @@ int main(void) {
             "\"channels\":[]}");
 #ifdef STEER_EXTENDED
         check("vless: спека принята", 0, load_from_str(s));
-        check("vless: вид OUT_VLESS", OUT_VLESS, g_out[0].kind);
-        check("vless: устройство создаёт наш процесс", 1, out_engine_managed(&g_out[0]));
+        check("vless: вид OUT_VLESS", OUT_VLESS, g_spec.out[0].kind);
+        check("vless: устройство создаёт наш процесс", 1, out_engine_managed(&g_spec.out[0]));
 #else
         check("vless: базовая сборка отвергает вид", 2, load_from_str(s));
 #endif
@@ -820,9 +817,9 @@ int main(void) {
             "\"nodes\":[6,7,12]}},"
             "\"channels\":[]}");
         check("nodes: спека принята", 0, load_from_str(s));
-        check("nodes: кандидатов трое", 3, (int)g_out[0].nodes_n);
+        check("nodes: кандидатов трое", 3, (int)g_spec.out[0].nodes_n);
         check("nodes: порядок как написан", 1,
-              g_out[0].nodes[0] == 6 && g_out[0].nodes[1] == 7 && g_out[0].nodes[2] == 12);
+              g_spec.out[0].nodes[0] == 6 && g_spec.out[0].nodes[1] == 7 && g_spec.out[0].nodes[2] == 12);
     }
     {
         /* Одиночная форма — сокращение для списка из одного, дальше по коду путь один. */
@@ -831,8 +828,8 @@ int main(void) {
             "\"node\":4}},"
             "\"channels\":[]}");
         check("node: спека принята", 0, load_from_str(s));
-        check("node: один кандидат", 1, (int)g_out[0].nodes_n);
-        check("node: номер сохранён", 4, g_out[0].nodes[0]);
+        check("node: один кандидат", 1, (int)g_spec.out[0].nodes_n);
+        check("node: номер сохранён", 4, g_spec.out[0].nodes[0]);
     }
     {
         /* Прежнее «первый рабочий» записывается пустым списком: спека, написанная до
@@ -842,14 +839,14 @@ int main(void) {
             "\"node\":-1}},"
             "\"channels\":[]}");
         check("node -1: спека принята", 0, load_from_str(s));
-        check("node -1: кандидатов не выбрано", 0, (int)g_out[0].nodes_n);
+        check("node -1: кандидатов не выбрано", 0, (int)g_spec.out[0].nodes_n);
     }
     {
         const char *s = SPEC(
             "\"outputs\":{\"vpn\":{\"kind\":\"vless\",\"sub_file\":\"/tmp/sub.txt\"}},"
             "\"channels\":[]}");
         check("без node: спека принята", 0, load_from_str(s));
-        check("без node: кандидатов не выбрано", 0, (int)g_out[0].nodes_n);
+        check("без node: кандидатов не выбрано", 0, (int)g_spec.out[0].nodes_n);
     }
     {
         /* Пустой список — та же «вся подписка», а не «узлов нет»: отказывать на нём значило бы
@@ -859,7 +856,7 @@ int main(void) {
             "\"nodes\":[]}},"
             "\"channels\":[]}");
         check("nodes пустой список принят", 0, load_from_str(s));
-        check("nodes пустой список: кандидатов не выбрано", 0, (int)g_out[0].nodes_n);
+        check("nodes пустой список: кандидатов не выбрано", 0, (int)g_spec.out[0].nodes_n);
     }
     {
         /* Обе формы сразу — отказ, ровно как lan_device вместе с lan_devices: взять одну молча
@@ -924,7 +921,7 @@ int main(void) {
             "\"outputs\":{\"vpn\":{\"kind\":\"xsteer\",\"conf\":\"/etc/hub.conf\"}},"
             "\"channels\":[]}");
         check("xsteer: явный conf принят", 0, load_from_str(s));
-        check_str("xsteer: явный conf сохранён", "/etc/hub.conf", g_out[0].xs_conf);
+        check_str("xsteer: явный conf сохранён", "/etc/hub.conf", g_spec.out[0].xs_conf);
     }
     {
         const char *s = SPEC(
@@ -992,7 +989,7 @@ int main(void) {
             "\"alt\":{\"kind\":\"interface\",\"device\":\"wg1\"}},"
             "\"channels\":[]}");
         check("спека с двумя туннелями загрузилась", 0, load_from_str(s2));
-        registry_assign(&e);
+        registry_assign(&g_spec, &e);
 
         char path[512];
         snprintf(path, sizeof(path), "%s/steer.conf", rdir);
@@ -1012,7 +1009,7 @@ int main(void) {
         /* Повторный вызов при том же составе выходов файл трогать не должен. */
         struct stat st1, st2;
         stat(path, &st1);
-        registry_assign(&e);
+        registry_assign(&g_spec, &e);
         stat(path, &st2);
         check("повторный вызов файл не перезаписывает",
               1, st1.st_mtime == st2.st_mtime && st1.st_size == st2.st_size);
@@ -1024,7 +1021,7 @@ int main(void) {
             "\"outputs\":{\"vpn\":{\"kind\":\"interface\",\"device\":\"wg0\"}},"
             "\"channels\":[]}");
         check("спека с одним туннелем загрузилась", 0, load_from_str(s3));
-        registry_assign(&e);
+        registry_assign(&g_spec, &e);
         memset(have, 0, sizeof(have));
         f = fopen(path, "r");
         hn = f ? fread(have, 1, sizeof(have) - 1, f) : 0;
@@ -1067,18 +1064,18 @@ int main(void) {
                            i ? "," : "", i, i);
         snprintf(many + mn, sizeof(many) - (size_t)mn, "},\"channels\":[]}");
         check("спека на все MAX_OUTPUTS туннелей загрузилась", 0, load_from_str(many));
-        registry_assign(&e);
+        registry_assign(&g_spec, &e);
 
         int no_mark = 0, off_mask = 0, dup_mark = 0, dup_table = 0, dup_queue = 0;
         int bad_table = 0;
-        for (size_t i = 0; i < g_out_n; i++) {
-            if (!g_out[i].mark) { no_mark++; continue; }
-            if (g_out[i].mark & ~STEER_MARK_MASK) off_mask++;
-            if (g_out[i].table < 300 || g_out[i].table > 300 + MAX_OUTPUTS - 1) bad_table++;
+        for (size_t i = 0; i < g_spec.out_n; i++) {
+            if (!g_spec.out[i].mark) { no_mark++; continue; }
+            if (g_spec.out[i].mark & ~STEER_MARK_MASK) off_mask++;
+            if (g_spec.out[i].table < 300 || g_spec.out[i].table > 300 + MAX_OUTPUTS - 1) bad_table++;
             for (size_t j = 0; j < i; j++) {
-                if (g_out[j].mark == g_out[i].mark) dup_mark++;
-                if (g_out[j].table == g_out[i].table) dup_table++;
-                if (out_zapret_queue(&g_out[j]) == out_zapret_queue(&g_out[i])) dup_queue++;
+                if (g_spec.out[j].mark == g_spec.out[i].mark) dup_mark++;
+                if (g_spec.out[j].table == g_spec.out[i].table) dup_table++;
+                if (out_zapret_queue(&g_spec.out[j]) == out_zapret_queue(&g_spec.out[i])) dup_queue++;
             }
         }
         check("метку получили все MAX_OUTPUTS выходов", 0, no_mark);
@@ -1105,14 +1102,14 @@ int main(void) {
             "\"fresh\":{\"kind\":\"interface\",\"device\":\"wg1\"}},"
             "\"channels\":[]}");
         check("спека со старым и новым выходом загрузилась", 0, load_from_str(s4));
-        registry_assign(&e);
+        registry_assign(&g_spec, &e);
         unsigned old_mark = 0, fresh_mark = 0;
         int old_table = 0, fresh_table = 0;
-        for (size_t i = 0; i < g_out_n; i++) {
-            if (!strcmp(g_out[i].name, "old")) {
-                old_mark = g_out[i].mark; old_table = g_out[i].table;
-            } else if (!strcmp(g_out[i].name, "fresh")) {
-                fresh_mark = g_out[i].mark; fresh_table = g_out[i].table;
+        for (size_t i = 0; i < g_spec.out_n; i++) {
+            if (!strcmp(g_spec.out[i].name, "old")) {
+                old_mark = g_spec.out[i].mark; old_table = g_spec.out[i].table;
+            } else if (!strcmp(g_spec.out[i].name, "fresh")) {
+                fresh_mark = g_spec.out[i].mark; fresh_table = g_spec.out[i].table;
             }
         }
         check("старая метка из реестра сохранена как есть", STEER_MARK_BASE << 7, old_mark);
@@ -1336,7 +1333,7 @@ int main(void) {
             snprintf(what, sizeof what, "enabled:%s — грузится", ev[k].v);
             check(what, 0, load_from_str(s));
             snprintf(what, sizeof what, "enabled:%s — disabled=%d", ev[k].v, ev[k].disabled);
-            check(what, ev[k].disabled, g_ch_n ? g_ch[0].disabled : -1);
+            check(what, ev[k].disabled, g_spec.ch_n ? g_spec.ch[0].disabled : -1);
         }
     }
 
@@ -1380,16 +1377,16 @@ int main(void) {
             "\"match\":{\"domains_file\":\"/tmp/x.lst\"}},"
             "{\"name\":\"d\",\"out\":\"direct\","
             "\"match\":{\"domains_file\":\"/tmp/y.lst\"}}]")));
-        check("и этот канал не применяется", 1, g_ch_n ? g_ch[0].disabled : -1);
-        check("а соседний канал — применяется", 0, g_ch_n > 1 ? g_ch[1].disabled : -1);
+        check("и этот канал не применяется", 1, g_spec.ch_n ? g_spec.ch[0].disabled : -1);
+        check("а соседний канал — применяется", 0, g_spec.ch_n > 1 ? g_spec.ch[1].disabled : -1);
         check("пустая строка рядом с адресом — грузится", 0, load_from_str(SPEC(
             "\"outputs\":{\"direct\":{\"kind\":\"direct\"}},"
             "\"channels\":[{\"name\":\"c\",\"out\":\"direct\","
             "\"from\":[\"192.168.1.5\",\"\"],"
             "\"match\":{\"domains_file\":\"/tmp/x.lst\"}}]")));
-        check("и пустая выброшена, адрес остался", 1, g_ch_n ? (int)g_ch[0].from_n : -1);
-        check_str("и это тот адрес", "192.168.1.5", g_ch_n ? g_ch[0].from[0] : "");
-        check("и канал применяется", 0, g_ch_n ? g_ch[0].disabled : -1);
+        check("и пустая выброшена, адрес остался", 1, g_spec.ch_n ? (int)g_spec.ch[0].from_n : -1);
+        check_str("и это тот адрес", "192.168.1.5", g_spec.ch_n ? g_spec.ch[0].from[0] : "");
+        check("и канал применяется", 0, g_spec.ch_n ? g_spec.ch[0].disabled : -1);
         check("from:[\"\"] у выключенного канала — грузится", 0, load_from_str(SPEC(
             "\"outputs\":{\"direct\":{\"kind\":\"direct\"}},"
             "\"channels\":[{\"name\":\"c\",\"out\":\"direct\",\"from\":[\"\"],"
@@ -1414,23 +1411,23 @@ int main(void) {
         check("via: interface с obfs через interface — принята", 0, load_from_str(SPEC(
             "\"outputs\":{\"a\":" OBFS("wg0") ",\"via\":\"b\"},"
             "\"b\":{\"kind\":\"interface\",\"device\":\"wg1\"}},\"channels\":[]}")));
-        check_str("via: поле заполнено", "b", g_out_n ? g_out[0].via : "");
-        check("via: out_via находит цель", 1, g_out_n == 2 && out_via(&g_out[0]) == &g_out[1]);
-        check("via: у цели via нет", 1, g_out_n == 2 && out_via(&g_out[1]) == NULL);
+        check_str("via: поле заполнено", "b", g_spec.out_n ? g_spec.out[0].via : "");
+        check("via: out_via находит цель", 1, g_spec.out_n == 2 && out_via(&g_spec, &g_spec.out[0]) == &g_spec.out[1]);
+        check("via: у цели via нет", 1, g_spec.out_n == 2 && out_via(&g_spec, &g_spec.out[1]) == NULL);
         /* Метка туннеля — метка цели; без via — «мимо каналов» (на роутере ноль). Метки здесь
          * ставятся руками: registry_assign в этом стенде не зовётся. */
-        g_out[0].mark = 0x00100000;
-        g_out[1].mark = 0x00200000;
-        check("via: метка туннеля — метка цели", 0x00200000, (int)out_underlay_mark(&g_out[0]));
-        check("via: без via — метки нет", 0, (int)out_underlay_mark(&g_out[1]));
-        check("via: глубина 1 и 0", 1, out_via_depth(&g_out[0]) == 1 && out_via_depth(&g_out[1]) == 0);
+        g_spec.out[0].mark = 0x00100000;
+        g_spec.out[1].mark = 0x00200000;
+        check("via: метка туннеля — метка цели", 0x00200000, (int)out_underlay_mark(&g_spec, &g_spec.out[0]));
+        check("via: без via — метки нет", 0, (int)out_underlay_mark(&g_spec, &g_spec.out[1]));
+        check("via: глубина 1 и 0", 1, out_via_depth(&g_spec, &g_spec.out[0]) == 1 && out_via_depth(&g_spec, &g_spec.out[1]) == 0);
     }
     check("via: цель ниже в спеке — принята", 0, load_from_str(SPEC(
         "\"outputs\":{\"b\":{\"kind\":\"interface\",\"device\":\"wg1\"},"
         "\"a\":" OBFS("wg0") ",\"via\":\"b\"}},\"channels\":[]}")));
     check("via: пустая строка — как без via", 0, load_from_str(SPEC(
         "\"outputs\":{\"a\":" OBFS("wg0") ",\"via\":\"\"}},\"channels\":[]}")));
-    check("via: пустая строка — поле пустое", 1, g_out_n == 1 && !out_via(&g_out[0]));
+    check("via: пустая строка — поле пустое", 1, g_spec.out_n == 1 && !out_via(&g_spec, &g_spec.out[0]));
     check("via: негодное имя — отказ", 2, load_from_str(SPEC(
         "\"outputs\":{\"a\":" OBFS("wg0") ",\"via\":\"b c\"}},\"channels\":[]}")));
     check("via: несуществующий выход — отказ", 2, load_from_str(SPEC(
@@ -1464,12 +1461,12 @@ int main(void) {
             "\"outputs\":{\"a\":" OBFS("wg0") ",\"via\":\"b\"},"
             "\"b\":" OBFS("wg1") ",\"via\":\"c\"},"
             "\"c\":{\"kind\":\"interface\",\"device\":\"wg2\"}},\"channels\":[]}")));
-        check("via: глубина цепочки из трёх — 2", 2, g_out_n == 3 ? out_via_depth(&g_out[0]) : -1);
-        g_out[0].mark = 0x00100000; g_out[1].mark = 0x00200000; g_out[2].mark = 0x00300000;
+        check("via: глубина цепочки из трёх — 2", 2, g_spec.out_n == 3 ? out_via_depth(&g_spec, &g_spec.out[0]) : -1);
+        g_spec.out[0].mark = 0x00100000; g_spec.out[1].mark = 0x00200000; g_spec.out[2].mark = 0x00300000;
         /* Каждый слой метит СВОЙ сокет меткой СВОЕЙ цели — не конца цепочки: пакет a едет в
          * устройство b, а уже соединение b — в устройство c. */
-        check("via: слой a метится меткой b", 0x00200000, (int)out_underlay_mark(&g_out[0]));
-        check("via: слой b метится меткой c", 0x00300000, (int)out_underlay_mark(&g_out[1]));
+        check("via: слой a метится меткой b", 0x00200000, (int)out_underlay_mark(&g_spec, &g_spec.out[0]));
+        check("via: слой b метится меткой c", 0x00300000, (int)out_underlay_mark(&g_spec, &g_spec.out[1]));
     }
     check("via: три перехода — принята", 0, load_from_str(SPEC(
         "\"outputs\":{\"a\":" OBFS("wg0") ",\"via\":\"b\"},"
@@ -1497,7 +1494,7 @@ int main(void) {
         check("via: awg через interface — принята", 0, load_from_str(SPEC(
             "\"outputs\":{\"a\":{\"kind\":\"awg\",\"via\":\"w\"},"
             "\"w\":{\"kind\":\"interface\",\"device\":\"wg0\"}},\"channels\":[]}")));
-        check("via: awg умеет via", 1, g_out_n == 2 && out_via_capable(&g_out[0]));
+        check("via: awg умеет via", 1, g_spec.out_n == 2 && out_via_capable(&g_spec.out[0]));
         check("via: interface с obfs через awg — принята", 0, load_from_str(SPEC(
             "\"outputs\":{\"o\":" OBFS("wg0") ",\"via\":\"a\"},"
             "\"a\":{\"kind\":\"awg\"}},\"channels\":[]}")));
@@ -1515,7 +1512,7 @@ int main(void) {
             "\"outputs\":{\"v\":{\"kind\":\"vless\",\"sub_file\":\"/tmp/s\",\"via\":\"w\"},"
             "\"w\":{\"kind\":\"interface\",\"device\":\"wg0\"}},\"channels\":[]}")));
         check("via: vless через interface — цель найдена", 1,
-              g_out_n == 2 && out_via(&g_out[0]) == &g_out[1]);
+              g_spec.out_n == 2 && out_via(&g_spec, &g_spec.out[0]) == &g_spec.out[1]);
         check("via: xsteer через vless — принята", 0, load_from_str(SPEC(
             "\"outputs\":{\"x\":{\"kind\":\"xsteer\",\"via\":\"v\"},"
             "\"v\":{\"kind\":\"vless\",\"sub_file\":\"/tmp/s\"}},\"channels\":[]}")));

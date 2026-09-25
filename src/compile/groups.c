@@ -46,9 +46,9 @@ static int group_add_file(struct group *g, const char *path, struct err *e) {
 }
 size_t g_grp_n;
 
-static int same_from(const struct channel *c, const struct group *g) {
-    const char (*cf)[64] = c->from_n ? c->from : g_from_default;
-    size_t cn = c->from_n ? c->from_n : g_from_default_n;
+static int same_from(const struct spec *sp, const struct channel *c, const struct group *g) {
+    const char (*cf)[64] = c->from_n ? c->from : sp->from_default;
+    size_t cn = c->from_n ? c->from_n : sp->from_default_n;
     if (cn != g->from_n) return 0;
     for (size_t i = 0; i < cn; i++)
         if (strcmp(cf[i], g->from[i]) != 0) return 0;
@@ -70,11 +70,11 @@ static int same_from(const struct channel *c, const struct group *g) {
  *
  * Внутри каждой из двух групп порядок спеки сохраняется: два правила на разные устройства
  * или два глобальных по-прежнему читаются сверху вниз, как и раньше. */
-int build_groups(struct err *e) {
+int build_groups(const struct spec *sp, struct err *e) {
     g_grp_n = 0;
     for (int pass = 0; pass < 2; pass++)
-    for (size_t i = 0; i < g_ch_n; i++) {
-        const struct channel *c = &g_ch[i];
+    for (size_t i = 0; i < sp->ch_n; i++) {
+        const struct channel *c = &sp->ch[i];
         /* Первый проход берёт только правила на устройство, второй — только остальные. */
         if ((pass == 0) != (c->dev_scope != 0)) continue;
         /* Выключенное правило не превращается ни в набор, ни в правило — то есть его нет в
@@ -98,7 +98,7 @@ int build_groups(struct err *e) {
              * ведущие в один outbound для одних клиентов, — это одно правило и один набор.
              * Разделение по виду было следствием запрета смешивать, а не требованием ядра. */
             if (domains && g->domains && g->realip != c->realip) continue;
-            if (!same_from(c, g)) continue;
+            if (!same_from(sp, c, g)) continue;
             /* СУЖЕНИЕ ПО ПРОТОКОЛУ И ПОРТАМ РАЗДЕЛЯЕТ ГРУППЫ так же, как выход и клиенты.
              *
              * Слить их было бы молчаливой потерей смысла в обе стороны сразу: набор у группы
@@ -118,13 +118,13 @@ int build_groups(struct err *e) {
             g->domains = 0;
             g->all = all;
             g->realip = c->realip;
-            g->from = c->from_n ? c->from : g_from_default;
-            g->from_n = c->from_n ? c->from_n : g_from_default_n;
+            g->from = c->from_n ? c->from : sp->from_default;
+            g->from_n = c->from_n ? c->from_n : sp->from_default_n;
             g->l4 = &c->l4;
             /* Имя ставим предварительно, окончательное — ниже: домены могут прийти вторым
              * правилом, и тогда набор обязан называться _dom, иначе резолвер его не найдёт
              * (он вычисляет имя сам, той же функцией group_set_name). */
-            group_set_name(g->name, sizeof(g->name), g->out, all ? "all" : domains ? "dom" : "ip",
+            group_set_name(sp, g->name, sizeof(g->name), g->out, all ? "all" : domains ? "dom" : "ip",
                            g->from, g->from_n, g->realip, g->l4);
         }
         struct group *g = &g_grp[k];
@@ -145,7 +145,7 @@ int build_groups(struct err *e) {
     for (size_t i = 0; i < g_grp_n; i++) {
         struct group *g = &g_grp[i];
         if (!g->files_n && !g->domains) continue;
-        group_set_name(g->name, sizeof(g->name), g->out, g->domains ? "dom" : "ip",
+        group_set_name(sp, g->name, sizeof(g->name), g->out, g->domains ? "dom" : "ip",
                        g->from, g->from_n, g->realip, g->l4);
     }
     /* Страховка, а не проверка входа: имя обязано быть уникальным по построению, и если
@@ -169,17 +169,17 @@ int has_domains(void) {
 /* Есть ли хоть один выход kind=zapret. Отдельной функцией по той же причине, что
  * has_domains: цепочка очередей пишется только когда ей есть что писать, а пустая базовая
  * цепочка в postrouting — это лишний проход по правилам на КАЖДОМ пакете роутера. */
-int has_zapret(void) {
-    for (size_t i = 0; i < g_out_n; i++)
-        if (g_out[i].kind == OUT_ZAPRET) return 1;
+int has_zapret(const struct spec *sp) {
+    for (size_t i = 0; i < sp->out_n; i++)
+        if (sp->out[i].kind == OUT_ZAPRET) return 1;
     return 0;
 }
 
 /* Есть ли хоть один выход kind=tgws. Тот же довод, что у has_zapret: цепочка перехвата
  * пишется, только когда ей есть что перехватывать. */
-int has_tgws(void) {
-    for (size_t i = 0; i < g_out_n; i++)
-        if (g_out[i].kind == OUT_TGWS) return 1;
+int has_tgws(const struct spec *sp) {
+    for (size_t i = 0; i < sp->out_n; i++)
+        if (sp->out[i].kind == OUT_TGWS) return 1;
     return 0;
 }
 
@@ -232,8 +232,8 @@ int has_local_domains(void) {
 
 /* Есть ли в спеке туннель через via — тогда его сокет несёт STEER_TUNNEL_BIT, и заворот DNS
  * обязан его пропускать (см. emit_local_dns_redirect). */
-int has_via(void) {
-    for (size_t i = 0; i < g_out_n; i++) if (g_out[i].via[0]) return 1;
+int has_via(const struct spec *sp) {
+    for (size_t i = 0; i < sp->out_n; i++) if (sp->out[i].via[0]) return 1;
     return 0;
 }
 

@@ -118,12 +118,12 @@ static void emit_who(FILE *f, const struct group *g, int reverse) {
  *
  * Один элемент печатается без фигурных скобок: так вывод `--dry-run` у обычной
  * конфигурации остаётся тем же текстом, что и раньше, и nft печатает его так же. */
-static void emit_ifs(FILE *f, int reverse) {
+static void emit_ifs(const struct spec *sp, FILE *f, int reverse) {
     const char *kw = reverse ? "oifname" : "iifname";
-    if (g_lan_dev_n == 1) { fprintf(f, "%s \"%s\" ", kw, g_lan_dev[0]); return; }
+    if (sp->lan_dev_n == 1) { fprintf(f, "%s \"%s\" ", kw, sp->lan_dev[0]); return; }
     fprintf(f, "%s { ", kw);
-    for (size_t i = 0; i < g_lan_dev_n; i++)
-        fprintf(f, "%s\"%s\"", i ? ", " : "", g_lan_dev[i]);
+    for (size_t i = 0; i < sp->lan_dev_n; i++)
+        fprintf(f, "%s\"%s\"", i ? ", " : "", sp->lan_dev[i]);
     fprintf(f, " } ");
 }
 
@@ -137,13 +137,13 @@ static void emit_ifs(FILE *f, int reverse) {
  * бы смысл давно написанной строки. Поэтому явный `from_default` значит ровно то, что
  * написано, а противоречие «клиенты описаны и подсетями, и несколькими устройствами»
  * отвергается при загрузке спеки (см. load_spec), а не разрешается движком на свой вкус. */
-static void emit_from(FILE *f, const struct group *g) {
-    if (g->from_n) emit_who(f, g, 0); else emit_ifs(f, 0);
+static void emit_from(const struct spec *sp, FILE *f, const struct group *g) {
+    if (g->from_n) emit_who(f, g, 0); else emit_ifs(sp, f, 0);
 }
 
 /* То же «кто», но на встречном пути: там наш клиент — это ПОЛУЧАТЕЛЬ. */
-static void emit_to(FILE *f, const struct group *g) {
-    if (g->from_n) emit_who(f, g, 1); else emit_ifs(f, 1);
+static void emit_to(const struct spec *sp, FILE *f, const struct group *g) {
+    if (g->from_n) emit_who(f, g, 1); else emit_ifs(sp, f, 1);
 }
 
 
@@ -201,9 +201,9 @@ static void emit_to(FILE *f, const struct group *g) {
  * вовсе. Пропуск — по биту STEER_TUNNEL_BIT, который такой сокет несёт рядом с меткой цели (почему
  * бит, а не UID помощника, — у определения в spec.h). Условие пишется только в спеке с via: у
  * остальных текст правил остаётся прежним побайтно, а бита там не ставит никто. */
-static void emit_local_dns_redirect(FILE *f) {
+static void emit_local_dns_redirect(const struct spec *sp, FILE *f) {
     char tun[64] = "";
-    if (has_via())
+    if (has_via(sp))
         snprintf(tun, sizeof(tun), "meta mark and 0x%08x == 0x00000000 ", STEER_TUNNEL_BIT);
     fprintf(f, "        meta mark and 0x%08x != 0x%08x %sudp dport 53 ct mark set mark counter "
                "redirect to :%d comment \"steer-dns-local\"\n",
@@ -213,8 +213,8 @@ static void emit_local_dns_redirect(FILE *f) {
             STEER_MARK_MASK, STEER_SELF_MARK, tun, DNS_PORT);
 }
 
-static void emit_local_dns(FILE *f, const char *dnat_kw) {
-    emit_local_dns_redirect(f);
+static void emit_local_dns(const struct spec *sp, FILE *f, const char *dnat_kw) {
+    emit_local_dns_redirect(sp, f);
     if (has_fakeip())
         fprintf(f, "        ip daddr 198.18.0.0/15 counter %s to ip daddr map @fakeip "
                    "comment \"steer-fakeip-local\"\n", dnat_kw);
@@ -533,9 +533,9 @@ static void emit_traceroute_raw(FILE *f) {
 
 /* Правила перехвата Telegram — объяснение у цепочки tgws_redirect в generate. Функцией по
  * той же причине: в старой раскладке они живут в общей цепочке nat таблицы ip. */
-static void emit_tgws_rules(FILE *f) {
-    for (size_t i = 0; i < g_out_n; i++) {
-        struct output *o = &g_out[i];
+static void emit_tgws_rules(const struct spec *sp, FILE *f) {
+    for (size_t i = 0; i < sp->out_n; i++) {
+        const struct output *o = &sp->out[i];
         if (o->kind != OUT_TGWS) continue;
         fprintf(f, "        meta mark and 0x%08x == 0x%08x tcp dport { 443, 80, 5222 } "
                    "counter redirect to :%d comment \"steer:tgws:%s\"\n",
@@ -547,9 +547,9 @@ static void emit_tgws_rules(FILE *f) {
  * файла в cmd_apply (добавить-и-удалить каждую таблицу раскладки одной транзакцией), — и
  * ответ у них обязан совпадать, иначе `delete table` встретил бы таблицу, которой файл не
  * создаёт, или наоборот. */
-int legacy_has_ip(void) {
+int legacy_has_ip(const struct spec *sp) {
     if (!NFT_LEGACY) return 0;
-    if (has_tgws()) return 1;
+    if (has_tgws(sp)) return 1;
 #ifdef STEER_TGWS
     return 0;
 #else
@@ -582,14 +582,14 @@ int legacy_has_ip6(void) {
  * трафик» набора нет, и её IPv6 ушёл бы мимо туннеля: маршруты выхода движок ставит только
  * для IPv4. Поэтому такой группе IPv6 отвечается отказом — приложения переходят на IPv4 (так
  * устроен выбор адреса у любого клиента с двумя стеками), и ничего не утекает напрямую. */
-static int emit_output_mark(FILE *f, struct err *e) {
+static int emit_output_mark(const struct spec *sp, FILE *f, struct err *e) {
     fprintf(f, "\n    chain output_mark {\n"
                "        type %s hook output priority mangle + 1; policy accept;\n",
             NFT_LEGACY ? "filter" : "route");
     for (size_t i = 0; i < g_grp_n; i++) {
         struct group *g = &g_grp[i];
         if (!group_is_local(g)) continue;
-        struct output *o = out_by_name(g->out);
+        struct output *o = out_by_name(sp, g->out);
         if (!o) return err_set(e, "channel group %s points at a missing output", g->name);
         if (g->all && out_needs_mark(o)) {
             /* С тем же сужением по протоколу и портам, что и канал: канал «UDP 50000-65535»
@@ -678,11 +678,11 @@ static int emit_output_mark(FILE *f, struct err *e) {
  * ip6 — только заворот DNS, и только если ядро умеет nat в ip6 (NFTC_IP6NAT): без этого вся
  * транзакция отверглась бы из-за одной таблицы. Пустая цепочка postrouting — там же и по той
  * же причине. */
-static void generate_legacy_tail(FILE *f) {
-    if (has_domains() && g_traceroute_hops && (g_nftc & NFTC_NOTRACK)) emit_traceroute_raw(f);
+static void generate_legacy_tail(const struct spec *sp, FILE *f) {
+    if (has_domains() && sp->traceroute_hops && (g_nftc & NFTC_NOTRACK)) emit_traceroute_raw(f);
     fprintf(f, "}\n");
     int fakeip = has_domains() && has_fakeip();
-    if (legacy_has_ip()) {
+    if (legacy_has_ip(sp)) {
         fprintf(f, "table ip %s {\n", nft_table());
         if (fakeip) {
             fprintf(f, "    map fakeip {\n        type ipv4_addr : ipv4_addr;\n");
@@ -695,33 +695,33 @@ static void generate_legacy_tail(FILE *f) {
         /* IPv4-половина prerouting_dns: подсети клиентов по адресу, а без подсетей — по
          * устройству. Устройственное правило при заданных подсетях в современной раскладке
          * помечено `meta nfproto ipv6` — здесь оно уезжает в таблицу ip6. */
-        for (size_t i = 0; i < g_from_default_n; i++)
+        for (size_t i = 0; i < sp->from_default_n; i++)
             fprintf(f, "        ip saddr %s udp dport 53 counter redirect to :%d\n",
-                    g_from_default[i], DNS_PORT);
-        if (!g_from_default_n) {
+                    sp->from_default[i], DNS_PORT);
+        if (!sp->from_default_n) {
             fprintf(f, "        ");
-            emit_ifs(f, 0);
+            emit_ifs(sp, f, 0);
             fprintf(f, "udp dport 53 counter redirect to :%d\n", DNS_PORT);
         }
         /* TCP/53 рядом с UDP/53 — почему, сказано у prerouting_dns в generate. */
-        for (size_t i = 0; i < g_from_default_n; i++)
+        for (size_t i = 0; i < sp->from_default_n; i++)
             fprintf(f, "        ip saddr %s tcp dport 53 counter redirect to :%d\n",
-                    g_from_default[i], DNS_PORT);
-        if (!g_from_default_n) {
+                    sp->from_default[i], DNS_PORT);
+        if (!sp->from_default_n) {
             fprintf(f, "        ");
-            emit_ifs(f, 0);
+            emit_ifs(sp, f, 0);
             fprintf(f, "tcp dport 53 counter redirect to :%d\n", DNS_PORT);
         }
 #endif
         if (fakeip)
             fprintf(f, "        ip daddr 198.18.0.0/15 counter dnat to ip daddr map @fakeip\n");
-        emit_tgws_rules(f);
+        emit_tgws_rules(sp, f);
         fprintf(f, "    }\n");
 #ifdef STEER_ANDROID
         if (has_local_domains()) {
             fprintf(f, "    chain output_nat {\n"
                        "        type nat hook output priority dstnat - 1; policy accept;\n");
-            emit_local_dns(f, "dnat");
+            emit_local_dns(sp, f, "dnat");
             fprintf(f, "    }\n");
         }
         /* Снятие бита перемаршрутизации — см. STEER_REROUTE_BIT в spec.h. mangle + 2: сразу
@@ -742,10 +742,10 @@ static void generate_legacy_tail(FILE *f) {
                    "    chain prerouting_nat {\n"
                    "        type nat hook prerouting priority dstnat - 1; policy accept;\n"
                    "        ", nft_table());
-        emit_ifs(f, 0);
+        emit_ifs(sp, f, 0);
         fprintf(f, "udp dport 53 counter redirect to :%d\n", DNS_PORT);
         fprintf(f, "        ");
-        emit_ifs(f, 0);
+        emit_ifs(sp, f, 0);
         fprintf(f, "tcp dport 53 counter redirect to :%d\n", DNS_PORT);
         fprintf(f, "    }\n");
 #ifdef STEER_ANDROID
@@ -754,7 +754,7 @@ static void generate_legacy_tail(FILE *f) {
         if (has_local_domains()) {
             fprintf(f, "    chain output_nat {\n"
                        "        type nat hook output priority dstnat - 1; policy accept;\n");
-            emit_local_dns_redirect(f);
+            emit_local_dns_redirect(sp, f);
             fprintf(f, "    }\n");
         }
 #endif
@@ -764,7 +764,7 @@ static void generate_legacy_tail(FILE *f) {
     }
 }
 
-int generate(FILE *f, struct err *e) {
+int generate(const struct spec *sp, FILE *f, struct err *e) {
     fprintf(f, "table inet %s {\n", nft_table());
     for (size_t i = 0; i < g_grp_n; i++) {
         struct group *g = &g_grp[i];
@@ -837,7 +837,7 @@ int generate(FILE *f, struct err *e) {
                "        type filter hook prerouting priority mangle + 1; policy accept;\n");
     for (size_t i = 0; i < g_grp_n; i++) {
         struct group *g = &g_grp[i];
-        struct output *o = out_by_name(g->out);
+        struct output *o = out_by_name(sp, g->out);
         if (!o) return err_set(e, "channel group %s points at a missing output", g->name);
         /* Каналы на сам телефон — на хуке output, см. emit_output_mark. */
         if (group_is_local(g)) continue;
@@ -855,7 +855,7 @@ int generate(FILE *f, struct err *e) {
             const char *set = g->name;
             if (halves == 2 && h == 0) { nft_static_set_name(sn, sizeof(sn), g->name); set = sn; }
             fprintf(f, "        ");
-            emit_from(f, g);
+            emit_from(sp, f, g);
             emit_l4(f, g->l4, 0);
             if (g->files_n || g->domains || g->emptied) fprintf(f, "ip daddr @%s ", set);
             /* НАШИ биты, а не всё слово: `mark and ~маска or метка`. Перезапись стирала метку
@@ -904,7 +904,7 @@ int generate(FILE *f, struct err *e) {
     fprintf(f, "    }\n");
 
 #ifdef STEER_ANDROID
-    if (has_local() && emit_output_mark(f, e) != 0) return -1;
+    if (has_local() && emit_output_mark(sp, f, e) != 0) return -1;
 #endif
 
     /* ВЫХОД УПАЛ И ПУЩЕН НАПРЯМУЮ — бит «не для zapret» снимается. Правило разметки выше
@@ -917,8 +917,8 @@ int generate(FILE *f, struct err *e) {
      * postrouting. Счётчик — чтобы по дампу было видно, что правило действительно брало
      * пакеты, а не только стояло. */
     int failopen = 0;
-    for (size_t i = 0; i < g_out_n; i++)
-        if (out_failopen_capable(&g_out[i])) failopen = 1;
+    for (size_t i = 0; i < sp->out_n; i++)
+        if (out_failopen_capable(&sp->out[i])) failopen = 1;
     if (failopen)
         fprintf(f, "\n    set %s {\n        type mark\n    }\n"
                    "    chain prerouting_failopen {\n"
@@ -967,7 +967,7 @@ int generate(FILE *f, struct err *e) {
             const char *set = g->name;
             if (halves == 2 && h == 0) { nft_static_set_name(sn, sizeof(sn), g->name); set = sn; }
             fprintf(f, "        ");
-            emit_to(f, g);
+            emit_to(sp, f, g);
             /* Зеркало сужения: без него счётчик скачанного считал бы и тот трафик, который
              * правило разметки не берёт, — то есть врал бы ровно на ту величину, ради которой
              * порты и заведены. Тот же довод, что у emit_to рядом. */
@@ -1035,7 +1035,7 @@ int generate(FILE *f, struct err *e) {
      * умер, — значит нарушить единственное обещание выхода ровно тогда, когда это важнее
      * всего. Оговорка у `bypass` одна и её стоит знать: он срабатывает и на ПЕРЕПОЛНЕНИИ
      * очереди, а не только на отсутствии процесса. */
-    if (has_zapret()) {
+    if (has_zapret(sp)) {
         fprintf(f, "\n    chain zapret_queue {\n"
                    "        type filter hook postrouting priority srcnat + 2; policy accept;\n");
         fprintf(f, "        meta mark and 0x%08x == 0x%08x counter return "
@@ -1060,8 +1060,8 @@ int generate(FILE *f, struct err *e) {
          * правило стоит, счётчик нулевой, обработчик жив. Метку соединения никто из соседей
          * не трогает — она наша по назначению, тот же довод, что у conntrack_evict. Цепочка
          * ответов (zapret_queue_in) по ct mark работала и прежде. */
-        for (size_t i = 0; i < g_out_n; i++) {
-            struct output *o = &g_out[i];
+        for (size_t i = 0; i < sp->out_n; i++) {
+            const struct output *o = &sp->out[i];
             if (o->kind != OUT_ZAPRET) continue;
             fprintf(f, "        ct mark and 0x%08x == 0x%08x ct original packets 1-%d "
                        "meta mark set mark and 0x%08x counter queue num %d%s "
@@ -1078,8 +1078,8 @@ int generate(FILE *f, struct err *e) {
          * судьбу соединения. */
         fprintf(f, "\n    chain zapret_queue_in {\n"
                    "        type filter hook prerouting priority mangle; policy accept;\n");
-        for (size_t i = 0; i < g_out_n; i++) {
-            struct output *o = &g_out[i];
+        for (size_t i = 0; i < sp->out_n; i++) {
+            const struct output *o = &sp->out[i];
             if (o->kind != OUT_ZAPRET) continue;
             fprintf(f, "        ct mark and 0x%08x == 0x%08x ct reply packets 1-3 "
                        "counter queue num %d bypass comment \"steer:zapret-reply:%s\"\n",
@@ -1160,7 +1160,7 @@ int generate(FILE *f, struct err *e) {
     /* Всё, что ниже, — nat и то, что стоит рядом с ним. В старой раскладке оно устроено
      * иначе целиком (другие таблицы, одна цепочка nat), и смешивать две раскладки строками
      * через одну значило бы читать каждую строку дважды. Поэтому отдельная функция. */
-    if (NFT_LEGACY) { generate_legacy_tail(f); return 0; }
+    if (NFT_LEGACY) { generate_legacy_tail(sp, f); return 0; }
 
     /* ---- перехват Telegram у выходов kind=tgws ------------------------------------
      *
@@ -1186,10 +1186,10 @@ int generate(FILE *f, struct err *e) {
      * redirect, а не dnat на петлю: redirect подставляет адрес того интерфейса, откуда
      * пришёл пакет, и обратный путь ядро собирает само. Исходный адрес назначения мост
      * узнаёт у ядра через SO_ORIGINAL_DST — из него же выводится номер дата-центра. */
-    if (has_tgws()) {
+    if (has_tgws(sp)) {
         fprintf(f, "\n    chain tgws_redirect {\n"
                    "        type nat hook prerouting priority dstnat + 1; policy accept;\n");
-        emit_tgws_rules(f);
+        emit_tgws_rules(sp, f);
         fprintf(f, "    }\n");
     }
 
@@ -1242,12 +1242,12 @@ int generate(FILE *f, struct err *e) {
 #ifndef STEER_TGWS
     fprintf(f, "    chain prerouting_dns {\n"
                "        type nat hook prerouting priority dstnat; policy accept;\n");
-    for (size_t i = 0; i < g_from_default_n; i++)
+    for (size_t i = 0; i < sp->from_default_n; i++)
         fprintf(f, "        ip saddr %s udp dport 53 counter redirect to :%d\n",
-                g_from_default[i], DNS_PORT);
+                sp->from_default[i], DNS_PORT);
     fprintf(f, "        ");
-    if (g_from_default_n) fprintf(f, "meta nfproto ipv6 ");
-    emit_ifs(f, 0);
+    if (sp->from_default_n) fprintf(f, "meta nfproto ipv6 ");
+    emit_ifs(sp, f, 0);
     fprintf(f, "udp dport 53 counter redirect to :%d\n", DNS_PORT);
     /* TCP/53 рядом с UDP/53. Резолвер слушает TCP на том же порту (dnsd.c, «DNS по TCP»), а без
      * заворота доменный канал слеп ко всему, что спрошено по TCP: к переспросу после усечённого
@@ -1255,12 +1255,12 @@ int generate(FILE *f, struct err *e) {
      * fakeip и не попадает в набор, и соединение уходит по настоящему адресу мимо выхода.
      * Замерено на живом роутере с steer 1.5.8: Windows-клиент за несколько минут задал 22
      * вопроса по TCP к IPv6-адресу роутера — все мимо резолвера, прямо в dnsmasq. */
-    for (size_t i = 0; i < g_from_default_n; i++)
+    for (size_t i = 0; i < sp->from_default_n; i++)
         fprintf(f, "        ip saddr %s tcp dport 53 counter redirect to :%d\n",
-                g_from_default[i], DNS_PORT);
+                sp->from_default[i], DNS_PORT);
     fprintf(f, "        ");
-    if (g_from_default_n) fprintf(f, "meta nfproto ipv6 ");
-    emit_ifs(f, 0);
+    if (sp->from_default_n) fprintf(f, "meta nfproto ipv6 ");
+    emit_ifs(sp, f, 0);
     fprintf(f, "tcp dport 53 counter redirect to :%d\n", DNS_PORT);
     fprintf(f, "    }\n");
 #endif
@@ -1291,7 +1291,7 @@ int generate(FILE *f, struct err *e) {
         if (has_local_domains()) {
             fprintf(f, "    chain output_dns {\n"
                        "        type nat hook output priority dstnat; policy accept;\n");
-            emit_local_dns(f, "dnat ip");
+            emit_local_dns(sp, f, "dnat ip");
             fprintf(f, "    }\n");
         }
 #endif
@@ -1307,7 +1307,7 @@ int generate(FILE *f, struct err *e) {
          *
          * Scope is just time-exceeded (type 11): dest-unreachable must stay tracked or
          * path-MTU discovery breaks, which trades a cosmetic win for broken transfers. */
-        if (g_traceroute_hops) emit_traceroute_raw(f);
+        if (sp->traceroute_hops) emit_traceroute_raw(f);
         /* The resolver only sees what is steered to it. IPv6 as well as IPv4: the
          * router advertises itself as an IPv6 resolver by default and clients prefer
          * that server, so an IPv4-only redirect catches almost nothing — measured on a

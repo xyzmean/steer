@@ -110,12 +110,16 @@ static unsigned test_sleep(unsigned n) { (void)n; g_slept++; return 0; }
 
 #include "../src/model/spec.h"
 
-/* Mock globals */
-size_t g_out_n = 0;
-struct output g_out[MAX_OUTPUTS];
+/* Спека — значение, а не глобалы (правило 6, docs/architecture.md, раздел 2): один экземпляр
+ * на весь стенд, ровно как в других стендах модели. load_spec/registry_assign здесь мокнуты —
+ * они его не заполняют, наполняют его сами тестовые блоки ниже, напрямую полями g_spec.out[]. */
+static struct spec g_spec;
 const char *g_state_dir = "/tmp";
-int load_spec(const char *path, struct err *e) { (void)path; (void)e; return 0; }
-int registry_assign(struct err *e) { (void)e; return 0; }
+/* cmd_failover держит СВОЙ static struct spec (правило 6) и заполняет его настоящим
+ * load_spec — здесь подмена копирует туда фикстуру стенда, собранную в g_spec тестовыми
+ * блоками (out_set и соседи), ровно как настоящий load_spec заполнил бы её из файла. */
+int load_spec(const char *path, struct spec *s, struct err *e) { (void)path; (void)e; *s = g_spec; return 0; }
+int registry_assign(struct spec *s, struct err *e) { (void)s; (void)e; return 0; }
 
 /* Ход подъёма выхода читается из файла в state_dir (src/model/spec.c). Здесь он задаётся прямо:
  * стенду нужен не разбор файла — его проверяет specmatch, — а поведение сторожа при каждом
@@ -139,7 +143,7 @@ int ctnl_evict_mark(uint32_t val, uint32_t mask) {
 /* Выход kind=awg спрашивает ядро по netlink (src/kinds/awg.c); стенду сторожа ядро не нужно —
  * здоровье устройств он задаёт своим швом g_health_probe, и до этих функций дело не доходит. */
 int awg_healthy(const struct output *o, const char *dev) { (void)o; (void)dev; return 1; }
-int awg_revive(const struct output *o, const char *dev) { (void)o; (void)dev; return 0; }
+int awg_revive(const struct spec *sp, const struct output *o, const char *dev) { (void)sp; (void)o; (void)dev; return 0; }
 #include "../src/daemon/failover.c"
 
 #undef popen
@@ -159,7 +163,7 @@ static int revive_with_stderr(const struct output *o, const char *dev, char *buf
     fflush(stderr);
     int saved = dup(fileno(stderr));
     dup2(fd, fileno(stderr));
-    int rc = revive(o, dev, 0);
+    int rc = revive(&g_spec, o, dev, 0);
     fflush(stderr);
     dup2(saved, fileno(stderr));
     close(saved);
@@ -291,15 +295,15 @@ static void state_write(const char *name, const char *text) {
 /* Выход kind=xsteer с одним устройством: здоровье такого выхода — наличие устройства,
  * поэтому ни сети, ни root стенду не нужно. */
 static void out_set(const char *dev, enum on_fail of) {
-    memset(g_out, 0, sizeof(g_out));
-    g_out_n = 1;
-    snprintf(g_out[0].name, sizeof(g_out[0].name), "%s", "vl");
-    g_out[0].kind = OUT_XSTEER;
-    g_out[0].on_fail = of;
-    snprintf(g_out[0].devices[0], sizeof(g_out[0].devices[0]), "%s", dev);
-    g_out[0].devices_n = 1;
-    g_out[0].mark = 0x100000;
-    g_out[0].table = 300;
+    memset(g_spec.out, 0, sizeof(g_spec.out));
+    g_spec.out_n = 1;
+    snprintf(g_spec.out[0].name, sizeof(g_spec.out[0].name), "%s", "vl");
+    g_spec.out[0].kind = OUT_XSTEER;
+    g_spec.out[0].on_fail = of;
+    snprintf(g_spec.out[0].devices[0], sizeof(g_spec.out[0].devices[0]), "%s", dev);
+    g_spec.out[0].devices_n = 1;
+    g_spec.out[0].mark = 0x100000;
+    g_spec.out[0].table = 300;
 }
 
 /* Пул разнородных выходов: устройство создаёт и обслуживает выход-владелец (здесь
@@ -311,25 +315,25 @@ static void out_set(const char *dev, enum on_fail of) {
  * бы владелец шёл первым, он забирал бы попытку себе — проверка ниже проходила бы, ничего
  * не проверяя. */
 static void out_set_pool(const char *dev) {
-    memset(g_out, 0, sizeof(g_out));
-    g_out_n = 2;
+    memset(g_spec.out, 0, sizeof(g_spec.out));
+    g_spec.out_n = 2;
 
-    snprintf(g_out[0].name, sizeof(g_out[0].name), "%s", "pool");
-    g_out[0].kind = OUT_INTERFACE;
-    g_out[0].on_fail = FAIL_DROP;
-    snprintf(g_out[0].devices[0], sizeof(g_out[0].devices[0]), "%s", dev);
-    g_out[0].devices_n = 1;
-    g_out[0].mark = 0x200000;
-    g_out[0].table = 301;
+    snprintf(g_spec.out[0].name, sizeof(g_spec.out[0].name), "%s", "pool");
+    g_spec.out[0].kind = OUT_INTERFACE;
+    g_spec.out[0].on_fail = FAIL_DROP;
+    snprintf(g_spec.out[0].devices[0], sizeof(g_spec.out[0].devices[0]), "%s", dev);
+    g_spec.out[0].devices_n = 1;
+    g_spec.out[0].mark = 0x200000;
+    g_spec.out[0].table = 301;
 
-    snprintf(g_out[1].name, sizeof(g_out[1].name), "%s", "hub");
-    g_out[1].kind = OUT_XSTEER;
-    g_out[1].on_fail = FAIL_DROP;
-    snprintf(g_out[1].device, sizeof(g_out[1].device), "%s", dev);
-    snprintf(g_out[1].devices[0], sizeof(g_out[1].devices[0]), "%s", dev);
-    g_out[1].devices_n = 1;
-    g_out[1].mark = 0x100000;
-    g_out[1].table = 300;
+    snprintf(g_spec.out[1].name, sizeof(g_spec.out[1].name), "%s", "hub");
+    g_spec.out[1].kind = OUT_XSTEER;
+    g_spec.out[1].on_fail = FAIL_DROP;
+    snprintf(g_spec.out[1].device, sizeof(g_spec.out[1].device), "%s", dev);
+    snprintf(g_spec.out[1].devices[0], sizeof(g_spec.out[1].devices[0]), "%s", dev);
+    g_spec.out[1].devices_n = 1;
+    g_spec.out[1].mark = 0x100000;
+    g_spec.out[1].table = 300;
 }
 
 /* Пул из ДВУХ устройств одного выхода: первое — предпочтение, второе — запас. Здоровье
@@ -337,8 +341,8 @@ static void out_set_pool(const char *dev) {
  * нужны. Это ровно форма, на которой мелькал живой роутер: узел-предпочтение подхватывался
  * пробой на тик и снова падал. */
 static int g_h_first = 1, g_h_second = 1;
-static int hyst_health(const struct output *o, const char *dev) {
-    (void)o;
+static int hyst_health(const struct spec *sp, const struct output *o, const char *dev) {
+    (void)sp; (void)o;
     if (!strcmp(dev, "vpref"))  return g_h_first;
     if (!strcmp(dev, "vspare")) return g_h_second;
     return 0;
@@ -346,8 +350,8 @@ static int hyst_health(const struct output *o, const char *dev) {
 /* Задержки кандидатов задаёт стенд — тем же приёмом, что и здоровье. Сокетов не надо:
  * device_latency в бою мерит соединением TCP через устройство, а здесь шов отдаёт число. */
 static int g_ms_first = -1, g_ms_second = -1;
-static int lat_probe(const struct output *o, const char *dev) {
-    (void)o;
+static int lat_probe(const struct spec *sp, const struct output *o, const char *dev) {
+    (void)sp; (void)o;
     if (!strcmp(dev, "vpref"))  return g_ms_first;
     if (!strcmp(dev, "vspare")) return g_ms_second;
     return -1;
@@ -360,47 +364,47 @@ static void unlink_lat(void) {
     unlink(pth);
 }
 /* ВЛОЖЕННЫЕ ВЫХОДЫ (`via`): туннель выхода «in» идёт через выход «outer». Внутренний стоит в
- * g_out ПЕРВЫМ нарочно — сторож обязан спросить цель раньше него, а не полагаться на порядок
+ * g_spec.out ПЕРВЫМ нарочно — сторож обязан спросить цель раньше него, а не полагаться на порядок
  * спеки. Здоровье задаёт стенд; счётчик проб внутреннего ловит пробу, которой быть не должно:
  * при лежащей цели она не нужна и стоила бы батареи на телефоне. */
 static int g_outer_ok = 1, g_in_probes;
-static int via_health(const struct output *o, const char *dev) {
-    (void)o;
+static int via_health(const struct spec *sp, const struct output *o, const char *dev) {
+    (void)sp; (void)o;
     if (!strcmp(dev, "vout")) return g_outer_ok;
     if (!strcmp(dev, "vin")) { g_in_probes++; return 1; }
     return 0;
 }
 static void out_set_via(void) {
-    memset(g_out, 0, sizeof(g_out));
-    g_out_n = 2;
-    snprintf(g_out[0].name, sizeof(g_out[0].name), "%s", "in");
-    g_out[0].kind = OUT_XSTEER;
-    g_out[0].on_fail = FAIL_DROP;
-    snprintf(g_out[0].via, sizeof(g_out[0].via), "%s", "outer");
-    snprintf(g_out[0].devices[0], sizeof(g_out[0].devices[0]), "%s", "vin");
-    g_out[0].devices_n = 1;
-    g_out[0].mark = 0x100000;
-    g_out[0].table = 300;
-    snprintf(g_out[1].name, sizeof(g_out[1].name), "%s", "outer");
-    g_out[1].kind = OUT_INTERFACE;
-    g_out[1].on_fail = FAIL_DIRECT;
-    snprintf(g_out[1].devices[0], sizeof(g_out[1].devices[0]), "%s", "vout");
-    g_out[1].devices_n = 1;
-    g_out[1].mark = 0x200000;
-    g_out[1].table = 301;
+    memset(g_spec.out, 0, sizeof(g_spec.out));
+    g_spec.out_n = 2;
+    snprintf(g_spec.out[0].name, sizeof(g_spec.out[0].name), "%s", "in");
+    g_spec.out[0].kind = OUT_XSTEER;
+    g_spec.out[0].on_fail = FAIL_DROP;
+    snprintf(g_spec.out[0].via, sizeof(g_spec.out[0].via), "%s", "outer");
+    snprintf(g_spec.out[0].devices[0], sizeof(g_spec.out[0].devices[0]), "%s", "vin");
+    g_spec.out[0].devices_n = 1;
+    g_spec.out[0].mark = 0x100000;
+    g_spec.out[0].table = 300;
+    snprintf(g_spec.out[1].name, sizeof(g_spec.out[1].name), "%s", "outer");
+    g_spec.out[1].kind = OUT_INTERFACE;
+    g_spec.out[1].on_fail = FAIL_DIRECT;
+    snprintf(g_spec.out[1].devices[0], sizeof(g_spec.out[1].devices[0]), "%s", "vout");
+    g_spec.out[1].devices_n = 1;
+    g_spec.out[1].mark = 0x200000;
+    g_spec.out[1].table = 301;
 }
 
 static void out_set_two(void) {
-    memset(g_out, 0, sizeof(g_out));
-    g_out_n = 1;
-    snprintf(g_out[0].name, sizeof(g_out[0].name), "%s", "vl");
-    g_out[0].kind = OUT_INTERFACE;
-    g_out[0].on_fail = FAIL_DROP;
-    snprintf(g_out[0].devices[0], sizeof(g_out[0].devices[0]), "%s", "vpref");
-    snprintf(g_out[0].devices[1], sizeof(g_out[0].devices[1]), "%s", "vspare");
-    g_out[0].devices_n = 2;
-    g_out[0].mark = 0x100000;
-    g_out[0].table = 300;
+    memset(g_spec.out, 0, sizeof(g_spec.out));
+    g_spec.out_n = 1;
+    snprintf(g_spec.out[0].name, sizeof(g_spec.out[0].name), "%s", "vl");
+    g_spec.out[0].kind = OUT_INTERFACE;
+    g_spec.out[0].on_fail = FAIL_DROP;
+    snprintf(g_spec.out[0].devices[0], sizeof(g_spec.out[0].devices[0]), "%s", "vpref");
+    snprintf(g_spec.out[0].devices[1], sizeof(g_spec.out[0].devices[1]), "%s", "vspare");
+    g_spec.out[0].devices_n = 2;
+    g_spec.out[0].mark = 0x100000;
+    g_spec.out[0].table = 300;
 }
 /* Что записано активным устройством после прохода. */
 static void active_dev(char *buf, size_t n) { active_get("vl", buf, n); }
@@ -805,23 +809,23 @@ int main(void) {
      * Проверяется здесь именно порядок ответа, потому что ошибиться можно в каждой из трёх
      * ступеней по отдельности. */
     {
-        memset(g_out, 0, sizeof(g_out));
-        g_out_n = 1;
-        snprintf(g_out[0].name, sizeof(g_out[0].name), "%s", "pool");
-        g_out[0].kind = OUT_INTERFACE;
-        g_out[0].on_fail = FAIL_DROP;
-        snprintf(g_out[0].devices[0], sizeof(g_out[0].devices[0]), "%s", "nodev0");
-        snprintf(g_out[0].devices[1], sizeof(g_out[0].devices[1]), "%s", "lo");
-        g_out[0].devices_n = 2;
-        g_out[0].mark = 0x100000;
-        g_out[0].table = 300;
+        memset(g_spec.out, 0, sizeof(g_spec.out));
+        g_spec.out_n = 1;
+        snprintf(g_spec.out[0].name, sizeof(g_spec.out[0].name), "%s", "pool");
+        g_spec.out[0].kind = OUT_INTERFACE;
+        g_spec.out[0].on_fail = FAIL_DROP;
+        snprintf(g_spec.out[0].devices[0], sizeof(g_spec.out[0].devices[0]), "%s", "nodev0");
+        snprintf(g_spec.out[0].devices[1], sizeof(g_spec.out[0].devices[1]), "%s", "lo");
+        g_spec.out[0].devices_n = 2;
+        g_spec.out[0].mark = 0x100000;
+        g_spec.out[0].table = 300;
 
         /* Запись сторожа названа кандидатом и устройство на месте — берётся она. */
-        snprintf(g_out[0].device, sizeof(g_out[0].device), "%s", "nodev0");
+        snprintf(g_spec.out[0].device, sizeof(g_spec.out[0].device), "%s", "nodev0");
         state_write("active", "pool lo\n");
-        outputs_adopt_active();
+        outputs_adopt_active(&g_spec);
         check("активное устройство берётся из записи сторожа",
-              strcmp(g_out[0].device, "lo"), 0);
+              strcmp(g_spec.out[0].device, "lo"), 0);
 
         /* Записи нет вовсе: сторож ещё не проходил. Первый СУЩЕСТВУЮЩИЙ кандидат — то же
          * самое, к чему привяжет таблицу apply, и рассказывать надо о нём. */
@@ -830,29 +834,29 @@ int main(void) {
             snprintf(path, sizeof(path), "%s/active", g_dir);
             unlink(path);
         }
-        snprintf(g_out[0].device, sizeof(g_out[0].device), "%s", "nodev0");
-        outputs_adopt_active();
+        snprintf(g_spec.out[0].device, sizeof(g_spec.out[0].device), "%s", "nodev0");
+        outputs_adopt_active(&g_spec);
         check("без записи — первый существующий кандидат",
-              strcmp(g_out[0].device, "lo"), 0);
+              strcmp(g_spec.out[0].device, "lo"), 0);
 
         /* Запись устарела: названное устройство больше не кандидат этого выхода (человек
          * переписал список). Идти по ней значило бы привязать таблицу к устройству, которого
          * в настройке нет вовсе. */
-        snprintf(g_out[0].device, sizeof(g_out[0].device), "%s", "nodev0");
+        snprintf(g_spec.out[0].device, sizeof(g_spec.out[0].device), "%s", "nodev0");
         state_write("active", "pool lo0old\n");
-        outputs_adopt_active();
+        outputs_adopt_active(&g_spec);
         check("устаревшая запись не берётся",
-              strcmp(g_out[0].device, "lo"), 0);
+              strcmp(g_spec.out[0].device, "lo"), 0);
 
         /* Отказ выхода записан как «-»: активного устройства нет. Существующих кандидатов
          * тоже нет — оставляем как было, и apply честно доложит отказ, а при on_fail=drop
          * поставит запрет. Гадать тут нечем и незачем. */
-        snprintf(g_out[0].devices[1], sizeof(g_out[0].devices[1]), "%s", "nodev1");
-        snprintf(g_out[0].device, sizeof(g_out[0].device), "%s", "nodev0");
+        snprintf(g_spec.out[0].devices[1], sizeof(g_spec.out[0].devices[1]), "%s", "nodev1");
+        snprintf(g_spec.out[0].device, sizeof(g_spec.out[0].device), "%s", "nodev0");
         state_write("active", "pool -\n");
-        outputs_adopt_active();
+        outputs_adopt_active(&g_spec);
         check("живых кандидатов нет — устройство не подменяется",
-              strcmp(g_out[0].device, "nodev0"), 0);
+              strcmp(g_spec.out[0].device, "nodev0"), 0);
     }
 
     /* Уборка: файлы состояния и папка. */
@@ -1041,7 +1045,7 @@ int main(void) {
         g_state_dir = g_dir;
         g_rules = "";
         g_routes = "";
-        g_out_n = 0;                    /* выхода kind=xsteer в спеке НЕТ — и не должно быть */
+        g_spec.out_n = 0;                    /* выхода kind=xsteer в спеке НЕТ — и не должно быть */
 
         struct output o = {0};
         snprintf(o.name, sizeof(o.name), "wg0");
@@ -1058,7 +1062,7 @@ int main(void) {
         /* Файла нет: устройство не наше, и приговор прежний — проба ICMP. Эта проверка
          * стоит здесь затем, чтобы правка не отменила обычный путь заодно. */
         g_cmd_n = 0;
-        device_healthy_for(&o, "lo");
+        device_healthy_for(&g_spec, &o, "lo");
         check("без файла состояния — обычная проба пингом", cmd_seen("ping"), 1);
 
         /* Файл свежий и говорит «поднят». Пинговать наружу нельзя: у хаба полной звезды
@@ -1067,7 +1071,7 @@ int main(void) {
         state_write("xsteer-lo.json",
                     "{\"schema\":1,\"out\":\"lo\",\"up\":true,\"handshake_age\":3}\n");
         g_cmd_n = 0;
-        check("файл говорит «поднят» — устройство живо", device_healthy_for(&o, "lo"), 1);
+        check("файл говорит «поднят» — устройство живо", device_healthy_for(&g_spec, &o, "lo"), 1);
         check("файл говорит «поднят» — наружу не пингуем", cmd_seen("ping"), 0);
 
         /* Файл свежий и говорит «не поднят» — приговор его, а не пинга: клиент знает про
@@ -1075,7 +1079,7 @@ int main(void) {
         state_write("xsteer-lo.json",
                     "{\"schema\":1,\"out\":\"lo\",\"up\":false,\"handshake_age\":-1}\n");
         g_cmd_n = 0;
-        check("файл говорит «не поднят» — устройство мертво", device_healthy_for(&o, "lo"), 0);
+        check("файл говорит «не поднят» — устройство мертво", device_healthy_for(&g_spec, &o, "lo"), 0);
         check("файл говорит «не поднят» — наружу тоже не пингуем", cmd_seen("ping"), 0);
 
         /* Файл устарел: писавшего процесса нет. Врать в сторону «сломано» здесь дороже
@@ -1087,7 +1091,7 @@ int main(void) {
             ts[0].tv_nsec = ts[1].tv_nsec = 0;
             if (utimensat(AT_FDCWD, xs, ts, 0) != 0) { perror("utimensat"); return 1; }
         }
-        check("файл устарел — судим по наличию устройства", device_healthy_for(&o, "lo"), 1);
+        check("файл устарел — судим по наличию устройства", device_healthy_for(&g_spec, &o, "lo"), 1);
 
         /* И «починка»: ifdown по имени устройства netifd отвечает «Interface not found» —
          * интерфейс зовётся иначе. Сторожу здесь делать нечего, кроме как подождать. */
@@ -1139,7 +1143,7 @@ int main(void) {
         g_latency_probe = lat_probe;
         g_h_first = g_h_second = 1;
         out_set_two();
-        g_out[0].prefer_latency = 1;
+        g_spec.out[0].prefer_latency = 1;
         snprintf(g_dir, sizeof(g_dir), "/tmp/failovermatch-lat-XXXXXX");
         if (!mkdtemp(g_dir)) { perror("mkdtemp"); return 1; }
         g_state_dir = g_dir;
@@ -1166,12 +1170,12 @@ int main(void) {
         active_dev(dev, sizeof(dev));
         check("замер: разница внутри допуска решается порядком", !strcmp(dev, "vpref"), 1);
 
-        g_out[0].lat_tolerance_ms = 10;
+        g_spec.out[0].lat_tolerance_ms = 10;
         unlink_lat();
         cmd_failover(NULL, 0);
         active_dev(dev, sizeof(dev));
         check("замер: свой допуск делает ту же разницу значимой", !strcmp(dev, "vspare"), 1);
-        g_out[0].lat_tolerance_ms = 0;
+        g_spec.out[0].lat_tolerance_ms = 0;
 
         /* И ОБРАТНАЯ СТОРОНА ДОПУСКА: с текущего не уходим ради выигрыша внутри него.
          *
@@ -1220,7 +1224,7 @@ int main(void) {
         active_dev(dev, sizeof(dev));
         check("замер: без замеров выбор по порядку", !strcmp(dev, "vpref"), 1);
 
-        g_out[0].prefer_latency = 0;
+        g_spec.out[0].prefer_latency = 0;
         g_ms_first = 500; g_ms_second = 5;
         unlink_lat();
         cmd_failover(NULL, 0);

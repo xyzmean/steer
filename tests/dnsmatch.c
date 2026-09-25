@@ -406,9 +406,10 @@ int main(void) {
                         "]}\n", lst);
                 fclose(ws);
 
+                static struct spec cfg;
                 struct err e = {0};
-                if (load_spec(sp, &e) < 0) err_die(&e);
-                dch_build();
+                if (load_spec(sp, &cfg, &e) < 0) err_die(&e);
+                dch_build(&cfg);
                 check("выключенное: канала у резолвера нет", 0, (int)g_dch_n);
                 unlink(sp);
             }

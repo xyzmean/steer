@@ -100,7 +100,16 @@ int failover_loop(const char *spec, int verbose, int period) {
             if (piped) close(pfd[0]);
             int rc = cmd_failover(spec, verbose);
 #ifdef STEER_ANDROID
-            android_masq_ensure();      /* спека уже загружена проходом */
+            /* Свой экземпляр спеки (правило 6): та, что cmd_failover уже разобрал, живёт в
+             * его собственном static struct spec и наружу не смотрит. Дочерний процесс за
+             * миг до этого прошёл этим же load_spec внутри cmd_failover — если спека была
+             * годной там, второй разбор здесь не откажет; не откажет — просто не подметём
+             * masquerade в этом проходе, тем же кругом починится в следующем. */
+            {
+                static struct spec cfg;
+                struct err e2 = {0};
+                if (load_spec(spec, &cfg, &e2) == 0) android_masq_ensure(&cfg);
+            }
 #endif
             if (piped) awg_hs_send(pfd[1]);
             exit(rc);

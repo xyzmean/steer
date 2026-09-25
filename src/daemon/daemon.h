@@ -16,8 +16,8 @@ struct fwcheck { int in_firewall, masqueraded; };
 struct fwcheck fw_check(const char *device);
 int report_mark_overlap(void);
 #ifndef STEER_ANDROID
-void report_traceroute_dep(void);
-void report_output_deps(void);
+void report_traceroute_dep(const struct spec *sp);
+void report_output_deps(const struct spec *sp);
 #endif
 
 /* Путь снимка состояния status — снимает apply.c, пишет и отдаёт status.c. */
@@ -40,7 +40,7 @@ int cmd_failover(const char *spec, int verbose);   /* failover.c */
 void probe_rule_cleanup(void);   /* failover.c */
 
 #ifdef STEER_ANDROID
-void android_masq_ensure(void);
+void android_masq_ensure(const struct spec *sp);
 #endif
 
 #endif

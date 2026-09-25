@@ -271,6 +271,9 @@ int main(int argc, char **argv) {
      * (правило 5, docs/architecture.md, раздел 2) — здесь, в точке входа, err_die довершает
      * то же самое: код 2, тот же текст, что раньше печатал die() изнутри load_spec. */
     struct err e = {0};
+    /* Спека — значение, а не глобалы (правило 6): один экземпляр на весь диспетчер команд,
+     * static — держать struct spec на стеке нельзя, он большой. */
+    static struct spec cfg;
     cli_parse(c, argc, argv, 2, &a);
     if (a.state_dir) g_state_dir = a.state_dir;
     const char *spec = a.spec, *arg = a.npos ? a.pos[0] : NULL;
@@ -299,24 +302,24 @@ int main(int argc, char **argv) {
          * единой строки о причине. */
         if (a.kind && !out_kind_known(a.kind))
             die("--kind: нужен interface, vless, xsteer, zapret или direct, а не %s", a.kind);
-        if (load_spec(spec, &e) < 0) err_die(&e);
-        for (size_t i = 0; i < g_out_n; i++) {
-            const char *k = out_kind_name(g_out[i].kind);
+        if (load_spec(spec, &cfg, &e) < 0) err_die(&e);
+        for (size_t i = 0; i < cfg.out_n; i++) {
+            const char *k = out_kind_name(cfg.out[i].kind);
             if (a.kind && strcmp(a.kind, k) != 0) continue;
             /* --obfs — отдельный признак, а не вид: обфускация есть свойство выхода,
              * и init-скрипту нужен именно список тех, кому поднимать процесс. */
-            if (a.obfs && !g_out[i].obfs.on) continue;
+            if (a.obfs && !cfg.out[i].obfs.on) continue;
             if (a.via) {
-                if (g_out[i].via[0]) printf("%s\t%s\n", g_out[i].name, g_out[i].via);
+                if (cfg.out[i].via[0]) printf("%s\t%s\n", cfg.out[i].name, cfg.out[i].via);
                 continue;
             }
             /* --devices печатает устройство, и выход без устройства (kind=direct) при этом
              * пропускается: пустая строка в списке для настройки фаервола хуже её отсутствия. */
             if (a.devices) {
-                if (g_out[i].device[0]) printf("%s\n", g_out[i].device);
+                if (cfg.out[i].device[0]) printf("%s\n", cfg.out[i].device);
                 continue;
             }
-            printf("%s\n", g_out[i].name);
+            printf("%s\n", cfg.out[i].name);
         }
         return 0;
     }
@@ -359,12 +362,12 @@ int main(int argc, char **argv) {
      *
      * Код возврата — как у needs-dnsd: 0, если поднимать есть что. */
     if (!strcmp(cmd, "zapret-instances")) {
-        if (load_spec(spec, &e) < 0) err_die(&e);
-        if (registry_assign(&e) < 0) err_die(&e);
+        if (load_spec(spec, &cfg, &e) < 0) err_die(&e);
+        if (registry_assign(&cfg, &e) < 0) err_die(&e);
         int n = 0;
-        for (size_t i = 0; i < g_out_n; i++) {
-            if (g_out[i].kind != OUT_ZAPRET) continue;
-            if (access(g_out[i].zp_opts, R_OK) != 0) {
+        for (size_t i = 0; i < cfg.out_n; i++) {
+            if (cfg.out[i].kind != OUT_ZAPRET) continue;
+            if (access(cfg.out[i].zp_opts, R_OK) != 0) {
                 /* С УРОВНЕМ, а не голым «steer: ». Голый префикс в этом движке
                  * зарезервирован за отказами вызывающему (die и разбор аргументов), которые
                  * кончаются кодом 2 и до журнала не доходят; барьер в buildmatch.sh это и
@@ -372,11 +375,11 @@ int main(int argc, char **argv) {
                  * называет остальные выходы. */
                 fprintf(stderr, "steer[warn] zapret %s: файла стратегии %s нет — "
                                 "поднимать нечем, выберите стратегию\n",
-                        g_out[i].name, g_out[i].zp_opts);
+                        cfg.out[i].name, cfg.out[i].zp_opts);
                 continue;
             }
-            printf("%s\t%d\t%s\n", g_out[i].name, out_zapret_queue(&g_out[i]),
-                   g_out[i].zp_opts);
+            printf("%s\t%d\t%s\n", cfg.out[i].name, out_zapret_queue(&cfg.out[i]),
+                   cfg.out[i].zp_opts);
             n++;
         }
         return n ? 0 : 1;
@@ -386,12 +389,12 @@ int main(int argc, char **argv) {
      * не считает init-скрипт — второй расчёт того же в shell разошёлся бы при первой
      * правке, и мост слушал бы порт, на который ядро ничего не заворачивает. */
     if (!strcmp(cmd, "tgws-instances")) {
-        if (load_spec(spec, &e) < 0) err_die(&e);
-        if (registry_assign(&e) < 0) err_die(&e);
+        if (load_spec(spec, &cfg, &e) < 0) err_die(&e);
+        if (registry_assign(&cfg, &e) < 0) err_die(&e);
         int n = 0;
-        for (size_t i = 0; i < g_out_n; i++) {
-            if (g_out[i].kind != OUT_TGWS) continue;
-            printf("%s\t%d\n", g_out[i].name, out_tgws_port(&g_out[i]));
+        for (size_t i = 0; i < cfg.out_n; i++) {
+            if (cfg.out[i].kind != OUT_TGWS) continue;
+            printf("%s\t%d\n", cfg.out[i].name, out_tgws_port(&cfg.out[i]));
             n++;
         }
         return n ? 0 : 1;
@@ -422,9 +425,9 @@ int main(int argc, char **argv) {
          * зависеть от содержимого файлов списков (домен и подсеть лежат в одном), то есть
          * могла бы перевернуться ночным обновлением. Раньше этот код отвечал на вопрос
          * «нужен ли», теперь — «поднимаем», и переворачиваться нечему. */
-        if (load_spec(spec, &e) < 0) err_die(&e);
-        if (registry_assign(&e) < 0) err_die(&e);
-        if (build_groups(&e) < 0) err_die(&e);
+        if (load_spec(spec, &cfg, &e) < 0) err_die(&e);
+        if (registry_assign(&cfg, &e) < 0) err_die(&e);
+        if (build_groups(&cfg, &e) < 0) err_die(&e);
         /* В мини-сборке — «поднимать нечего», и это тот же ответ, что даёт генератор
          * правил: он там перенаправления DNS не ставит. Два ответа обязаны совпадать,
          * иначе init-скрипт однажды поднимет резолвер без правила или, хуже, правило
@@ -480,16 +483,16 @@ int main(int argc, char **argv) {
     if (!strcmp(cmd, "dev-id")) return cmd_dev_id();
     if (!strcmp(cmd, "srs-read")) return srs_dump(arg, a.out_file, a.prefixes_out, a.meta_out);
     if (!strcmp(cmd, "obfs")) {
-        if (load_spec(spec, &e) < 0) err_die(&e);
-        struct output *o = out_by_name(arg);
+        if (load_spec(spec, &cfg, &e) < 0) err_die(&e);
+        struct output *o = out_by_name(&cfg, arg);
         if (!o) die("нет такого выхода: %s", arg);
         if (!o->obfs.on) die("у выхода %s не настроен obfs", arg);
         /* Метка сокета к серверу обфускации — out_underlay_mark (см. «вложенные выходы» в
          * spec.h). При via она — метка выхода-цели, а та появляется только в реестре: без
          * registry_assign функция вернула бы ноль, то есть «напрямую», молча. Без via реестр
          * не нужен и не трогается — у этого процесса его прежде не было. */
-        if (o->via[0] && registry_assign(&e) < 0) err_die(&e);
-        obfs_set_sock_mark(out_underlay_mark(o), o->via[0] != 0);
+        if (o->via[0] && registry_assign(&cfg, &e) < 0) err_die(&e);
+        obfs_set_sock_mark(out_underlay_mark(&cfg, o), o->via[0] != 0);
         return obfs_client(o->name, o->obfs.server, o->obfs.server_port,
                            o->obfs.listen, o->obfs.listen_port);
     }

@@ -952,14 +952,14 @@ static const char *awg_out_via(const struct output *o) {
  * Здесь остаётся только то, что out_underlay_mark не решает, — имя, которого нет: -1. Спека такое
  * отвергает (via_check), так что это страховка вызова в обход парсера (стенд awgmatch). Выход via
  * без метки (direct; или метка ещё не выдана) означает то же, что via нет. */
-int awg_sock_mark(const char *via, uint32_t *mark) {
+int awg_sock_mark(const struct spec *sp, const char *via, uint32_t *mark) {
     struct output t;
     memset(&t, 0, sizeof t);
-    *mark = out_underlay_mark(&t);
+    *mark = out_underlay_mark(sp, &t);
     if (!via || !*via) return 0;
     snprintf(t.via, sizeof t.via, "%s", via);
-    if (!out_via(&t)) return -1;
-    *mark = out_underlay_mark(&t);
+    if (!out_via(sp, &t)) return -1;
+    *mark = out_underlay_mark(sp, &t);
     return 0;
 }
 
@@ -1301,7 +1301,7 @@ static void dev_state_drop(const char *dev) {
 
 /* Поднять и настроить устройство выхода. loud — apply (предупреждения о файле печатаются);
  * сторож зовёт тихо, чтобы раз в пять минут не повторять одно и то же. 0 — готово. */
-static int awg_configure(const struct output *o, int loud) {
+static int awg_configure(const struct spec *sp, const struct output *o, int loud) {
     static struct awg_conf c;         /* ~20 КБ — не на стек телефона */
     struct awg_secrets s;
     char err[256];
@@ -1330,7 +1330,7 @@ static int awg_configure(const struct output *o, int loud) {
 
     uint32_t fwmark;
     const char *via = awg_out_via(o);
-    if (awg_sock_mark(via, &fwmark) != 0) {
+    if (awg_sock_mark(sp, via, &fwmark) != 0) {
         fprintf(stderr, LOG_W "выход %s: via %s — такого выхода нет\n", o->name, via);
         goto out;
     }
@@ -1472,25 +1472,25 @@ out:
 
 /* ---- apply и down ------------------------------------------------------------------------ */
 
-int awg_apply_all(void) {
+int awg_apply_all(const struct spec *sp) {
     char reg[REG_MAX][IFNAMSIZ], keep[REG_MAX][IFNAMSIZ];
     size_t reg_n = reg_read(reg), keep_n = 0;
     int bad = 0;
-    for (size_t i = 0; i < g_out_n; i++) {
-        const struct output *o = &g_out[i];
+    for (size_t i = 0; i < sp->out_n; i++) {
+        const struct output *o = &sp->out[i];
         if (o->kind != OUT_AWG) continue;
         /* Два выхода на одно устройство настраивали бы его по очереди, и победил бы второй —
          * молча. Имена выводятся из имён выходов, так что это почти всегда явный `device`. */
         int dup = 0;
         for (size_t k = 0; k < i; k++)
-            if (g_out[k].kind == OUT_AWG && !strcmp(g_out[k].device, o->device)) dup = 1;
+            if (sp->out[k].kind == OUT_AWG && !strcmp(sp->out[k].device, o->device)) dup = 1;
         if (dup) {
             fprintf(stderr, LOG_W "выход %s: устройство %s уже занято другим выходом kind=awg\n",
                     o->name, o->device);
             bad++;
             continue;
         }
-        if (awg_configure(o, 1) != 0) bad++;
+        if (awg_configure(sp, o, 1) != 0) bad++;
         /* В реестр — даже при отказе: устройство могло быть создано до отказа настройки, и
          * снять его потом должен кто-то. */
         if (keep_n < REG_MAX) snprintf(keep[keep_n++], IFNAMSIZ, "%s", o->device);
@@ -1512,10 +1512,10 @@ int awg_apply_all(void) {
     return bad;
 }
 
-int awg_check_all(void) {
+int awg_check_all(const struct spec *sp) {
     int bad = 0;
-    for (size_t i = 0; i < g_out_n; i++) {
-        const struct output *o = &g_out[i];
+    for (size_t i = 0; i < sp->out_n; i++) {
+        const struct output *o = &sp->out[i];
         if (o->kind != OUT_AWG) continue;
         static struct awg_conf c;
         struct awg_secrets s;
@@ -1637,9 +1637,9 @@ int awg_healthy(const struct output *o, const char *dev) {
     return verdict;
 }
 
-int awg_revive(const struct output *o, const char *dev) {
+int awg_revive(const struct spec *sp, const struct output *o, const char *dev) {
     fprintf(stderr, LOG_W "%s: туннель молчит — заново разрешаю Endpoint и перенастраиваю\n", dev);
-    if (awg_configure(o, 0) != 0) return 0;
+    if (awg_configure(sp, o, 0) != 0) return 0;
     return awg_healthy(o, dev);
 }
 

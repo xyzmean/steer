@@ -254,7 +254,7 @@ size_t fakeip_rehydrate(int nk_open, size_t *routed_out);
 uint64_t dch_match_mask(const char *host);
 int dch_first(uint64_t mask);
 uint64_t dch_fakeip_only(uint64_t mask);
-void dch_build(void);
+void dch_build(const struct spec *sp);
 void dch_sig_write(void);
 
 /* dlog.c */

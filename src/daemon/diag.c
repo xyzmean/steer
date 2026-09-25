@@ -227,15 +227,17 @@ static int bridge_nf_on(void) {
 #endif
 
 int cmd_diag(const char *spec) {
+    static struct spec cfg;
+    const struct spec *sp = &cfg;
     /* Правило 5, docs/architecture.md, раздел 2: err_die здесь довершает то, что раньше делал
      * die() изнутри load_spec/build_groups. */
     struct err e = {0};
-    if (load_spec(spec, &e) < 0) err_die(&e);
-    if (registry_assign(&e) < 0) err_die(&e);
-    if (build_groups(&e) < 0) err_die(&e);
+    if (load_spec(spec, &cfg, &e) < 0) err_die(&e);
+    if (registry_assign(&cfg, &e) < 0) err_die(&e);
+    if (build_groups(&cfg, &e) < 0) err_die(&e);
     /* Приговор выносится тому устройству, которое несёт трафик, — тому же, о котором
      * рассказывает status и к которому привязал таблицу apply (outputs_adopt_active). */
-    outputs_adopt_active();
+    outputs_adopt_active(&cfg);
     /* Раскладка — чтобы искать правила там, где их ставит apply (nft_has, наборы ниже). */
     g_nftc = nft_compat();
     printf("{\"schema\":1,\"checks\":[");
@@ -302,15 +304,15 @@ int cmd_diag(const char *spec) {
      *
      *     Спрашиваем /sys/class/net, а не спеку: спека описывает намерение, а вопрос здесь
      *     про роутер. warn, а не fail — остальные устройства при этом работают. */
-    for (size_t i = 0; i < g_lan_dev_n; i++) {
+    for (size_t i = 0; i < sp->lan_dev_n; i++) {
         char devpath[128], what[160];
-        snprintf(devpath, sizeof(devpath), "/sys/class/net/%.63s", g_lan_dev[i]);
+        snprintf(devpath, sizeof(devpath), "/sys/class/net/%.63s", sp->lan_dev[i]);
         if (access(devpath, F_OK) == 0) {
-            snprintf(what, sizeof(what), "трафик забирается с %.64s", g_lan_dev[i]);
+            snprintf(what, sizeof(what), "трафик забирается с %.64s", sp->lan_dev[i]);
             diag("lan_device", "ok", what, "");
         } else {
             snprintf(what, sizeof(what), "%.64s перечислен, но такого устройства на роутере нет",
-                     g_lan_dev[i]);
+                     sp->lan_dev[i]);
             diag("lan_device", "warn", what,
                  "правила по нему не сработают: проверьте имя или поднимите интерфейс "
                  "(у Tailscale и ZeroTier устройство появляется вместе со своим демоном)");
@@ -398,8 +400,8 @@ int cmd_diag(const char *spec) {
     int v6 = system("ip -6 route show default 2>/dev/null | grep -q .") == 0;
     if (v6) {
         int drops = 0;
-        for (size_t i = 0; i < g_out_n; i++)
-            if (g_out[i].on_fail == FAIL_DROP) drops++;
+        for (size_t i = 0; i < sp->out_n; i++)
+            if (sp->out[i].on_fail == FAIL_DROP) drops++;
         int dom_only = 1;
         for (size_t i = 0; i < g_grp_n; i++)
             if (g_grp[i].files_n) dom_only = 0;
@@ -440,7 +442,7 @@ int cmd_diag(const char *spec) {
      *    тоже нет. Скопировать заметку на xsteer значило бы напечатать постоянную заметку
      *    без причины — ровно то, из-за чего была убрана проверка `udp`. */
     for (size_t i = 0; i < g_grp_n; i++) {
-        struct output *o = out_by_name(g_grp[i].out);
+        struct output *o = out_by_name(sp, g_grp[i].out);
         if (!o || o->kind != OUT_VLESS) continue;
         char found[64];
         const char *who = NULL;
@@ -471,10 +473,10 @@ int cmd_diag(const char *spec) {
 
     /* 7. Выходы: устройство, зона фаервола, NAT. То же, что в status, но с приговором —
      *    в status это поля, и какие из них важны, человек угадывал сам. */
-    for (size_t i = 0; i < g_out_n; i++) {
-        if (!out_has_device(&g_out[i])) continue;
+    for (size_t i = 0; i < sp->out_n; i++) {
+        if (!out_has_device(&sp->out[i])) continue;
         char path[128];
-        snprintf(path, sizeof(path), "/sys/class/net/%s/operstate", g_out[i].device);
+        snprintf(path, sizeof(path), "/sys/class/net/%s/operstate", sp->out[i].device);
         int present = access(path, R_OK) == 0;
         char what[160], why[240];
         if (!present) {
@@ -492,11 +494,11 @@ int cmd_diag(const char *spec) {
              * приговор. */
             /* У владельца устройства, а не у назвавшего его выхода: см. ту же строку в
              * cmd_status. */
-            const struct output *po = out_for_device(&g_out[i], g_out[i].device);
+            const struct output *po = out_for_device(sp, &sp->out[i], sp->out[i].device);
             struct probe_status pr = probe_read(po->name);
             if (pr.state == PROBE_RUNNING) {
                 snprintf(what, sizeof(what), "выход %.40s: проверяю узлы, %d из %d",
-                         g_out[i].name, pr.node, pr.total);
+                         sp->out[i].name, pr.node, pr.total);
                 /* Строка короткая не для красоты: буфер 240 байт, а кириллица — два байта
                  * на знак, и обрезка пришлась бы посреди последовательности UTF-8. */
                 snprintf(why, sizeof(why),
@@ -516,7 +518,7 @@ int cmd_diag(const char *spec) {
             if (pr.state == PROBE_NO_SUCH_NODE) {
                 snprintf(what, sizeof(what),
                          "выход %.40s: выбран узел %d, а пригодных в подписке %d",
-                         g_out[i].name, pr.node, pr.total);
+                         sp->out[i].name, pr.node, pr.total);
                 /* Текст короткий не для красоты: буфер 240 байт, а кириллица — два байта на
                  * знак, и обрезка пришлась бы посреди последовательности UTF-8. Ровно на
                  * этом компилятор и поймал первую редакцию (301 байт). */
@@ -530,10 +532,10 @@ int cmd_diag(const char *spec) {
                 if (pr.total > 0)
                     snprintf(what, sizeof(what),
                              "выход %.40s: ни один узел подписки не ответил (проверено %d)",
-                             g_out[i].name, pr.total);
+                             sp->out[i].name, pr.total);
                 else
                     snprintf(what, sizeof(what), "выход %.40s: в подписке нет пригодных узлов",
-                             g_out[i].name);
+                             sp->out[i].name);
                 /* Два готовых текста вместо одного с подстановкой: с подстановкой длинная
                  * ветка не влезала в буфер, а обрезка кириллицы рвёт знак пополам. */
                 if (pr.total > 0)
@@ -548,22 +550,22 @@ int cmd_diag(const char *spec) {
                 continue;
             }
             snprintf(what, sizeof(what), "выход %.40s: устройства %.24s нет",
-                     g_out[i].name, g_out[i].device);
+                     sp->out[i].name, sp->out[i].device);
             snprintf(why, sizeof(why), "туннель не поднят — %s",
                      out_engine_managed(po) ? "смотрите журнал движка"
                                             : "проверьте настройку интерфейса");
             diag("output", "fail", what, why);
             continue;
         }
-        struct fwcheck c = fw_check(g_out[i].device);
+        struct fwcheck c = fw_check(sp->out[i].device);
         /* Нужен ли masquerade — свойство УСТРОЙСТВА, а не выхода, который его назвал: в пуле
          * kind=interface активным бывает устройство VLESS-туннеля или хаба xsteer, и вопрос
          * решает его владелец. Без этого исправно собранный пул получал бы вечное «нет
          * masquerade» — ту самую жёлтую метку, из-за которой перестают смотреть на проверки. */
-        const struct output *nat_o = out_for_device(&g_out[i], g_out[i].device);
+        const struct output *nat_o = out_for_device(sp, &sp->out[i], sp->out[i].device);
         if (!c.in_firewall) {
             snprintf(what, sizeof(what), "выход %.40s: %.24s вне зоны фаервола",
-                     g_out[i].name, g_out[i].device);
+                     sp->out[i].name, sp->out[i].device);
             diag("output", "fail", what,
                  "фаервол отбросит ответы — добавьте устройство в зону");
         } else if (!c.masqueraded && !out_self_natting(nat_o)) {
@@ -572,13 +574,13 @@ int cmd_diag(const char *spec) {
              * на исправной системе — это постоянная жёлтая метка, которая учит не смотреть на
              * проверки вовсе. */
             snprintf(what, sizeof(what), "выход %.40s: у %.24s нет masquerade",
-                     g_out[i].name, g_out[i].device);
+                     sp->out[i].name, sp->out[i].device);
             diag("output", "warn", what,
                  "без подмены адреса ответы не найдут дорогу назад, если туннель этого "
                  "не делает сам");
         } else if (c.masqueraded) {
             snprintf(what, sizeof(what), "выход %.40s: устройство %.24s в зоне, NAT есть",
-                     g_out[i].name, g_out[i].device);
+                     sp->out[i].name, sp->out[i].device);
             diag("output", "ok", what, "");
         } else {
             /* Сюда попадает выход без masquerade, которому он и не нужен (vless, xsteer)
@@ -590,7 +592,7 @@ int cmd_diag(const char *spec) {
              * уходят, к хабу. Расширить условие через ||, оставив прежнее объяснение,
              * значило бы записать в диагностику неправду — а по ней настраивают. */
             snprintf(what, sizeof(what), "выход %.40s: устройство %.24s в зоне",
-                     g_out[i].name, g_out[i].device);
+                     sp->out[i].name, sp->out[i].device);
             diag("output", "ok", what,
                  nat_o->kind == OUT_XSTEER
                      ? "masquerade не нужен и вреден: адреса клиентов уходят к хабу, а NAT "
@@ -607,54 +609,54 @@ int cmd_diag(const char *spec) {
      *    собственное ядро); маршрут к серверу обфускации идёт через сам туннель (петля,
      *    которую не разорвать изнутри); MTU туннеля больше того, что помещается в
      *    поддельный TCP (тогда работает всё, кроме больших пакетов). */
-    for (size_t i = 0; i < g_out_n; i++) {
-        if (!g_out[i].obfs.on) continue;
+    for (size_t i = 0; i < sp->out_n; i++) {
+        if (!sp->out[i].obfs.on) continue;
         char what[200], why[400], cmdline[128];
 
         snprintf(cmdline, sizeof(cmdline), "pgrep -f 'steer obfs %.32s' >/dev/null 2>&1",
-                 g_out[i].name);
+                 sp->out[i].name);
         int alive = system(cmdline) == 0;
         snprintf(what, sizeof(what), "выход %.40s: обфускатор %s",
-                 g_out[i].name, alive ? "работает" : "не запущен");
+                 sp->out[i].name, alive ? "работает" : "не запущен");
         diag("obfs", alive ? "ok" : "fail", what,
              alive ? "" : "перезапустите движок: /etc/init.d/steer restart");
 
         /* nft_has смотрит в таблицу steer, здесь нужна соседняя — поэтому свой вызов. */
         snprintf(cmdline, sizeof(cmdline),
-                 "nft list chain inet steer_obfs o_%.32s >/dev/null 2>&1", g_out[i].name);
+                 "nft list chain inet steer_obfs o_%.32s >/dev/null 2>&1", sp->out[i].name);
         int guard = system(cmdline) == 0;
         if (!guard) {
             snprintf(what, sizeof(what), "выход %.40s: правила против RST нет",
-                     g_out[i].name);
+                     sp->out[i].name);
             diag("obfs", "warn", what,
                  "ядро отвечает RST на входящие сегменты обфускатора и рвёт его же сессию — "
                  "проверьте, что nft доступен процессу");
         }
 
         char dev[64] = "";
-        int link_mtu = route_egress(g_out[i].obfs.server, dev, sizeof(dev));
-        if (dev[0] && !strcmp(dev, g_out[i].device)) {
+        int link_mtu = route_egress(sp->out[i].obfs.server, dev, sizeof(dev));
+        if (dev[0] && !strcmp(dev, sp->out[i].device)) {
             snprintf(what, sizeof(what), "выход %.40s: маршрут к %.20s идёт через %.24s",
-                     g_out[i].name, g_out[i].obfs.server, dev);
+                     sp->out[i].name, sp->out[i].obfs.server, dev);
             diag("obfs", "fail", what,
                  "сервер обфускации доступен только через туннель, который сам через него и "
                  "поднимается: петля. Уберите адрес сервера из списков канала или пропишите "
                  "к нему отдельный маршрут");
         }
 
-        int wg_mtu = dev_mtu(g_out[i].device);
+        int wg_mtu = dev_mtu(sp->out[i].device);
         /* 20 внешний IP + 20 поддельный TCP + 32 сам WireGuard. Считаем от MTU того
          * устройства, которым пакет уходит наружу, а не от 1500: на PPPoE это 1492, и
          * разница ровно в те восемь байт, на которых «всё работает, кроме больших
          * страниц». */
         if (link_mtu > 0 && wg_mtu > 0 && wg_mtu > link_mtu - 72) {
             snprintf(what, sizeof(what), "выход %.40s: MTU %d великоват для обфускации",
-                     g_out[i].name, wg_mtu);
+                     sp->out[i].name, wg_mtu);
             snprintf(why, sizeof(why),
                      "поверх поддельного TCP в %d байт канала помещается %d: поставьте "
                      "интерфейсу %.24s MTU %d и тот же MTU на другой стороне туннеля, иначе "
                      "пропадать будут только большие пакеты",
-                     link_mtu, link_mtu - 72, g_out[i].device, link_mtu - 72);
+                     link_mtu, link_mtu - 72, sp->out[i].device, link_mtu - 72);
             diag("obfs", "warn", what, why);
         }
     }
@@ -670,37 +672,37 @@ int cmd_diag(const char *spec) {
      *    нет файла стратегии (обработчику нечего применять), обработчик не запущен (при
      *    on_fail=drop это ещё и остановленный трафик канала, что человек читает как
      *    «интернета нет», а не как «обход упал»). */
-    for (size_t i = 0; i < g_out_n; i++) {
-        if (g_out[i].kind != OUT_ZAPRET) continue;
+    for (size_t i = 0; i < sp->out_n; i++) {
+        if (sp->out[i].kind != OUT_ZAPRET) continue;
         char what[200], why[400];
-        int q = out_zapret_queue(&g_out[i]);
+        int q = out_zapret_queue(&sp->out[i]);
 
         if (access(NFQWS_PATH, X_OK) != 0) {
             snprintf(what, sizeof(what), "выход %.40s: обход DPI не установлен",
-                     g_out[i].name);
+                     sp->out[i].name);
             snprintf(why, sizeof(why),
                      "нет " NFQWS_PATH " — поставьте пакет zapret. Правило очереди при этом "
                      "стоит, и при on_fail=%s трафик канала %s",
-                     g_out[i].on_fail == FAIL_DROP ? "drop" : "direct",
-                     g_out[i].on_fail == FAIL_DROP ? "остановлен" : "идёт без обхода");
+                     sp->out[i].on_fail == FAIL_DROP ? "drop" : "direct",
+                     sp->out[i].on_fail == FAIL_DROP ? "остановлен" : "идёт без обхода");
             diag("zapret", "fail", what, why);
             continue;
         }
-        if (access(g_out[i].zp_opts, R_OK) != 0) {
-            snprintf(what, sizeof(what), "выход %.40s: файла стратегии нет", g_out[i].name);
+        if (access(sp->out[i].zp_opts, R_OK) != 0) {
+            snprintf(what, sizeof(what), "выход %.40s: файла стратегии нет", sp->out[i].name);
             snprintf(why, sizeof(why),
                      "%.200s не читается — стратегию выбирают в splify2, вкладка Zapret. "
                      "Без файла обработчик не поднимается вовсе",
-                     g_out[i].zp_opts);
+                     sp->out[i].zp_opts);
             diag("zapret", "fail", what, why);
             continue;
         }
         int alive = nfqws_on_queue(q);
         snprintf(what, sizeof(what), "выход %.40s: обработчик очереди %d %s",
-                 g_out[i].name, q, alive ? "работает" : "не запущен");
+                 sp->out[i].name, q, alive ? "работает" : "не запущен");
         snprintf(why, sizeof(why), "%s",
                  alive ? ""
-                 : g_out[i].on_fail == FAIL_DROP
+                 : sp->out[i].on_fail == FAIL_DROP
                    ? "перезапустите движок: /etc/init.d/steer restart. До тех пор трафик "
                      "канала ОСТАНОВЛЕН — так выражен on_fail=drop, очередь стоит без bypass"
                    : "перезапустите движок: /etc/init.d/steer restart. До тех пор трафик "

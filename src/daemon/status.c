@@ -96,7 +96,7 @@ static int status_from_snapshot(void) {
 /* Сам ответ. Поток параметром, потому что печатается он ДВАЖДЫ в разные места: в снимок на
  * диске и человеку (точнее, тому, кто позвал). Считать его два раза было бы вдвое дороже
  * ровно того, ради чего снимок и заведён. */
-static void status_emit(FILE *out) {
+static void status_emit(const struct spec *sp, FILE *out) {
     /* УМЕНИЯ ДВИЖКА — перечнем имён и верхним уровнем.
      *
      * Зачем вообще. Незнакомый ключ спеки движок пропускает МОЛЧА (js_skip) — это и есть
@@ -132,14 +132,14 @@ static void status_emit(FILE *out) {
      * без этого поля ему пришлось бы читать спеку вторым источником, то есть однажды
      * показать не то, что применено. */
     fprintf(out, ",\"lan_devices\":[");
-    for (size_t i = 0; i < g_lan_dev_n; i++)
-        fprintf(out, "%s\"%s\"", i ? "," : "", g_lan_dev[i]);
+    for (size_t i = 0; i < sp->lan_dev_n; i++)
+        fprintf(out, "%s\"%s\"", i ? "," : "", sp->lan_dev[i]);
     fprintf(out, "],\"outputs\":{");
-    for (size_t i = 0; i < g_out_n; i++) {
+    for (size_t i = 0; i < sp->out_n; i++) {
         char devpath[128];
         int up = 0;
-        if (out_has_device(&g_out[i])) {
-            snprintf(devpath, sizeof(devpath), "/sys/class/net/%s/operstate", g_out[i].device);
+        if (out_has_device(&sp->out[i])) {
+            snprintf(devpath, sizeof(devpath), "/sys/class/net/%s/operstate", sp->out[i].device);
             FILE *df = fopen(devpath, "r");
             if (df) {
                 char st[16] = "";
@@ -147,18 +147,18 @@ static void status_emit(FILE *out) {
                 fclose(df);
             }
         }
-        fprintf(out, "%s\"%s\":{\"kind\":\"%s\"", i ? "," : "", g_out[i].name,
-               out_kind_name(g_out[i].kind));
+        fprintf(out, "%s\"%s\":{\"kind\":\"%s\"", i ? "," : "", sp->out[i].name,
+               out_kind_name(sp->out[i].kind));
         /* Через какой выход идёт туннель этого выхода (`via`, см. «вложенные выходы» в
          * spec.h). Поля нет, когда туннель идёт напрямую, — как в спеке. Живость цели здесь не
          * повторяется: она видна у самой цели в этом же ответе, а второй источник того же
          * ответа однажды разошёлся бы с первым. */
-        if (g_out[i].via[0]) fprintf(out, ",\"via\":\"%s\"", g_out[i].via);
-        if (out_has_device(&g_out[i])) {
-            struct fwcheck c = fw_check(g_out[i].device);
+        if (sp->out[i].via[0]) fprintf(out, ",\"via\":\"%s\"", sp->out[i].via);
+        if (out_has_device(&sp->out[i])) {
+            struct fwcheck c = fw_check(sp->out[i].device);
             fprintf(out, ",\"device\":\"%s\",\"up\":%s,\"mark\":\"0x%08x\",\"table\":%d"
                    ",\"in_firewall\":%s,\"nat\":%s",
-                   g_out[i].device, up ? "true" : "false", g_out[i].mark, g_out[i].table,
+                   sp->out[i].device, up ? "true" : "false", sp->out[i].mark, sp->out[i].table,
                    c.in_firewall ? "true" : "false", c.masqueraded ? "true" : "false");
             /* Кандидаты и режим отказа: без них failover не виден из интерфейса, и
              * человек не может понять, почему выход вдруг ведёт в другое устройство. */
@@ -173,7 +173,7 @@ static void status_emit(FILE *out) {
                  * «проверяю узлы, 3 из 26» — то же враньё, ради снятия которого перебор и
                  * стал виден (I-100). */
                 struct probe_status pr =
-                    probe_read(out_for_device(&g_out[i], g_out[i].device)->name);
+                    probe_read(out_for_device(sp, &sp->out[i], sp->out[i].device)->name);
                 if (pr.state == PROBE_RUNNING)
                     fprintf(out, ",\"probe\":{\"state\":\"probing\",\"node\":%d,\"total\":%d}",
                            pr.node, pr.total);
@@ -187,11 +187,11 @@ static void status_emit(FILE *out) {
                                  ",\"total\":%d}", pr.node, pr.total);
             }
             fprintf(out, ",\"devices\":[");
-            for (size_t d = 0; d < g_out[i].devices_n; d++)
-                fprintf(out, "%s\"%s\"", d ? "," : "", g_out[i].devices[d]);
+            for (size_t d = 0; d < sp->out[i].devices_n; d++)
+                fprintf(out, "%s\"%s\"", d ? "," : "", sp->out[i].devices[d]);
             fprintf(out, "],\"on_fail\":\"%s\"",
-                   g_out[i].on_fail == FAIL_DROP ? "drop" :
-                   g_out[i].on_fail == FAIL_ZAPRET ? "zapret" : "direct");
+                   sp->out[i].on_fail == FAIL_DROP ? "drop" :
+                   sp->out[i].on_fail == FAIL_ZAPRET ? "zapret" : "direct");
             /* Выбранные узлы подписки — рядом с devices, потому что это то же самое: список
              * кандидатов выхода, только у vless кандидаты называются номерами узлов.
              * Печатается ВСЕГДА, в том числе пустым, и это главное здесь: незнакомый ключ
@@ -200,23 +200,23 @@ static void status_emit(FILE *out) {
              * выбирал. Наличие поля в status — единственный способ узнать движок, который
              * `nodes` понимает, до того как их писать. Тем же приёмом узнаётся движок с
              * lan_devices. */
-            if (g_out[i].kind == OUT_VLESS) {
+            if (sp->out[i].kind == OUT_VLESS) {
                 fprintf(out, ",\"nodes\":[");
-                for (size_t d = 0; d < g_out[i].nodes_n; d++)
-                    fprintf(out, "%s%d", d ? "," : "", g_out[i].nodes[d]);
+                for (size_t d = 0; d < sp->out[i].nodes_n; d++)
+                    fprintf(out, "%s%d", d ? "," : "", sp->out[i].nodes[d]);
                 fprintf(out, "]");
             }
             /* Обфускация — поле, а не отдельный вид выхода, поэтому и в статусе она
              * поле. Признак живости здесь не печатается намеренно: status опрашивают
              * раз в пять секунд, а pgrep — это запуск процесса; приговор о живости
              * даёт diag, который спрашивают по нажатию. */
-            if (g_out[i].obfs.on)
+            if (sp->out[i].obfs.on)
                 fprintf(out, ",\"obfs\":{\"mode\":\"wg-over-tcp\",\"server\":\"%s:%d\""
                        ",\"listen\":\"%s:%d\"}",
-                       g_out[i].obfs.server, g_out[i].obfs.server_port,
-                       g_out[i].obfs.listen, g_out[i].obfs.listen_port);
+                       sp->out[i].obfs.server, sp->out[i].obfs.server_port,
+                       sp->out[i].obfs.listen, sp->out[i].obfs.listen_port);
             /* Туннель kind=awg: рукопожатие, счётчики, эндпоинт — из ядра, см. awg_status_json. */
-            if (g_out[i].kind == OUT_AWG) awg_status_json(out, &g_out[i]);
+            if (sp->out[i].kind == OUT_AWG) awg_status_json(out, &sp->out[i]);
         }
         /* Выход kind=zapret: устройства нет, поэтому и ветка своя. Печатается всё, что о
          * нём вообще можно знать снаружи, и ничего сверх того:
@@ -236,13 +236,13 @@ static void status_emit(FILE *out) {
          * дублирует diag; здесь без него у выхода не было бы вообще НИ ОДНОГО признака
          * работы — устройства нет, счётчик канала растёт одинаково при живом и мёртвом
          * обходе (пакеты уходят и так, разница в том, доходят ли они). */
-        if (g_out[i].kind == OUT_ZAPRET) {
-            int q = out_zapret_queue(&g_out[i]);
+        if (sp->out[i].kind == OUT_ZAPRET) {
+            int q = out_zapret_queue(&sp->out[i]);
             fprintf(out, ",\"mark\":\"0x%08x\",\"queue\":%d,\"opts_file\":\"%s\""
                    ",\"up\":%s,\"on_fail\":\"%s\"",
-                   g_out[i].mark, q, g_out[i].zp_opts,
+                   sp->out[i].mark, q, sp->out[i].zp_opts,
                    nfqws_on_queue(q) ? "true" : "false",
-                   g_out[i].on_fail == FAIL_DROP ? "drop" : "direct");
+                   sp->out[i].on_fail == FAIL_DROP ? "drop" : "direct");
         }
         fprintf(out, "}");
     }
@@ -279,6 +279,7 @@ static void status_emit(FILE *out) {
  * Печатается ФАЙЛ, а не второй проход печати: обход выходов читает /sys, а счётчики — живую
  * цепочку nft, и второй проход дал бы в снимке и на экране два разных мгновения. */
 int cmd_status(const char *spec, int fast) {
+    static struct spec cfg;
     /* Запомненное — раньше разбора спеки: смысл `--fast` в том, чтобы не делать работу
      * вовсе. Спека при этом не читается, то есть негодная спека `--fast` не ломает — он
      * отвечает тем, что было применено, пока она была годной. */
@@ -287,28 +288,28 @@ int cmd_status(const char *spec, int fast) {
     /* Правило 5, docs/architecture.md, раздел 2: err_die здесь довершает то, что раньше делал
      * die() изнутри load_spec/build_groups. */
     struct err e = {0};
-    if (load_spec(spec, &e) < 0) err_die(&e);
-    if (registry_assign(&e) < 0) err_die(&e);
-    if (build_groups(&e) < 0) err_die(&e);
+    if (load_spec(spec, &cfg, &e) < 0) err_die(&e);
+    if (registry_assign(&cfg, &e) < 0) err_die(&e);
+    if (build_groups(&cfg, &e) < 0) err_die(&e);
     /* О том же устройстве, к которому apply привязал таблицу, — см. outputs_adopt_active.
      * Без этого пул, уведённый сторожем на запасное устройство, отдавался бы интерфейсу
      * основным устройством с `up: false`: рабочий выход, нарисованный сломанным. */
-    outputs_adopt_active();
+    outputs_adopt_active(&cfg);
 
     char snap[256], tmp[288];
     status_snap_path(snap, sizeof snap);
     snprintf(tmp, sizeof tmp, "%s.new", snap);
     mkdir(g_state_dir, 0755);
     FILE *f = fopen(tmp, "w");
-    if (!f) { status_emit(stdout); return 0; }
-    status_emit(f);
+    if (!f) { status_emit(&cfg, stdout); return 0; }
+    status_emit(&cfg, f);
     if (fclose(f) != 0 || rename(tmp, snap) != 0) {
         unlink(tmp);
-        status_emit(stdout);
+        status_emit(&cfg, stdout);
         return 0;
     }
     f = fopen(snap, "r");
-    if (!f) { status_emit(stdout); return 0; }
+    if (!f) { status_emit(&cfg, stdout); return 0; }
     char buf[8192];
     size_t n;
     while ((n = fread(buf, 1, sizeof buf, f)) > 0) fwrite(buf, 1, n, stdout);
