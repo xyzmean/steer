@@ -305,7 +305,7 @@ static void report_legacy_gaps(const struct spec *sp, const struct groups *gr) {
     fprintf(stderr, "steer[info] apply: ядро без nat в семействе inet — правила собраны для "
                     "nftables старого ядра: таблицы inet и ip%s\n",
             legacy_has_ip6() ? " и ip6" : "");
-    if (has_zapret(sp) && !(g_nftc & NFTC_NOTRACK))
+    if (zapret_present(sp) && !(g_nftc & NFTC_NOTRACK))
         fprintf(stderr, LOG_W "ядро не знает notrack: порождённые обработчиком zapret пакеты "
                         "(подделки, куски разрезанного) остаются на учёте conntrack. Где "
                         "firewall отбрасывает ct state invalid, обход выходов kind=zapret "
@@ -449,7 +449,7 @@ int cmd_apply(const char *spec, int dry) {
     /* Отказываем ДО транзакции и НАЗЫВАЕМ причину: иначе человек получит отказ всей
      * маршрутизации с сообщением про несуществующий файл. Пакет назван прямо — его же
      * тянет за собой zapret, поэтому у тех, кто обходом уже пользуется, он стоит. */
-    if (has_zapret(&cfg) && !nfqueue_supported())
+    if (zapret_present(&cfg) && !nfqueue_supported())
         die("в спеке есть выход kind=zapret, а ядро не принимает правило queue — "
             "нужен пакет kmod-nft-queue (его ставит и сам zapret). Правила НЕ применены: "
             "nft грузит набор целиком, и отказ на очереди снял бы заодно наборы, метки и "

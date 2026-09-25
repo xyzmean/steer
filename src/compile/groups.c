@@ -169,24 +169,6 @@ int has_domains(const struct groups *gr) {
     return 0;
 }
 
-/* Есть ли хоть один выход kind=zapret. Отдельной функцией по той же причине, что
- * has_domains: цепочка очередей пишется только когда ей есть что писать, а пустая базовая
- * цепочка в postrouting — это лишний проход по правилам на КАЖДОМ пакете роутера. */
-int has_zapret(const struct spec *sp) {
-    for (size_t i = 0; i < sp->out_n; i++)
-        if (sp->out[i].kind == OUT_ZAPRET) return 1;
-    return 0;
-}
-
-/* Есть ли хоть один выход kind=tgws. Тот же довод, что у has_zapret: цепочка перехвата
- * пишется, только когда ей есть что перехватывать. */
-int has_tgws(const struct spec *sp) {
-    for (size_t i = 0; i < sp->out_n; i++)
-        if (sp->out[i].kind == OUT_TGWS) return 1;
-    return 0;
-}
-
-
 int has_fakeip(const struct groups *gr) {
     for (size_t i = 0; i < gr->n; i++)
         if (gr->g[i].domains && !gr->g[i].realip) return 1;

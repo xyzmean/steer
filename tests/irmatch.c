@@ -301,6 +301,46 @@ static void t_mixed_legacy(int nftc) {
     nft_rs_free(&rs);
 }
 
+/* ---- 2б. emit вида подключён, и порядок в тексте не зависит от порядка выходов в спеке --- */
+static const char *mixed_rev =
+    "{ \"schema\": 2, \"from_default\": [\"192.168.1.0/24\"],"
+    "  \"outputs\": { \"vpn\": { \"kind\": \"interface\", \"device\": \"wg0\" },"
+    "               \"tg\": { \"kind\": \"tgws\", \"domain\": \"ex.co.uk\" },"
+    "               \"yt\": { \"kind\": \"zapret\" } },"
+    "  \"channels\": ["
+    "    { \"name\": \"dom\", \"match\": { \"domains_files\": [\"TMP/d.lst\"], \"prefixes_files\": [\"TMP/a.lst\"] }, \"out\": \"vpn\" },"
+    "    { \"name\": \"t\", \"match\": { \"prefixes_file\": \"TMP/b.lst\" }, \"out\": \"tg\" },"
+    "    { \"name\": \"z\", \"match\": { \"prefixes_file\": \"TMP/b.lst\" }, \"out\": \"yt\" } ] }";
+
+static void t_mixed_order(void) {
+    printf("\n-- emit вида подключён; порядок выходов в спеке текст не меняет --\n");
+    check("kind zapret даёт emit", 1, kind_by_name("zapret") && kind_by_name("zapret")->emit != NULL);
+    check("kind tgws даёт emit", 1, kind_by_name("tgws") && kind_by_name("tgws")->emit != NULL);
+
+    /* Та же спека, что у mixed, но tg (tgws) объявлен ПЕРЕД yt (zapret) — и в outputs, и в
+     * channels. kind_emit_all зовёт виды в порядке реестра (zapret раньше tgws), а не в
+     * порядке их появления в спеке, поэтому в дереве цепочки zapret обязаны стоять раньше
+     * цепочки моста так же, как в t_mixed_modern. */
+    if (load(mixed_rev)) { check("спека разобрана", 0, 1); return; }
+    struct nft_rs rs;
+    if (build(&rs, 0)) { check("дерево построено", 0, 1); return; }
+    struct nft_table *t = ir_table_find(&rs, NFT_FAM_INET, NULL);
+    int zi = -1, ti = -1, i = 0;
+    for (struct nft_obj *o = t ? t->objs : NULL; o; o = o->next, i++) {
+        if (!strcmp(o->name, "zapret_queue")) zi = i;
+        if (!strcmp(o->name, "tgws_redirect")) ti = i;
+    }
+    check("цепочка zapret_queue построена", 1, zi >= 0);
+    check("цепочка tgws_redirect построена", 1, ti >= 0);
+    check("правило очереди выхода yt на месте", 1,
+          ir_rule_find(ir_chain_find(t, "zapret_queue"), "steer:zapret:yt") != NULL);
+    check("правило моста выхода tg на месте", 1,
+          ir_rule_find(ir_chain_find(t, "tgws_redirect"), "steer:tgws:tg") != NULL);
+    check("zapret в тексте раньше моста, хоть в спеке он объявлен вторым", 1,
+          zi >= 0 && ti >= 0 && zi < ti);
+    nft_rs_free(&rs);
+}
+
 #else
 /* ---- 3. каналы на сам телефон ------------------------------------------------------------ */
 static const char *phone =
@@ -405,6 +445,7 @@ int main(void) {
     t_mixed_modern();
     t_mixed_legacy(NFTC_LEGACY);
     t_mixed_legacy(NFTC_LEGACY | NFTC_IP6NAT | NFTC_NOTRACK);
+    t_mixed_order();
 #else
     t_phone(0);
     t_phone(NFTC_LEGACY);

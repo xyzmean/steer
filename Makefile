@@ -27,7 +27,12 @@ EXT_ALL_SRC := $(sort $(XS_COMMON_SRC) $(EXT_ROUTER_SRC) $(EXT_SERVER_SRC) $(EXT
 # вместе с моделью идут виды (src/kinds). Без awg.c: он тянет run_quiet из lib/run.c, а стенды
 # подменяют run_quiet своим — awg.c берут только те, кому нужен сам вид awg (specmatch, awgmatch).
 # Вид, которого в списке нет, у реестра остаётся записью отказа (см. src/kinds/kind.c).
-MODEL_KINDS := $(MODEL_SRC) $(filter-out src/kinds/awg.c,$(KINDS_BASE_SRC))
+# С src/compile/ir.c: kind_ops.emit видов zapret и tgws строит дерево ruleset (compile/ir.h)
+# напрямую, и без него компоновка падает на ir_rule/ir_x и соседях, даже если стенд emit не
+# зовёт вовсе, — символ нужен компоновщику. ir.c ничего не знает о модели (только stdlib и
+# свой заголовок), поэтому тянуть его сюда безопасно; в irmatch он уже приходит с COMPILE_SRC,
+# и там его вычитают, чтобы не собрать дважды.
+MODEL_KINDS := $(MODEL_SRC) $(filter-out src/kinds/awg.c,$(KINDS_BASE_SRC)) src/compile/ir.c
 # -I на все каталоги слоёв — через override, чтобы `make CFLAGS=...` его не терял.
 override CFLAGS += $(addprefix -I,$(INC_DIRS))
 
@@ -239,20 +244,24 @@ $(BUILD)/awgmatch-android: tests/awgmatch.c src/kinds/awg.c src/kinds/awg.h src/
 	@mkdir -p $(BUILD)
 	$(CC) $(CFLAGS) -DSTEER_ANDROID -o $@ tests/awgmatch.c $(MODEL_KINDS)
 
-# Виды — объектами (без awg.c и без парсера: стенд подменяет load_spec своей спекой).
-FAILOVERMATCH_KINDS := $(filter-out src/kinds/awg.c,$(KINDS_BASE_SRC)) $(KINDS_EXT_SRC)
+# Виды — объектами (без awg.c и без парсера: стенд подменяет load_spec своей спекой). С
+# src/compile/ir.c — тем же доводом, что у MODEL_KINDS: zapret_emit/tgws_emit зовут ir_* на
+# компоновке, даже когда стенд их не вызывает.
+FAILOVERMATCH_KINDS := $(filter-out src/kinds/awg.c,$(KINDS_BASE_SRC)) $(KINDS_EXT_SRC) src/compile/ir.c
 
 # Дерево набора правил (src/compile/ir.h): генератор и раскладка старого ядра проверяются
 # запросами к дереву, а не текстом — см. шапку tests/irmatch.c. Модули компилятора линкуются
 # с моделью отдельными объектами. Дважды — роутер и телефон (цепочки на output).
 COMPILE_SRC := $(filter-out $(MODEL_SRC),$(filter src/compile/%,$(CORE_SRC)))
+# ir.c уже входит в MODEL_KINDS (zapret_emit/tgws_emit) — не дублировать его здесь.
+COMPILE_SRC_NO_IR := $(filter-out src/compile/ir.c,$(COMPILE_SRC))
 $(BUILD)/irmatch: tests/irmatch.c tests/unit.h $(COMPILE_SRC) $(MODEL_KINDS) $(CORE_HDR)
 	@mkdir -p $(BUILD)
-	$(CC) $(CFLAGS) -o $@ tests/irmatch.c $(COMPILE_SRC) $(MODEL_KINDS)
+	$(CC) $(CFLAGS) -o $@ tests/irmatch.c $(COMPILE_SRC_NO_IR) $(MODEL_KINDS)
 
 $(BUILD)/irmatch-android: tests/irmatch.c tests/unit.h $(COMPILE_SRC) $(MODEL_KINDS) $(CORE_HDR)
 	@mkdir -p $(BUILD)
-	$(CC) $(CFLAGS) -DSTEER_ANDROID -o $@ tests/irmatch.c $(COMPILE_SRC) $(MODEL_KINDS)
+	$(CC) $(CFLAGS) -DSTEER_ANDROID -o $@ tests/irmatch.c $(COMPILE_SRC_NO_IR) $(MODEL_KINDS)
 
 $(BUILD)/failovermatch: tests/failovermatch.c src/daemon/failover.c src/daemon/daemon.h \
                         src/daemon/failover_int.h src/model/spec.h src/lib/err.c $(FAILOVERMATCH_KINDS)

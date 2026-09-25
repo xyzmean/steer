@@ -17,10 +17,6 @@ int nft_build(struct nft_rs *rs, const struct spec *sp, const struct groups *gr,
  * пишется ничего. */
 int generate(const struct spec *sp, const struct groups *gr, FILE *f, struct err *e);
 
-/* Построители видов выхода — будущий kind_ops.emit (docs/architecture.md, «Вид выхода»):
- * дописывают в дерево то, что нужно одному выходу своего вида. */
-void nft_emit_zapret(struct nft_rs *rs, const struct spec *sp, const struct output *o);
-void nft_emit_tgws(struct nft_rs *rs, const struct spec *sp, const struct output *o);
 #ifdef STEER_ANDROID
 /* Части только телефона — будущий platform_ops. */
 int nft_emit_output_mark(struct nft_rs *rs, const struct spec *sp, const struct groups *gr,

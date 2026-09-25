@@ -71,6 +71,22 @@ const struct kind_ops *kind_by_name(const char *name) {
     return NULL;
 }
 
+/* Правила видов в дерево ruleset (generate.c: nft_build). По ВИДАМ, в порядке реестра, а
+ * внутри вида — по выходам в порядке спеки: тот же приём, что у diag.c (шаг 8, kind_ops.diag)
+ * — «Обход по видам в порядке реестра, а внутри вида — по выходам в порядке спеки», и тот же
+ * довод: правила одного вида ложатся в дерево подряд, одним блоком, и текст ruleset не
+ * зависит от того, в каком порядке человек перечислил выходы разных видов в спеке. До
+ * переноса на emit это обеспечивали два ЖЁСТКО заказанных прохода в generate.c (сначала все
+ * zapret, потом все tgws); порядок реестра даёт то же самое без знания имён видов. */
+void kind_emit_all(struct nft_rs *rs, const struct spec *sp) {
+    for (size_t ki = 0; ki < REG_N; ki++) {
+        const struct kind_ops *k = kind_at(ki);
+        if (!k->emit) continue;
+        for (size_t i = 0; i < sp->out_n; i++)
+            if (kind_of(&sp->out[i]) == k) k->emit(rs, sp, &sp->out[i]);
+    }
+}
+
 void kind_sig_mix(unsigned long long *h, const void *p, size_t n) {
     const unsigned char *b = p;
     for (size_t i = 0; i < n; i++) { *h ^= b[i]; *h *= 1099511628211ULL; }

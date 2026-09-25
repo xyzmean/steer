@@ -195,22 +195,23 @@ check "в src/model, src/compile и src/lib (кроме err.c) нет die()/exit
 # найти все такие места, а забытое место — выход, который настроен и молча не работает.
 #
 # Что считается сравнением: прежние имена видов (OUT_DIRECT… — в kind.h они оставлены только
-# для генератора), записи видов по имени (kind_direct… — сравнение указателя с ними и есть
-# сравнение вида) и сравнение поля kind с адресом (`->kind == &…`). Имя вида строкой в
-# strcmp рядом с kind_of — та же проверка в другой одежде. Комментарии не в счёт.
+# для стендов, которые собирают выход конкретного вида в обход разбора спеки), записи видов по
+# имени (kind_direct… — сравнение указателя с ними и есть сравнение вида) и сравнение поля kind
+# с адресом (`->kind == &…`). Имя вида строкой в strcmp рядом с kind_of — та же проверка в
+# другой одежде. Комментарии не в счёт.
 #
-# src/compile пока исключён: генератор переводят на промежуточное дерево, и его сравнения
-# вида (has_zapret, has_tgws, цепочки очередей и перехвата) уходят вместе с переводом — в поле
-# emit таблицы вида. Когда перевод закончится, исключение снимается.
+# src/compile здесь наравне с остальным движком: построители видов (zapret, tgws) переехали в
+# kind_ops.emit (src/kinds), а has_zapret/has_tgws — в zapret_present/tgws_present там же;
+# генератор зовёт их через kind_emit_all, не зная имён видов.
 kindbad=""
 for f in $(find src -name '*.c' -o -name '*.h' | sort); do
-    case "$f" in src/kinds/*|src/compile/*) continue ;; esac
+    case "$f" in src/kinds/*) continue ;; esac
     n=$(grep -vE '^[[:space:]]*(\*|//|/\*)' "$f" |
         grep -cE '\<OUT_(DIRECT|INTERFACE|VLESS|XSTEER|ZAPRET|TGWS|AWG)\>|\<kind_(direct|interface|vless|xsteer|zapret|tgws|awg)\>|(->|\.)kind *[!=]= *&|kind_of\([^)]*\)->name *, *"|"(direct|interface|vless|xsteer|zapret|tgws|awg)" *, *kind_of')
     [ -n "$n" ] || n=0
     [ "$n" -gt 0 ] && kindbad="$kindbad$f:$n "
 done
-check "вне src/kinds (и src/compile, пока его переводят) вид выхода не сравнивается" "" "$kindbad"
+check "вне src/kinds вид выхода не сравнивается" "" "$kindbad"
 
 check "имени splify-dnsd в сообщениях журнала нет" "0" \
     "$(grep -c 'fprintf(stderr, "splify-dnsd' src/dnsd/*.c | awk -F: '{s+=$2} END{print s+0}')"

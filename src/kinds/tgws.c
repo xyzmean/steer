@@ -14,6 +14,7 @@
 #include <string.h>
 
 #include "spec.h"
+#include "ir.h"
 
 const struct tgws_cfg *out_tgws(const struct output *o) {
     return kind_of(o) == &kind_tgws ? &o->tg : NULL;
@@ -79,6 +80,58 @@ int tgws_instances(const struct spec *sp) {
     return n ? 0 : 1;
 }
 
+/* Есть ли в спеке хоть один выход kind=tgws (kind.h). */
+int tgws_present(const struct spec *sp) {
+    for (size_t i = 0; i < sp->out_n; i++)
+        if (kind_of(&sp->out[i]) == &kind_tgws) return 1;
+    return 0;
+}
+
+/* ---- перехват Telegram у выходов kind=tgws ------------------------------------
+ *
+ * ПЕРЕХВАТ, А НЕ МАРШРУТ. Приложению ничего не настраивают: соединение с дата-центром
+ * заворачивается на мост здесь же, в ядре, а он уводит его веб-сокетом (см. длинное
+ * объяснение у TGWS_PORT_BASE в spec.h).
+ *
+ * ПРИОРИТЕТ dstnat + 1, и оба слова важны. Метку канала ставит prerouting на
+ * `mangle + 1` (то есть -149), а трансляция адресов идёт на -100 — значит к моменту
+ * этой цепочки метка на пакете уже есть и по ней можно узнать выход. Плюс единица —
+ * чтобы пропустить вперёд свою же цепочку fakeip: доменное правило сначала должно
+ * вернуть настоящий адрес, и только потом мы решаем, наш ли он.
+ *
+ * ТОЛЬКО PREROUTING, то есть только трафик клиентов сети. Трафик самого роутера сюда
+ * не попадает нарочно: перехватывать собственные соединения движка (обновление
+ * списков, проверки) значило бы заворачивать в мост то, что к Telegram отношения не
+ * имеет, а разделять их было бы нечем.
+ *
+ * ПОРТЫ — те, на которых Telegram держит MTProto: 443 и 80 (обычные), 5222 (запасной у
+ * старых клиентов). UDP здесь нет: голос звонков в веб-сокет не заворачивается (см.
+ * spec.h), и пусть идёт своим путём.
+ *
+ * redirect, а не dnat на петлю: redirect подставляет адрес того интерфейса, откуда
+ * пришёл пакет, и обратный путь ядро собирает само. Исходный адрес назначения мост
+ * узнаёт у ядра через SO_ORIGINAL_DST — из него же выводится номер дата-центра.
+ *
+ * Правило помечено как IPv4 (дата-центры Telegram — IPv4-адреса): в старой раскладке оно
+ * уходит только в таблицу ip. Построитель (kind_ops.emit) — на один выход, цепочку заводит
+ * первый вызов. */
+static void tgws_emit(struct nft_rs *rs, const struct spec *sp, const struct output *o) {
+    (void)sp;
+    struct nft_table *t = ir_table_find(rs, NFT_FAM_INET, NULL);
+    struct nft_chain *c = ir_chain_find(t, "tgws_redirect");
+    if (!c) {
+        c = ir_base_chain_add(t, "tgws_redirect", "nat", "prerouting", "dstnat", 1);
+        ir_gap(c);
+    }
+    struct nft_rule *r = ir_rule(c);
+    ir_rule_fam(r, 4);
+    ir_x(r, "meta mark and 0x%08x == 0x%08x", STEER_MARK_MASK, o->mark);
+    ir_x(r, "tcp dport { 443, 80, 5222 }");
+    ir_counter(r, 0, 0);
+    ir_x(r, "redirect to :%d", out_tgws_port(o));
+    ir_comment(r, "steer:tgws:%s", o->name);
+}
+
 const struct kind_ops kind_tgws = {
     .name = "tgws",
     .caps = KC_MARK | KC_SKIP_ZAPRET,
@@ -88,5 +141,6 @@ const struct kind_ops kind_tgws = {
     .lan_only = "у трафика самого телефона моста нет",
     .parse = tgws_parse,
     .check = tgws_check,
+    .emit = tgws_emit,
     .helper = TGWS_HELPER,
 };

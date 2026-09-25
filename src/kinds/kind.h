@@ -106,7 +106,18 @@ struct kind_ops {
     int (*check)(const struct spec *sp, const struct output *o, struct err *e);
 
     /* ---- правила ---- */
-    /* Свои правила nft. Пока NULL у всех: заполнится после перевода генератора на дерево. */
+    /* Свои правила nft: дописывает в дерево (compile/ir.h) то, что нужно ОДНОМУ выходу этого
+     * вида. Цепочки, общие для всех выходов вида (например, zapret_queue — своя очередь на
+     * каждый выход, но цепочка одна), заводит первый вызов на пустом дереве — тот же приём,
+     * что у build_group_sets и соседей. NULL — виду в дереве сказать нечего (direct, group и
+     * виды с устройством: их правила пишет общий код по caps, а не per-kind emit).
+     *
+     * Порядок вызовов — kind_emit_all (kind.c): по ВИДАМ, в порядке реестра (kind_at), а
+     * внутри вида — по выходам в порядке спеки. Так текст ruleset не зависит от того, в каком
+     * порядке человек перечислил выходы разных видов: все правила одного вида ложатся в дерево
+     * подряд, одним блоком, как было при отдельных построителях nft_emit_zapret/nft_emit_tgws
+     * (docs/architecture.md, «Вид выхода»). Тот же приём и с тем же доводом уже применяется в
+     * kind_ops.diag (daemon/diag.c). */
     void (*emit)(struct nft_rs *rs, const struct spec *sp, const struct output *o);
 
     /* ---- сторож (failover.c) ---- */
@@ -140,6 +151,11 @@ const struct kind_ops *kind_at(size_t i);
 void kind_sig_mix(unsigned long long *h, const void *p, size_t n);
 #define KIND_SIG_INIT 14695981039346656037ULL
 
+/* Дописать в дерево rs правила всех видов, у которых есть emit: по видам в порядке реестра,
+ * внутри вида — по выходам в порядке спеки (см. kind_ops.emit выше). Одна точка входа вместо
+ * ручного прохода по видам в generate.c — новый вид с emit не требует правки компилятора. */
+void kind_emit_all(struct nft_rs *rs, const struct spec *sp);
+
 /* Записи видов. Определены в src/kinds/<вид>.c; реестр ссылается на них слабо (kind.c), поэтому
  * вид, файла которого нет в сборке, у реестра есть — записью отказа. */
 extern const struct kind_ops kind_direct, kind_interface, kind_vless, kind_xsteer, kind_zapret,
@@ -149,9 +165,11 @@ extern const struct kind_ops kind_direct, kind_interface, kind_vless, kind_xstee
  * значения прежнего перечня видов. Читает его kind_of в spec.h. */
 #define KIND_ZERO (&kind_direct)
 
-/* ПРЕЖНИЕ ИМЕНА ВИДОВ — только для src/compile (и стендов), пока генератор переводят на
- * промежуточное дерево: там вид ещё сравнивается по-старому, и правка этих мест идёт вместе с
- * переводом. Вне src/kinds и src/compile эти имена ловит tests/buildmatch.sh. */
+/* ПРЕЖНИЕ ИМЕНА ВИДОВ — только для стендов (tests/specmatch.c, tests/failovermatch.c), которым
+ * нужно собрать выход конкретного вида, не читая спеку: `g_spec.out[0].kind = OUT_XSTEER`.
+ * Общий код вида не сравнивает — он спрашивает kind_of(o)->caps или конкретную функцию вида
+ * (zapret_present, out_tgws и соседи ниже). Вне src/kinds и стендов эти имена ловит
+ * tests/buildmatch.sh. */
 #define OUT_DIRECT    (&kind_direct)
 #define OUT_INTERFACE (&kind_interface)
 #define OUT_VLESS     (&kind_vless)
@@ -207,10 +225,19 @@ int nfqws_on_queue(int queue);
 int zapret_running(void);
 /* `steer zapret-instances`: что поднимать init-скрипту. Код — как у команды. */
 int zapret_instances(const struct spec *sp);
+/* Есть ли в спеке хоть один выход kind=zapret — общему коду (apply.c) это нужно знать про
+ * ядро: без notrack порождённые обработчиком пакеты остаются на учёте conntrack, а без
+ * kmod-nft-queue правило очереди не встанет вовсе. Раньше жила в compile/groups.c как
+ * has_zapret и сравнивала kind напрямую; здесь то же самое — вопрос вида, а не общего кода. */
+int zapret_present(const struct spec *sp);
 
 /* tgws */
 const struct tgws_cfg *out_tgws(const struct output *o);
 /* `steer tgws-instances`: что поднимать init-скрипту. Код — как у команды. */
 int tgws_instances(const struct spec *sp);
+/* Есть ли в спеке хоть один выход kind=tgws — нужно раскладке старого ядра (legacy.c): в ней
+ * заводится своя таблица `ip`, только когда моста есть куда перехватывать. Тот же довод и та
+ * же замена, что у zapret_present. */
+int tgws_present(const struct spec *sp);
 
 #endif

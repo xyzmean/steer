@@ -90,8 +90,8 @@ struct groups {
 int build_groups(const struct spec *sp, struct groups *gr, struct err *e);
 void groups_free(struct groups *gr);
 int has_domains(const struct groups *gr);
-int has_zapret(const struct spec *sp);
-int has_tgws(const struct spec *sp);
+/* Есть ли в спеке выход zapret/tgws — вопросы к видам (kind.h: zapret_present, tgws_present),
+ * не к группам; здесь не живут (общий код кроме src/kinds вид не сравнивает). */
 int has_fakeip(const struct groups *gr);
 int is_mac(const char *s);
 int group_is_local(const struct group *g);
