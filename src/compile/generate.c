@@ -213,9 +213,9 @@ static void emit_local_dns_redirect(const struct spec *sp, FILE *f) {
             STEER_MARK_MASK, STEER_SELF_MARK, tun, DNS_PORT);
 }
 
-static void emit_local_dns(const struct spec *sp, FILE *f, const char *dnat_kw) {
+static void emit_local_dns(const struct spec *sp, const struct groups *gr, FILE *f, const char *dnat_kw) {
     emit_local_dns_redirect(sp, f);
-    if (has_fakeip())
+    if (has_fakeip(gr))
         fprintf(f, "        ip daddr 198.18.0.0/15 counter %s to ip daddr map @fakeip "
                    "comment \"steer-fakeip-local\"\n", dnat_kw);
 }
@@ -602,12 +602,12 @@ int legacy_has_ip6(void) {
  * трафик» набора нет, и её IPv6 ушёл бы мимо туннеля: маршруты выхода движок ставит только
  * для IPv4. Поэтому такой группе IPv6 отвечается отказом — приложения переходят на IPv4 (так
  * устроен выбор адреса у любого клиента с двумя стеками), и ничего не утекает напрямую. */
-static int emit_output_mark(const struct spec *sp, FILE *f, struct err *e) {
+static int emit_output_mark(const struct spec *sp, const struct groups *gr, FILE *f, struct err *e) {
     fprintf(f, "\n    chain output_mark {\n"
                "        type %s hook output priority mangle + 1; policy accept;\n",
             NFT_LEGACY ? "filter" : "route");
-    for (size_t i = 0; i < g_grp_n; i++) {
-        struct group *g = &g_grp[i];
+    for (size_t i = 0; i < gr->n; i++) {
+        const struct group *g = &gr->g[i];
         if (!group_is_local(g)) continue;
         struct output *o = out_by_name(sp, g->out);
         if (!o) return err_set(e, "channel group %s points at a missing output", g->name);
@@ -663,8 +663,8 @@ static int emit_output_mark(const struct spec *sp, FILE *f, struct err *e) {
      * правила без вердикта. */
     fprintf(f, "\n    chain input_down {\n"
                "        type filter hook input priority filter + 10; policy accept;\n");
-    for (size_t i = 0; i < g_grp_n; i++) {
-        struct group *g = &g_grp[i];
+    for (size_t i = 0; i < gr->n; i++) {
+        const struct group *g = &gr->g[i];
         if (!group_is_local(g)) continue;
         struct output *o = out_by_name(sp, g->out);
         if (!o || !out_needs_mark(o) || !out_needs_ctmark(o)) continue;
@@ -729,10 +729,10 @@ static int emit_output_mark(const struct spec *sp, FILE *f, struct err *e) {
  * ip6 — только заворот DNS, и только если ядро умеет nat в ip6 (NFTC_IP6NAT): без этого вся
  * транзакция отверглась бы из-за одной таблицы. Пустая цепочка postrouting — там же и по той
  * же причине. */
-static void generate_legacy_tail(const struct spec *sp, FILE *f) {
-    if (has_domains() && sp->traceroute_hops && (g_nftc & NFTC_NOTRACK)) emit_traceroute_raw(f);
+static void generate_legacy_tail(const struct spec *sp, const struct groups *gr, FILE *f) {
+    if (has_domains(gr) && sp->traceroute_hops && (g_nftc & NFTC_NOTRACK)) emit_traceroute_raw(f);
     fprintf(f, "}\n");
-    int fakeip = has_domains() && has_fakeip();
+    int fakeip = has_domains(gr) && has_fakeip(gr);
     if (legacy_has_ip(sp)) {
         fprintf(f, "table ip %s {\n", nft_table());
         if (fakeip) {
@@ -769,15 +769,15 @@ static void generate_legacy_tail(const struct spec *sp, FILE *f) {
         emit_tgws_rules(sp, f);
         fprintf(f, "    }\n");
 #ifdef STEER_ANDROID
-        if (has_local_domains()) {
+        if (has_local_domains(gr)) {
             fprintf(f, "    chain output_nat {\n"
                        "        type nat hook output priority dstnat - 1; policy accept;\n");
-            emit_local_dns(sp, f, "dnat");
+            emit_local_dns(sp, gr, f, "dnat");
             fprintf(f, "    }\n");
         }
         /* Снятие бита перемаршрутизации — см. STEER_REROUTE_BIT в spec.h. mangle + 2: сразу
          * после разметки (output_mark в inet, mangle + 1) и до nat на выходе. */
-        if (has_local())
+        if (has_local(gr))
             fprintf(f, "    chain output_reroute {\n"
                        "        type route hook output priority mangle + 2; policy accept;\n"
                        "        meta mark and 0x%08x == 0x%08x meta mark set mark and 0x%08x "
@@ -802,7 +802,7 @@ static void generate_legacy_tail(const struct spec *sp, FILE *f) {
 #ifdef STEER_ANDROID
         /* IPv6-половина заворота DNS приложений (см. emit_local_dns): та же цепочка, что в
          * таблице ip, без fakeip — поддельные адреса только IPv4. */
-        if (has_local_domains()) {
+        if (has_local_domains(gr)) {
             fprintf(f, "    chain output_nat {\n"
                        "        type nat hook output priority dstnat - 1; policy accept;\n");
             emit_local_dns_redirect(sp, f);
@@ -815,10 +815,10 @@ static void generate_legacy_tail(const struct spec *sp, FILE *f) {
     }
 }
 
-int generate(const struct spec *sp, FILE *f, struct err *e) {
+int generate(const struct spec *sp, const struct groups *gr, FILE *f, struct err *e) {
     fprintf(f, "table inet %s {\n", nft_table());
-    for (size_t i = 0; i < g_grp_n; i++) {
-        struct group *g = &g_grp[i];
+    for (size_t i = 0; i < gr->n; i++) {
+        const struct group *g = &gr->g[i];
         /* `any`-группе набор не нужен; опустевшей — нужен, иначе её правило потеряет
          * `ip daddr` и станет безусловным (см. поле `emptied`). */
         if (!g->files_n && !g->domains && !g->emptied) continue;
@@ -886,8 +886,8 @@ int generate(const struct spec *sp, FILE *f, struct err *e) {
      * step after mangle leaves room for anything that legitimately wants to run first. */
     fprintf(f, "    chain prerouting_mark {\n"
                "        type filter hook prerouting priority mangle + 1; policy accept;\n");
-    for (size_t i = 0; i < g_grp_n; i++) {
-        struct group *g = &g_grp[i];
+    for (size_t i = 0; i < gr->n; i++) {
+        const struct group *g = &gr->g[i];
         struct output *o = out_by_name(sp, g->out);
         if (!o) return err_set(e, "channel group %s points at a missing output", g->name);
         /* Каналы на сам телефон — на хуке output, см. emit_output_mark. */
@@ -955,7 +955,7 @@ int generate(const struct spec *sp, FILE *f, struct err *e) {
     fprintf(f, "    }\n");
 
 #ifdef STEER_ANDROID
-    if (has_local() && emit_output_mark(sp, f, e) != 0) return -1;
+    if (has_local(gr) && emit_output_mark(sp, gr, f, e) != 0) return -1;
 #endif
 
     /* ВЫХОД УПАЛ И ПУЩЕН НАПРЯМУЮ — бит «не для zapret» снимается. Правило разметки выше
@@ -1005,8 +1005,8 @@ int generate(const struct spec *sp, FILE *f, struct err *e) {
      * скачивания это один поиск по набору на пакет. */
     fprintf(f, "\n    chain postrouting_down {\n"
                "        type filter hook postrouting priority srcnat + 10; policy accept;\n");
-    for (size_t i = 0; i < g_grp_n; i++) {
-        struct group *g = &g_grp[i];
+    for (size_t i = 0; i < gr->n; i++) {
+        const struct group *g = &gr->g[i];
         /* Скачанное каналом на сам телефон этой цепочкой не считается: получатель у него —
          * сокет телефона, и пакет идёт через input, а не через postrouting. */
         if (group_is_local(g)) continue;
@@ -1211,7 +1211,7 @@ int generate(const struct spec *sp, FILE *f, struct err *e) {
     /* Всё, что ниже, — nat и то, что стоит рядом с ним. В старой раскладке оно устроено
      * иначе целиком (другие таблицы, одна цепочка nat), и смешивать две раскладки строками
      * через одну значило бы читать каждую строку дважды. Поэтому отдельная функция. */
-    if (NFT_LEGACY) { generate_legacy_tail(sp, f); return 0; }
+    if (NFT_LEGACY) { generate_legacy_tail(sp, gr, f); return 0; }
 
     /* ---- перехват Telegram у выходов kind=tgws ------------------------------------
      *
@@ -1246,7 +1246,7 @@ int generate(const struct spec *sp, FILE *f, struct err *e) {
 
     /* ПЕРЕНАПРАВЛЕНИЕ DNS СТОИТ ВСЕГДА, а не только при доменных каналах.
      *
-     * Раньше оно появлялось и исчезало вместе с has_domains(), и это была переменная,
+     * Раньше оно появлялось и исчезало вместе с has_domains(gr), и это была переменная,
      * от которой зависели три вещи в разных местах: сам резолвер (needs-dnsd в
      * init-скрипте), это правило и ключ force_dns у https-dns-proxy в splify2. Две
      * последние обязаны меняться вместе — два перенаправления порта 53 в одной точке
@@ -1320,8 +1320,8 @@ int generate(const struct spec *sp, FILE *f, struct err *e) {
      * стоят per-packet, и держать их пустыми на роутере без доменов незачем. Это гейт
      * по СТОИМОСТИ, а не по смыслу, и переворачиваться он может свободно — ни один
      * чужой ключ от него не зависит. */
-    if (has_domains()) {
-        if (has_fakeip()) {
+    if (has_domains(gr)) {
+        if (has_fakeip(gr)) {
             fprintf(f, "\n    map fakeip {\n        type ipv4_addr : ipv4_addr;\n");
             emit_fakeip_elements(f);
             fprintf(f, "    }\n");
@@ -1339,10 +1339,10 @@ int generate(const struct spec *sp, FILE *f, struct err *e) {
                        "    }\n");
         }
 #ifdef STEER_ANDROID
-        if (has_local_domains()) {
+        if (has_local_domains(gr)) {
             fprintf(f, "    chain output_dns {\n"
                        "        type nat hook output priority dstnat; policy accept;\n");
-            emit_local_dns(sp, f, "dnat ip");
+            emit_local_dns(sp, gr, f, "dnat ip");
             fprintf(f, "    }\n");
         }
 #endif

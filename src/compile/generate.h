@@ -14,8 +14,8 @@ extern int g_nftc;
 
 /* 0 — успех, текст ruleset записан в f; -1 — отказ (недостижимо на разобранной спеке, см.
  * определение), текст в e->msg — см. правило 5, docs/architecture.md, раздел 2. Читает
- * спеку sp — правило 6. */
-int generate(const struct spec *sp, FILE *f, struct err *e);
+ * спеку sp и её группы gr (результат build_groups) — правило 6. */
+int generate(const struct spec *sp, const struct groups *gr, FILE *f, struct err *e);
 void counters_load(void);
 int counter_find(const char *name, int down, unsigned long *p, unsigned long *b);
 void l4_describe(const struct l4match *m, char *dst, size_t n);

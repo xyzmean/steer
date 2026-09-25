@@ -96,7 +96,7 @@ static int status_from_snapshot(void) {
 /* Сам ответ. Поток параметром, потому что печатается он ДВАЖДЫ в разные места: в снимок на
  * диске и человеку (точнее, тому, кто позвал). Считать его два раза было бы вдвое дороже
  * ровно того, ради чего снимок и заведён. */
-static void status_emit(const struct spec *sp, FILE *out) {
+static void status_emit(const struct spec *sp, const struct groups *gr, FILE *out) {
     /* УМЕНИЯ ДВИЖКА — перечнем имён и верхним уровнем.
      *
      * Зачем вообще. Незнакомый ключ спеки движок пропускает МОЛЧА (js_skip) — это и есть
@@ -249,21 +249,21 @@ static void status_emit(const struct spec *sp, FILE *out) {
     fprintf(out, "},\"channels\":[");
 
     counters_load();
-    for (size_t i = 0; i < g_grp_n; i++) {
+    for (size_t i = 0; i < gr->n; i++) {
         unsigned long up_p = 0, up_b = 0, dn_p = 0, dn_b = 0;
-        int live = counter_find(g_grp[i].name, 0, &up_p, &up_b) == 0;
-        int dn = counter_find(g_grp[i].name, 1, &dn_p, &dn_b) == 0;
+        int live = counter_find(gr->g[i].name, 0, &up_p, &up_b) == 0;
+        int dn = counter_find(gr->g[i].name, 1, &dn_p, &dn_b) == 0;
         fprintf(out, "%s{\"name\":\"%s\",\"out\":\"%s\",\"kind\":\"%s\",\"live\":%s",
-               i ? "," : "", g_grp[i].name, g_grp[i].out,
-               g_grp[i].domains ? "domains" : "prefixes", live ? "true" : "false");
+               i ? "," : "", gr->g[i].name, gr->g[i].out,
+               gr->g[i].domains ? "domains" : "prefixes", live ? "true" : "false");
         if (live) fprintf(out, ",\"packets\":%lu,\"bytes\":%lu", up_p, up_b);
         /* Отдельными именами, а не вторым «bytes»: старое имя значило «наружу» и в таком
          * значении уже разошлось по установленным версиям splify2. Переопределить его
          * значило бы, что новый движок со старым интерфейсом молча показывает не то. */
         if (dn) fprintf(out, ",\"down_packets\":%lu,\"down_bytes\":%lu", dn_p, dn_b);
-        fprintf(out, ",\"lists\":%zu,\"channels\":[", g_grp[i].files_n + g_grp[i].dfiles_n);
-        for (size_t m = 0; m < g_grp[i].members_n; m++)
-            fprintf(out, "%s\"%s\"", m ? "," : "", g_grp[i].members[m]);
+        fprintf(out, ",\"lists\":%zu,\"channels\":[", gr->g[i].files_n + gr->g[i].dfiles_n);
+        for (size_t m = 0; m < gr->g[i].members_n; m++)
+            fprintf(out, "%s\"%s\"", m ? "," : "", gr->g[i].members[m]);
         fprintf(out, "]}");
     }
     fprintf(out, "]}\n");
@@ -280,6 +280,7 @@ static void status_emit(const struct spec *sp, FILE *out) {
  * цепочку nft, и второй проход дал бы в снимке и на экране два разных мгновения. */
 int cmd_status(const char *spec, int fast) {
     static struct spec cfg;
+    static struct groups gr;
     /* Запомненное — раньше разбора спеки: смысл `--fast` в том, чтобы не делать работу
      * вовсе. Спека при этом не читается, то есть негодная спека `--fast` не ломает — он
      * отвечает тем, что было применено, пока она была годной. */
@@ -290,7 +291,7 @@ int cmd_status(const char *spec, int fast) {
     struct err e = {0};
     if (load_spec(spec, &cfg, &e) < 0) err_die(&e);
     if (registry_assign(&cfg, &e) < 0) err_die(&e);
-    if (build_groups(&cfg, &e) < 0) err_die(&e);
+    if (build_groups(&cfg, &gr, &e) < 0) err_die(&e);
     /* О том же устройстве, к которому apply привязал таблицу, — см. outputs_adopt_active.
      * Без этого пул, уведённый сторожем на запасное устройство, отдавался бы интерфейсу
      * основным устройством с `up: false`: рабочий выход, нарисованный сломанным. */
@@ -301,15 +302,15 @@ int cmd_status(const char *spec, int fast) {
     snprintf(tmp, sizeof tmp, "%s.new", snap);
     mkdir(g_state_dir, 0755);
     FILE *f = fopen(tmp, "w");
-    if (!f) { status_emit(&cfg, stdout); return 0; }
-    status_emit(&cfg, f);
+    if (!f) { status_emit(&cfg, &gr, stdout); return 0; }
+    status_emit(&cfg, &gr, f);
     if (fclose(f) != 0 || rename(tmp, snap) != 0) {
         unlink(tmp);
-        status_emit(&cfg, stdout);
+        status_emit(&cfg, &gr, stdout);
         return 0;
     }
     f = fopen(snap, "r");
-    if (!f) { status_emit(&cfg, stdout); return 0; }
+    if (!f) { status_emit(&cfg, &gr, stdout); return 0; }
     char buf[8192];
     size_t n;
     while ((n = fread(buf, 1, sizeof buf, f)) > 0) fwrite(buf, 1, n, stdout);

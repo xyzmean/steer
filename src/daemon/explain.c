@@ -208,12 +208,13 @@ static int set_lookup(const char *set, const char *elem, const char *addr) {
 
 int cmd_explain(const char *spec, const char *what) {
     static struct spec cfg;
+    static struct groups gr;
     /* Правило 5, docs/architecture.md, раздел 2: err_die здесь довершает то, что раньше делал
      * die() изнутри load_spec/build_groups. */
     struct err e = {0};
     if (load_spec(spec, &cfg, &e) < 0) err_die(&e);
     if (registry_assign(&cfg, &e) < 0) err_die(&e);
-    if (build_groups(&cfg, &e) < 0) err_die(&e);
+    if (build_groups(&cfg, &gr, &e) < 0) err_die(&e);
     g_nftc = nft_compat();
 
     /* Имя сначала превращаем в адрес — и печатаем, во что именно. Без этой строки человек
@@ -227,7 +228,7 @@ int cmd_explain(const char *spec, const char *what) {
             /* Два разных случая, и путать их нельзя. Нет доменных правил — резолвер и не
              * должен работать, а «не отвечает» звучало бы как поломка. Есть — тогда молчание
              * резолвера и есть поломка, причём для всех клиентов сразу. */
-            if (!has_domains())
+            if (!has_domains(&gr))
                 printf("%s -> в настройке нет ни одного правила по доменам, поэтому резолвер "
                        "steer не запущен: имена он не разбирает, спрашивайте адресом\n", what);
             else
@@ -246,8 +247,8 @@ int cmd_explain(const char *spec, const char *what) {
                     : "настоящий адрес — имя ни в одном доменном списке не нашлось");
         addr = resolved;
     }
-    for (size_t i = 0; i < g_grp_n; i++) {
-        int hit = !g_grp[i].files_n && !g_grp[i].domains;   /* an `any` group */
+    for (size_t i = 0; i < gr.n; i++) {
+        int hit = !gr.g[i].files_n && !gr.g[i].domains;   /* an `any` group */
         /* Domain channels own a set too — it is just filled by the resolver. Asking
          * only the prefix channels made explain answer "no channel matches" for
          * every fake IP, i.e. exactly the addresses a user is most likely to ask
@@ -258,22 +259,22 @@ int cmd_explain(const char *spec, const char *what) {
              * channel matches" meaning "not listed" and meaning "explain never
              * looked". */
             if (getenv("STEER_EXPLAIN_TRACE"))
-                fprintf(stderr, "checking %.63s\n", g_grp[i].name);
-            snprintf(setname, sizeof(setname), "%.63s", g_grp[i].name);
+                fprintf(stderr, "checking %.63s\n", gr.g[i].name);
+            snprintf(setname, sizeof(setname), "%.63s", gr.g[i].name);
             snprintf(elem, sizeof(elem), "{ %s }", addr);
             hit = set_lookup(setname, elem, addr);
             /* Старая раскладка: у доменной группы вторая половина набора, с префиксами. */
-            if (!hit && legacy_may_have_static(&g_grp[i])) {
-                nft_static_set_name(setname, sizeof(setname), g_grp[i].name);
+            if (!hit && legacy_may_have_static(&gr.g[i])) {
+                nft_static_set_name(setname, sizeof(setname), gr.g[i].name);
                 hit = set_lookup(setname, elem, addr);
             }
         }
         if (!hit) continue;
-        struct output *o = out_by_name(&cfg, g_grp[i].out);
-        if (!o) die("group %s points at a missing output", g_grp[i].name);
+        struct output *o = out_by_name(&cfg, gr.g[i].out);
+        if (!o) die("group %s points at a missing output", gr.g[i].name);
         printf("%s -> %s \"%s\" -> output \"%s\"", addr,
-               explain_set_phrase(addr, g_grp[i].files_n > 0, g_grp[i].domains),
-               g_grp[i].name, o->name);
+               explain_set_phrase(addr, gr.g[i].files_n > 0, gr.g[i].domains),
+               gr.g[i].name, o->name);
         if (out_has_device(o))
             printf(" -> dev %s (mark 0x%08x, table %d)\n", o->device, o->mark, o->table);
         else
@@ -283,11 +284,11 @@ int cmd_explain(const char *spec, const char *what) {
          * ответить правдой наполовину: человек, выясняющий, почему TCP к 104.16.0.1 идёт
          * напрямую, получил бы подтверждение, что канал его забирает. Отдельной строкой,
          * чтобы первая осталась той же, что была, — её читают и глазами, и разбором. */
-        if (!l4match_empty(g_grp[i].l4)) {
+        if (!l4match_empty(gr.g[i].l4)) {
             /* С запасом на предел MAX_PORTS: шестнадцать диапазонов вида «50000-65535» с
              * разделителями — это 217 байт, и обрезанное пояснение было бы хуже полного. */
             char d[256];
-            l4_describe(g_grp[i].l4, d, sizeof(d));
+            l4_describe(gr.g[i].l4, d, sizeof(d));
             printf("      канал сужен: только %s — остальной трафик к этому адресу "
                    "идёт мимо канала\n", d);
         }

@@ -298,7 +298,7 @@ static int nft_table_exists(const char *fam) {
  * выбросить правило значило бы, что человек узнает о нём по симптому, — поэтому каждое
  * выброшенное называется здесь вместе с последствием. Строки идут в stderr и в журнал, как
  * остальные предупреждения apply. */
-static void report_legacy_gaps(const struct spec *sp) {
+static void report_legacy_gaps(const struct spec *sp, const struct groups *gr) {
     if (!NFT_LEGACY) return;
     fprintf(stderr, "steer[info] apply: ядро без nat в семействе inet — правила собраны для "
                     "nftables старого ядра: таблицы inet и ip%s\n",
@@ -308,7 +308,7 @@ static void report_legacy_gaps(const struct spec *sp) {
                         "(подделки, куски разрезанного) остаются на учёте conntrack. Где "
                         "firewall отбрасывает ct state invalid, обход выходов kind=zapret "
                         "может не срабатывать\n");
-    if (sp->traceroute_hops && has_domains() && !(g_nftc & NFTC_NOTRACK))
+    if (sp->traceroute_hops && has_domains(gr) && !(g_nftc & NFTC_NOTRACK))
         fprintf(stderr, LOG_W "ядро не знает notrack: traceroute_hops на нём не действует, "
                         "промежуточные узлы будут видны как прежде\n");
 #ifndef STEER_TGWS
@@ -318,7 +318,7 @@ static void report_legacy_gaps(const struct spec *sp) {
                         "спрашивает по IPv4\n");
 #endif
 #ifdef STEER_ANDROID
-    if (!(g_nftc & NFTC_IP6NAT) && has_local_domains())
+    if (!(g_nftc & NFTC_IP6NAT) && has_local_domains(gr))
         fprintf(stderr, LOG_W "ядро не умеет nat для IPv6: запросы DNS приложений телефона по "
                         "IPv6 идут мимо резолвера движка, и доменные каналы телефона их не "
                         "видят\n");
@@ -390,6 +390,7 @@ int cmd_apply(const char *spec, int dry) {
      * Спека — значение, а не глобалы (правило 6): свой экземпляр у точки входа, static —
      * держать struct spec на стеке нельзя, он большой (g_ch один под 200 КБ). */
     static struct spec cfg;
+    static struct groups gr;
     struct err e = {0};
     if (load_spec(spec, &cfg, &e) < 0) err_die(&e);
     /* Снимок реестра — строго до registry_assign: тот перезапишет файл текущими
@@ -397,7 +398,7 @@ int cmd_apply(const char *spec, int dry) {
      * единственным способом снять их правила из ядра. */
     registry_snapshot();
     if (registry_assign(&cfg, &e) < 0) err_die(&e);
-    if (build_groups(&cfg, &e) < 0) err_die(&e);
+    if (build_groups(&cfg, &gr, &e) < 0) err_die(&e);
     /* ДОМЕННЫЙ КАНАЛ В МИНИ-СБОРКЕ — ОТКАЗ, А НЕ ПРЕДУПРЕЖДЕНИЕ.
      *
      * Домены маршрутизируются через резолвер движка, а мини-сборка его не поднимает и
@@ -406,11 +407,11 @@ int cmd_apply(const char *spec, int dry) {
      * пустым. Молчаливое применение здесь хуже отказа — искать причину пришлось бы на
      * роутере. */
 #ifdef STEER_TGWS
-    for (size_t i = 0; i < g_grp_n; i++)
-        if (g_grp[i].domains)
+    for (size_t i = 0; i < gr.n; i++)
+        if (gr.g[i].domains)
             die("канал «%s» доменный, а эта сборка резолвера не поднимает: разрешать имена "
                 "ей нечем. Переведите канал на адресный список или поставьте полный движок",
-                g_grp[i].name);
+                gr.g[i].name);
 #endif
     /* Устройство выхода — то, что несёт трафик сейчас, а не первое в списке кандидатов.
      * Иначе применение настройки уводило бы таблицу с работающего запасного устройства на
@@ -422,11 +423,11 @@ int cmd_apply(const char *spec, int dry) {
      * До dry-run намеренно: интерфейс проверяет спеку именно им, перед записью на диск.
      * Значит человек узнает про не тот список сразу при сохранении, а не потом, когда
      * apply молча не подействует. */
-    if (check_address_lists(&e) < 0) err_die(&e);
+    if (check_address_lists(&gr, &e) < 0) err_die(&e);
     /* Раскладка набора правил — до генерации и до dry-run: интерфейс проверяет спеку именно
      * dry-run'ом, и печатать ему надо то, что реально встанет на этом ядре. */
     g_nftc = nft_compat();
-    report_legacy_gaps(&cfg);
+    report_legacy_gaps(&cfg, &gr);
     /* Снять накопленное ДО генерации: она вписывает эти значения в новые правила, иначе
      * каждый apply обнулял бы объёмы. Читаем и при --dry-run — так печатаемый текст остаётся
      * тем, что реально применится, а на машине без таблицы вывод не меняется вовсе. */
@@ -439,7 +440,7 @@ int cmd_apply(const char *spec, int dry) {
      * применения. Предупреждением в stderr: набор правил от файла туннеля не зависит. */
     if (dry) {
         awg_check_all(&cfg);
-        if (generate(&cfg, stdout, &e) < 0) err_die(&e);
+        if (generate(&cfg, &gr, stdout, &e) < 0) err_die(&e);
         return 0;
     }
 
@@ -512,7 +513,7 @@ int cmd_apply(const char *spec, int dry) {
                 fprintf(f, "delete table %s %s\n", fams[k], nft_table());
         }
     }
-    if (generate(&cfg, f, &e) < 0) err_die(&e);
+    if (generate(&cfg, &gr, f, &e) < 0) err_die(&e);
     fclose(f);
 
     const char *load[] = { "nft", "-f", tmp, NULL };
