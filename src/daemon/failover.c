@@ -36,6 +36,7 @@
 #include <ifaddrs.h>
 #include <signal.h>
 #include <sys/stat.h>
+#include <ctype.h>
 #include "spec.h"
 #include "awg.h"
 #include "run.h"
@@ -273,17 +274,18 @@ int (*g_latency_probe)(const struct spec *, const struct output *, const char *)
  * Берётся ЛУЧШИЙ из целей, а не первый ответивший: цели в разных сетях, и «первая ответила
  * за 300 мс» на канале, где вторая отвечает за 20, — это не задержка канала.
  *
- * xsteer не меряется НИКОГДА, и это то же решение, что у его здоровья: PROBE_TARGETS — это
- * проверка интернета У ХАБА, а хаб полной звезды имеет право маршрутизировать только между
- * пирами. Замер дал бы -1 на исправном туннеле, то есть выбросил бы его из сравнения.
- * Возврат -1 честнее: вызывающий на нём откатывается к порядку. */
+ * Вид, которому такой замер не годится, отвечает сам (kind_ops.latency): xsteer не меряется
+ * НИКОГДА — см. kinds/xsteer.c. */
 static int device_latency(const struct spec *sp, const struct output *o, const char *dev) {
     if (g_latency_probe) return g_latency_probe(sp, o, dev);
     if (!device_present(dev)) return -1;
     o = out_for_device(sp, o, dev);
-    /* И тот же туннель, поднятый netifd, — по тому же доводу: мерить его нечем, а число
-     * из пробы наружу означало бы не задержку туннеля, а наличие интернета у хаба. */
-    if (o->kind == OUT_XSTEER || xs_state_read(dev, NULL, NULL)) return -1;
+    const struct kind_ops *k = kind_of(o);
+    if (k->latency) return k->latency(sp, o, dev);
+    /* И туннель xsteer, поднятый netifd, — по тому же доводу, что у вида xsteer: мерить его
+     * нечем, а число из пробы наружу означало бы не задержку туннеля, а наличие интернета у
+     * хаба. */
+    if (xs_state_read(dev, NULL, NULL)) return -1;
     int best = -1;
     for (int i = 0; PROBE_TARGETS[i]; i++) {
         int ms = -1;
@@ -329,27 +331,12 @@ int device_healthy_for(const struct spec *sp, const struct output *o, const char
      * устройства с владельцем спрашиваем так, как спросил бы владелец. Для выхода,
      * владеющего своим устройством сам, это тот же ответ, что и раньше. */
     o = out_for_device(sp, o, dev);
-    /* xsteer НЕ проверяется ни PROBE_TARGETS, ни пробой TCP, и это не недоделка.
-     *
-     * PROBE_TARGETS — публичные адреса, то есть проверка интернета У ХАБА. Хаб полной
-     * звезды имеет право маршрутизировать только между пирами: у такого выхода
-     * AllowedIPs это, скажем, 10.0.0.0/8, и пинг 1.1.1.1 через его устройство теряется на
-     * полностью исправном туннеле. При on_fail=drop (умолчании) сторож поставил бы
-     * blackhole работающему выходу — то есть сам сломал бы то, что охраняет. Проба TCP,
-     * как у vless, проверила бы ровно то же самое и с тем же итогом.
-     *
-     * Правильная мера здоровья здесь — возраст последнего рукопожатия с хабом, и её
-     * источник (файл состояния, который пишет сам процесс) появляется вместе с клиентом.
-     * До тех пор приговор даёт наличие устройства: устройство создаёт наш процесс, и
-     * пропало оно — значит процесса нет. Это не полная проверка, но она никогда не врёт в
-     * сторону «сломано», а именно эта сторона здесь дорого стоит. */
-    if (o->kind == OUT_XSTEER) return 1;
-    /* Туннель в ядре, заведённый движком (kind=awg): мера — свежесть рукопожатия и счётчики
-     * пира, которые ядро и так ведёт, без единого пакета от нас. Ни ping, ни проба TCP: и то и
-     * другое будило бы радио телефона ради вопроса, на который ответ уже лежит в ядре, — см.
-     * «здоровье» в src/kinds/awg.c, там же почему старое рукопожатие само по себе не приговор. */
-    if (o->kind == OUT_AWG) return awg_healthy(o, dev);
-    /* Тот же туннель, поднятый netifd (см. xs_state_read выше). Спека про него знает только
+    /* Своя мера у вида владельца (kind_ops.health): xsteer — наличие устройства (пинг наружу
+     * через хаб полной звезды теряется на исправном туннеле, kinds/xsteer.c), awg — свежесть
+     * рукопожатия и счётчики пира в ядре (kinds/awg.c). */
+    const struct kind_ops *k = kind_of(o);
+    if (k->health) return k->health(sp, o, dev);
+    /* Туннель xsteer, поднятый netifd (см. xs_state_read выше). Спека про него знает только
      * имя устройства, а про рукопожатие с хабом знает его собственный клиент — и пишет это в
      * свой файл. Приговор отдаётся файлу целиком: пинг наружу здесь запрещён ровно по той же
      * причине, что и у выхода kind=xsteer.
@@ -363,7 +350,9 @@ int device_healthy_for(const struct spec *sp, const struct output *o, const char
         int up = 0, fresh = 0;
         if (xs_state_read(dev, &up, &fresh)) return fresh ? up : 1;
     }
-    if (o->kind == OUT_VLESS) {
+    /* Туннель, который завершает TCP у себя (vless): ICMP через него не проходит вовсе,
+     * проверяем TCP-рукопожатием — см. TCP_PROBE_PORT выше. */
+    if (out_has_cap(o, KC_TCP_PROBE)) {
         for (int i = 0; PROBE_TARGETS[i]; i++)
             if (tcp_reachable(dev, PROBE_TARGETS[i], TCP_PROBE_PORT, TCP_PROBE_TIMEOUT, NULL))
                 return 1;
@@ -372,77 +361,15 @@ int device_healthy_for(const struct spec *sp, const struct output *o, const char
     return device_healthy(dev);
 }
 
+/* Работает ли обход (zapret_running) и жив ли обработчик очереди (nfqws_on_queue) — вопросы к
+ * процессам nfqws, они в kinds/zapret.c. */
+
 /* Куда направить таблицу выхода, когда живых устройств нет.
  *
  * drop   — blackhole: трафик канала останавливается заметно и никуда не утекает;
  * direct — правило снимается, трафик идёт как обычный (осознанный выбор);
  * zapret — то же, что direct, но нужен работающий обход DPI, иначе это просто
  *          direct под другим именем, о чём и сообщаем. */
-#include <dirent.h>
-#include <ctype.h>
-
-/* Есть ли в системе процесс, командная строка которого содержит NEEDLE.
- *
- * Вынесено из zapret_running, потому что тот же обход /proc понадобился второму
- * спрашивающему — выходу kind=zapret, которому нужен не «работает ли обход вообще», а
- * «жив ли обработчик МОЕЙ очереди». Два обхода /proc с двумя копиями разбора cmdline
- * разошлись бы на первой же правке (буфер, замена нулей, пропуск не-цифр).
- *
- * Почему вообще /proc, а не вопрос ядру: списка «кто слушает очередь nfqueue N» ядро не
- * отдаёт ни через netlink, ни через /proc/net/netfilter/nfnetlink_queue (там номер очереди
- * и pid, но только для очередей, через которые уже прошёл пакет, — то есть у поднятого и
- * ещё не нагруженного обработчика запись отсутствует). Командная строка с --qnum=N
- * отвечает на тот же вопрос и отвечает всегда. */
-static int cmdline_find(const char *needle, int digit_end);
-static int cmdline_has(const char *needle) { return cmdline_find(needle, 0); }
-
-/* NEEDLE в командной строке какого-нибудь процесса. digit_end — требовать, чтобы сразу за
- * NEEDLE не стояла цифра: так «--qnum=830» перестаёт находиться в «--qnum=8300». */
-static int cmdline_find(const char *needle, int digit_end) {
-    DIR *d = opendir("/proc");
-    if (!d) return 0;
-    struct dirent *dir;
-    int found = 0;
-    char path[300];
-    char buf[512];
-
-    while ((dir = readdir(d)) != NULL && !found) {
-        if (!isdigit(dir->d_name[0])) continue;
-        snprintf(path, sizeof(path), "/proc/%s/cmdline", dir->d_name);
-        int fd = open(path, O_RDONLY | O_CLOEXEC);
-        if (fd >= 0) {
-            ssize_t n = read(fd, buf, sizeof(buf) - 1);
-            if (n > 0) {
-                buf[n] = '\0';
-                for (ssize_t i = 0; i < n; i++) {
-                    if (buf[i] == '\0') buf[i] = ' ';
-                }
-                for (const char *q = strstr(buf, needle); q; q = strstr(q + 1, needle)) {
-                    char after = q[strlen(needle)];
-                    if (digit_end && after >= '0' && after <= '9') continue;
-                    found = 1;
-                    break;
-                }
-            }
-            close(fd);
-        }
-    }
-    closedir(d);
-    return found;
-}
-
-static int zapret_running(void) { return cmdline_has("nfqws"); }
-
-/* Жив ли обработчик ИМЕННО ЭТОЙ очереди.
- *
- * Ищется «--qnum=N» целиком, вместе с ключом, и это не педантизм: подстрока «8300» нашлась
- * бы и в чужом пути, и в номере другой очереди (83001), а ответ «выход работает» о мёртвом
- * обходе — худший из возможных, потому что трафик при этом уходит и выглядит ушедшим. */
-int nfqws_on_queue(int queue) {
-    char needle[32];
-    snprintf(needle, sizeof(needle), "--qnum=%d", queue);
-    return cmdline_find(needle, 1);
-}
 
 /* ---- правило маршрутизации выхода: одно место на четыре вызывающих ---------------
  *
@@ -1408,13 +1335,15 @@ int revive(const struct spec *sp, const struct output *o, const char *dev, int v
      * названо выходом kind=interface, и решение по виду НАЗВАВШЕГО дало бы здесь ifdown/ifup
      * по устройству, которым netifd не управляет, — «Interface … not found» раз в минуту и
      * ничего больше. */
-    /* Туннель kind=awg чинится не ожиданием: процесса, который поднял бы его заново, нет —
-     * устройство живёт в ядре. Лечится то же, что у netifd лечит ifdown/ifup: имя Endpoint
-     * разрешается заново (переезд сервера по DNS), настройка ложится заново, а пропавшее
-     * устройство создаётся. Частоту уже ограничил restart_allowed выше. */
+    /* Вид, который чинит своё устройство сам (kind_ops.revive), — у ВЛАДЕЛЬЦА устройства. Туннель
+     * kind=awg чинится не ожиданием: процесса, который поднял бы его заново, нет — устройство
+     * живёт в ядре. Лечится то же, что у netifd лечит ifdown/ifup: имя Endpoint разрешается
+     * заново (переезд сервера по DNS), настройка ложится заново, а пропавшее устройство
+     * создаётся. Частоту уже ограничил restart_allowed выше. */
     {
-        const struct output *aw = out_for_device(sp, o, dev);
-        if (aw->kind == OUT_AWG) return awg_revive(sp, aw, dev);
+        const struct output *ow = out_for_device(sp, o, dev);
+        const struct kind_ops *k = kind_of(ow);
+        if (k->revive) return k->revive(sp, ow, dev);
     }
     if (out_engine_managed(o) || device_owner(sp, dev)) {
         /* СНАЧАЛА спрашиваем, не известна ли уже причина, по которой ждать бессмысленно.
@@ -1458,7 +1387,7 @@ int revive(const struct spec *sp, const struct output *o, const char *dev, int v
     return 0;
 #endif
     fprintf(stderr, LOG_W "%s: не отвечает — перезапускаю интерфейс\n", dev);
-    /* Сначала обфускатор, потом интерфейс, и порядок здесь — не вкусовщина.
+    /* Сначала помощник выхода (обфускатор), потом интерфейс, и порядок здесь — не вкусовщина.
      *
      * У выхода с obfs датаграммы WireGuard идут не в сеть, а в свой процесс, и если
      * молчит он, то поднимать заново интерфейс бессмысленно: рукопожатие уйдёт в тот же
@@ -1467,15 +1396,19 @@ int revive(const struct spec *sp, const struct output *o, const char *dev, int v
      * отправлять нечего. Отсюда явный сигнал: procd поднимет процесс заново, и уже
      * после этого ifdown/ifup даст WireGuard свежую попытку.
      *
-     * Через ubus, а не kill: экземпляром владеет procd, и он же обязан поднять замену.
-     * Отказ игнорируем — выход мог быть настроен без obfs, и это норма. */
-    if (o->obfs.on) {
+     * Через ubus, а не kill: экземпляром владеет procd, и он же обязан поднять замену
+     * (экземпляр зовётся «<помощник>_<выход>», как его заводит init-скрипт). Отказ
+     * игнорируем. Помощника спрашиваем у вида: сюда доходит только устройство netifd, то есть
+     * interface, а у него помощник — ровно обфускатор, когда obfs настроен. */
+    struct kind_helper hp = { .sig = KIND_SIG_INIT };
+    const struct kind_ops *hk = kind_of(o);
+    if (hk->helper && hk->helper(sp, o, &hp) == 0) {
         /* С запасом: имя выхода до 24 символов плюс обрамление JSON — иначе
          * -Wformat-truncation справедливо ругается, а сборка здесь обязана быть без
          * предупреждений (I-007). */
-        char inst[96];
-        snprintf(inst, sizeof(inst), "{\"name\":\"steer\",\"instance\":\"obfs_%.24s\","
-                                     "\"signal\":15}", o->name);
+        char inst[112];
+        snprintf(inst, sizeof(inst), "{\"name\":\"steer\",\"instance\":\"%.7s_%.24s\","
+                                     "\"signal\":15}", hp.cmd, o->name);
         const char *sig[] = { "ubus", "call", "service", "signal", inst, NULL };
         run_quiet(sig);
         sleep(1);

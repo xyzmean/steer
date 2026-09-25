@@ -32,6 +32,11 @@
 
 #include "spec.h"
 
+/* awg.c (вид awg) зовёт run_quiet из lib/run.c; стенду разбора он не нужен — ядро здесь не
+ * трогают. */
+int run_quiet(const char *const argv[]);
+int run_quiet(const char *const argv[]) { (void)argv; return 0; }
+
 static int fails;
 
 /* Спека — значение, а не глобалы (правило 6, docs/architecture.md, раздел 2): один экземпляр
@@ -123,7 +128,7 @@ int main(void) {
         check("минимальная спека: один выход", 1, (int)g_spec.out_n);
         check("минимальная спека: один канал", 1, (int)g_spec.ch_n);
         check_str("минимальная спека: имя выхода", "direct", g_spec.out[0].name);
-        check("минимальная спека: kind direct", OUT_DIRECT, g_spec.out[0].kind);
+        check("минимальная спека: kind direct", 1, kind_of(&g_spec.out[0]) == OUT_DIRECT);
         check_str("минимальная спека: имя канала", "yt", g_spec.ch[0].name);
         check_str("минимальная спека: канал → direct", "direct", g_spec.ch[0].out);
         check("минимальная спека: domains_n", 1, (int)g_spec.ch[0].domains_n);
@@ -559,11 +564,11 @@ int main(void) {
             "\"listen\":\"127.0.0.1:51820\"}}},"
             "\"channels\":[]}");
         check("obfs: спека принята", 0, load_from_str(s));
-        check("obfs: признак включён", 1, g_spec.out[0].obfs.on);
-        check_str("obfs: адрес сервера", "203.0.113.10", g_spec.out[0].obfs.server);
-        check("obfs: порт сервера", 4567, g_spec.out[0].obfs.server_port);
-        check_str("obfs: локальный адрес", "127.0.0.1", g_spec.out[0].obfs.listen);
-        check("obfs: локальный порт", 51820, g_spec.out[0].obfs.listen_port);
+        check("obfs: признак включён", 1, g_spec.out[0].iface.obfs.on);
+        check_str("obfs: адрес сервера", "203.0.113.10", g_spec.out[0].iface.obfs.server);
+        check("obfs: порт сервера", 4567, g_spec.out[0].iface.obfs.server_port);
+        check_str("obfs: локальный адрес", "127.0.0.1", g_spec.out[0].iface.obfs.listen);
+        check("obfs: локальный порт", 51820, g_spec.out[0].iface.obfs.listen_port);
     }
     {
         /* Умолчание по режиму: спека без mode обязана значить сегодняшний
@@ -573,7 +578,7 @@ int main(void) {
             "\"obfs\":{\"server\":\"203.0.113.10:4567\",\"listen\":\"127.0.0.1:51820\"}}},"
             "\"channels\":[]}");
         check("obfs: без mode — тот же режим", 0, load_from_str(s));
-        check("obfs: без mode — признак включён", 1, g_spec.out[0].obfs.on);
+        check("obfs: без mode — признак включён", 1, g_spec.out[0].iface.obfs.on);
     }
     {
         const char *s = SPEC(
@@ -622,7 +627,7 @@ int main(void) {
             "\"outputs\":{\"wg\":{\"kind\":\"interface\",\"device\":\"wg0\"}},"
             "\"channels\":[]}");
         check("без obfs: спека принята", 0, load_from_str(s));
-        check("без obfs: признак выключен", 0, g_spec.out[0].obfs.on);
+        check("без obfs: признак выключен", 0, g_spec.out[0].iface.obfs.on);
     }
 
     /* ---- kind=zapret: выход без устройства, но с меткой -------------------------
@@ -635,7 +640,7 @@ int main(void) {
             "\"outputs\":{\"yt\":{\"kind\":\"zapret\"}},"
             "\"channels\":[]}");
         check("zapret: спека принята", 0, load_from_str(s));
-        check("zapret: вид OUT_ZAPRET", OUT_ZAPRET, g_spec.out[0].kind);
+        check("zapret: вид zapret", 1, kind_of(&g_spec.out[0]) == OUT_ZAPRET);
         /* Главное различие этого вида: устройства нет, а метка есть. Пока условие было
          * одно на две надобности, такой выход получил бы правило канала и не получил
          * метки — то есть в очередь не попал бы ни один пакет. */
@@ -643,7 +648,7 @@ int main(void) {
         check("zapret: метка нужна", 1, out_needs_mark(&g_spec.out[0]));
         check("zapret: устройство не названо", 0, g_spec.out[0].device[0]);
         check_str("zapret: opts_file по умолчанию из имени выхода",
-                  "/etc/steer/zapret/yt.opts", g_spec.out[0].zp_opts);
+                  "/etc/steer/zapret/yt.opts", g_spec.out[0].zp.opts);
         /* Умолчание on_fail общее для всех выходов — drop, и здесь оно значит «нет обхода
          * — нет трафика», то есть очередь без bypass. */
         check("zapret: on_fail по умолчанию drop", FAIL_DROP, g_spec.out[0].on_fail);
@@ -653,7 +658,7 @@ int main(void) {
             "\"outputs\":{\"yt\":{\"kind\":\"zapret\",\"opts_file\":\"/etc/y.opts\"}},"
             "\"channels\":[]}");
         check("zapret: явный opts_file принят", 0, load_from_str(s));
-        check_str("zapret: явный opts_file сохранён", "/etc/y.opts", g_spec.out[0].zp_opts);
+        check_str("zapret: явный opts_file сохранён", "/etc/y.opts", g_spec.out[0].zp.opts);
     }
     {
         /* Относительный путь «работал бы из шелла» и не работал бы у службы: процесс
@@ -716,12 +721,12 @@ int main(void) {
             "\"channels\":[]}");
 #ifdef STEER_EXTENDED
         check("xsteer: спека принята", 0, load_from_str(s));
-        check("xsteer: вид OUT_XSTEER", OUT_XSTEER, g_spec.out[0].kind);
+        check("xsteer: вид xsteer", 1, kind_of(&g_spec.out[0]) == OUT_XSTEER);
         /* Устройство и путь к конфигурации выводятся из имени выхода: держать их
          * отдельными полями значило бы позволить двум именам разойтись. */
         check_str("xsteer: устройство из имени выхода", "vpn", g_spec.out[0].device);
         check("xsteer: один кандидат в devices", 1, (int)g_spec.out[0].devices_n);
-        check_str("xsteer: conf по умолчанию", "/etc/steer/xsteer/vpn.conf", g_spec.out[0].xs_conf);
+        check_str("xsteer: conf по умолчанию", "/etc/steer/xsteer/vpn.conf", g_spec.out[0].xs.conf);
         check("xsteer: считается выходом с устройством", 1, out_has_device(&g_spec.out[0]));
         check("xsteer: устройство создаёт наш процесс", 1, out_engine_managed(&g_spec.out[0]));
         check("xsteer: masquerade не нужен", 1, out_self_natting(&g_spec.out[0]));
@@ -739,7 +744,7 @@ int main(void) {
             "\"channels\":[]}");
 #ifdef STEER_EXTENDED
         check("vless: спека принята", 0, load_from_str(s));
-        check("vless: вид OUT_VLESS", OUT_VLESS, g_spec.out[0].kind);
+        check("vless: вид vless", 1, kind_of(&g_spec.out[0]) == OUT_VLESS);
         check("vless: устройство создаёт наш процесс", 1, out_engine_managed(&g_spec.out[0]));
 #else
         check("vless: базовая сборка отвергает вид", 2, load_from_str(s));
@@ -756,7 +761,8 @@ int main(void) {
      *
      * Проверяется здесь и разбор, и ЗНАЧЕНИЕ поля (out_node_list): порядок перебора решает,
      * через какую страну пойдёт трафик, а стенда на подъём туннеля нет — он требует и
-     * mbedtls, и сети. */
+     * mbedtls, и сети. Функции живут в src/kinds/vless.c, то есть только в расширенной сборке. */
+#ifdef STEER_EXTENDED
     {
         /* Развёртка выбора в порядок перебора. Собирается прямо в структуре: это чистая
          * функция от поля спеки и размера подписки, спека для неё не нужна. */
@@ -766,8 +772,8 @@ int main(void) {
               (int)out_node_list(&o, 4, dst, 16));
         check("nodes пуст: порядок подписки", 1, dst[0] == 0 && dst[3] == 3);
 
-        o.nodes_n = 3;
-        o.nodes[0] = 6; o.nodes[1] = 7; o.nodes[2] = 12;
+        o.vless.nodes_n = 3;
+        o.vless.nodes[0] = 6; o.vless.nodes[1] = 7; o.vless.nodes[2] = 12;
         check("выбор из трёх: кандидатов трое", 3, (int)out_node_list(&o, 26, dst, 16));
         check("выбор из трёх: порядок предпочтения сохранён", 1,
               dst[0] == 6 && dst[1] == 7 && dst[2] == 12);
@@ -791,12 +797,13 @@ int main(void) {
     {
         struct output o = {0};
         check("подписка из одного узла: узел никем не назван", 0, out_node_named(&o));
-        o.nodes_n = 3; o.nodes[0] = 6; o.nodes[1] = 7; o.nodes[2] = 12;
+        o.vless.nodes_n = 3; o.vless.nodes[0] = 6; o.vless.nodes[1] = 7; o.vless.nodes[2] = 12;
         check("из трёх выбранных уцелел один: выбор всё равно не именной", 0,
               out_node_named(&o));
-        o.nodes_n = 1; o.nodes[0] = 4;
+        o.vless.nodes_n = 1; o.vless.nodes[0] = 4;
         check("номер написан в спеке: узел назван", 1, out_node_named(&o));
     }
+#endif
     {
         /* Выбор узлов есть только у подписки. У kind=interface кандидаты — устройства, и
          * принять здесь `nodes` молча значило бы сказать «настроено», не настроив ничего. */
@@ -813,9 +820,9 @@ int main(void) {
             "\"nodes\":[6,7,12]}},"
             "\"channels\":[]}");
         check("nodes: спека принята", 0, load_from_str(s));
-        check("nodes: кандидатов трое", 3, (int)g_spec.out[0].nodes_n);
+        check("nodes: кандидатов трое", 3, (int)g_spec.out[0].vless.nodes_n);
         check("nodes: порядок как написан", 1,
-              g_spec.out[0].nodes[0] == 6 && g_spec.out[0].nodes[1] == 7 && g_spec.out[0].nodes[2] == 12);
+              g_spec.out[0].vless.nodes[0] == 6 && g_spec.out[0].vless.nodes[1] == 7 && g_spec.out[0].vless.nodes[2] == 12);
     }
     {
         /* Одиночная форма — сокращение для списка из одного, дальше по коду путь один. */
@@ -824,8 +831,8 @@ int main(void) {
             "\"node\":4}},"
             "\"channels\":[]}");
         check("node: спека принята", 0, load_from_str(s));
-        check("node: один кандидат", 1, (int)g_spec.out[0].nodes_n);
-        check("node: номер сохранён", 4, g_spec.out[0].nodes[0]);
+        check("node: один кандидат", 1, (int)g_spec.out[0].vless.nodes_n);
+        check("node: номер сохранён", 4, g_spec.out[0].vless.nodes[0]);
     }
     {
         /* Прежнее «первый рабочий» записывается пустым списком: спека, написанная до
@@ -835,14 +842,14 @@ int main(void) {
             "\"node\":-1}},"
             "\"channels\":[]}");
         check("node -1: спека принята", 0, load_from_str(s));
-        check("node -1: кандидатов не выбрано", 0, (int)g_spec.out[0].nodes_n);
+        check("node -1: кандидатов не выбрано", 0, (int)g_spec.out[0].vless.nodes_n);
     }
     {
         const char *s = SPEC(
             "\"outputs\":{\"vpn\":{\"kind\":\"vless\",\"sub_file\":\"/tmp/sub.txt\"}},"
             "\"channels\":[]}");
         check("без node: спека принята", 0, load_from_str(s));
-        check("без node: кандидатов не выбрано", 0, (int)g_spec.out[0].nodes_n);
+        check("без node: кандидатов не выбрано", 0, (int)g_spec.out[0].vless.nodes_n);
     }
     {
         /* Пустой список — та же «вся подписка», а не «узлов нет»: отказывать на нём значило бы
@@ -852,7 +859,7 @@ int main(void) {
             "\"nodes\":[]}},"
             "\"channels\":[]}");
         check("nodes пустой список принят", 0, load_from_str(s));
-        check("nodes пустой список: кандидатов не выбрано", 0, (int)g_spec.out[0].nodes_n);
+        check("nodes пустой список: кандидатов не выбрано", 0, (int)g_spec.out[0].vless.nodes_n);
     }
     {
         /* Обе формы сразу — отказ, ровно как lan_device вместе с lan_devices: взять одну молча
@@ -917,7 +924,7 @@ int main(void) {
             "\"outputs\":{\"vpn\":{\"kind\":\"xsteer\",\"conf\":\"/etc/hub.conf\"}},"
             "\"channels\":[]}");
         check("xsteer: явный conf принят", 0, load_from_str(s));
-        check_str("xsteer: явный conf сохранён", "/etc/hub.conf", g_spec.out[0].xs_conf);
+        check_str("xsteer: явный conf сохранён", "/etc/hub.conf", g_spec.out[0].xs.conf);
     }
     {
         const char *s = SPEC(
@@ -957,10 +964,12 @@ int main(void) {
             "\"outputs\":{\"vpn\":{\"kind\":\"xsteerr\"}},"
             "\"channels\":[]}");
         check("неизвестный kind — отказ", 2, load_from_str(s));
-        check("out_kind_known: xsteer известен", 1, out_kind_known("xsteer"));
-        check("out_kind_known: опечатка неизвестна", 0, out_kind_known("xsteerr"));
-        check_str("out_kind_name: xsteer", "xsteer", out_kind_name(OUT_XSTEER));
-        check_str("out_kind_name: interface", "interface", out_kind_name(OUT_INTERFACE));
+        /* Реестр знает вид и тогда, когда его нет в сборке (запись отказа): `--kind xsteer` в
+         * базовой сборке — пустой список, а не «нет такого вида». */
+        check("kind_by_name: xsteer известен", 1, kind_by_name("xsteer") != NULL);
+        check("kind_by_name: опечатка неизвестна", 1, kind_by_name("xsteerr") == NULL);
+        check_str("kind_by_name: имя xsteer", "xsteer", kind_by_name("xsteer")->name);
+        check_str("kind_of: имя interface", "interface", kind_of(&(struct output){ .kind = OUT_INTERFACE })->name);
     }
 
     /* ---- имена таблиц маршрутизации объявляются системе ------------------------
@@ -1208,20 +1217,22 @@ int main(void) {
          * том, из-за чего правка и понадобилась: знание «кому ставить чужой бит» было
          * `case`-ом по kind на месте, и вид выхода, добавленный позже (tgws), в него не
          * попал — молча, потому что правила при этом выглядят исправно. Стенд, знающий про
-         * два вида, повторил бы ту же ошибку; стенд, идущий по KINDS, покраснеет на
+         * два вида, повторил бы ту же ошибку; стенд, идущий по реестру видов, покраснеет на
          * следующем добавленном виде, если его забудут рассудить.
          *
          * Ожидание сформулировано ОТРИЦАНИЕМ («все, кроме direct»), а не перечнем: перечень
          * здесь был бы второй копией самой функции, и сверять копию с копией бессмысленно.
          * Утверждение проверки — про СМЫСЛ: единственный вид, чей трафик отдаётся общему
          * обходу, это прямой канал, потому что для этого его и заводят. */
-        for (size_t i = 0; i < KINDS_N; i++) {
+        for (size_t i = 0; i < kind_count(); i++) {
+            /* Вид вне сборки (запись отказа) свойств не имеет — рассуждать о нём нечего. */
+            if (kind_at(i)->absent) continue;
             struct output o = {0};
-            o.kind = KINDS[i].kind;
+            o.kind = kind_at(i);
             char what[96];
-            int want = KINDS[i].kind != OUT_DIRECT;
+            int want = kind_at(i) != OUT_DIRECT;
             snprintf(what, sizeof(what), "обход DPI не трогает выход kind=%s: %s",
-                     KINDS[i].name, want ? "да" : "нет (прямой канал)");
+                     kind_at(i)->name, want ? "да" : "нет (прямой канал)");
             check(what, want, out_skips_zapret(&o));
         }
         /* И отдельной строкой то, ради чего перечень выше: direct — единственное
@@ -1229,9 +1240,10 @@ int main(void) {
          * появиться вместе с решением, а не тихо. */
         {
             int exceptions = 0;
-            for (size_t i = 0; i < KINDS_N; i++) {
+            for (size_t i = 0; i < kind_count(); i++) {
+                if (kind_at(i)->absent) continue;
                 struct output o = {0};
-                o.kind = KINDS[i].kind;
+                o.kind = kind_at(i);
                 if (!out_skips_zapret(&o)) exceptions++;
             }
             check("исключение ровно одно", 1, exceptions);

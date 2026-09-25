@@ -62,6 +62,11 @@ cc_defaults {
         "src/tools/hwid.c",
         "src/daemon/ctl.c",
         "src/daemon/conns.c",
+        "src/kinds/kind.c",
+        "src/kinds/direct.c",
+        "src/kinds/interface.c",
+        "src/kinds/zapret.c",
+        "src/kinds/tgws.c",
         "src/kinds/awg.c",
     ],
     // Каталоги слоёв — те же, что INC_DIRS в build/sources.mk (сверяет tests/buildmatch.sh).
@@ -144,6 +149,10 @@ cc_binary {
         "src/proto/vless/subfetch.c",
         "src/proto/tgws/tgws.c",
         "src/proto/tls/tlsprobe.c",
+        // Kinds of the full package (KINDS_EXT_SRC in build/sources.mk); without them the
+        // registry answers "requires steer-extended" — see src/kinds/kind.c.
+        "src/kinds/vless.c",
+        "src/kinds/xsteer.c",
     ],
     cflags: [
         "-DSTEER_EXTENDED",

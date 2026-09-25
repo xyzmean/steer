@@ -331,15 +331,15 @@ int obfs_split_hostport(const char *s, char *host, size_t hn, int *port) {
  * единственное место, где две настройки обязаны знать друг о друге, и вывести одну из
  * другой движок не может — ключи и пиры не его. Несовпадение молчаливо: WireGuard шлёт
  * в никуда, туннель не поднимается, и причина не видна ниоткуда, кроме tcpdump. */
-static int parse_obfs(struct js *j, struct output *o, struct err *e) {
-    if (js_lit(j, '{') != 0) return err_set(e, "outputs.%s: obfs должен быть объектом", o->name);
+static int parse_obfs(struct js *j, const char *name, struct out_obfs *ob, struct err *e) {
+    if (js_lit(j, '{') != 0) return err_set(e, "outputs.%s: obfs должен быть объектом", name);
     char mode[32] = "", server[80] = "", listen[80] = "";
     js_ws(j);
     while (*j->p != '}') {
         char key[32];
         if (js_str(j, key, sizeof(key), e) != 0)
-            return err_prop(e, "outputs.%s: плохой ключ в obfs", o->name);
-        if (js_lit(j, ':') != 0) return err_set(e, "outputs.%s: в obfs после ключа нет двоеточия", o->name);
+            return err_prop(e, "outputs.%s: плохой ключ в obfs", name);
+        if (js_lit(j, ':') != 0) return err_set(e, "outputs.%s: в obfs после ключа нет двоеточия", name);
         if (!strcmp(key, "mode")) { if (js_str(j, mode, sizeof(mode), e) != 0 && e->msg[0]) return -1; }
         else if (!strcmp(key, "server")) { if (js_str(j, server, sizeof(server), e) != 0 && e->msg[0]) return -1; }
         else if (!strcmp(key, "listen")) { if (js_str(j, listen, sizeof(listen), e) != 0 && e->msg[0]) return -1; }
@@ -354,57 +354,27 @@ static int parse_obfs(struct js *j, struct output *o, struct err *e) {
      * молчаливое «наверное, тот самый»: обфускация, которой нет, выглядит как рабочий
      * выход, из которого не выходит ни один пакет. */
     if (mode[0] && strcmp(mode, "wg-over-tcp") != 0)
-        return err_set(e, "outputs.%s: неизвестный obfs.mode (сейчас есть только wg-over-tcp)", o->name);
-    if (!server[0]) return err_set(e, "outputs.%s: obfs нужен server вида адрес:порт", o->name);
-    if (obfs_split_hostport(server, o->obfs.server, sizeof(o->obfs.server),
-                            &o->obfs.server_port) != 0)
-        return err_set(e, "outputs.%s: obfs.server должен быть вида адрес:порт", o->name);
+        return err_set(e, "outputs.%s: неизвестный obfs.mode (сейчас есть только wg-over-tcp)", name);
+    if (!server[0]) return err_set(e, "outputs.%s: obfs нужен server вида адрес:порт", name);
+    if (obfs_split_hostport(server, ob->server, sizeof(ob->server),
+                            &ob->server_port) != 0)
+        return err_set(e, "outputs.%s: obfs.server должен быть вида адрес:порт", name);
     /* Имя, а не адрес — отказ. Имя пришлось бы разрешать, и разрешать его через тот
      * самый DNS, который может идти в туннель, который поднимается через этот самый
      * сервер. Управляющий слой резолвит один раз и кладёт сюда адрес — то же правило,
      * что со списками: движок читает то, что ему положили. */
     struct in_addr tmp;
-    if (inet_pton(AF_INET, o->obfs.server, &tmp) != 1)
-        return err_set(e, "outputs.%s: obfs.server должен быть адресом, а не именем", o->name);
+    if (inet_pton(AF_INET, ob->server, &tmp) != 1)
+        return err_set(e, "outputs.%s: obfs.server должен быть адресом, а не именем", name);
 
     if (!listen[0]) return err_set(e, "outputs.%s: obfs нужен listen — тот же адрес и порт, что в "
-                        "Endpoint пира WireGuard", o->name);
-    if (obfs_split_hostport(listen, o->obfs.listen, sizeof(o->obfs.listen),
-                            &o->obfs.listen_port) != 0)
-        return err_set(e, "outputs.%s: obfs.listen должен быть вида адрес:порт", o->name);
-    if (inet_pton(AF_INET, o->obfs.listen, &tmp) != 1)
-        return err_set(e, "outputs.%s: obfs.listen должен быть адресом, а не именем", o->name);
-    o->obfs.on = 1;
-    return 0;
-}
-
-/* Виды выходов ОДНИМ списком: из него и печать (out_kind_name), и проверка флага
- * --kind (out_kind_known), и разбор поля kind ниже. Три места, читающие одну таблицу,
- * вместо трёх списков, которые расходятся молча — см. объяснение у объявлений в spec.h.
- * struct out_kind_entry, KINDS_N и объявление KINDS[7] — там же: "static" снят ради
- * tests/specmatch.c. */
-const struct out_kind_entry KINDS[7] = {
-    { "direct",    OUT_DIRECT },
-    { "interface", OUT_INTERFACE },
-    { "vless",     OUT_VLESS },
-    { "xsteer",    OUT_XSTEER },
-    { "zapret",    OUT_ZAPRET },
-    { "tgws",      OUT_TGWS },
-    { "awg",       OUT_AWG },
-};
-
-const char *out_kind_name(enum out_kind k) {
-    for (size_t i = 0; i < KINDS_N; i++)
-        if (KINDS[i].kind == k) return KINDS[i].name;
-    /* Недостижимо: вид приходит из этой же таблицы. Но возвращать здесь «interface»
-     * значило бы напечатать неправду про вид, которого мы не знаем, — а именно это уже
-     * делал тернарник, который эта функция заменила. */
-    return "?";
-}
-
-int out_kind_known(const char *s) {
-    for (size_t i = 0; i < KINDS_N; i++)
-        if (!strcmp(KINDS[i].name, s)) return 1;
+                        "Endpoint пира WireGuard", name);
+    if (obfs_split_hostport(listen, ob->listen, sizeof(ob->listen),
+                            &ob->listen_port) != 0)
+        return err_set(e, "outputs.%s: obfs.listen должен быть вида адрес:порт", name);
+    if (inet_pton(AF_INET, ob->listen, &tmp) != 1)
+        return err_set(e, "outputs.%s: obfs.listen должен быть адресом, а не именем", name);
+    ob->on = 1;
     return 0;
 }
 
@@ -414,11 +384,11 @@ static int parse_outputs(struct js *j, struct spec *s, struct err *e) {
     if (*j->p == '}') { j->p++; return 0; }
     for (;;) {
         struct output o = {0};
-        /* Какой из двух форм записан выбор узлов. Нужно, чтобы отличить «поля нет» от «поле
-         * задано» и поймать выход, где заданы обе: молча взять одну значило бы, что половина
-         * написанного человеком не действует, и понять это было бы нечем (тот же приём, что
-         * у lan_device/lan_devices в load_spec). */
-        int node_one = 0, node_many = 0;
+        /* Ключи видов — сюда, до того как известен вид: `kind` может стоять в объекте последним.
+         * Разбираются они здесь для всех видов, в том числе не вошедших в сборку: ошибка в
+         * значении ключа и отказ «ключ чужого вида» обязаны звучать одинаково в любой сборке.
+         * Что значения значат, решает вид (kind_ops.parse). */
+        struct out_keys k = {0};
         if (js_str(j, o.name, sizeof(o.name), e) != 0)
             return err_prop(e, "outputs: expected a name", NULL);
         /* Состав имени — см. name_ok(). Оно уходит в командную строку через diag и в имя
@@ -466,15 +436,15 @@ static int parse_outputs(struct js *j, struct spec *s, struct err *e) {
                     }
                 }
             }
-            else if (!strcmp(key, "obfs")) { if (parse_obfs(j, &o, e) != 0) return -1; }
-            else if (!strcmp(key, "sub_file")) { if (js_str(j, o.sub_file, sizeof(o.sub_file), e) != 0 && e->msg[0]) return -1; }
-            else if (!strcmp(key, "conf")) { if (js_str(j, o.xs_conf, sizeof(o.xs_conf), e) != 0 && e->msg[0]) return -1; }
+            else if (!strcmp(key, "obfs")) { if (parse_obfs(j, o.name, &k.obfs, e) != 0) return -1; }
+            else if (!strcmp(key, "sub_file")) { if (js_str(j, k.sub_file, sizeof(k.sub_file), e) != 0 && e->msg[0]) return -1; }
+            else if (!strcmp(key, "conf")) { if (js_str(j, k.conf, sizeof(k.conf), e) != 0 && e->msg[0]) return -1; }
             /* Файл ключей nfqws у kind=zapret. Отдельным ключом, а не переиспользованным
              * `conf`: у xsteer там конфигурация в стиле wg с приватным ключом, здесь —
              * список ключей командной строки, и одно имя для двух разных вещей однажды
              * привело бы к попытке поднять туннель по стратегии обхода. */
-            else if (!strcmp(key, "opts_file")) { if (js_str(j, o.zp_opts, sizeof(o.zp_opts), e) != 0 && e->msg[0]) return -1; }
-            else if (!strcmp(key, "domain")) { if (js_str(j, o.tg_domain, sizeof(o.tg_domain), e) != 0 && e->msg[0]) return -1; }
+            else if (!strcmp(key, "opts_file")) { if (js_str(j, k.opts_file, sizeof(k.opts_file), e) != 0 && e->msg[0]) return -1; }
+            else if (!strcmp(key, "domain")) { if (js_str(j, k.domain, sizeof(k.domain), e) != 0 && e->msg[0]) return -1; }
             /* Через какой выход идёт трафик самого туннеля — см. блок «вложенные выходы» в
              * spec.h. Состав имени проверяется тем же name_ok, что имя выхода: строка уходит в
              * status и в подпись помощника, а годное имя выхода по-другому и не выглядит.
@@ -493,11 +463,11 @@ static int parse_outputs(struct js *j, struct spec *s, struct err *e) {
              * обязана переживать перезагрузку. */
             /* Проверяем на 't', как соседнее `enabled` проверяется на 'f': значение здесь
              * либо true, либо false, и разбирать его полноценным разбором JSON незачем. */
-            else if (!strcmp(key, "stream")) { js_ws(j); o.xs_stream = (*j->p == 't'); if (js_skip(j, e) != 0) return -1; }
+            else if (!strcmp(key, "stream")) { js_ws(j); k.stream = (*j->p == 't'); if (js_skip(j, e) != 0) return -1; }
             else if (!strcmp(key, "stream_port")) {
                 long v = 0;
                 if (js_num(j, &v, e) != 0) return -1;
-                o.xs_stream_port = (int)v;
+                k.stream_port = (int)v;
             }
             /* `node` — сокращение для списка из одного узла, `nodes` — сам список. Дальше по
              * коду путь один, ровно как у `device`/`devices`. Прежнее `-1` («первый рабочий»)
@@ -506,14 +476,14 @@ static int parse_outputs(struct js *j, struct spec *s, struct err *e) {
             else if (!strcmp(key, "node")) {
                 long v = 0;
                 if (js_num(j, &v, e) != 0) return -1;
-                node_one = 1;
-                if (v >= 0) { o.nodes[0] = (int)v; o.nodes_n = 1; }
-                else o.nodes_n = 0;
+                k.node_one = 1;
+                if (v >= 0) { k.nodes[0] = (int)v; k.nodes_n = 1; }
+                else k.nodes_n = 0;
             }
             else if (!strcmp(key, "nodes")) {
-                if (num_array(j, o.nodes, MAX_NODE_SEL, &o.nodes_n, e) != 0)
+                if (num_array(j, k.nodes, MAX_NODE_SEL, &k.nodes_n, e) != 0)
                     return err_prop(e, "outputs.%s: nodes — массив номеров узлов подписки", o.name);
-                node_many = 1;
+                k.node_many = 1;
             }
             else if (!strcmp(key, "on_fail")) {
                 char m[16];
@@ -565,182 +535,56 @@ static int parse_outputs(struct js *j, struct spec *s, struct err *e) {
             if (*j->p == ',') { j->p++; js_ws(j); }
         }
         j->p++;
-        if (!strcmp(kind, "direct")) o.kind = OUT_DIRECT;
-        else if (!strcmp(kind, "vless")) {
-#ifndef STEER_EXTENDED
-            /* Отказываем СРАЗУ, а не при подъёме: иначе спека применяется, правила
-             * встают, и выход молча никуда не ведёт — то есть человек видит рабочую
-             * конфигурацию, в которой трафик пропадает. */
-            return err_set(e, "outputs.%s: kind vless требует пакет steer-extended", o.name);
-#endif
-            o.kind = OUT_VLESS;
-            if (!o.sub_file[0])
-                return err_set(e, "outputs.%s: kind vless нужен sub_file с подпиской", o.name);
-            /* Имя устройства выводится из имени выхода: держать его отдельным полем
-             * значило бы дать двум именам расходиться, а никакой пользы от их различия
-             * нет. Ограничение в 15 символов — предел IFNAMSIZ. */
-            if (!o.device[0]) snprintf(o.device, sizeof(o.device), "%.15s", o.name);
-            if (!o.devices_n) snprintf(o.devices[o.devices_n++], 32, "%s", o.device);
-        }
-        else if (!strcmp(kind, "xsteer")) {
-#ifndef STEER_EXTENDED
-            /* Отказываем СРАЗУ и по той же причине, что у vless выше: иначе спека
-             * применяется, правила и метки встают, а устройства не создаст никто —
-             * человек видит рабочую конфигурацию, из которой не выходит ни один пакет.
-             * Подстроку «steer-extended» здесь читают снаружи (см. src/daemon/main.c). */
-            return err_set(e, "outputs.%s: kind xsteer требует пакет steer-extended", o.name);
-#endif
-            o.kind = OUT_XSTEER;
-            /* Имя устройства и путь к конфигурации выводятся из имени выхода — тот же
-             * довод, что у vless: два имени, которым позволено разойтись, пользы не
-             * приносят. Имя выхода уже проверено name_ok выше, поэтому путь собирается
-             * из проверенного. */
-            if (!o.device[0]) snprintf(o.device, sizeof(o.device), "%.15s", o.name);
-            if (!o.devices_n) snprintf(o.devices[o.devices_n++], 32, "%s", o.device);
-            if (!o.xs_conf[0])
-                snprintf(o.xs_conf, sizeof(o.xs_conf), STEER_ETC_DIR "/xsteer/%.200s.conf", o.name);
-            /* Абсолютный путь: процесс запускает procd со своим рабочим каталогом, а не
-             * наша оболочка, — относительный «работал бы из шелла» и не работал у
-             * сервиса. Годность к JSON: путь печатается в status, diag и xsteer-peers. */
-            else if (o.xs_conf[0] != '/' || !label_ok(o.xs_conf))
-                return err_set(e, "outputs.%s: conf должен быть абсолютным путём без кавычек", o.name);
-            if (o.xs_stream_port && (o.xs_stream_port < 1 || o.xs_stream_port > 65535))
-                return err_set(e, "outputs.%s: stream_port вне 1..65535", o.name);
-            /* Порт без режима — это настройка, которая ничего не делает: сказать «настроено»,
-             * не настроив, хуже, чем отказать. Тот же довод, что у obfs при чужом kind. */
-            if (o.xs_stream_port && !o.xs_stream)
-                return err_set(e, "outputs.%s: stream_port без stream: транспорт остался бы поддельным TCP",
-                    o.name);
-        }
-        else if (!strcmp(kind, "zapret")) {
-#ifdef STEER_ANDROID
-            return err_set(e, "outputs.%s: kind zapret — в сборке под Android zapret нет", o.name);
-#endif
-            o.kind = OUT_ZAPRET;
-            /* Устройства нет и не будет: трафик уходит обычным маршрутом, а выход меняет
-             * только то, ЧТО с ним по дороге сделает nfqws. Названное устройство здесь —
-             * почти наверняка описка (человек копировал выход-туннель), и принять его
-             * молча значило бы обещать маршрутизацию, которой не будет. */
-            if (o.device[0] || o.devices_n)
-                return err_set(e, "outputs.%s: у kind zapret нет устройства — трафик идёт обычным путём",
-                    o.name);
-            /* Путь выводится из имени выхода — тот же довод, что у conf у xsteer: два
-             * имени, которым позволено разойтись, пользы не приносят. Имя уже проверено
-             * name_ok выше, поэтому путь собирается из проверенного. */
-            if (!o.zp_opts[0])
-                snprintf(o.zp_opts, sizeof(o.zp_opts), STEER_ETC_DIR "/zapret/%.200s.opts", o.name);
-            /* Абсолютный путь и годность к JSON: путь печатается в status и в diag, а
-             * запускает процесс procd со своим рабочим каталогом — относительный «работал
-             * бы из шелла» и не работал бы у службы. Тот же барьер, что у conf. */
-            else if (o.zp_opts[0] != '/' || !label_ok(o.zp_opts))
-                return err_set(e, "outputs.%s: opts_file должен быть абсолютным путём без кавычек", o.name);
-        }
-        else if (!strcmp(kind, "tgws")) {
-            o.kind = OUT_TGWS;
-            /* Домен обязателен и умолчания у него нет НАРОЧНО. Сам web.telegram.org мост
-             * пробует и без спеки, но только для ДЦ2 и ДЦ4 (TLS 1.2 на адрес веб-клиента,
-             * см. «прямо к Telegram» в tgws.c): ДЦ1, 3, 5 и 203 там не обслуживаются. Им
-             * нужен домен за Cloudflare, и подставить вместо него web.telegram.org молча
-             * значило бы завести выход, у которого эти дата-центры не работают никогда. */
-            if (!o.tg_domain[0])
-                return err_set(e, "outputs.%s: kind tgws нужен domain — имя за Cloudflare, у которого "
-                    "kwsN.<domain> ведёт на веб-точку Telegram: web.telegram.org обслуживает "
-                    "только ДЦ2 и ДЦ4", o.name);
-            /* Устройства нет по той же причине, что у zapret: маршрут не меняется, меняется
-             * то, куда уводится перехваченное соединение. Названное устройство — почти
-             * наверняка описка, и принять её молча значило бы обещать маршрутизацию,
-             * которой не будет. */
-            if (o.device[0] || o.devices_n)
-                return err_set(e, "outputs.%s: у kind tgws нет устройства — соединение перехватывается",
-                    o.name);
-        }
-        else if (!strcmp(kind, "awg")) {
-            /* Туннель AmneziaWG/WireGuard, который заводит сам движок (src/kinds/awg.c). В базовой
-             * сборке, а не в extended: ни TLS, ни mbedtls ему не нужны, только netlink. */
-            o.kind = OUT_AWG;
-            /* Устройство у выхода ОДНО — его создаёт этот выход. Пул из нескольких туннелей
-             * собирается выходом kind=interface, в devices которого названо и это устройство;
-             * список здесь означал бы устройства, которые никто не создаст. */
-            if (o.devices_n > 1 ||
-                (o.devices_n == 1 && o.device[0] && strcmp(o.device, o.devices[0]) != 0))
-                return err_set(e, "outputs.%s: у kind awg одно устройство — его заводит движок; пул "
-                    "собирается выходом kind=interface", o.name);
-            if (o.devices_n == 1 && !o.device[0])
-                snprintf(o.device, sizeof(o.device), "%s", o.devices[0]);
-            /* Имя устройства выбирает движок так, чтобы оно не выдавало туннель (см.
-             * awg_default_ifname в awg.h). Названное явно обязано тому же правилу: приложение
-             * видит имена интерфейсов, и «wg0» рядом с wlan0 — это ровно тот след, которого
-             * владелец просил не оставлять. */
-            if (o.device[0]) {
-                if (strlen(o.device) > 15)
-                    return err_set(e, "outputs.%s: имя устройства длиннее 15 символов", o.name);
-                if (awg_ifname_conspicuous(o.device))
-                    return err_set(e, "outputs.%s: имя устройства выдаёт туннель (tun, wg, awg, ppp, vpn…) — "
-                        "уберите device, и движок выберет имя сам", o.name);
-            } else awg_default_ifname(o.name, o.device, sizeof(o.device));
-            o.devices_n = 0;
-            snprintf(o.devices[o.devices_n++], 32, "%s", o.device);
-            /* Путь к файлу — тем же порядком, что у xsteer: по умолчанию из имени выхода, иначе
-             * абсолютный и годный к JSON (печатается в status и diag). */
-            if (!o.xs_conf[0])
-                snprintf(o.xs_conf, sizeof(o.xs_conf), STEER_ETC_DIR "/awg/%.200s.conf", o.name);
-            else if (o.xs_conf[0] != '/' || !label_ok(o.xs_conf))
-                return err_set(e, "outputs.%s: conf должен быть абсолютным путём без кавычек", o.name);
-        }
-        else if (!strcmp(kind, "interface")) {
-            o.kind = OUT_INTERFACE;
-            /* device и devices описывают одно и то же с разных сторон: device — что
-             * работает сейчас, devices — из чего выбирать. Задан один, выводится
-             * второй, чтобы дальше по коду не было двух путей. */
-            if (!o.devices_n && o.device[0]) snprintf(o.devices[o.devices_n++], 32, "%s", o.device);
-            if (!o.device[0] && o.devices_n) snprintf(o.device, sizeof(o.device), "%s", o.devices[0]);
-            if (!o.device[0]) return err_set(e, "outputs.%s: kind interface needs a device", o.name);
-        } else return err_set(e, "outputs.%s: неизвестный kind "
+        /* Вид — по имени из реестра (src/kinds/kind.c). Вид, не вошедший в сборку, отвечает своей
+         * строкой отказа СРАЗУ, а не при подъёме: иначе спека применяется, правила встают, и выход
+         * молча никуда не ведёт. */
+        const struct kind_ops *kd = kind_by_name(kind);
+        if (!kd) return err_set(e, "outputs.%s: неизвестный kind "
                    "(нужен direct, interface, vless, xsteer, zapret, tgws или awg)", o.name);
-        /* Обфускация осмысленна только там, где транспорт — чужой UDP, до которого
+        if (kd->absent) {
+            static char msg[256];
+            snprintf(msg, sizeof(msg), "outputs.%s: %s", o.name, kd->absent);
+            return err_set(e, "%s", msg);
+        }
+        o.kind = kd;
+        if (kd->parse && kd->parse(&o, &k, e) != 0) return -1;
+        /* КЛЮЧ ЧУЖОГО ВИДА — отказ. Поле, принятое молча у чужого вида выхода, — это
+         * «настроено», сказанное о том, что не настроено. Проверки стоят ПОСЛЕ разбора вида,
+         * и порядок их прежний: сообщение называет первый чужой ключ.
+         *
+         * Обфускация осмысленна только там, где транспорт — чужой UDP, до которого
          * движку не дотянуться иначе. У vless свой транспорт внутри движка (и свои
          * средства маскировки — Reality), у xsteer он свой и поддельный TCP уже внутри
-         * него, у direct транспорта нет вовсе. Принять поле молча значило бы сказать
-         * «настроено», не настроив ничего. */
-        if (o.obfs.on && o.kind != OUT_INTERFACE)
+         * него, у direct транспорта нет вовсе. Режим потока — свойство транспорта xsteer. */
+        if (k.obfs.on && !(kd->keys & KK_OBFS))
             return err_set(e, "outputs.%s: obfs есть только у kind=interface", o.name);
-        /* Режим потока — свойство транспорта xsteer, и у прочих видов выхода его нет. Принять
-         * поле молча значило бы сказать «настроено», не настроив ничего. */
-        if ((o.xs_stream || o.xs_stream_port) && o.kind != OUT_XSTEER)
+        if ((k.stream || k.stream_port) && !(kd->keys & KK_STREAM))
             return err_set(e, "outputs.%s: stream есть только у kind=xsteer", o.name);
-        /* Тот же довод, что у obfs и stream: поле, принятое молча у чужого вида выхода, —
-         * это «настроено», сказанное о том, что не настроено. Проверка стоит ПОСЛЕ разбора
-         * kind, потому что у своего вида это поле выставляет умолчание. */
-        if (o.zp_opts[0] && o.kind != OUT_ZAPRET)
+        if (k.opts_file[0] && !(kd->keys & KK_OPTS))
             return err_set(e, "outputs.%s: opts_file есть только у kind=zapret", o.name);
-        if (o.tg_domain[0] && o.kind != OUT_TGWS)
+        if (k.domain[0] && !(kd->keys & KK_DOMAIN))
             return err_set(e, "outputs.%s: domain есть только у kind=tgws", o.name);
-        /* on_fail=zapret у выхода kind=zapret — это «при отказе обхода включить обход».
-         * Молча принять значило бы записать в настройку круг, который ничего не значит. */
-        if (o.kind == OUT_ZAPRET && o.on_fail == FAIL_ZAPRET)
-            return err_set(e, "outputs.%s: on_fail zapret у выхода kind zapret ничего не значит "
-                "(нужен drop или direct)", o.name);
-        /* У tgws on_fail не выражается вовсе, и молчать об этом нельзя. Перехват — это
-         * правило nat, оно стоит в ядре всегда; когда моста нет, ядро отвечает отказом на
-         * соединение, то есть ведёт себя как drop, и никаким полем это не переключить.
-         * Обещать direct и не сделать его хуже, чем отказать сразу. */
-        if (o.kind == OUT_TGWS && o.on_fail != FAIL_DROP)
-            return err_set(e, "outputs.%s: у kind tgws on_fail только drop: перехват стоит в ядре, и без "
-                "моста соединение отвергается — обойти это правилом нечем", o.name);
-        if (node_one && node_many)
+        /* Своя проверка вида после общих — то, что зависит от общих полей (on_fail у zapret и
+         * tgws). */
+        if (kd->check && kd->check(s, &o, e) != 0) return -1;
+        /* Какой из двух форм записан выбор узлов. Нужно, чтобы отличить «поля нет» от «поле
+         * задано» и поймать выход, где заданы обе: молча взять одну значило бы, что половина
+         * написанного человеком не действует, и понять это было бы нечем (тот же приём, что
+         * у lan_device/lan_devices в load_spec). */
+        if (k.node_one && k.node_many)
             return err_set(e, "outputs.%s: задано и node, и nodes — оставьте одно", o.name);
         /* Выбор узлов есть только у подписки. Отвергается ТОЛЬКО новая форма: `nodes` не
          * может стоять в спеке, написанной до этой версии, а `node` там стоять мог — и у
          * чужого вида выхода он и раньше ничего не делал. Отказать на нём сейчас значило бы
          * сломать применение спеки, которая работала, ради поля, которое ничего не меняет. */
-        if (node_many && o.kind != OUT_VLESS)
+        if (k.node_many && !(kd->keys & KK_NODES))
             return err_set(e, "outputs.%s: nodes есть только у kind=vless — это номера узлов подписки",
                 o.name);
         /* Дубликат номера делает перебор бессмысленным ровно так же, как дубликат устройства
          * в devices: второй кандидат ничем не отличается от первого. */
-        for (size_t a = 0; a < o.nodes_n; a++)
-            for (size_t b = a + 1; b < o.nodes_n; b++)
-                if (o.nodes[a] == o.nodes[b])
+        for (size_t a = 0; a < k.nodes_n; a++)
+            for (size_t b = a + 1; b < k.nodes_n; b++)
+                if (k.nodes[a] == k.nodes[b])
                     return err_set(e, "outputs.%s: узел подписки указан в nodes дважды", o.name);
         if (s->out_n >= MAX_OUTPUTS) return err_set(e, "too many outputs", NULL);
         /* Два выхода с одним именем: реестр раздаст две метки, init поднимет два процесса
@@ -1008,7 +852,7 @@ static int via_check(const struct spec *sp, struct err *e) {
                      "выход %.31s: via есть только у выходов со своим соединением с сервером — "
                      "vless, xsteer, awg и interface с obfs; у kind=%s соединение открывает не движок, "
                      "и пустить его через другой выход нечем", o->name,
-                     o->kind == OUT_INTERFACE ? "interface без obfs" : out_kind_name(o->kind));
+                     kind_of(o)->novia ? kind_of(o)->novia : kind_of(o)->name);
             return err_set(e, "%s", msg);
         }
         if (!strcmp(o->via, o->name))
@@ -1024,7 +868,7 @@ static int via_check(const struct spec *sp, struct err *e) {
             snprintf(msg, sizeof(msg),
                      "выход %.31s: via «%.31s» — это kind=%s, у него нет устройства, в которое "
                      "можно пустить туннель (нужен выход с устройством: interface, vless, xsteer, awg)",
-                     o->name, v->name, out_kind_name(v->kind));
+                     o->name, v->name, kind_of(v)->name);
             return err_set(e, "%s", msg);
         }
 
@@ -1453,14 +1297,17 @@ int load_spec(const char *path, struct spec *s, struct err *e) {
                 "добавьте \"allow_all\": true — иначе выберите список", c->name);
 
         struct output *o = out_by_name(s, c->out);
-        /* Мост Telegram перехватывает соединения только в prerouting (раздача): у трафика самого
-         * телефона такого заворота нет, и канал «приложение → tgws» стоял бы применённым, не
-         * делая ничего. */
-        if (local && o && o->kind == OUT_TGWS)
-            return err_set(e, "канал %s: выход kind=tgws работает только для клиентов раздачи — у трафика "
-                "самого телефона моста нет", c->name);
+        /* Выход, который работает только для клиентов раздачи (мост Telegram перехватывает
+         * соединения только в prerouting): канал «приложение → такой выход» стоял бы
+         * применённым, не делая ничего. Почему — говорит вид (kind_ops.lan_only). */
+        if (local && o && kind_of(o)->lan_only) {
+            static char msg[300];
+            snprintf(msg, sizeof(msg), "канал %s: выход kind=%s работает только для клиентов раздачи — %s",
+                     c->name, kind_of(o)->name, kind_of(o)->lan_only);
+            return err_set(e, "%s", msg);
+        }
         /* Дальше — проверки, которым нужен выход С УСТРОЙСТВОМ. Через out_has_device, а не
-         * сравнением с OUT_INTERFACE: у выхода kind=vless последствие ровно то же — весь
+         * сравнением с видом interface: у выхода kind=vless последствие ровно то же — весь
          * трафик клиента, включая доступ к роутеру и его DNS, уходит в туннель. Проверка,
          * знающая про один вид выхода, молча пропускала бы вторую половину случаев, а
          * «защита от дурака», работающая через раз, хуже отсутствующей: на неё рассчитывают. */
@@ -1480,25 +1327,6 @@ struct output *out_by_name(const struct spec *sp, const char *n) {
     return NULL;
 }
 
-/* Порядок перебора узлов подписки. Объяснение — у объявления в spec.h. */
-size_t out_node_list(const struct output *o, size_t usable, int *dst, size_t max) {
-    size_t n = 0;
-    if (!o->nodes_n) {
-        /* Кандидатов не выбирали — кандидаты все, в порядке подписки. Это прежнее
-         * поведение `node: -1` и умолчание, которое рекомендует интерфейс: номер узла
-         * меняется при обновлении подписки, а проверка находит живой сама. */
-        for (size_t i = 0; i < usable && n < max; i++) dst[n++] = (int)i;
-        return n;
-    }
-    for (size_t i = 0; i < o->nodes_n && n < max; i++)
-        if (o->nodes[i] >= 0 && (size_t)o->nodes[i] < usable) dst[n++] = o->nodes[i];
-    return n;
-}
-
-/* Назван ли узел человеком. Объяснение — у объявления в spec.h. */
-int out_node_named(const struct output *o) {
-    return o->nodes_n == 1;
-}
 
 /* ---- что такое строка списка -------------------------------------------------------
  *

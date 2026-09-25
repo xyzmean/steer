@@ -691,7 +691,8 @@ static int cmd_xsteer_spec(const char *spec_path, const char *out_name, const ch
     if (load_spec(spec_path, &cfg, &e) < 0) err_die(&e);
     struct output *o = out_by_name(&cfg, out_name);
     if (!o) die("нет такого выхода: %s", out_name);
-    if (o->kind != OUT_XSTEER) die("выход %s не kind=xsteer", out_name);
+    const struct xsteer_cfg *xc = out_xsteer(o);
+    if (!xc) die("выход %s не kind=xsteer", out_name);
     /* Реестр нужен ДО подъёма: из него берутся метка и номер таблицы выхода, а их привязка к
      * устройству — работа этого процесса (см. bind_device ниже). Вызов идемпотентен и с apply
      * не спорит: тот же файл, те же номера. Без него метка была бы нулевой, и правило
@@ -708,10 +709,10 @@ static int cmd_xsteer_spec(const char *spec_path, const char *out_name, const ch
      * настройку выхода, а ключом человек проверяет руками — и «проверил ключом, а работало по
      * спеке» это потерянный час. Отсутствие ключа (0) при заданном в спеке потоке оставляет
      * поток: выключить его руками можно --no-stream, который приезжает сюда как -1. */
-    s.stream = stream ? stream > 0 : o->xs_stream;
-    s.stream_port = stream_port ? stream_port : o->xs_stream_port;
+    s.stream = stream ? stream > 0 : xc->stream;
+    s.stream_port = stream_port ? stream_port : xc->stream_port;
     char err[256];
-    const char *path = conf_path ? conf_path : o->xs_conf;
+    const char *path = conf_path ? conf_path : xc->conf;
     if (xs_conf_load_any(path, XS_ROLE_SPOKE, &g_cf, &g_sc, NULL, 0, NULL,
                          err, sizeof(err)) != 0) {
         fprintf(stderr, LOG_W "%s\n", err);
@@ -1831,11 +1832,12 @@ int cmd_xsteer_peers(const char *spec_path, const char *out_name, const char *co
     if (load_spec(spec_path, &cfg, &e) < 0) err_die(&e);
     struct output *o = out_by_name(&cfg, out_name);
     if (!o) die("нет такого выхода: %s", out_name);
-    if (o->kind != OUT_XSTEER) die("выход %s не kind=xsteer", out_name);
+    const struct xsteer_cfg *xc = out_xsteer(o);
+    if (!xc) die("выход %s не kind=xsteer", out_name);
     struct xs_conf c;
     struct xs_secrets sec;
     char err[256];
-    const char *path = conf_path ? conf_path : o->xs_conf;
+    const char *path = conf_path ? conf_path : xc->conf;
     if (xs_conf_load_any(path, XS_ROLE_SPOKE, &c, &sec, NULL, 0, NULL, err, sizeof(err)) != 0) {
         fprintf(stderr, LOG_W "%s\n", err);
         return 2;

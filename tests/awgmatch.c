@@ -395,11 +395,11 @@ int main(void) {
     check("kind awg без conf — годен", 0,
           spec_str("\"outputs\":{\"nl\":{\"kind\":\"awg\",\"on_fail\":\"drop\"}},\"channels\":[]"));
     check_str("  устройство — имя выхода", "nl", g_spec.out[0].device);
-    check_str("  conf по умолчанию из имени выхода", STEER_ETC_DIR "/awg/nl.conf", g_spec.out[0].xs_conf);
+    check_str("  conf по умолчанию из имени выхода", STEER_ETC_DIR "/awg/nl.conf", g_spec.out[0].awg.conf);
     check("  выход с устройством и меткой", 1, out_has_device(&g_spec.out[0]) && out_needs_mark(&g_spec.out[0]));
     check("  устройство заводит движок", 1, out_engine_managed(&g_spec.out[0]));
     check("  masquerade ему нужен (не self_natting)", 0, out_self_natting(&g_spec.out[0]));
-    check_str("  вид печатается как awg", "awg", out_kind_name(g_spec.out[0].kind));
+    check_str("  вид печатается как awg", "awg", kind_of(&g_spec.out[0])->name);
     check("kind awg c именем wg0 — годен", 0,
           spec_str("\"outputs\":{\"wg0\":{\"kind\":\"awg\",\"conf\":\"/data/misc/steer/awg/a.conf\"}},\"channels\":[]"));
     check("  устройство не «wg0»", 1, strcmp(g_spec.out[0].device, "wg0") != 0 && !strncmp(g_spec.out[0].device, "if", 2));

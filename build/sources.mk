@@ -47,6 +47,17 @@ DNSD_SRC := src/lib/sindex.c src/lib/nftnl.c src/lib/ctnl.c \
             src/dnsd/rules.c src/dnsd/wire.c src/dnsd/origdst.c src/dnsd/fakeip.c src/dnsd/table.c \
             src/dnsd/dlog.c src/dnsd/proxy.c src/dnsd/main.c
 
+# Виды выхода (src/kinds, docs/architecture.md, раздел 2, правило 1): вид — это файл, и какие виды
+# есть в сборке, решает профиль. Реестр (kind.c) ссылается на записи видов слабо, поэтому вид,
+# файла которого в профиле нет, у движка есть — одной строкой отказа («kind vless требует пакет
+# steer-extended»), без #ifdef в разборе. Базовые виды — в каждом профиле (через CORE_SRC); виды,
+# которым нужны TLS и клиенты туннелей, — только в полном пакете (PROFILE_extended и android).
+# tgws — базовый: правила перехвата пишет любой движок, мост живёт своей программой (полный
+# пакет, микропакет stgws). Состав проверяет tests/buildmatch.sh.
+KINDS_BASE_SRC := src/kinds/kind.c src/kinds/direct.c src/kinds/interface.c src/kinds/zapret.c \
+                  src/kinds/tgws.c src/kinds/awg.c
+KINDS_EXT_SRC  := src/kinds/vless.c src/kinds/xsteer.c
+
 # src/daemon/steer.c нарезан на модули (docs/architecture.md, раздел 2, «Слои и каталоги»):
 # компиляция спеки в правила — в src/compile, остальное ядро — в src/daemon, порядок ниже
 # такой же, как был в steer.c (lib/run.c раньше всех — на него ссылаются и compile, и daemon).
@@ -55,7 +66,7 @@ CORE_SRC := src/lib/run.c src/lib/jsonw.c src/compile/groups.c src/compile/gener
             src/daemon/explain.c src/daemon/supervise.c src/daemon/watch.c src/daemon/main.c \
             $(MODEL_SRC) $(DNSD_SRC) src/daemon/failover.c src/tools/aggregate.c src/proto/obfs/obfs.c \
             src/cli/cli.c src/tools/srs.c src/tools/puff.c src/tools/hwid.c src/daemon/ctl.c \
-            src/daemon/conns.c src/kinds/awg.c
+            src/daemon/conns.c $(KINDS_BASE_SRC)
 
 # Общее для обеих ролей: формат кадра, конфигурация, маршрутизация, рукопожатие, соединение
 # и то, на чём они стоят (TLS-записи, примитивы Reality, TUN). Расходиться на проводе этим
@@ -84,7 +95,7 @@ EXT_TGWS_SRC := src/proto/tls/tls13.c src/proto/tls/certverify.c src/proto/tls/r
                 src/proto/tls/chello.c src/proto/tgws/tgws.c src/proto/tls/tlsprobe.c
 
 PROFILE_base     := $(CORE_SRC)
-PROFILE_extended := $(CORE_SRC) $(XS_COMMON_SRC) $(EXT_ROUTER_SRC)
+PROFILE_extended := $(CORE_SRC) $(XS_COMMON_SRC) $(EXT_ROUTER_SRC) $(KINDS_EXT_SRC)
 PROFILE_server   := $(CORE_SRC) $(XS_COMMON_SRC) $(EXT_SERVER_SRC)
 PROFILE_tgws     := $(CORE_SRC) $(EXT_TGWS_SRC)
 # Телефон: тот же состав, что расширенный роутерный (Android.bp, цель steer).

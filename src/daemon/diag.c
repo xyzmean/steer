@@ -113,45 +113,6 @@ static const struct { const char *addr; const char *who; } RESOLVERS[] = {
     { "208.67.220.220",  "OpenDNS" },
 };
 
-/* MTU устройства из sysfs. -1, если устройства нет. Читаем файл, а не спрашиваем ip:
- * это один открытый файл против запуска процесса, а ответ тот же. */
-static int dev_mtu(const char *dev) {
-    char path[128];
-    snprintf(path, sizeof(path), "/sys/class/net/%.32s/mtu", dev);
-    FILE *f = fopen(path, "r");
-    if (!f) return -1;
-    int mtu = -1;
-    if (fscanf(f, "%d", &mtu) != 1) mtu = -1;
-    fclose(f);
-    return mtu;
-}
-
-/* Через какое устройство ядро отправит пакет к адресу и каков MTU этого устройства.
- * Возвращает MTU (или -1) и пишет имя устройства в dev.
- *
- * Адрес попадает в командную строку, поэтому обязан быть проверен ДО вызова: здесь он
- * приходит из спеки, где парсер уже отверг всё, что не является литералом IPv4
- * (inet_pton). Это то же требование, из-за которого в explain появилась проверка
- * формы: подстановка непроверенной строки в вызов однажды уже была дырой. */
-static int route_egress(const char *addr, char *dev, size_t devn) {
-    dev[0] = '\0';
-    char cmd[160];
-    snprintf(cmd, sizeof(cmd), "ip route get %.45s 2>/dev/null", addr);
-    FILE *p = popen(cmd, "r");
-    if (!p) return -1;
-    char line[512];
-    if (fgets(line, sizeof(line), p)) {
-        char *d = strstr(line, " dev ");
-        if (d) {
-            d += 5;
-            size_t k = 0;
-            while (d[k] && d[k] != ' ' && d[k] != '\n' && k + 1 < devn) { dev[k] = d[k]; k++; }
-            dev[k] = '\0';
-        }
-    }
-    pclose(p);
-    return dev[0] ? dev_mtu(dev) : -1;
-}
 
 
 
@@ -436,14 +397,15 @@ int cmd_diag(const char *spec) {
      *    лишь в том, кого это касается — при доменных правилах клиентов из from_default
      *    прикрывает перенаправление DNS на свой резолвер, и цену платят только остальные.
      *
-     *    ТОЛЬКО vless, и на xsteer это НЕ распространяется, хотя оба вида — наши туннели.
+     *    ТОЛЬКО vless (бит KC_FLOW_UDP вида), и на xsteer это НЕ распространяется, хотя оба
+     *    вида — наши туннели.
      *    Причина заметки в том, что у VLESS поток к узлу свой на каждую пару адрес-порт;
      *    xsteer несёт сырой IP, как wireguard, никаких потоков к узлу у него нет, и цены
      *    тоже нет. Скопировать заметку на xsteer значило бы напечатать постоянную заметку
      *    без причины — ровно то, из-за чего была убрана проверка `udp`. */
     for (size_t i = 0; i < g_grp_n; i++) {
         struct output *o = out_by_name(sp, g_grp[i].out);
-        if (!o || o->kind != OUT_VLESS) continue;
+        if (!o || !out_has_cap(o, KC_FLOW_UDP)) continue;
         char found[64];
         const char *who = NULL;
         for (size_t k = 0; k < g_grp[i].files_n && !who; k++)
@@ -589,125 +551,28 @@ int cmd_diag(const char *spec) {
              *
              * Тексты РАЗНЫЕ, и это не оформление. Формулировка vless («туннель завершает
              * TCP сам, адреса клиентов наружу не уходят») для xsteer неверна: адреса
-             * уходят, к хабу. Расширить условие через ||, оставив прежнее объяснение,
-             * значило бы записать в диагностику неправду — а по ней настраивают. */
+             * уходят, к хабу. Поэтому текст даёт вид (kind_ops.selfnat_why), а не общий код:
+             * одно объяснение на всех значило бы записать в диагностику неправду — а по ней
+             * настраивают. */
             snprintf(what, sizeof(what), "выход %.40s: устройство %.24s в зоне",
                      sp->out[i].name, sp->out[i].device);
             diag("output", "ok", what,
-                 nat_o->kind == OUT_XSTEER
-                     ? "masquerade не нужен и вреден: адреса клиентов уходят к хабу, а NAT "
-                       "скрыл бы, от какой пира пришёл пакет"
-                     : "masquerade не нужен: туннель завершает TCP сам, адреса клиентов "
-                       "наружу не уходят");
+                 kind_of(nat_o)->selfnat_why ? kind_of(nat_o)->selfnat_why : "");
         }
     }
 
-    /* 8. Обфускация транспорта (WireGuard поверх поддельного TCP).
+    /* 8. Свои проверки видов (kind_ops.diag): обфускация транспорта у interface, обработчик
+     *    очереди и файл стратегии у zapret.
      *
-     *    Четыре проверки, и каждая — про отказ, который иначе виден только как «туннель
-     *    не поднимается»: процесса нет; правило против RST не встало (тогда сессию рвёт
-     *    собственное ядро); маршрут к серверу обфускации идёт через сам туннель (петля,
-     *    которую не разорвать изнутри); MTU туннеля больше того, что помещается в
-     *    поддельный TCP (тогда работает всё, кроме больших пакетов). */
-    for (size_t i = 0; i < sp->out_n; i++) {
-        if (!sp->out[i].obfs.on) continue;
-        char what[200], why[400], cmdline[128];
-
-        snprintf(cmdline, sizeof(cmdline), "pgrep -f 'steer obfs %.32s' >/dev/null 2>&1",
-                 sp->out[i].name);
-        int alive = system(cmdline) == 0;
-        snprintf(what, sizeof(what), "выход %.40s: обфускатор %s",
-                 sp->out[i].name, alive ? "работает" : "не запущен");
-        diag("obfs", alive ? "ok" : "fail", what,
-             alive ? "" : "перезапустите движок: /etc/init.d/steer restart");
-
-        /* nft_has смотрит в таблицу steer, здесь нужна соседняя — поэтому свой вызов. */
-        snprintf(cmdline, sizeof(cmdline),
-                 "nft list chain inet steer_obfs o_%.32s >/dev/null 2>&1", sp->out[i].name);
-        int guard = system(cmdline) == 0;
-        if (!guard) {
-            snprintf(what, sizeof(what), "выход %.40s: правила против RST нет",
-                     sp->out[i].name);
-            diag("obfs", "warn", what,
-                 "ядро отвечает RST на входящие сегменты обфускатора и рвёт его же сессию — "
-                 "проверьте, что nft доступен процессу");
-        }
-
-        char dev[64] = "";
-        int link_mtu = route_egress(sp->out[i].obfs.server, dev, sizeof(dev));
-        if (dev[0] && !strcmp(dev, sp->out[i].device)) {
-            snprintf(what, sizeof(what), "выход %.40s: маршрут к %.20s идёт через %.24s",
-                     sp->out[i].name, sp->out[i].obfs.server, dev);
-            diag("obfs", "fail", what,
-                 "сервер обфускации доступен только через туннель, который сам через него и "
-                 "поднимается: петля. Уберите адрес сервера из списков канала или пропишите "
-                 "к нему отдельный маршрут");
-        }
-
-        int wg_mtu = dev_mtu(sp->out[i].device);
-        /* 20 внешний IP + 20 поддельный TCP + 32 сам WireGuard. Считаем от MTU того
-         * устройства, которым пакет уходит наружу, а не от 1500: на PPPoE это 1492, и
-         * разница ровно в те восемь байт, на которых «всё работает, кроме больших
-         * страниц». */
-        if (link_mtu > 0 && wg_mtu > 0 && wg_mtu > link_mtu - 72) {
-            snprintf(what, sizeof(what), "выход %.40s: MTU %d великоват для обфускации",
-                     sp->out[i].name, wg_mtu);
-            snprintf(why, sizeof(why),
-                     "поверх поддельного TCP в %d байт канала помещается %d: поставьте "
-                     "интерфейсу %.24s MTU %d и тот же MTU на другой стороне туннеля, иначе "
-                     "пропадать будут только большие пакеты",
-                     link_mtu, link_mtu - 72, sp->out[i].device, link_mtu - 72);
-            diag("obfs", "warn", what, why);
-        }
-    }
-
-    /* 9. Выходы kind=zapret (обход DPI своим обработчиком на свою очередь).
-     *
-     *    У такого выхода НЕТ НИ ОДНОГО обычного признака работы: устройства нет, таблицы
-     *    маршрутизации нет, а счётчик канала растёт одинаково при живом и мёртвом обходе —
-     *    пакеты уходят и так, разница лишь в том, доходят ли они. То есть «не открывается
-     *    YouTube» здесь не отличить от «всё в порядке» ничем, кроме этих проверок.
-     *
-     *    Три вопроса, и каждый про свой отказ: нет пакета zapret (обработчика взять негде),
-     *    нет файла стратегии (обработчику нечего применять), обработчик не запущен (при
-     *    on_fail=drop это ещё и остановленный трафик канала, что человек читает как
-     *    «интернета нет», а не как «обход упал»). */
-    for (size_t i = 0; i < sp->out_n; i++) {
-        if (sp->out[i].kind != OUT_ZAPRET) continue;
-        char what[200], why[400];
-        int q = out_zapret_queue(&sp->out[i]);
-
-        if (access(NFQWS_PATH, X_OK) != 0) {
-            snprintf(what, sizeof(what), "выход %.40s: обход DPI не установлен",
-                     sp->out[i].name);
-            snprintf(why, sizeof(why),
-                     "нет " NFQWS_PATH " — поставьте пакет zapret. Правило очереди при этом "
-                     "стоит, и при on_fail=%s трафик канала %s",
-                     sp->out[i].on_fail == FAIL_DROP ? "drop" : "direct",
-                     sp->out[i].on_fail == FAIL_DROP ? "остановлен" : "идёт без обхода");
-            diag("zapret", "fail", what, why);
-            continue;
-        }
-        if (access(sp->out[i].zp_opts, R_OK) != 0) {
-            snprintf(what, sizeof(what), "выход %.40s: файла стратегии нет", sp->out[i].name);
-            snprintf(why, sizeof(why),
-                     "%.200s не читается — стратегию выбирают в splify2, вкладка Zapret. "
-                     "Без файла обработчик не поднимается вовсе",
-                     sp->out[i].zp_opts);
-            diag("zapret", "fail", what, why);
-            continue;
-        }
-        int alive = nfqws_on_queue(q);
-        snprintf(what, sizeof(what), "выход %.40s: обработчик очереди %d %s",
-                 sp->out[i].name, q, alive ? "работает" : "не запущен");
-        snprintf(why, sizeof(why), "%s",
-                 alive ? ""
-                 : sp->out[i].on_fail == FAIL_DROP
-                   ? "перезапустите движок: /etc/init.d/steer restart. До тех пор трафик "
-                     "канала ОСТАНОВЛЕН — так выражен on_fail=drop, очередь стоит без bypass"
-                   : "перезапустите движок: /etc/init.d/steer restart. До тех пор трафик "
-                     "канала идёт без обхода — так выражен on_fail=direct");
-        diag("zapret", alive ? "ok" : "fail", what, why);
+     *    Обход — по видам в порядке реестра, а внутри вида — по выходам в порядке спеки. Так
+     *    проверки одного вида идут подряд, одним блоком, как шли, пока были секциями этой
+     *    функции (сначала все obfs, потом все zapret), и ответ не зависит от того, в каком
+     *    порядке человек записал выходы разных видов. */
+    for (size_t ki = 0; ki < kind_count(); ki++) {
+        const struct kind_ops *k = kind_at(ki);
+        if (!k->diag) continue;
+        for (size_t i = 0; i < sp->out_n; i++)
+            if (kind_of(&sp->out[i]) == k) k->diag(diag, sp, &sp->out[i]);
     }
 
     printf("],\"warn\":%d,\"fail\":%d}\n", g_diag_warn, g_diag_fail);

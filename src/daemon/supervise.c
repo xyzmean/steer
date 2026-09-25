@@ -77,31 +77,12 @@ struct sup_helper {
  * помощник действительно читает при старте. Правка устройства, on_fail или каналов помощника
  * не касается, а перезапуск рвёт туннель и меняет выходной адрес — трогать его из-за неё нельзя.
  *
- * Поля по видам: vless — файл подписки и выбор узлов; xsteer — файл конфигурации и режим
- * потока; tgws — домен точек; obfs — сервер и локальный адрес. Содержимое файлов (подписка
- * обновилась) подписью не ловится, как и на роутере: это отдельный повод со своим путём. */
-static void sup_fnv(unsigned long long *h, const void *p, size_t n) {
-    const unsigned char *b = p;
-    for (size_t i = 0; i < n; i++) { *h ^= b[i]; *h *= 1099511628211ULL; }
-    *h ^= 0xff; *h *= 1099511628211ULL;   /* граница поля: «ab»+«c» не равно «a»+«bc» */
-}
-static unsigned long long sup_sig(const struct spec *sp, const char *cmd, const struct output *o) {
-    unsigned long long h = 14695981039346656037ULL;
-    if (!strcmp(cmd, "vless")) {
-        sup_fnv(&h, o->sub_file, strlen(o->sub_file));
-        for (size_t i = 0; i < o->nodes_n; i++) sup_fnv(&h, &o->nodes[i], sizeof(o->nodes[i]));
-    } else if (!strcmp(cmd, "xsteer")) {
-        sup_fnv(&h, o->xs_conf, strlen(o->xs_conf));
-        sup_fnv(&h, &o->xs_stream, sizeof(o->xs_stream));
-        sup_fnv(&h, &o->xs_stream_port, sizeof(o->xs_stream_port));
-    } else if (!strcmp(cmd, "tgws")) {
-        sup_fnv(&h, o->tg_domain, strlen(o->tg_domain));
-    } else if (!strcmp(cmd, "obfs")) {
-        sup_fnv(&h, o->obfs.server, strlen(o->obfs.server));
-        sup_fnv(&h, &o->obfs.server_port, sizeof(o->obfs.server_port));
-        sup_fnv(&h, o->obfs.listen, strlen(o->obfs.listen));
-        sup_fnv(&h, &o->obfs.listen_port, sizeof(o->obfs.listen_port));
-    }
+ * Поля по видам называет сам вид (kind_ops.helper в src/kinds): vless — файл подписки и выбор
+ * узлов; xsteer — файл конфигурации и режим потока; tgws — домен точек; obfs у interface —
+ * сервер и локальный адрес. Содержимое файлов (подписка обновилась) подписью не ловится, как и
+ * на роутере: это отдельный повод со своим путём. */
+static unsigned long long sup_sig(const struct spec *sp, const struct output *o, const struct kind_helper *hp) {
+    unsigned long long h = hp->sig;       /* поля вида уже подмешаны его kind_ops.helper */
     /* Цель `via` помощник тоже читает при старте: метку сокета наверх он берёт один раз
      * (out_underlay_mark), и смена цели без перезапуска оставила бы туннель в прежнем выходе.
      * Только когда поле задано — подпись выхода без via остаётся прежней, и обновление движка
@@ -114,9 +95,9 @@ static unsigned long long sup_sig(const struct spec *sp, const char *cmd, const 
      * reload после такого apply перезапускает его сразу. Метку считает out_underlay_mark — ровно
      * то значение, что помощник поставит на сокет (с битом туннеля на телефоне). */
     if (o->via[0]) {
-        sup_fnv(&h, o->via, strlen(o->via));
+        kind_sig_mix(&h, o->via, strlen(o->via));
         uint32_t um = out_underlay_mark(sp, o);
-        sup_fnv(&h, &um, sizeof(um));
+        kind_sig_mix(&h, &um, sizeof(um));
     }
     return h;
 }
@@ -161,16 +142,13 @@ static int sup_list(const char *spec, struct sup_helper *out, size_t *n) {
             for (size_t i = 0; i < cfg.out_n; i++) {
                 const struct output *o = &cfg.out[i];
                 if (out_via_depth(&cfg, o) != depth) continue;
-#if defined(STEER_EXTENDED)
-                if (o->kind == OUT_VLESS)
-                    fprintf(w, "vless %s %llx\n", o->name, sup_sig(&cfg, "vless", o));
-                if (o->kind == OUT_XSTEER)
-                    fprintf(w, "xsteer %s %llx\n", o->name, sup_sig(&cfg, "xsteer", o));
-                if (o->kind == OUT_TGWS)
-                    fprintf(w, "tgws %s %llx\n", o->name, sup_sig(&cfg, "tgws", o));
-#endif
-                if (o->obfs.on)
-                    fprintf(w, "obfs %s %llx\n", o->name, sup_sig(&cfg, "obfs", o));
+                /* Какой помощник нужен выходу, говорит вид (kind_ops.helper). Вид, чьей команды
+                 * в этой сборке нет, помощника не называет: vless и xsteer здесь только в
+                 * расширенной сборке, мост tgws — там же (kinds/tgws.c). */
+                const struct kind_ops *k = kind_of(o);
+                struct kind_helper hp = { .sig = KIND_SIG_INIT };
+                if (k->helper && k->helper(&cfg, o, &hp) == 0)
+                    fprintf(w, "%s %s %llx\n", hp.cmd, o->name, sup_sig(&cfg, o, &hp));
             }
         }
         fclose(w);

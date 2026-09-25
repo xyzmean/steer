@@ -44,7 +44,7 @@ int registry_assign(struct spec *s, struct err *e) {
              * срабатывает. Такой выход получает метку заново, как новый. */
             if (!mark || (mark & ~STEER_MARK_MASK)) continue;
             for (size_t i = 0; i < s->out_n; i++)
-                if (!strcmp(s->out[i].name, name) && s->out[i].kind != OUT_DIRECT) {
+                if (!strcmp(s->out[i].name, name) && out_needs_mark(&s->out[i])) {
                     s->out[i].mark = mark;
                     s->out[i].table = table;
                 }
@@ -76,7 +76,9 @@ int registry_assign(struct spec *s, struct err *e) {
     }
 
     for (size_t i = 0; i < s->out_n; i++) {
-        if (s->out[i].kind == OUT_DIRECT || s->out[i].mark) continue;
+        /* Место в реестре (метку и таблицу) получает выход со своей меткой — все виды, кроме
+         * direct (out_needs_mark). */
+        if (!out_needs_mark(&s->out[i]) || s->out[i].mark) continue;
         /* СВЕРХУ ИЛИ СНИЗУ. Обычно места раздаются снизу: первый выход получает нулевое,
          * второй первое и так далее. Но на роутере движок бывает не один — рядом с полным
          * ставится микропакет tgws со своей спекой и своим состоянием, — и оба, начав с
@@ -112,7 +114,7 @@ int registry_assign(struct spec *s, struct err *e) {
     char want[1024]; /* 16 выходов по ≤53 байта строки — влезает с запасом */
     size_t wn = 0;
     for (size_t i = 0; i < s->out_n && wn < sizeof(want); i++)
-        if (s->out[i].kind != OUT_DIRECT) {
+        if (out_needs_mark(&s->out[i])) {
             int w = snprintf(want + wn, sizeof(want) - wn, "%s %x %d\n",
                              s->out[i].name, s->out[i].mark, s->out[i].table);
             if (w < 0 || (size_t)w >= sizeof(want) - wn) break; /* не бывает, но не рвём буфер */
@@ -174,7 +176,7 @@ static void rt_tables_write(const struct spec *s) {
     char want[1024];
     size_t wn = 0;
     for (size_t i = 0; i < s->out_n && wn < sizeof(want); i++) {
-        if (s->out[i].kind == OUT_DIRECT || !s->out[i].table) continue;
+        if (!out_needs_mark(&s->out[i]) || !s->out[i].table) continue;
         /* Имя с приставкой: таблица принадлежит выходу, но пространство имён общее для всей
          * коробки, и «vpn» там заняли бы и mwan3, и человек руками. */
         int w = snprintf(want + wn, sizeof(want) - wn, "%d steer_%s\n",
