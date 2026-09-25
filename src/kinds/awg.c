@@ -1638,7 +1638,15 @@ int awg_healthy(const struct output *o, const char *dev) {
 }
 
 int awg_revive(const struct spec *sp, const struct output *o, const char *dev) {
-    fprintf(stderr, LOG_W "%s: туннель молчит — заново разрешаю Endpoint и перенастраиваю\n", dev);
+    /* Устройства нет — это не «молчит», а «ещё не поднято»: так бывает при каждом включении
+     * движка на телефоне, где сторож стартует раньше, чем выход успел создать устройство, и
+     * после ручного `ip link del`. Предупреждение о молчащем пире в этом случае — ложная
+     * тревога, которую человек видит в журнале приложения, поэтому причины разведены. */
+    char kb[32];
+    if (!live_kind_of(dev, kb, sizeof kb))
+        fprintf(stderr, LOG_I "%s: устройства нет — поднимаю\n", dev);
+    else
+        fprintf(stderr, LOG_W "%s: туннель молчит — заново разрешаю Endpoint и перенастраиваю\n", dev);
     if (awg_configure(sp, o, 0) != 0) return 0;
     return awg_healthy(o, dev);
 }
