@@ -1,0 +1,3 @@
+# args: apply --dry-run --spec TMP/s4.json --state-dir TMP/state
+# exit: 2
+# stderr: steer: outputs.vpn: kind interface needs a device

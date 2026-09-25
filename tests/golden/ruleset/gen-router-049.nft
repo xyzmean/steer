@@ -1,0 +1,3 @@
+# args: apply --dry-run --spec TMP/lanloop.json --state-dir TMP/state-lan
+# exit: 2
+# stderr: steer: выход vpn ведёт в tailscale0 — это локальная сеть, трафик закольцуется

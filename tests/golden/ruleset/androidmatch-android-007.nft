@@ -1,0 +1,3 @@
+# args: apply --dry-run --spec TMP/bad.json --state-dir TMP/state
+# exit: 2
+# stderr: steer: канал a: «self» уже включает все приложения — уберите из «кому» остальное

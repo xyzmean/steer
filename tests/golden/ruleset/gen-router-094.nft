@@ -1,0 +1,26 @@
+# args: apply --dry-run --spec TMP/spec.json --state-dir TMP/st-fo-drop
+# exit: 0
+table inet steer {
+    set vpn_ip {
+        type ipv4_addr
+        flags interval
+        auto-merge
+        elements = { 203.0.113.0/24, 198.51.100.5 }
+    }
+    chain prerouting_mark {
+        type filter hook prerouting priority mangle + 1; policy accept;
+        ip saddr { 192.168.1.0/24 } ip daddr @vpn_ip meta mark set mark and 0xf00fffff or 0x40100000 ct mark set mark counter return comment "steer:vpn_ip"
+    }
+
+    chain postrouting_down {
+        type filter hook postrouting priority srcnat + 10; policy accept;
+        ip daddr { 192.168.1.0/24 } ip saddr @vpn_ip counter comment "steer-down:vpn_ip"
+    }
+    chain prerouting_dns {
+        type nat hook prerouting priority dstnat; policy accept;
+        ip saddr 192.168.1.0/24 udp dport 53 counter redirect to :5300
+        meta nfproto ipv6 iifname "br-lan" udp dport 53 counter redirect to :5300
+        ip saddr 192.168.1.0/24 tcp dport 53 counter redirect to :5300
+        meta nfproto ipv6 iifname "br-lan" tcp dport 53 counter redirect to :5300
+    }
+}

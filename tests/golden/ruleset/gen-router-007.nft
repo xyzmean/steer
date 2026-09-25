@@ -1,0 +1,36 @@
+# args: apply --dry-run --spec TMP/dspec.json --state-dir TMP/state-dom
+# exit: 0
+table inet steer {
+    set geo_dom {
+        type ipv4_addr
+        flags interval,timeout
+        auto-merge
+    }
+    chain prerouting_mark {
+        type filter hook prerouting priority mangle + 1; policy accept;
+        ip saddr { 192.168.1.0/24 } ip daddr @geo_dom meta mark set mark and 0xf00fffff or 0x40100000 ct mark set mark counter return comment "steer:geo_dom"
+    }
+
+    chain postrouting_down {
+        type filter hook postrouting priority srcnat + 10; policy accept;
+        ip daddr { 192.168.1.0/24 } ip saddr @geo_dom counter comment "steer-down:geo_dom"
+    }
+    chain prerouting_dns {
+        type nat hook prerouting priority dstnat; policy accept;
+        ip saddr 192.168.1.0/24 udp dport 53 counter redirect to :5300
+        meta nfproto ipv6 iifname "br-lan" udp dport 53 counter redirect to :5300
+        ip saddr 192.168.1.0/24 tcp dport 53 counter redirect to :5300
+        meta nfproto ipv6 iifname "br-lan" tcp dport 53 counter redirect to :5300
+    }
+
+    map fakeip {
+        type ipv4_addr : ipv4_addr;
+        elements = { 198.18.0.1 : 203.0.113.10,
+            198.18.0.9 : 203.0.113.20,
+            198.18.0.3 : 203.0.113.13 }
+    }
+    chain prerouting_dnat {
+        type nat hook prerouting priority dstnat; policy accept;
+        ip daddr 198.18.0.0/15 counter dnat ip to ip daddr map @fakeip
+    }
+}

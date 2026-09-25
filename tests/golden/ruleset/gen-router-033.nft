@@ -1,0 +1,3 @@
+# args: apply --dry-run --spec TMP/tgws-of.json --state-dir TMP/state-to
+# exit: 2
+# stderr: steer: outputs.tg: у kind tgws on_fail только drop: перехват стоит в ядре, и без моста соединение отвергается — обойти это правилом нечем

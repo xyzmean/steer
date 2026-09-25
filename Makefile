@@ -17,7 +17,7 @@ VERSION := $(shell cat VERSION 2>/dev/null || echo dev)
 REV     := $(shell git describe --tags --always --dirty 2>/dev/null)
 DEFS    := -DSTEER_VERSION='"$(VERSION)"' $(if $(REV),-DSTEER_REV='"$(REV)"',)
 
-.PHONY: all test clean ext-syntax ext-test
+.PHONY: all test clean ext-syntax ext-test snapshot-record
 all: $(BUILD)/steer
 
 $(BUILD)/steer: src/steer.c src/spec.c src/dnsd.c src/failover.c src/aggregate.c \
@@ -41,6 +41,7 @@ $(BUILD)/steer-android: src/steer.c src/spec.c src/dnsd.c src/failover.c src/agg
 test: all ext-syntax $(BUILD)/steer-android $(BUILD)/tgwssim $(BUILD)/dnsmatch $(BUILD)/specmatch $(BUILD)/specmatch-ext $(BUILD)/xswirematch $(BUILD)/xsconnmatch $(BUILD)/xsstreammatch $(BUILD)/tungromatch $(BUILD)/tunnelmatch $(BUILD)/tunnamematch $(BUILD)/xsconfmatch $(BUILD)/xslinkmatch $(BUILD)/xsroutematch $(BUILD)/chellomatch $(BUILD)/failovermatch $(BUILD)/dcmatch $(BUILD)/msgsplitmatch $(BUILD)/warmmatch $(BUILD)/upmatch $(BUILD)/tgwsfailmatch $(BUILD)/h2match $(BUILD)/xhupmatch $(BUILD)/submatch $(BUILD)/subfetchmatch $(BUILD)/fwmatch $(BUILD)/obfsmatch $(BUILD)/visionmatch $(BUILD)/tlsprobematch $(BUILD)/diagsim $(BUILD)/hwidsum $(BUILD)/awgmatch $(BUILD)/awgmatch-android
 	@sh tests/run.sh
 	@sh tests/gen.sh
+	@sh tests/snapshot.sh
 	@sh tests/tgwsmark.sh
 	@sh tests/climatch.sh
 	@sh tests/dnsproxy.sh
@@ -86,6 +87,11 @@ test: all ext-syntax $(BUILD)/steer-android $(BUILD)/tgwssim $(BUILD)/dnsmatch $
 	@$(BUILD)/awgmatch
 	@$(BUILD)/awgmatch-android
 	@sh tests/awgns.sh
+
+# Перезапись снимка генератора (tests/snapshot.sh). Только когда ruleset меняется
+# намеренно, и в том же коммите, что и изменение: иначе снимок перестаёт что-либо сторожить.
+snapshot-record: all $(BUILD)/steer-android $(BUILD)/tgwssim
+	@sh tests/snapshot.sh record
 
 # Мини-сборка микропакета tgws на хосте — для стенда tgwsmark: ядро движка с -DSTEER_TGWS,
 # мост заменён заглушкой (tests/tgws-stub.c), потому что настоящий тянет TLS и docker.

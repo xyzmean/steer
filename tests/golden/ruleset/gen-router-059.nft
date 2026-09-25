@@ -1,0 +1,3 @@
+# args: apply --dry-run --spec TMP/s3.json --state-dir TMP/state
+# exit: 2
+# stderr: steer: channel blocked points at an output that does not exist

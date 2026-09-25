@@ -1,0 +1,3 @@
+# args: apply --dry-run --spec TMP/mix.json --state-dir TMP/state-mix
+# exit: 2
+# stderr: steer: канал mix: в «кому» смешаны адреса и MAC-адреса. nft не умеет «или» внутри правила — разделите на два канала

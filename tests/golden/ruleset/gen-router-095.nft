@@ -1,0 +1,72 @@
+# args: apply --dry-run --spec TMP/legacy.json --state-dir TMP/st-legacy
+# exit: 0
+# env: STEER_NFT_COMPAT=legacy-min
+# stderr: steer[info] apply: ядро без nat в семействе inet — правила собраны для nftables старого ядра: таблицы inet и ip
+# stderr: steer[warn] apply: ядро не знает notrack: порождённые обработчиком zapret пакеты (подделки, куски разрезанного) остаются на учёте conntrack. Где firewall отбрасывает ct state invalid, обход выходов kind=zapret может не срабатывать
+# stderr: steer[warn] apply: ядро не знает notrack: traceroute_hops на нём не действует, промежуточные узлы будут видны как прежде
+# stderr: steer[warn] apply: ядро не умеет nat для IPv6: запросы DNS клиентов по IPv6 идут мимо резолвера движка, и доменные каналы видят только тех, кто спрашивает по IPv4
+table inet steer {
+    set vpn_dom {
+        type ipv4_addr
+        flags timeout
+    }
+    set vpn_dom_n {
+        type ipv4_addr
+        flags interval
+        auto-merge
+        elements = { 198.51.100.0/24 }
+    }
+    set yt_ip {
+        type ipv4_addr
+        flags interval
+        auto-merge
+        elements = { 203.0.113.0/24, 198.51.100.5 }
+    }
+    set tg_ip {
+        type ipv4_addr
+        flags interval
+        auto-merge
+        elements = { 198.51.100.5 }
+    }
+    chain prerouting_mark {
+        type filter hook prerouting priority mangle + 1; policy accept;
+        ip saddr { 192.168.1.0/24 } ip daddr @vpn_dom_n meta mark set mark and 0xf00fffff or 0x40100000 ct mark set mark counter return comment "steer:vpn_dom"
+        ip saddr { 192.168.1.0/24 } ip daddr @vpn_dom meta mark set mark and 0xf00fffff or 0x40100000 ct mark set mark counter return comment "steer:vpn_dom"
+        ip saddr { 192.168.1.0/24 } ip daddr @yt_ip meta mark set mark and 0xf00fffff or 0x40200000 ct mark set mark counter return comment "steer:yt_ip"
+        ip saddr { 192.168.1.0/24 } ip daddr @tg_ip meta mark set mark and 0xf00fffff or 0x40300000 counter return comment "steer:tg_ip"
+    }
+
+    chain postrouting_down {
+        type filter hook postrouting priority srcnat + 10; policy accept;
+        ip daddr { 192.168.1.0/24 } ip saddr @vpn_dom_n counter comment "steer-down:vpn_dom"
+        ip daddr { 192.168.1.0/24 } ip saddr @vpn_dom counter comment "steer-down:vpn_dom"
+        ip daddr { 192.168.1.0/24 } ip saddr @yt_ip counter comment "steer-down:yt_ip"
+        ip daddr { 192.168.1.0/24 } ip saddr @tg_ip counter comment "steer-down:tg_ip"
+    }
+
+    chain zapret_queue {
+        type filter hook postrouting priority srcnat + 2; policy accept;
+        meta mark and 0x20000000 == 0x20000000 counter return comment "steer:zapret-own"
+        ct mark and 0x0ff00000 == 0x00200000 ct original packets 1-9 meta mark set mark and 0xbfffffff counter queue num 8301 comment "steer:zapret:yt"
+    }
+
+    chain zapret_queue_in {
+        type filter hook prerouting priority mangle; policy accept;
+        ct mark and 0x0ff00000 == 0x00200000 ct reply packets 1-3 counter queue num 8301 bypass comment "steer:zapret-reply:yt"
+    }
+}
+table ip steer {
+    map fakeip {
+        type ipv4_addr : ipv4_addr;
+    }
+    chain prerouting_nat {
+        type nat hook prerouting priority dstnat - 1; policy accept;
+        ip saddr 192.168.1.0/24 udp dport 53 counter redirect to :5300
+        ip saddr 192.168.1.0/24 tcp dport 53 counter redirect to :5300
+        ip daddr 198.18.0.0/15 counter dnat to ip daddr map @fakeip
+        meta mark and 0x0ff00000 == 0x00300000 tcp dport { 443, 80, 5222 } counter redirect to :8482 comment "steer:tgws:tg"
+    }
+    chain postrouting_nat {
+        type nat hook postrouting priority srcnat + 1; policy accept;
+    }
+}

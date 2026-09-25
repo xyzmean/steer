@@ -1,0 +1,3 @@
+# args: apply --dry-run --spec TMP/any-zap.json --state-dir TMP/state-any
+# exit: 2
+# stderr: steer: канал c забирает ВЕСЬ трафик в туннель. Если это правда нужно, добавьте "allow_all": true — иначе выберите список

@@ -1,0 +1,3 @@
+# args: apply --dry-run --spec TMP/rbad.json --state-dir TMP/state-r
+# exit: 2
+# stderr: steer: channels: unknown mode nonsense (want fakeip or realip)

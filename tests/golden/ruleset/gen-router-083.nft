@@ -1,0 +1,3 @@
+# args: apply --dry-run --spec TMP/pp.json --state-dir TMP/st-pp
+# exit: 2
+# stderr: steer: channels.p: ports: негодная запись «» — нужно «443» или «50000-65535», числа от 1 до 65535, начало не больше конца

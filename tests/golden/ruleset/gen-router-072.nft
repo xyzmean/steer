@@ -1,0 +1,3 @@
+# args: apply --dry-run --spec TMP/spec.json --state-dir TMP/st-o
+# exit: 2
+# stderr: steer: канал discord: proto и ports появились в schema 2, а в спеке schema 1. Поднимите "schema": 2 — иначе движок постарше поймёт спеку наполовину и канал заберёт больше, чем вы написали

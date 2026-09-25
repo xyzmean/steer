@@ -1,0 +1,3 @@
+# args: apply --dry-run --spec TMP/lanboth2.json --state-dir TMP/state-lan
+# exit: 2
+# stderr: steer: клиенты описаны дважды: и from_default, и несколько lan_devices. Уберите from_default — устройства опишут клиентов точнее

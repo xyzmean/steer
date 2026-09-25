@@ -1,0 +1,3 @@
+# args: apply --dry-run --spec TMP/dup.json --state-dir TMP/state-g
+# exit: 2
+# stderr: steer: выход o: устройство wg0 указано дважды

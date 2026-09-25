@@ -1,0 +1,3 @@
+# args: apply --dry-run --spec TMP/allspec.json --state-dir TMP/state-dev2
+# exit: 2
+# stderr: steer: канал all забирает ВЕСЬ трафик в туннель. Если это правда нужно, добавьте "allow_all": true — иначе выберите список

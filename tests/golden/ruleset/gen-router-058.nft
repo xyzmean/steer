@@ -1,0 +1,3 @@
+# args: apply --dry-run --spec TMP/s2.json --state-dir TMP/state
+# exit: 2
+# stderr: steer: spec schema 3 is not supported (this build speaks 1 and 2)

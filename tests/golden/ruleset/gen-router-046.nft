@@ -1,0 +1,3 @@
+# args: apply --dry-run --spec TMP/loop.json --state-dir TMP/state-g
+# exit: 2
+# stderr: steer: выход o ведёт в br-lan — это локальная сеть, трафик закольцуется

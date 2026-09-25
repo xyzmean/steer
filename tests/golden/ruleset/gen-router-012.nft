@@ -1,0 +1,32 @@
+# args: apply --dry-run --spec TMP/xspec.json --state-dir TMP/state-m
+# exit: 0
+table inet steer {
+    set vpn_dom {
+        type ipv4_addr
+        flags interval,timeout
+        auto-merge
+        elements = { 10.1.0.0/24 }
+    }
+    chain prerouting_mark {
+        type filter hook prerouting priority mangle + 1; policy accept;
+        iifname "br-lan" ip daddr @vpn_dom meta mark set mark and 0xf00fffff or 0x40100000 ct mark set mark counter return comment "steer:vpn_dom"
+    }
+
+    chain postrouting_down {
+        type filter hook postrouting priority srcnat + 10; policy accept;
+        oifname "br-lan" ip saddr @vpn_dom counter comment "steer-down:vpn_dom"
+    }
+    chain prerouting_dns {
+        type nat hook prerouting priority dstnat; policy accept;
+        iifname "br-lan" udp dport 53 counter redirect to :5300
+        iifname "br-lan" tcp dport 53 counter redirect to :5300
+    }
+
+    map fakeip {
+        type ipv4_addr : ipv4_addr;
+    }
+    chain prerouting_dnat {
+        type nat hook prerouting priority dstnat; policy accept;
+        ip daddr 198.18.0.0/15 counter dnat ip to ip daddr map @fakeip
+    }
+}

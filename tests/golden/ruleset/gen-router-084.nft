@@ -1,0 +1,3 @@
+# args: apply --dry-run --spec TMP/pp.json --state-dir TMP/st-pp
+# exit: 2
+# stderr: steer: channels.p: ports: диапазон пишется СТРОКОЙ ("443", а не 443)

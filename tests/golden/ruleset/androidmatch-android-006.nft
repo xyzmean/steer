@@ -1,0 +1,3 @@
+# args: apply --dry-run --spec TMP/bad.json --state-dir TMP/state
+# exit: 2
+# stderr: steer: канал a: в «кому» смешаны сам телефон и клиенты раздачи — это разные пути пакета, разделите на два канала

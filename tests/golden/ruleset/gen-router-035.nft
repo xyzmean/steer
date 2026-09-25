@@ -1,0 +1,3 @@
+# args: apply --dry-run --spec TMP/tgws-alien.json --state-dir TMP/state-ta
+# exit: 2
+# stderr: steer: outputs.d: domain есть только у kind=tgws

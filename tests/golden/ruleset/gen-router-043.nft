@@ -1,0 +1,18 @@
+# args: apply --dry-run --spec TMP/allok.json --state-dir TMP/state-g
+# exit: 0
+table inet steer {
+    chain prerouting_mark {
+        type filter hook prerouting priority mangle + 1; policy accept;
+        iifname "br-lan" meta mark set mark and 0xf00fffff or 0x40100000 ct mark set mark counter return comment "steer:o_all"
+    }
+
+    chain postrouting_down {
+        type filter hook postrouting priority srcnat + 10; policy accept;
+        oifname "br-lan" counter comment "steer-down:o_all"
+    }
+    chain prerouting_dns {
+        type nat hook prerouting priority dstnat; policy accept;
+        iifname "br-lan" udp dport 53 counter redirect to :5300
+        iifname "br-lan" tcp dport 53 counter redirect to :5300
+    }
+}

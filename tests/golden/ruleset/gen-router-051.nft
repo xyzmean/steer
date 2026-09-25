@@ -1,0 +1,3 @@
+# args: apply --dry-run --spec TMP/landup.json --state-dir TMP/state-lan
+# exit: 2
+# stderr: steer: lan_devices: устройство br-lan указано дважды

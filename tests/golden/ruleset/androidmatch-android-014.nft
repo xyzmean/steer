@@ -1,0 +1,3 @@
+# args: apply --dry-run --spec TMP/sb.json --state-dir TMP/state
+# exit: 2
+# stderr: steer: канал t: выход kind=tgws работает только для клиентов раздачи — у трафика самого телефона моста нет

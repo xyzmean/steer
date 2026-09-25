@@ -1,0 +1,26 @@
+# args: apply --dry-run --spec TMP/spec.json --state-dir TMP/st-mini
+# exit: 0
+# env: STEER_MARK_ORDER=top
+# env: STEER_NFT_TABLE=stgws
+table inet stgws {
+    set tg_ip {
+        type ipv4_addr
+        flags interval
+        auto-merge
+        elements = { 149.154.160.0/20, 91.108.4.0/22 }
+    }
+    chain prerouting_mark {
+        type filter hook prerouting priority mangle + 1; policy accept;
+        iifname "br-lan" ip daddr @tg_ip meta mark set mark and 0xefffffff or 0x50000000 counter return comment "steer:tg_ip"
+    }
+
+    chain postrouting_down {
+        type filter hook postrouting priority srcnat + 10; policy accept;
+        oifname "br-lan" ip saddr @tg_ip counter comment "steer-down:tg_ip"
+    }
+
+    chain tgws_redirect {
+        type nat hook prerouting priority dstnat + 1; policy accept;
+        meta mark and 0x10000000 == 0x10000000 tcp dport { 443, 80, 5222 } counter redirect to :8490 comment "steer:tgws:tg"
+    }
+}

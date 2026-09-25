@@ -1,0 +1,39 @@
+# args: apply --dry-run --spec TMP/any-dev.json --state-dir TMP/state-any
+# exit: 0
+table inet steer {
+    chain prerouting_mark {
+        type filter hook prerouting priority mangle + 1; policy accept;
+        ip saddr { 192.168.1.50 } meta mark set mark and 0xf00fffff or 0x40100000 ct mark set mark counter return comment "steer:zt_all_c0"
+    }
+
+    chain postrouting_down {
+        type filter hook postrouting priority srcnat + 10; policy accept;
+        ip daddr { 192.168.1.50 } counter comment "steer-down:zt_all_c0"
+    }
+
+    chain zapret_queue {
+        type filter hook postrouting priority srcnat + 2; policy accept;
+        meta mark and 0x20000000 == 0x20000000 counter return comment "steer:zapret-own"
+        ct mark and 0x0ff00000 == 0x00100000 ct original packets 1-9 meta mark set mark and 0xbfffffff counter queue num 8300 comment "steer:zapret:zt"
+    }
+
+    chain zapret_queue_in {
+        type filter hook prerouting priority mangle; policy accept;
+        ct mark and 0x0ff00000 == 0x00100000 ct reply packets 1-3 counter queue num 8300 bypass comment "steer:zapret-reply:zt"
+    }
+
+    chain zapret_predefrag {
+        type filter hook output priority -401; policy accept;
+        meta mark and 0x40000000 != 0x00000000 jump zapret_predefrag_nfqws comment "steer:zapret-notrack"
+    }
+    chain zapret_predefrag_nfqws {
+        ip frag-off and 0x1fff != 0x0 notrack comment "ipfrag"
+        exthdr frag exists notrack comment "ipfrag"
+        tcp flags ! syn,rst,ack notrack comment "datanoack"
+    }
+    chain prerouting_dns {
+        type nat hook prerouting priority dstnat; policy accept;
+        iifname "br-lan" udp dport 53 counter redirect to :5300
+        iifname "br-lan" tcp dport 53 counter redirect to :5300
+    }
+}

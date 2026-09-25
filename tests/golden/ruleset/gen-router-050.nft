@@ -1,0 +1,3 @@
+# args: apply --dry-run --spec TMP/lanboth.json --state-dir TMP/state-lan
+# exit: 2
+# stderr: steer: задано и lan_device, и lan_devices — оставьте одно

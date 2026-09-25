@@ -1,0 +1,47 @@
+# args: apply --dry-run --spec TMP/skipspec.json --state-dir TMP/state-skip
+# exit: 0
+table inet steer {
+    set vpn_ip {
+        type ipv4_addr
+        flags interval
+        auto-merge
+        elements = { 203.0.113.0/24 }
+    }
+    set tg_ip {
+        type ipv4_addr
+        flags interval
+        auto-merge
+        elements = { 104.16.0.0/12 }
+    }
+    set direct_ip {
+        type ipv4_addr
+        flags interval
+        auto-merge
+        elements = { 203.0.113.0/24 }
+    }
+    chain prerouting_mark {
+        type filter hook prerouting priority mangle + 1; policy accept;
+        ip saddr { 192.168.1.0/24 } ip daddr @vpn_ip meta mark set mark and 0xf00fffff or 0x40100000 ct mark set mark counter return comment "steer:vpn_ip"
+        ip saddr { 192.168.1.0/24 } ip daddr @tg_ip meta mark set mark and 0xf00fffff or 0x40200000 counter return comment "steer:tg_ip"
+        ip saddr { 192.168.1.0/24 } ip daddr @direct_ip counter return comment "steer:direct_ip"
+    }
+
+    chain postrouting_down {
+        type filter hook postrouting priority srcnat + 10; policy accept;
+        ip daddr { 192.168.1.0/24 } ip saddr @vpn_ip counter comment "steer-down:vpn_ip"
+        ip daddr { 192.168.1.0/24 } ip saddr @tg_ip counter comment "steer-down:tg_ip"
+        ip daddr { 192.168.1.0/24 } ip saddr @direct_ip counter comment "steer-down:direct_ip"
+    }
+
+    chain tgws_redirect {
+        type nat hook prerouting priority dstnat + 1; policy accept;
+        meta mark and 0x0ff00000 == 0x00200000 tcp dport { 443, 80, 5222 } counter redirect to :8481 comment "steer:tgws:tg"
+    }
+    chain prerouting_dns {
+        type nat hook prerouting priority dstnat; policy accept;
+        ip saddr 192.168.1.0/24 udp dport 53 counter redirect to :5300
+        meta nfproto ipv6 iifname "br-lan" udp dport 53 counter redirect to :5300
+        ip saddr 192.168.1.0/24 tcp dport 53 counter redirect to :5300
+        meta nfproto ipv6 iifname "br-lan" tcp dport 53 counter redirect to :5300
+    }
+}
