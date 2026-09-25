@@ -1036,7 +1036,7 @@ static inline void nft_static_set_name(char *dst, size_t n, const char *group) {
  * из документации, а из живого набора правил на роутере — /etc/config/zapret объявляет
  * `DESYNC_MARK 0x40000000` и `DESYNC_MARK_POSTNAT 0x20000000`, и оба бита стоят в условиях
  * его цепочек (postnat_hook, predefrag, predefrag_nfqws; полная выписка — у генерации
- * цепочки zapret_queue в src/daemon/steer.c).
+ * цепочки zapret_queue в src/compile/generate.c).
  *
  * ZAPRET_SKIP_MARK мы СТАВИМ САМИ, и это единственный способ сказать системному обходу «этот
  * трафик не твой»: его цепочка входит по условию `meta mark & 0x40000000 == 0`.

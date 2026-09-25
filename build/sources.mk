@@ -21,11 +21,17 @@
 # Каталоги слоёв (docs/architecture.md). Заголовки подключаются по имени (`#include "spec.h"`)
 # из любого слоя, поэтому каждая сборка получает -I на все каталоги сразу; имена заголовков
 # в дереве уникальны, и стенд tests/buildmatch.sh за этим следит.
-CORE_DIRS := src/lib src/model src/daemon src/kinds src/cli src/dnsd src/tools src/proto/obfs
+CORE_DIRS := src/lib src/model src/compile src/daemon src/kinds src/cli src/dnsd src/tools src/proto/obfs
 EXT_DIRS  := src/tunnel src/proto/tls src/proto/vless src/proto/xsteer src/proto/tgws
 INC_DIRS  := $(CORE_DIRS) $(EXT_DIRS)
 
-CORE_SRC := src/daemon/steer.c src/model/spec.c src/dnsd/dnsd.c src/daemon/failover.c src/tools/aggregate.c src/proto/obfs/obfs.c \
+# src/daemon/steer.c нарезан на модули (docs/architecture.md, раздел 2, «Слои и каталоги»):
+# компиляция спеки в правила — в src/compile, остальное ядро — в src/daemon, порядок ниже
+# такой же, как был в steer.c (lib/run.c раньше всех — на него ссылаются и compile, и daemon).
+CORE_SRC := src/lib/run.c src/compile/groups.c src/compile/generate.c src/daemon/fwcheck.c \
+            src/daemon/apply.c src/daemon/status.c src/daemon/nftquery.c src/daemon/diag.c \
+            src/daemon/explain.c src/daemon/supervise.c src/daemon/watch.c src/daemon/main.c \
+            src/model/spec.c src/dnsd/dnsd.c src/daemon/failover.c src/tools/aggregate.c src/proto/obfs/obfs.c \
             src/cli/cli.c src/tools/srs.c src/tools/puff.c src/tools/hwid.c src/daemon/ctl.c src/kinds/awg.c
 
 # Общее для обеих ролей: формат кадра, конфигурация, маршрутизация, рукопожатие, соединение
