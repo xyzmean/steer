@@ -15,7 +15,7 @@
  * Шифр в заглушках сквозной (memcpy), поэтому шифротекст равен открытому тексту: стенд
  * проверяет РАЗБОР ГРАНИЦ, а не обфускацию. Маска кадров нулевая по той же причине —
  * xc_random в заглушке отдаёт нули, и тело кадра можно сравнивать напрямую. */
-#include "../src/ext/tgws.c"
+#include "../src/proto/tgws/tgws.c"
 
 int xc_random(unsigned char *out, size_t n) { memset(out, 0, n); return 0; }
 int xc_x25519_keypair(unsigned char priv[32], unsigned char pub[32])

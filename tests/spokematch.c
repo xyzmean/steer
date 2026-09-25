@@ -15,11 +15,11 @@
  * стенд не входит, как и xsloop. Сборка (mbedtls 2.x требует заглушку MBEDTLS_PRIVATE,
  * в 3.x макрос свой):
  *
- *     cc -O1 -g -w -Isrc -fsanitize=address -o build/spokematch tests/spokematch.c \
- *        src/ext/xsconn.c src/ext/xswire.c src/ext/xsepoch.c src/ext/xsroute.c \
- *        src/ext/xsconf.c src/ext/xsstream.c src/ext/xshake.c src/ext/chello.c \
- *        src/ext/reality.c src/ext/tls13.c src/ext/h2.c src/ext/tun.c src/obfs.c \
- *        src/spec.c -lmbedcrypto -lpthread
+ *     cc -O1 -g -w $(make -s print-inc) -fsanitize=address -o build/spokematch tests/spokematch.c \
+ *        src/proto/xsteer/xsconn.c src/proto/xsteer/xswire.c src/proto/xsteer/xsepoch.c src/proto/xsteer/xsroute.c \
+ *        src/proto/xsteer/xsconf.c src/proto/xsteer/xsstream.c src/proto/xsteer/xshake.c src/proto/tls/chello.c \
+ *        src/proto/tls/reality.c src/proto/tls/tls13.c src/proto/tls/h2.c src/tunnel/tun.c src/proto/obfs/obfs.c \
+ *        src/model/spec.c -lmbedcrypto -lpthread
  */
 /* До любого include: xsclient.c просит расширения GNU (sendmmsg), а первый
  * подключённый заголовок фиксирует набор. */
@@ -27,9 +27,9 @@
 #include <stdio.h>
 #include <string.h>
 
-#include "../src/ext/xsclient.c"
+#include "../src/proto/xsteer/xsclient.c"
 
-/* Заглушки того, что живёт в src/steer.c: ни команд, ни устройств стенду не нужно. */
+/* Заглушки того, что живёт в src/daemon/steer.c: ни команд, ни устройств стенду не нужно. */
 int run_quiet(const char *const argv[]) { (void)argv; return 0; }
 void bind_device(struct output *o, const char *dev) { (void)o; (void)dev; }
 

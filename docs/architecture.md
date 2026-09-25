@@ -75,7 +75,7 @@ conntrack (которым пользуется и сторож: `ctnl_evict_mark
 
 **7. Модули нельзя собрать по отдельности.** В `spec.c` определён `die()` с `exit()`, всего
 вызовов `die()` — 174. Поэтому 34 из 53 файлов на C в `tests/` подключают исходник движка целиком
-(`#include "../src/spec.c"`) и перехватывают выход через `setjmp`. Часть прототипов объявлена
+(`#include "../src/model/spec.c"`) и перехватывают выход через `setjmp`. Часть прототипов объявлена
 в `spec.h`, а определена в `failover.c`/`dnsd.c`, чтобы стенды могли собирать одно без другого.
 
 **8. Мелкие повторы.** Объявление `run_quiet` скопировано в 8 файлов. Экранирование строки
@@ -189,8 +189,9 @@ src/
   proto/      tls/ (tls13, certverify, reality, chello, h2)
               vless/ (vless_proto, vision, sub, subfetch)   transport/ (tcp, tls, reality, grpc,
               xhttp, ws, httpupgrade)   xsteer/ (xswire, xshake, xsepoch, xsconf, xslink, xsconn,
-              xsroute, xsstream, xsclient, xshub, xsadmin)   tgws/
-  tools/      steer-tools: fit (aggregate.c), srs + puff, obfs, hwid, tls-probe, xsteer-admin
+              xsroute, xsstream, xsclient, xshub, xsadmin)   tgws/   obfs/ (WG поверх
+              поддельного TCP: помощник и obfs-server)
+  tools/      steer-tools: fit (aggregate.c), srs + puff, hwid, tls-probe, xsteer-admin
 ```
 
 Переносятся все файлы, включая защищённые пути `reality.c`, `tls13.c`, `vision.c`,

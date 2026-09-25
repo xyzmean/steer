@@ -17,11 +17,11 @@
  * Отсюда же растёт стенд для самого цикла, когда до него дойдёт очередь: включение .c уже
  * даёт доступ к struct worker, g_sess и статическим функциям.
  *
- *     cc -O2 -w -Isrc -I<mbedtls>/include -o build/hubmatch tests/hubmatch.c \
- *        src/ext/xsconn.c src/ext/xswire.c src/ext/xsepoch.c src/ext/xsroute.c \
- *        src/ext/xsconf.c src/ext/xsstream.c src/ext/xshake.c src/ext/chello.c \
- *        src/ext/reality.c src/ext/tls13.c src/ext/h2.c src/ext/tun.c src/obfs.c \
- *        src/spec.c <mbedtls>/library/libmbedcrypto.a -lpthread
+ *     cc -O2 -w $(make -s print-inc) -I<mbedtls>/include -o build/hubmatch tests/hubmatch.c \
+ *        src/proto/xsteer/xsconn.c src/proto/xsteer/xswire.c src/proto/xsteer/xsepoch.c src/proto/xsteer/xsroute.c \
+ *        src/proto/xsteer/xsconf.c src/proto/xsteer/xsstream.c src/proto/xsteer/xshake.c src/proto/tls/chello.c \
+ *        src/proto/tls/reality.c src/proto/tls/tls13.c src/proto/tls/h2.c src/tunnel/tun.c src/proto/obfs/obfs.c \
+ *        src/model/spec.c <mbedtls>/library/libmbedcrypto.a -lpthread
  */
 #define _GNU_SOURCE
 #include <stdio.h>
@@ -30,7 +30,7 @@
 #include <unistd.h>
 
 /* Хабу run_quiet нужен для `ip link` (hub_retune_mtu, hub_dev_up, cmd_xsteer_hub); в
- * src/steer.c его настоящая реализация, а здесь — ЗАПИСЬ вместо запуска: подъём устройства
+ * src/daemon/steer.c его настоящая реализация, а здесь — ЗАПИСЬ вместо запуска: подъём устройства
  * (hub_dev_up) проверяется именно по тому, какие команды он отдал и что сказал о неудавшихся.
  * По умолчанию все проходят; отказать умеет ровно та, чью подстроку назвал стенд (тот же
  * приём, что в tests/failovermatch.c). */
@@ -95,7 +95,7 @@ static int log_lines_with(const char *log, const char *level) {
     return n;
 }
 
-#include "../src/ext/xshub.c"
+#include "../src/proto/xsteer/xshub.c"
 #include "chello-frozen.h"
 
 static int fails;

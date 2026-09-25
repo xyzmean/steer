@@ -17,7 +17,7 @@
 #include <stdio.h>
 #include <string.h>
 
-#include "../src/ext/h2.c"
+#include "../src/proto/tls/h2.c"
 
 static int fails;
 

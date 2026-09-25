@@ -60,12 +60,13 @@ fi
 # VLESS/Reality. Базовому VLESS не нужен, а весит он вместе с TLS-стеком больше самого
 # движка — и на 4C с 6.9 МБ overlay это решает, влезет ли пакет.
 #
-# Собираются из ОДНИХ исходников: extended это те же файлы плюс src/ext и mbedtls.
+# Собираются из ОДНИХ исходников: extended это те же файлы плюс src/tunnel, src/proto и mbedtls.
 # Разные бинарники из разного набора файлов означали бы два места, где чинить одну ошибку.
 # Списки файлов всех сборок — в build/sources.mk и только там; build/build-ext.sh читает тот же
 # манифест сам (он запускается отдельным процессом и отсюда ничего не наследует).
 . ./build/sources.sh
 BASE_SRC="$(profile_src base)" || exit 2
+BASE_INC="$(for d in $(profile_var INC_DIRS); do printf -- '-I%s ' "$d"; done)"
 
 ISAS="
 mipsel_24kc:mipsel-linux-musl:mips32r2+soft_float
@@ -159,9 +160,9 @@ fi
 #                        OpenWrt 25.12 / nftables 1.1.6). Модуль весит единицы килобайт;
 #                        цена объявить его всем несравнимо меньше цены такого отказа.
 #                        Движок при этом ещё и проверяет ядро сам (nfqueue_supported в
-#                        src/steer.c) — установке файлом из релиза зависимости не помогают.
+#                        src/daemon/steer.c) — установке файлом из релиза зависимости не помогают.
 #   conntrack          — снятие установленных соединений выхода при смене маршрута
-#                        (src/failover.c, conntrack_evict). Снимает их сам движок, через
+#                        (src/daemon/failover.c, conntrack_evict). Снимает их сам движок, через
 #                        ctnetlink, а инструмент — запасной путь на случай, когда ядро по
 #                        ctnetlink не отвечает (нет модуля nf_conntrack_netlink). Без
 #                        обоих движок предупреждает и работает дальше, но при включённой выгрузке
@@ -239,7 +240,7 @@ for spec in $ISAS; do
     if docker run --rm -v "$PWD:/src" -w /src "$IMAGE" \
             cc -target "$target" -mcpu="$mcpu" -static -Os -Wall -Wextra \
                -DSTEER_VERSION="\"$VERSION\"" -DSTEER_REV="\"$REV\"" \
-               -o "build/steer-$arch" $BASE_SRC \
+               -o "build/steer-$arch" $BASE_INC $BASE_SRC \
                2>"build/$arch.err"; then
         echo "$(stat -c %s "build/steer-$arch") bytes"
     else

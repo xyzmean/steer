@@ -12,7 +12,7 @@
 #include <string.h>
 #include <stdlib.h>
 
-#include "../src/ext/rtx.h"
+#include "../src/tunnel/rtx.h"
 
 static int fails;
 

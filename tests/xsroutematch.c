@@ -11,7 +11,7 @@
 #include <string.h>
 #include <stdlib.h>
 
-#include "../src/ext/xsroute.c"
+#include "../src/proto/xsteer/xsroute.c"
 
 static int fails;
 

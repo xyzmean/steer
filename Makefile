@@ -13,7 +13,7 @@ VERSION := $(shell cat VERSION 2>/dev/null || echo dev)
 # «0.9.6-r1» (R-045/I-054). `--dirty` здесь, а не в build.sh: локальная сборка идёт по
 # рабочему дереву с правками, релизная — по коммиту (см. комментарий там).
 # Пустое значение, когда git недоступен: тогда define не даётся вовсе и работает честное
-# умолчание из src/cli.c, а не подставленное число.
+# умолчание из src/cli/cli.c, а не подставленное число.
 REV     := $(shell git describe --tags --always --dirty 2>/dev/null)
 DEFS    := -DSTEER_VERSION='"$(VERSION)"' $(if $(REV),-DSTEER_REV='"$(REV)"',)
 
@@ -21,9 +21,12 @@ DEFS    := -DSTEER_VERSION='"$(VERSION)"' $(if $(REV),-DSTEER_REV='"$(REV)"',)
 # (его же читают build.sh и build/build-ext.sh). Заголовки ядра — зависимостью целиком:
 # список файлов сборки они не меняют, а пересобрать движок при их правке нужно всегда.
 include build/sources.mk
-CORE_HDR := $(wildcard src/*.h)
+CORE_HDR := $(wildcard $(addsuffix /*.h,$(CORE_DIRS)))
+EXT_ALL_SRC := $(sort $(XS_COMMON_SRC) $(EXT_ROUTER_SRC) $(EXT_SERVER_SRC) $(EXT_TGWS_SRC))
+# -I на все каталоги слоёв — через override, чтобы `make CFLAGS=...` его не терял.
+override CFLAGS += $(addprefix -I,$(INC_DIRS))
 
-.PHONY: all test clean ext-syntax ext-test snapshot-record
+.PHONY: all test clean ext-syntax ext-test snapshot-record print-inc
 all: $(BUILD)/steer
 
 $(BUILD)/steer: $(CORE_SRC) $(CORE_HDR) VERSION
@@ -90,6 +93,10 @@ test: all ext-syntax $(BUILD)/steer-android $(BUILD)/tgwssim $(BUILD)/dnsmatch $
 
 # Перезапись снимка генератора (tests/snapshot.sh). Только когда ruleset меняется
 # намеренно, и в том же коммите, что и изменение: иначе снимок перестаёт что-либо сторожить.
+# Флаги -I для ручной сборки стенда (так их зовут шапки tests/*.c): cc $(make -s print-inc) ...
+print-inc:
+	@echo $(addprefix -I,$(INC_DIRS))
+
 snapshot-record: all $(BUILD)/steer-android $(BUILD)/tgwssim
 	@sh tests/snapshot.sh record
 
@@ -112,22 +119,22 @@ $(BUILD)/diagsim: $(CORE_SRC) $(CORE_HDR) tests/vless-stub.c
 # SHA-256 движка против sha256sum оболочки. Отдельная цель, потому что стенду нужен ПОЛНЫЙ
 # хеш: в самом идентификаторе он обрезан до двадцати знаков, и расхождение в старших байтах
 # такой проверкой не поймать. Ни сети, ни mbedtls — файл вложенный и самодостаточный.
-$(BUILD)/hwidsum: tests/hwidsum.c src/hwid.c src/hwid.h
+$(BUILD)/hwidsum: tests/hwidsum.c src/tools/hwid.c src/tools/hwid.h
 	@mkdir -p $(BUILD)
-	$(CC) $(CFLAGS) -o $@ tests/hwidsum.c src/hwid.c
+	$(CC) $(CFLAGS) -o $@ tests/hwidsum.c src/tools/hwid.c
 
-# Синтаксическая проверка расширенного движка (R-014/I-024). Полная сборка src/ext идёт
+# Синтаксическая проверка расширенного движка (R-014/I-024). Полная сборка расширенной части идёт
 # только в build.sh через docker с mbedtls, поэтому локальный make test оставался зелёным,
 # даже когда ext не компилировался вовсе — так в main пролез 654e4e6. -fsyntax-only ловит
 # ровно тот класс ошибок (несуществующее имя, снесённое объявление), заглушки mbedtls уже
 # лежат в tests/stub — их завёл стенд h2match. Компоновку по-прежнему проверяет build.sh.
 ext-syntax:
-	@for f in src/ext/*.c; do \
-		$(CC) $(CFLAGS) -fsyntax-only -Itests/stub -Isrc $$f || exit 1; \
+	@for f in $(EXT_ALL_SRC); do \
+		$(CC) $(CFLAGS) -fsyntax-only -Itests/stub $$f || exit 1; \
 	done
-	@echo "ext-syntax: src/ext компилируется"
+	@echo "ext-syntax: расширенная часть компилируется"
 
-# Стенды src/ext, которым нужен НАСТОЯЩИЙ mbedtls: xsloop (рукопожатие целиком), spokematch
+# Стенды расширенной части, которым нужен НАСТОЯЩИЙ mbedtls: xsloop (рукопожатие целиком), spokematch
 # (освобождение ключей под ASan) и hubmatch (арифметика записи в хабе, I-070). В `make test`
 # они не входят — там mbedtls нет по построению (R-014, см. ext-syntax), а роутерная сборка ext
 # идёт только docker'ом (build.sh), поэтому первые два до запуска 42 не прогонялись ни разу и
@@ -141,9 +148,9 @@ ext-test:
 # Подбор доменного правила проверяется отдельной программой, а не через движок: сам подбор
 # статический внутри dnsd.c, и дотянуться до него иначе значило бы добавить в движок
 # подкоманду ради теста. Файл включает исходник резолвера — см. tests/dnsmatch.c.
-$(BUILD)/dnsmatch: tests/dnsmatch.c src/dnsd.c src/spec.c src/spec.h
+$(BUILD)/dnsmatch: tests/dnsmatch.c src/dnsd/dnsd.c src/model/spec.c src/model/spec.h
 	@mkdir -p $(BUILD)
-	$(CC) $(CFLAGS) -o $@ tests/dnsmatch.c src/spec.c
+	$(CC) $(CFLAGS) -o $@ tests/dnsmatch.c src/model/spec.c
 
 # Парсер конфигурации проверяется отдельной программой по той же причине: load_spec
 # читает файл и зовёт die()/exit(2) на неверной спеке — перехватить это через подкоманду
@@ -152,42 +159,42 @@ $(BUILD)/dnsmatch: tests/dnsmatch.c src/dnsd.c src/spec.c src/spec.h
 # Таблица дата-центров Telegram — см. пояснение в самом стенде. Собирается с заглушками
 # mbedtls (-Itests/stub) по той же причине, что и ext-syntax: настоящей библиотеки в `make
 # test` нет по построению.
-$(BUILD)/dcmatch: tests/dcmatch.c src/ext/tgws.c
+$(BUILD)/dcmatch: tests/dcmatch.c src/proto/tgws/tgws.c
 	@mkdir -p $(BUILD)
-	$(CC) $(CFLAGS) -Itests/stub -Isrc -o $@ tests/dcmatch.c
+	$(CC) $(CFLAGS) -Itests/stub -o $@ tests/dcmatch.c
 
-$(BUILD)/msgsplitmatch: tests/msgsplitmatch.c src/ext/tgws.c
+$(BUILD)/msgsplitmatch: tests/msgsplitmatch.c src/proto/tgws/tgws.c
 	@mkdir -p $(BUILD)
-	$(CC) $(CFLAGS) -Itests/stub -Isrc -o $@ tests/msgsplitmatch.c
+	$(CC) $(CFLAGS) -Itests/stub -o $@ tests/msgsplitmatch.c
 
 # Запас поднятых соединений — там же и по той же причине: warm_* статические.
-$(BUILD)/warmmatch: tests/warmmatch.c src/ext/tgws.c
+$(BUILD)/warmmatch: tests/warmmatch.c src/proto/tgws/tgws.c
 	@mkdir -p $(BUILD)
-	$(CC) $(CFLAGS) -Itests/stub -Isrc -o $@ tests/warmmatch.c
+	$(CC) $(CFLAGS) -Itests/stub -o $@ tests/warmmatch.c
 
 # Исходы пробы браузерным рукопожатием и то, как она их называет (I-272). Там же и по той же
 # причине: bind_local и hello12_build статические. Срок пробы подменён секундой — с шестью
 # настоящими прогон стоял бы полминуты на ожиданиях, а стенд смотрит не на длительность
 # срока, а на то, чем он кончается.
-$(BUILD)/tlsprobematch: tests/tlsprobematch.c src/ext/tlsprobe.c src/ext/reality.h
+$(BUILD)/tlsprobematch: tests/tlsprobematch.c src/proto/tls/tlsprobe.c src/proto/tls/reality.h
 	@mkdir -p $(BUILD)
-	$(CC) $(CFLAGS) -Itests/stub -Isrc -DPROBE_TIMEOUT_S=1 -o $@ tests/tlsprobematch.c
+	$(CC) $(CFLAGS) -Itests/stub -DPROBE_TIMEOUT_S=1 -o $@ tests/tlsprobematch.c
 
 # Освобождение соединения наверх: чем обозначено «дескриптора нет» (I-204). Там же и по той
 # же причине: up_drop статическая.
-$(BUILD)/upmatch: tests/upmatch.c src/ext/tgws.c
+$(BUILD)/upmatch: tests/upmatch.c src/proto/tgws/tgws.c
 	@mkdir -p $(BUILD)
-	$(CC) $(CFLAGS) -Itests/stub -Isrc -o $@ tests/upmatch.c
+	$(CC) $(CFLAGS) -Itests/stub -o $@ tests/upmatch.c
 
 # Пути отказа моста, которых прогон настоящего бинаря не достаёт: длинная строка списка
 # запасных доменов, отказ источника случайности, отказ рукопожатия после разворота ключа
 # (I-155, I-196, I-197), срок затишья сессии через веб-сокет и причины её конца. Там же и по
 # той же причине: alt_init, ws_upgrade, tls_start и pump статические.
-$(BUILD)/tgwsfailmatch: tests/tgwsfailmatch.c src/ext/tgws.c
+$(BUILD)/tgwsfailmatch: tests/tgwsfailmatch.c src/proto/tgws/tgws.c
 	@mkdir -p $(BUILD)
-	$(CC) $(CFLAGS) -Itests/stub -Isrc -o $@ tests/tgwsfailmatch.c
+	$(CC) $(CFLAGS) -Itests/stub -o $@ tests/tgwsfailmatch.c
 
-$(BUILD)/specmatch: tests/specmatch.c src/spec.c src/spec.h
+$(BUILD)/specmatch: tests/specmatch.c src/model/spec.c src/model/spec.h
 	@mkdir -p $(BUILD)
 	$(CC) $(CFLAGS) -o $@ tests/specmatch.c
 
@@ -197,29 +204,29 @@ $(BUILD)/specmatch: tests/specmatch.c src/spec.c src/spec.h
 # бинарника kind=vless не проверялся здесь ни одной строкой, только комментарием.
 # Прецедент тот же, что у build/diagsim: один исходник, два бинарника, ветки внутри под
 # #ifdef — так «базовая отказывает» и «расширенная разбирает» проверяются одним файлом.
-$(BUILD)/specmatch-ext: tests/specmatch.c src/spec.c src/spec.h
+$(BUILD)/specmatch-ext: tests/specmatch.c src/model/spec.c src/model/spec.h
 	@mkdir -p $(BUILD)
 	$(CC) $(CFLAGS) -DSTEER_EXTENDED -o $@ tests/specmatch.c
 
 # Поддельный TCP проверяется в памяти: сборка и разбор сегмента, контрольные суммы и
 # арифметика номеров — чистые функции без сокетов, поэтому стенд не требует ни сети, ни
 # прав root. Циклы клиента и сервера сюда не входят намеренно — см. заголовок файла.
-$(BUILD)/obfsmatch: tests/obfsmatch.c src/obfs.c src/obfs.h src/spec.c src/spec.h
+$(BUILD)/obfsmatch: tests/obfsmatch.c src/proto/obfs/obfs.c src/proto/obfs/obfs.h src/model/spec.c src/model/spec.h
 	@mkdir -p $(BUILD)
-	$(CC) $(CFLAGS) -o $@ tests/obfsmatch.c src/spec.c
+	$(CC) $(CFLAGS) -o $@ tests/obfsmatch.c src/model/spec.c
 
 # Выход kind=awg без ядра: разбор файла awg-quick, спека, побайтная сборка сообщений netlink
 # (tests/awgmatch.c включает spec.c и awg.c). Дважды — роутерная и Android-сборка: у них разная
 # метка сокета туннеля без via (0 против STEER_SELF_MARK). С ядром — tests/awgns.sh.
-$(BUILD)/awgmatch: tests/awgmatch.c src/awg.c src/awg.h src/nlbuf.h src/spec.c src/spec.h
+$(BUILD)/awgmatch: tests/awgmatch.c src/kinds/awg.c src/kinds/awg.h src/lib/nlbuf.h src/model/spec.c src/model/spec.h
 	@mkdir -p $(BUILD)
 	$(CC) $(CFLAGS) -o $@ tests/awgmatch.c
 
-$(BUILD)/awgmatch-android: tests/awgmatch.c src/awg.c src/awg.h src/nlbuf.h src/spec.c src/spec.h
+$(BUILD)/awgmatch-android: tests/awgmatch.c src/kinds/awg.c src/kinds/awg.h src/lib/nlbuf.h src/model/spec.c src/model/spec.h
 	@mkdir -p $(BUILD)
 	$(CC) $(CFLAGS) -DSTEER_ANDROID -o $@ tests/awgmatch.c
 
-$(BUILD)/failovermatch: tests/failovermatch.c src/failover.c
+$(BUILD)/failovermatch: tests/failovermatch.c src/daemon/failover.c
 	@mkdir -p $(BUILD)
 	$(CC) $(CFLAGS) -o $@ tests/failovermatch.c
 
@@ -228,31 +235,31 @@ $(BUILD)/failovermatch: tests/failovermatch.c src/failover.c
 # подменяет popen на чтение из памяти — см. tests/fwmatch.c.
 $(BUILD)/fwmatch: tests/fwmatch.c $(CORE_SRC) $(CORE_HDR)
 	@mkdir -p $(BUILD)
-	$(CC) $(CFLAGS) -o $@ tests/fwmatch.c $(filter-out src/steer.c,$(CORE_SRC))
+	$(CC) $(CFLAGS) -o $@ tests/fwmatch.c $(filter-out src/daemon/steer.c,$(CORE_SRC))
 
 # Управление потоком HTTP/2 проверяется в памяти: h2.c общается с сетью только через
 # struct h2_io, поэтому стенд подменяет его целиком. -Itests/stub нужен, чтобы не тянуть
 # mbedtls ради типов, которые тест не трогает — см. tests/stub/mbedtls/sha256.h.
-$(BUILD)/h2match: tests/h2match.c src/ext/h2.c src/ext/h2.h src/ext/tls13.h
+$(BUILD)/h2match: tests/h2match.c src/proto/tls/h2.c src/proto/tls/h2.h src/proto/tls/tls13.h
 	@mkdir -p $(BUILD)
 	$(CC) $(CFLAGS) -Itests/stub -o $@ tests/h2match.c
 
 # Отказ сервера на выгрузку xhttp (stream-up, packet-up) обязан дойти до vless_send (I-219):
 # client.c включается целиком (up_drain статическая), h2.c настоящий, TLS и Reality
 # подменены — связь выгрузки голая, на сокетной паре. Подробности — в шапке стенда.
-XHUPMATCH_SRC = src/ext/h2.c src/ext/vless_proto.c src/ext/vision.c
-$(BUILD)/xhupmatch: tests/xhupmatch.c src/ext/client.c src/ext/client.h src/ext/h2.h $(XHUPMATCH_SRC)
+XHUPMATCH_SRC = src/proto/tls/h2.c src/proto/vless/vless_proto.c src/proto/vless/vision.c
+$(BUILD)/xhupmatch: tests/xhupmatch.c src/proto/vless/client.c src/proto/vless/client.h src/proto/tls/h2.h $(XHUPMATCH_SRC)
 	@mkdir -p $(BUILD)
-	$(CC) $(CFLAGS) -Itests/stub -Isrc -Isrc/ext -DSTEER_EXTENDED -o $@ tests/xhupmatch.c \
+	$(CC) $(CFLAGS) -Itests/stub -DSTEER_EXTENDED -o $@ tests/xhupmatch.c \
 		$(XHUPMATCH_SRC) -lpthread
 
 # Разбор подписки — единственное место, куда в движок попадает чужой текст из интернета.
 # Ни сети, ни mbedtls он не требует, поэтому стенд включает исходник напрямую и входит
-# в обычный make test, в отличие от остального src/ext (см. ext-syntax).
+# в обычный make test, в отличие от остальной расширенной части (см. ext-syntax).
 # Разбор потока Vision — вторая точка, куда в движок попадают недоверенные байты от
 # сервера. Ни сети, ни mbedtls он не требует, поэтому входит в обычный make test, как и
-# разбор подписки; остальной src/ext доходит только до ext-syntax.
-$(BUILD)/visionmatch: tests/visionmatch.c src/ext/vision.c src/ext/vision.h
+# разбор подписки; остальная расширенная часть доходит только до ext-syntax.
+$(BUILD)/visionmatch: tests/visionmatch.c src/proto/vless/vision.c src/proto/vless/vision.h
 	@mkdir -p $(BUILD)
 	$(CC) $(CFLAGS) -o $@ tests/visionmatch.c
 
@@ -261,8 +268,8 @@ $(BUILD)/visionmatch: tests/visionmatch.c src/ext/vision.c src/ext/vision.h
 # Xray по длине строки). Без этой строки правка вывода UUID не пересобирала стенд, то есть
 # зелёный прогон ничего не значил бы. Библиотек файл не тянет — mbedtls здесь нет
 # по построению (см. ext-syntax).
-$(BUILD)/submatch: tests/submatch.c src/ext/sub.c src/ext/vless.h \
-                  src/ext/vless_proto.c src/ext/vless_proto.h
+$(BUILD)/submatch: tests/submatch.c src/proto/vless/sub.c src/proto/vless/vless.h \
+                  src/proto/vless/vless_proto.c src/proto/vless/vless_proto.h
 	@mkdir -p $(BUILD)
 	$(CC) $(CFLAGS) -o $@ tests/submatch.c
 
@@ -271,9 +278,9 @@ $(BUILD)/submatch: tests/submatch.c src/ext/sub.c src/ext/vless.h \
 # считает его сама), свой run_quiet и поддельный curl в PATH. Поэтому ни сети, ни mbedtls, ни
 # docker он не требует и входит в обычный make test — при том что до переноса вся эта работа
 # жила в оболочке объекта rpcd и не проверялась ничем.
-$(BUILD)/subfetchmatch: tests/subfetchmatch.c src/ext/subfetch.c src/ext/subfetch.h \
-                  src/hwid.c src/hwid.h \
-                  src/ext/sub.c src/ext/vless.h src/ext/vless_proto.c src/ext/vless_proto.h
+$(BUILD)/subfetchmatch: tests/subfetchmatch.c src/proto/vless/subfetch.c src/proto/vless/subfetch.h \
+                  src/tools/hwid.c src/tools/hwid.h \
+                  src/proto/vless/sub.c src/proto/vless/vless.h src/proto/vless/vless_proto.c src/proto/vless/vless_proto.h
 	@mkdir -p $(BUILD)
 	$(CC) $(CFLAGS) -Itests/stub -o $@ tests/subfetchmatch.c
 
@@ -282,42 +289,42 @@ $(BUILD)/subfetchmatch: tests/subfetchmatch.c src/ext/subfetch.c src/ext/subfetc
 # стороны, или не расшифровывается, или отвергается как повтор, и ни одного сообщения об
 # этом нет. Ни сети, ни mbedtls стенд не требует (xswire.c намеренно без библиотеки),
 # поэтому он входит в обычный make test, как submatch и visionmatch.
-$(BUILD)/xswirematch: tests/xswirematch.c src/ext/xswire.c src/ext/xswire.h
+$(BUILD)/xswirematch: tests/xswirematch.c src/proto/xsteer/xswire.c src/proto/xsteer/xswire.h
 	@mkdir -p $(BUILD)
 	$(CC) $(CFLAGS) -o $@ tests/xswirematch.c
 
 # Стенд поддельного соединения: порог мёртвого пути и учёт своей незанятости. Входит в обычный
 # make test по той же причине, что xswirematch: ни сети, ни mbedtls — время приходит аргументом,
 # а сокета у соединения в стенде нет вовсе.
-$(BUILD)/xsconnmatch: tests/xsconnmatch.c src/ext/xsconn.c src/ext/xsconn.h src/obfs.c src/obfs.h
+$(BUILD)/xsconnmatch: tests/xsconnmatch.c src/proto/xsteer/xsconn.c src/proto/xsteer/xsconn.h src/proto/obfs/obfs.c src/proto/obfs/obfs.h
 	@mkdir -p $(BUILD)
-	$(CC) $(CFLAGS) -o $@ tests/xsconnmatch.c src/obfs.c src/spec.c
+	$(CC) $(CFLAGS) -o $@ tests/xsconnmatch.c src/proto/obfs/obfs.c src/model/spec.c
 
 # Рамка записей по настоящему потоку TCP: границы записей, смещения (они же nonce) и досылка
 # недописанного хвоста. Стенд входит в обычный make test по той же причине, что xswirematch:
 # xsstream.c не требует ни mbedtls, ни сети — обстановка делается из socketpair. Проверять это
 # на живом туннеле пришлось бы гигабайтом трафика, а ломается всё здесь молча.
-$(BUILD)/xsstreammatch: tests/xsstreammatch.c src/ext/xsstream.c src/ext/xsstream.h src/ext/xswire.h
+$(BUILD)/xsstreammatch: tests/xsstreammatch.c src/proto/xsteer/xsstream.c src/proto/xsteer/xsstream.h src/proto/xsteer/xswire.h
 	@mkdir -p $(BUILD)
-	$(CC) $(CFLAGS) -Isrc -o $@ tests/xsstreammatch.c
+	$(CC) $(CFLAGS) -o $@ tests/xsstreammatch.c
 
 # Склейка соседних сегментов в одну запись в устройство: что склеивается, что нет и какими
 # байтами уезжает. В make test входит потому, что tun.c не требует ни mbedtls, ни сети, а
 # обстановка делается из socketpair датаграммами — по одной на writev, поэтому видно и число
 # записей, и их содержимое. Ошибка здесь либо портит поток клиента (склеили лишнее), либо тихо
 # отключает выигрыш (не склеили ничего) — второе тут и случилось на живом прогоне.
-$(BUILD)/tungromatch: tests/tungromatch.c src/ext/tun.c src/ext/tun.h
+$(BUILD)/tungromatch: tests/tungromatch.c src/tunnel/tun.c src/tunnel/tun.h
 	@mkdir -p $(BUILD)
-	$(CC) $(CFLAGS) -Isrc -o $@ tests/tungromatch.c
+	$(CC) $(CFLAGS) -o $@ tests/tungromatch.c
 
 # Разбор пакетов туннеля VLESS на подменённом клиенте (I-320, I-321, I-322): tunnel.c
 # включается целиком, client.c подменён, поэтому mbedtls не нужна — заголовки из tests/stub,
 # как у ext-syntax. Подробности — в шапке стенда.
-TUNNELMATCH_SRC = src/ext/tun.c src/ext/rtx.c src/ext/vless_proto.c src/ext/vision.c \
-                  src/ext/sub.c src/spec.c
-$(BUILD)/tunnelmatch: tests/tunnelmatch.c src/ext/tunnel.c $(TUNNELMATCH_SRC)
+TUNNELMATCH_SRC = src/tunnel/tun.c src/tunnel/rtx.c src/proto/vless/vless_proto.c src/proto/vless/vision.c \
+                  src/proto/vless/sub.c src/model/spec.c
+$(BUILD)/tunnelmatch: tests/tunnelmatch.c src/tunnel/tunnel.c $(TUNNELMATCH_SRC)
 	@mkdir -p $(BUILD)
-	$(CC) $(CFLAGS) -Itests/stub -Isrc -Isrc/ext -DSTEER_EXTENDED -o $@ tests/tunnelmatch.c \
+	$(CC) $(CFLAGS) -Itests/stub -DSTEER_EXTENDED -o $@ tests/tunnelmatch.c \
 		$(TUNNELMATCH_SRC) -lpthread -ldl
 
 # Имя устройства: движок работает ровно с тем именем, о котором просил, — иначе отказ. Ядро
@@ -326,16 +333,16 @@ $(BUILD)/tunnelmatch: tests/tunnelmatch.c src/ext/tunnel.c $(TUNNELMATCH_SRC)
 # Здесь нужно НАСТОЯЩЕЕ устройство (TUNSETIFF — единственный источник выбранного имени),
 # поэтому стенд требует CAP_NET_ADMIN и без него пропускается вслух с кодом 0. В make test он
 # всё равно входит: стенд, который надо позвать руками, не запускается никогда.
-$(BUILD)/tunnamematch: tests/tunnamematch.c src/ext/tun.c src/ext/tun.h
+$(BUILD)/tunnamematch: tests/tunnamematch.c src/tunnel/tun.c src/tunnel/tun.h
 	@mkdir -p $(BUILD)
-	$(CC) $(CFLAGS) -Isrc -o $@ tests/tunnamematch.c
+	$(CC) $(CFLAGS) -o $@ tests/tunnamematch.c
 
 # Разбор конфигурации xsteer — единственное место, куда в движок попадает текст, который
 # человек написал руками, поэтому разбор строгий, а стенд перечисляет каждый отказ.
 # Отдельно проверяется, что приватный ключ не попадает в вывод: обещание держится на том,
 # что печатающая функция не имеет к нему доступа по построению. Без mbedtls — это же
 # требуется для build/diagsim, который линкует этот файл ради проверок diag.
-$(BUILD)/xsconfmatch: tests/xsconfmatch.c src/ext/xsconf.c src/ext/xsconf.h src/ext/xswire.h
+$(BUILD)/xsconfmatch: tests/xsconfmatch.c src/proto/xsteer/xsconf.c src/proto/xsteer/xsconf.h src/proto/xsteer/xswire.h
 	@mkdir -p $(BUILD)
 	$(CC) $(CFLAGS) -o $@ tests/xsconfmatch.c
 
@@ -343,8 +350,8 @@ $(BUILD)/xsconfmatch: tests/xsconfmatch.c src/ext/xsconf.c src/ext/xsconf.h src/
 # половинами звезды. Расхождение здесь не падает: ссылка «принялась», а туннель молчит, потому что
 # маска оказалась другой или keepalive включился сам. Поэтому стенд держит те же векторы, что
 # xsteer/conf/link_cross_test.go на стороне Go, и сверяет печать ПОБАЙТОВО.
-$(BUILD)/xslinkmatch: tests/xslinkmatch.c src/ext/xslink.c src/ext/xslink.h \
-                  src/ext/xsconf.c src/ext/xsconf.h src/ext/xswire.h
+$(BUILD)/xslinkmatch: tests/xslinkmatch.c src/proto/xsteer/xslink.c src/proto/xsteer/xslink.h \
+                  src/proto/xsteer/xsconf.c src/proto/xsteer/xsconf.h src/proto/xsteer/xswire.h
 	@mkdir -p $(BUILD)
 	$(CC) $(CFLAGS) -o $@ tests/xslinkmatch.c
 
@@ -352,7 +359,7 @@ $(BUILD)/xslinkmatch: tests/xslinkmatch.c src/ext/xslink.c src/ext/xslink.h \
 # пакеты приходят не тому пиру. Три утверждения, без которых звезда небезопасна, стоят
 # именно тут — самое длинное совпадение, «нет пира — отбросить» (а не «отдать первому»,
 # что было бы утечкой между спицами) и запрет отправлять от чужого имени.
-$(BUILD)/xsroutematch: tests/xsroutematch.c src/ext/xsroute.c src/ext/xsroute.h src/ext/xsconf.h
+$(BUILD)/xsroutematch: tests/xsroutematch.c src/proto/xsteer/xsroute.c src/proto/xsteer/xsroute.h src/proto/xsteer/xsconf.h
 	@mkdir -p $(BUILD)
 	$(CC) $(CFLAGS) -o $@ tests/xsroutematch.c
 
@@ -361,7 +368,7 @@ $(BUILD)/xsroutematch: tests/xsroutematch.c src/ext/xsroute.c src/ext/xsroute.h 
 # доверились. Разбирается НАСТОЯЩИЙ Hello из заморозки (tests/chello-frozen.h), поэтому
 # mbedtls не нужен. Байтовую неизменность самого сборщика проверяет tests/hellofreeze.c,
 # которому библиотека нужна и который поэтому в make test не входит.
-$(BUILD)/chellomatch: tests/chellomatch.c tests/chello-frozen.h src/ext/chello.c src/ext/chello.h
+$(BUILD)/chellomatch: tests/chellomatch.c tests/chello-frozen.h src/proto/tls/chello.c src/proto/tls/chello.h
 	@mkdir -p $(BUILD)
 	$(CC) $(CFLAGS) -o $@ tests/chellomatch.c
 

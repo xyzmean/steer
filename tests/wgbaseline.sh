@@ -86,7 +86,7 @@ ip -n $NSA addr add 10.201.0.1/24 dev wg0
 ip -n $NSB addr add 10.201.0.2/24 dev wg0
 # MTU туннеля WireGuard: канал минус 60 (20 IP + 8 UDP + 32 WireGuard). У xsteer здесь
 # будет 1439 — минус 61, то есть на байт больше накладных и на 11 байт меньше, чем у
-# WireGuard поверх поддельного TCP (см. src/ext/xswire.h).
+# WireGuard поверх поддельного TCP (см. src/proto/xsteer/xswire.h).
 for ns in $NSA $NSB; do ip -n $ns link set wg0 mtu 1440 up; done
 
 sleep 0.5

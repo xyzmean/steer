@@ -17,15 +17,15 @@
  * Нужен настоящий mbedtls (здесь считается криптография), поэтому в make test стенд не входит —
  * как tests/crypto.c и tests/xsloop.c:
  *
- *     cc -O2 -w -Isrc -I<mbedtls>/include -DMBEDTLS_CONFIG_FILE='"steer_mbedtls_config.h"' \
- *        -Isrc/ext -o build/xsepochmatch tests/xsepochmatch.c src/ext/xsepoch.c \
- *        src/ext/tls13.c src/ext/reality.c src/ext/h2.c <mbedtls>/library/libmbedcrypto.a
+ *     cc -O2 -w $(make -s print-inc) -I<mbedtls>/include -DMBEDTLS_CONFIG_FILE='"steer_mbedtls_config.h"' \
+ *        $(make -s print-inc) -o build/xsepochmatch tests/xsepochmatch.c src/proto/xsteer/xsepoch.c \
+ *        src/proto/tls/tls13.c src/proto/tls/reality.c src/proto/tls/h2.c <mbedtls>/library/libmbedcrypto.a
  */
 #include <stdio.h>
 #include <string.h>
 
-#include "../src/ext/xsepoch.h"
-#include "../src/ext/xswire.h"   /* XS_REC_HDR: AAD записи — её настоящий заголовок */
+#include "../src/proto/xsteer/xsepoch.h"
+#include "../src/proto/xsteer/xswire.h"   /* XS_REC_HDR: AAD записи — её настоящий заголовок */
 
 static int fails;
 

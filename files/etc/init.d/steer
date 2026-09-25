@@ -17,7 +17,7 @@ SPEC=/etc/steer/spec.json
 # — это заметно меньше процента времени коробки даже на самой слабой.
 FAILOVER_INTERVAL=60
 # Как часто освежать снимок состояния (`steer status`, см. комментарий про снимок в
-# src/steer.c). Пять минут — это компромисс между двумя ценами, и обе замерены на стенде
+# src/daemon/steer.c). Пять минут — это компромисс между двумя ценами, и обе замерены на стенде
 # (mipsel 24kc, 880 МГц): полный ответ стоит 91 мс, то есть чаще платить незачем, а реже —
 # значит показать человеку, открывшему страницу, состояние получасовой давности.
 #
@@ -257,7 +257,7 @@ start_service() {
 stop_service() {
     nft delete table inet steer 2>/dev/null
     # Раскладка для старого ядра (без nat в inet, Linux до 5.2) держит nat в своих таблицах
-    # ip и ip6 — см. nft_compat в src/spec.h. На обычном роутере их нет, и строки ничего не
+    # ip и ip6 — см. nft_compat в src/model/spec.h. На обычном роутере их нет, и строки ничего не
     # делают; там, где они есть, без них остались бы заворот DNS и dnat на закрытый порт.
     nft delete table ip steer 2>/dev/null
     nft delete table ip6 steer 2>/dev/null
@@ -273,7 +273,7 @@ stop_service() {
     # без неё — она осталась в ядре, если пакет обновили, а сервис с тех пор не
     # перезапускали. Маска здесь литералом, а не из движка: init-скрипт зовут и тогда,
     # когда бинарника уже нет (удаление пакета), а число объявлено в контракте
-    # (docs/contract-v1.md, STEER_MARK_MASK в src/spec.h) и меняться не должно.
+    # (docs/contract-v1.md, STEER_MARK_MASK в src/model/spec.h) и меняться не должно.
     for m in $(awk '{print $2}' /var/lib/steer/registry 2>/dev/null); do
         while ip rule del fwmark "0x$m/0x0ff00000" 2>/dev/null; do :; done
         while ip rule del fwmark "0x$m" 2>/dev/null; do :; done

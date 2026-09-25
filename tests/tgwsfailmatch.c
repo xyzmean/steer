@@ -34,7 +34,7 @@ static void *t_malloc(size_t n) { void *p = malloc(n); if (p) live_allocs++; ret
 static void t_free(void *p) { if (p) live_allocs--; free(p); }
 #define malloc(n) t_malloc(n)
 #define free(p) t_free(p)
-#include "../src/ext/tgws.c"
+#include "../src/proto/tgws/tgws.c"
 #undef malloc
 #undef free
 

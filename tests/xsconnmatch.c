@@ -23,7 +23,7 @@
 #include <stdio.h>
 #include <string.h>
 
-#include "../src/ext/xsconn.c"
+#include "../src/proto/xsteer/xsconn.c"
 
 /* Заглушки внешних символов. Стенд не зовёт ни подъём соединения (ему нужен xc_random), ни
  * настройку интерфейсов (run_quiet), но линковщик обязан их найти: xsconn.c и obfs.c подключены

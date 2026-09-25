@@ -7,7 +7,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include "../src/hwid.h"
+#include "../src/tools/hwid.h"
 
 /* Второй режим — PBKDF2, ради известных ответов RFC 6070: через готовый идентификатор их не
  * проверить, там вывод обрезан и завёрнут в приставку. */

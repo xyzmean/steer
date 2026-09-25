@@ -1,14 +1,14 @@
 // steer for the Android platform build (DerpFest 16.2 / lineage-23.2).
 //
 // Two builds of the same engine, as on the router: the base one (ten sources, the Makefile's
-// build/steer target) and the extended one — the same sources plus src/ext (VLESS/Reality
+// build/steer target) and the extended one — the same sources plus src/tunnel and src/proto (VLESS/Reality
 // client, xsteer, tgws) and mbedtls. The owner chose the extended build for the phone from the
 // first version, so it is the module named "steer" that vendor/der/config/der.mk installs; the
 // base build stays as steer_base for trees without mbedtls.
 //
 // Both are compiled with -DSTEER_ANDROID (mark field above netd's bits, ip rule priorities
-// below netd's ladder, directories under /data/misc/steer, /dev/tun — see src/spec.h and
-// src/paths.h). The engine calls `nft -f`, `ip` and `iptables` as external programs and finds
+// below netd's ladder, directories under /data/misc/steer, /dev/tun — see src/model/spec.h and
+// src/lib/paths.h). The engine calls `nft -f`, `ip` and `iptables` as external programs and finds
 // them through init's default PATH, which includes /system_ext/bin (nft) and /system/bin.
 //
 // Installed in system_ext/bin/der/ rather than system_ext/bin/: every domain may list
@@ -22,18 +22,34 @@ cc_defaults {
     relative_install_path: "der",
     stem: "steer",
     srcs: [
-        "src/steer.c",
-        "src/spec.c",
-        "src/dnsd.c",
-        "src/failover.c",
-        "src/aggregate.c",
-        "src/obfs.c",
-        "src/cli.c",
-        "src/srs.c",
-        "src/puff.c",
-        "src/hwid.c",
-        "src/ctl.c",
-        "src/awg.c",
+        "src/daemon/steer.c",
+        "src/model/spec.c",
+        "src/dnsd/dnsd.c",
+        "src/daemon/failover.c",
+        "src/tools/aggregate.c",
+        "src/proto/obfs/obfs.c",
+        "src/cli/cli.c",
+        "src/tools/srs.c",
+        "src/tools/puff.c",
+        "src/tools/hwid.c",
+        "src/daemon/ctl.c",
+        "src/kinds/awg.c",
+    ],
+    // Каталоги слоёв — те же, что INC_DIRS в build/sources.mk (сверяет tests/buildmatch.sh).
+    local_include_dirs: [
+        "src/lib",
+        "src/model",
+        "src/daemon",
+        "src/kinds",
+        "src/cli",
+        "src/dnsd",
+        "src/tools",
+        "src/proto/obfs",
+        "src/tunnel",
+        "src/proto/tls",
+        "src/proto/vless",
+        "src/proto/xsteer",
+        "src/proto/tgws",
     ],
     cflags: [
         "-DSTEER_ANDROID",
@@ -56,7 +72,7 @@ cc_binary {
     installable: false,
 }
 
-// mbedtls with the engine's own configuration (src/ext/steer_mbedtls_config.h): the sources
+// mbedtls with the engine's own configuration (src/proto/tls/steer_mbedtls_config.h): the sources
 // come from external/der-mbedtls, the configuration from here, because in mbedtls the config
 // header is seen by every .c and must be the one the engine's headers are compiled with.
 cc_library_static {
@@ -64,7 +80,7 @@ cc_library_static {
     srcs: [":libmbedtls_der_srcs"],
     header_libs: ["libmbedtls_der_headers"],
     export_header_lib_headers: ["libmbedtls_der_headers"],
-    local_include_dirs: ["src/ext"],
+    local_include_dirs: ["src/proto/tls"],
     cflags: ["-DMBEDTLS_CONFIG_FILE=\"steer_mbedtls_config.h\""],
 }
 
@@ -73,37 +89,36 @@ cc_binary {
     defaults: ["steer_defaults"],
     // The router role of build/build-ext.sh: XS_COMMON + EXT_ROUTER.
     srcs: [
-        "src/ext/xswire.c",
-        "src/ext/xsconf.c",
-        "src/ext/xslink.c",
-        "src/ext/xsroute.c",
-        "src/ext/chello.c",
-        "src/ext/xshake.c",
-        "src/ext/xsconn.c",
-        "src/ext/xsstream.c",
-        "src/ext/xsepoch.c",
-        "src/ext/tls13.c",
-        "src/ext/certverify.c",
-        "src/ext/reality.c",
-        "src/ext/tun.c",
-        "src/ext/h2.c",
-        "src/ext/xsadmin.c",
-        "src/ext/sub.c",
-        "src/ext/vless_proto.c",
-        "src/ext/vision.c",
-        "src/ext/client.c",
-        "src/ext/tunnel.c",
-        "src/ext/rtx.c",
-        "src/ext/xsclient.c",
-        "src/ext/subfetch.c",
-        "src/ext/tgws.c",
-        "src/ext/tlsprobe.c",
+        "src/proto/xsteer/xswire.c",
+        "src/proto/xsteer/xsconf.c",
+        "src/proto/xsteer/xslink.c",
+        "src/proto/xsteer/xsroute.c",
+        "src/proto/tls/chello.c",
+        "src/proto/xsteer/xshake.c",
+        "src/proto/xsteer/xsconn.c",
+        "src/proto/xsteer/xsstream.c",
+        "src/proto/xsteer/xsepoch.c",
+        "src/proto/tls/tls13.c",
+        "src/proto/tls/certverify.c",
+        "src/proto/tls/reality.c",
+        "src/tunnel/tun.c",
+        "src/proto/tls/h2.c",
+        "src/proto/xsteer/xsadmin.c",
+        "src/proto/vless/sub.c",
+        "src/proto/vless/vless_proto.c",
+        "src/proto/vless/vision.c",
+        "src/proto/vless/client.c",
+        "src/tunnel/tunnel.c",
+        "src/tunnel/rtx.c",
+        "src/proto/xsteer/xsclient.c",
+        "src/proto/vless/subfetch.c",
+        "src/proto/tgws/tgws.c",
+        "src/proto/tls/tlsprobe.c",
     ],
-    local_include_dirs: ["src/ext"],
     cflags: [
         "-DSTEER_EXTENDED",
         "-DMBEDTLS_CONFIG_FILE=\"steer_mbedtls_config.h\"",
-        // Soong builds this project with -Werror, and a comment in src/ext/certverify.c
+        // Soong builds this project with -Werror, and a comment in src/proto/tls/certverify.c
         // contains "*val/*val_n" (-Wcomment). That file is protected from edits, so the
         // warning is turned off here instead of being fixed there.
         "-Wno-comment",

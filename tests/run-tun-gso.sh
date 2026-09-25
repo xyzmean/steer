@@ -7,7 +7,7 @@ set -eu
 cd "$(dirname "$0")/.."
 
 BIN="${TMPDIR:-/tmp}/tun-gso"
-cc -O2 -Wall -Wextra -o "$BIN" tests/tun-gso.c src/ext/tun.c
+cc -O2 -Wall -Wextra -o "$BIN" tests/tun-gso.c src/tunnel/tun.c
 
 NS=steer-tungso
 ip netns delete "$NS" 2>/dev/null || true

@@ -10,7 +10,7 @@
  * на выдуманном, и для этого mbedtls не нужен вовсе.
  *
  * Как пересобрать (нужны исходники mbedtls 3.6.2, см. build/Dockerfile):
- *     cc -O2 -w -Isrc -I<mbedtls>/include -o freeze tests/hellofreeze.c \
+ *     cc -O2 -w $(make -s print-inc) -I<mbedtls>/include -o freeze tests/hellofreeze.c \
  *        <mbedtls>/library/libmbedcrypto.a
  *     ./freeze --emit > tests/chello-frozen.h
  *

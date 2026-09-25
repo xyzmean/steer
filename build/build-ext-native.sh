@@ -122,10 +122,11 @@ case "$ROLE" in
   *) echo "неизвестная роль: $ROLE (router|server)" >&2; exit 2 ;;
 esac
 [ -n "${FILES:-}" ] || { echo "нет списка файлов для роли $ROLE" >&2; exit 2; }
+STEER_INC="$(for d in $(profile_var INC_DIRS); do printf -- '-I%s/%s ' "$SRC" "$d"; done)"
 
 # shellcheck disable=SC2086
 "$CC" $OPT -w -s \
-    -I"$MBED/include" -I"$SRC/src/ext" $ROLEDEF \
+    -I"$MBED/include" -I"$SRC/src/proto/tls" $STEER_INC $ROLEDEF \
     -DSTEER_VERSION="\"$VERSION\"" -DSTEER_REV="\"$REV\"" \
     -o "$OUT" \
     $FILES -L"$WORK" -lmbedcrypto -lpthread

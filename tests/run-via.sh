@@ -30,7 +30,7 @@
 # WireGuard за сервером VLESS (fake-vless.py --udp-relay пересылает UDP по адресу из запроса);
 # без wg или модуля wireguard эта часть пропускается вслух.
 #
-# Движок — расширенная сборка с mbedtls 3.x и src/awg.c, статикой musl (glibc не даёт потокам
+# Движок — расширенная сборка с mbedtls 3.x и src/kinds/awg.c, статикой musl (glibc не даёт потокам
 # туннеля стек в 128 КБ при их __thread-буферах — pthread_create отвечает EINVAL). Для
 # Android-сборки на обычном Linux: -DSTEER_ANDROID и каталоги в /tmp (-DSTEER_TMP_DIR,
 # -DSTEER_STATE_DIR, -DSTEER_ETC_DIR, как в шапке local49.sh) плюс -DSTEER_TUN_DEV='"/dev/net/tun"'.

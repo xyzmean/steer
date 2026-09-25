@@ -56,13 +56,13 @@ command -v openssl >/dev/null 2>&1 || { echo "probe: ПРОПУЩЕН — нет
 command -v ip >/dev/null 2>&1 || { echo "probe: ПРОПУЩЕН — нет iproute2"; exit 0; }
 [ -x "$BIN" ] || {
     echo "probe: ПРОПУЩЕН — нет $BIN. Серверная сборка собирается так (mbedtls системный):"
-    echo "        cc -O1 -w -Isrc -DSTEER_SERVER \\"
+    echo "        cc -O1 -w $(make -s print-inc) -DSTEER_SERVER \\"
     echo "           \"-DMBEDTLS_PRIVATE(x)=x\" -o build/steer-hub-native \\"
-    echo "           src/steer.c src/spec.c src/dnsd.c src/failover.c src/aggregate.c \\"
-    echo "           src/obfs.c src/cli.c src/ext/xswire.c src/ext/xsconf.c src/ext/xsroute.c \\"
-    echo "           src/ext/chello.c src/ext/xshake.c src/ext/xsconn.c src/ext/xsstream.c \\"
-    echo "           src/ext/xsepoch.c src/ext/tls13.c src/ext/reality.c src/ext/tun.c \\"
-    echo "           src/ext/h2.c src/ext/xsadmin.c src/ext/xshub.c \\"
+    echo "           src/daemon/steer.c src/model/spec.c src/dnsd/dnsd.c src/daemon/failover.c src/tools/aggregate.c \\"
+    echo "           src/proto/obfs/obfs.c src/cli/cli.c src/proto/xsteer/xswire.c src/proto/xsteer/xsconf.c src/proto/xsteer/xsroute.c \\"
+    echo "           src/proto/tls/chello.c src/proto/xsteer/xshake.c src/proto/xsteer/xsconn.c src/proto/xsteer/xsstream.c \\"
+    echo "           src/proto/xsteer/xsepoch.c src/proto/tls/tls13.c src/proto/tls/reality.c src/tunnel/tun.c \\"
+    echo "           src/proto/tls/h2.c src/proto/xsteer/xsadmin.c src/proto/xsteer/xshub.c \\"
     echo "           -lmbedtls -lmbedx509 -lmbedcrypto -lpthread"
     echo "        (на mbedtls 3.x флаг доступа другой: -DMBEDTLS_ALLOW_PRIVATE_ACCESS)"
     exit 0

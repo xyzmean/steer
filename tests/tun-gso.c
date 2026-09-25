@@ -27,7 +27,7 @@
 #include <poll.h>
 #include <arpa/inet.h>
 
-#include "../src/ext/tun.h"
+#include "../src/tunnel/tun.h"
 
 #define PAYLOAD_N 16000
 #define QUEUES 4

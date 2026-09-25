@@ -13,7 +13,7 @@
 #include <string.h>
 #include <stdlib.h>
 
-#include "../src/ext/chello.c"
+#include "../src/proto/tls/chello.c"
 #include "chello-frozen.h"
 
 static int fails;

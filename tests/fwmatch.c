@@ -31,7 +31,7 @@ static FILE *test_popen(const char *cmd, const char *mode) {
 #define pclose(f) fclose(f)
 #define main steer_main_unused
 
-#include "../src/steer.c"
+#include "../src/daemon/steer.c"
 
 #undef popen
 #undef pclose

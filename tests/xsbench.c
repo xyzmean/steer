@@ -28,8 +28,8 @@
  *
  * Нужен настоящий mbedtls (здесь СЧИТАЕТСЯ шифр), поэтому в make test стенд не входит.
  * Собрать и запустить:
- *     cc -O2 -w -Isrc -I<mbedtls>/include -o build/xsbench tests/xsbench.c \
- *        src/ext/xswire.c src/ext/reality.c -lpthread <mbedtls>/library/libmbedcrypto.a
+ *     cc -O2 -w $(make -s print-inc) -I<mbedtls>/include -o build/xsbench tests/xsbench.c \
+ *        src/proto/xsteer/xswire.c src/proto/tls/reality.c -lpthread <mbedtls>/library/libmbedcrypto.a
  *     ./build/xsbench [размер_нагрузки] [секунд_на_замер] [потоков]
  */
 #define _GNU_SOURCE
@@ -47,13 +47,13 @@
 int run_quiet(const char *const argv[]);
 int run_quiet(const char *const argv[]) { (void)argv; return 0; }
 
-#include "../src/obfs.c"
-#include "../src/ext/xswire.h"
-#include "../src/ext/tls13.h"
+#include "../src/proto/obfs/obfs.c"
+#include "../src/proto/xsteer/xswire.h"
+#include "../src/proto/tls/tls13.h"
 
 /* tls13.c тянет за собой рукопожатие и h2; нам нужны только keys_setup и aead_*, но
  * включать исходник целиком проще, чем выкраивать: линкуется он без сети. */
-#include "../src/ext/tls13.c"
+#include "../src/proto/tls/tls13.c"
 
 static double now_s(void) {
     struct timespec ts;

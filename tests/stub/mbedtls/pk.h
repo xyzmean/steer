@@ -1,4 +1,4 @@
-/* См. tests/stub/mbedtls/sha256.h — заглушки для локальной проверки src/ext.
+/* См. tests/stub/mbedtls/sha256.h — заглушки для локальной проверки расширенной части.
  * Отсюда certverify.c берёт проверку подписи CertificateVerify. */
 #ifndef STEER_TESTSTUB_MBEDTLS_PK_H
 #define STEER_TESTSTUB_MBEDTLS_PK_H

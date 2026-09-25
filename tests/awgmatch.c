@@ -25,12 +25,12 @@
 static jmp_buf g_jmp;
 static int g_exit_code;
 #define exit(code) (g_exit_code = (code), longjmp(g_jmp, 1))
-#include "../src/spec.c"
+#include "../src/model/spec.c"
 #undef exit
 
 int run_quiet(const char *const argv[]) { (void)argv; return 0; }
 
-#include "../src/awg.c"
+#include "../src/kinds/awg.c"
 
 static int fails, passes;
 

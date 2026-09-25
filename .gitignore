@@ -66,7 +66,7 @@ build/diagsim
 build/tgwssim
 build/crypto-vec
 build/bx-*
-# Объекты mbedtls, собранные под хост для прогона стендов src/ext в образе
+# Объекты mbedtls, собранные под хост для прогона стендов расширенной части в образе
 build/mbedtls-host/
 build/asan-probe*
 build/devupmatch

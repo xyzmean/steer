@@ -26,7 +26,7 @@
  * Файл включает исходник моста: `up_drop` статическая, и дотянуться до неё иначе значило бы
  * объявить её в заголовке ради стенда (тот же приём, что в dcmatch.c, msgsplitmatch.c и
  * warmmatch.c). */
-#include "../src/ext/tgws.c"
+#include "../src/proto/tgws/tgws.c"
 
 #include <dirent.h>
 

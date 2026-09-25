@@ -16,7 +16,7 @@
 # пускает и 192.168.1.0/24 (его AllowedIPs), так что проверяется маршрутизация и туннель, а не
 # трансляция (её ставит iptables, которого в образе стенда нет, — это стенд local49).
 #
-# Запуск на стенде tools/vm49 хаба splicicd (сборка — как у ctnl49, плюс src/awg.c):
+# Запуск на стенде tools/vm49 хаба splicicd (сборка — как у ctnl49, плюс src/kinds/awg.c):
 #
 #   K=/root/vm49/sysroot/kinc
 #   musl-gcc -static -idirafter $K -O2 -DSTEER_ANDROID -o OUT/steer <исходники как в Makefile>

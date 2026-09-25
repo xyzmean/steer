@@ -7,7 +7,7 @@
  * эти случаи задаются руками, а смотрится то, что видно снаружи: пакеты, ушедшие в
  * устройство, и то, осталось ли соединение живым.
  *
- * КАК. Стенд включает src/ext/tunnel.c целиком (всё нужное в нём статическое) и подменяет
+ * КАК. Стенд включает src/tunnel/tunnel.c целиком (всё нужное в нём статическое) и подменяет
  * клиента VLESS (client.c не входит): vless_connect, vless_send и vless_recv_zc отвечают
  * так, как велит проверка. Устройство — сокетная пара: что туннель пишет в «TUN», стенд
  * читает с другого конца и разбирает тем же ip_parse. Дескриптор «сессии» — канал с
@@ -83,10 +83,10 @@ int run_quiet(const char *const argv[]) {
     return 0;
 }
 
-#include "../src/spec.h"
+#include "../src/model/spec.h"
 void bind_device(struct output *o, const char *dev) { (void)o; (void)dev; }
 
-#include "../src/ext/tunnel.c"
+#include "../src/tunnel/tunnel.c"
 
 /* ---- подменённый клиент VLESS -------------------------------------------------- */
 

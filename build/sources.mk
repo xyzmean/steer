@@ -18,8 +18,15 @@
 # пока остаются рядом (PROFILE_DEFS_*); по плану пересборки (docs/architecture.md) они
 # уходят, и профиль будет решать всё составом файлов.
 
-CORE_SRC := src/steer.c src/spec.c src/dnsd.c src/failover.c src/aggregate.c src/obfs.c \
-            src/cli.c src/srs.c src/puff.c src/hwid.c src/ctl.c src/awg.c
+# Каталоги слоёв (docs/architecture.md). Заголовки подключаются по имени (`#include "spec.h"`)
+# из любого слоя, поэтому каждая сборка получает -I на все каталоги сразу; имена заголовков
+# в дереве уникальны, и стенд tests/buildmatch.sh за этим следит.
+CORE_DIRS := src/lib src/model src/daemon src/kinds src/cli src/dnsd src/tools src/proto/obfs
+EXT_DIRS  := src/tunnel src/proto/tls src/proto/vless src/proto/xsteer src/proto/tgws
+INC_DIRS  := $(CORE_DIRS) $(EXT_DIRS)
+
+CORE_SRC := src/daemon/steer.c src/model/spec.c src/dnsd/dnsd.c src/daemon/failover.c src/tools/aggregate.c src/proto/obfs/obfs.c \
+            src/cli/cli.c src/tools/srs.c src/tools/puff.c src/tools/hwid.c src/daemon/ctl.c src/kinds/awg.c
 
 # Общее для обеих ролей: формат кадра, конфигурация, маршрутизация, рукопожатие, соединение
 # и то, на чём они стоят (TLS-записи, примитивы Reality, TUN). Расходиться на проводе этим
@@ -34,18 +41,18 @@ CORE_SRC := src/steer.c src/spec.c src/dnsd.c src/failover.c src/aggregate.c src
 # компилируется tls13.c, — то есть во всех трёх ролях. Внесённый только в EXT_ROUTER_SRC, он
 # оставил роли server и tgws с неопределёнными ссылками на cert_verify_server: сборка
 # роутерного пакета при этом шла как обычно, и заметить это было нечем, кроме релиза.
-XS_COMMON_SRC := src/ext/xswire.c src/ext/xsconf.c src/ext/xslink.c src/ext/xsroute.c \
-                 src/ext/chello.c src/ext/xshake.c src/ext/xsconn.c \
-                 src/ext/xsstream.c src/ext/xsepoch.c \
-                 src/ext/tls13.c src/ext/certverify.c \
-                 src/ext/reality.c src/ext/tun.c src/ext/h2.c \
-                 src/ext/xsadmin.c
-EXT_ROUTER_SRC := src/ext/sub.c src/ext/vless_proto.c src/ext/vision.c \
-                  src/ext/client.c src/ext/tunnel.c src/ext/rtx.c \
-                  src/ext/xsclient.c src/ext/subfetch.c src/ext/tgws.c src/ext/tlsprobe.c
-EXT_SERVER_SRC := src/ext/xshub.c
-EXT_TGWS_SRC := src/ext/tls13.c src/ext/certverify.c src/ext/reality.c \
-                src/ext/chello.c src/ext/tgws.c src/ext/tlsprobe.c
+XS_COMMON_SRC := src/proto/xsteer/xswire.c src/proto/xsteer/xsconf.c src/proto/xsteer/xslink.c src/proto/xsteer/xsroute.c \
+                 src/proto/tls/chello.c src/proto/xsteer/xshake.c src/proto/xsteer/xsconn.c \
+                 src/proto/xsteer/xsstream.c src/proto/xsteer/xsepoch.c \
+                 src/proto/tls/tls13.c src/proto/tls/certverify.c \
+                 src/proto/tls/reality.c src/tunnel/tun.c src/proto/tls/h2.c \
+                 src/proto/xsteer/xsadmin.c
+EXT_ROUTER_SRC := src/proto/vless/sub.c src/proto/vless/vless_proto.c src/proto/vless/vision.c \
+                  src/proto/vless/client.c src/tunnel/tunnel.c src/tunnel/rtx.c \
+                  src/proto/xsteer/xsclient.c src/proto/vless/subfetch.c src/proto/tgws/tgws.c src/proto/tls/tlsprobe.c
+EXT_SERVER_SRC := src/proto/xsteer/xshub.c
+EXT_TGWS_SRC := src/proto/tls/tls13.c src/proto/tls/certverify.c src/proto/tls/reality.c \
+                src/proto/tls/chello.c src/proto/tgws/tgws.c src/proto/tls/tlsprobe.c
 
 PROFILE_base     := $(CORE_SRC)
 PROFILE_extended := $(CORE_SRC) $(XS_COMMON_SRC) $(EXT_ROUTER_SRC)

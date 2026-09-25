@@ -8,12 +8,12 @@
  * разбирал вовсе — «не наш поток». Стенды tests/run-tunnel*.sh до этого не достают: у
  * поддельного сервера там голый tcp, без xhttp.
  *
- * КАК. Файл включает src/ext/client.c целиком (up_drain и up_request статические) и берёт
+ * КАК. Файл включает src/proto/vless/client.c целиком (up_drain и up_request статические) и берёт
  * настоящий h2.c. Связь выгрузки — голая (plain, как при security=none) на сокетной паре:
  * что клиент пишет, стенд вычитывает и выбрасывает, а «сервер» пишет на другой конец кадры
  * HTTP/2 руками. TLS и Reality стенду не нужны и подменены заглушками; заголовки mbedtls —
  * из tests/stub. Сетей и прав не нужно, поэтому стенд живёт в `make test`. */
-#include "../src/ext/client.c"
+#include "../src/proto/vless/client.c"
 
 #include <sys/socket.h>
 

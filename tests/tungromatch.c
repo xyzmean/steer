@@ -28,7 +28,7 @@
 #include <sys/socket.h>
 #include <unistd.h>
 
-#include "../src/ext/tun.c"
+#include "../src/tunnel/tun.c"
 
 static int fails;
 

@@ -17,7 +17,7 @@
  * не требует, — он в make test входит.
  *
  * Собрать и запустить (исходники mbedtls 3.6.2, как в build/Dockerfile):
- *     cc -O2 -w -Isrc -I<mbedtls>/include -o build/hellofreeze tests/hellofreeze.c \
+ *     cc -O2 -w $(make -s print-inc) -I<mbedtls>/include -o build/hellofreeze tests/hellofreeze.c \
  *        <mbedtls>/library/libmbedcrypto.a
  *     ./build/hellofreeze                # сверить с tests/chello-frozen.h
  *     ./build/hellofreeze --emit > tests/chello-frozen.h   # заново заморозить
@@ -48,7 +48,7 @@ static time_t det_time(time_t *p) { (void)p; return (time_t)1700000000; }
 
 #define getrandom(b, n, f) det_getrandom((b), (n), (f))
 #define time(p) det_time(p)
-#include "../src/ext/reality.c"
+#include "../src/proto/tls/reality.c"
 #undef getrandom
 #undef time
 

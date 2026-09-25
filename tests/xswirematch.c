@@ -9,13 +9,13 @@
  *
  * Ни сети, ни прав root, ни mbedtls: xswire.c намеренно не включает библиотеку (см. его
  * заголовок), поэтому стенд подключает исходник напрямую и входит в обычный make test —
- * так же, как submatch и visionmatch, и в отличие от остального src/ext, который доходит
+ * так же, как submatch и visionmatch, и в отличие от остальной расширенной части, который доходит
  * только до ext-syntax. */
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
 
-#include "../src/ext/xswire.c"
+#include "../src/proto/xsteer/xswire.c"
 
 static int fails;
 
@@ -38,7 +38,7 @@ static void check(const char *what, long want, long got) {
     }
 }
 
-/* Независимая реализация того же вывода nonce, что в src/ext/tls13.c (aead_nonce): номер
+/* Независимая реализация того же вывода nonce, что в src/proto/tls/tls13.c (aead_nonce): номер
  * записи 64-битный и накладывается на все восемь младших байт. Наша xs_nonce работает по
  * 32-битному смещению — то есть обязана давать тот же ответ на любом смещении, иначе
  * xsteer и TLS-слой, из которого взят AEAD, разойдутся в шифровании. Списывать её нельзя:

@@ -15,7 +15,7 @@
  * оно здесь и проверяется. Тот же приём, что в tests/h2match.c и tests/dnsmatch.c. */
 #include <stdio.h>
 #include <string.h>
-#include "../src/ext/vision.c"
+#include "../src/proto/vless/vision.c"
 
 static int fails;
 

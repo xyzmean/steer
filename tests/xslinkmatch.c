@@ -13,8 +13,8 @@
 #include <string.h>
 #include <stdlib.h>
 
-#include "../src/ext/xsconf.c"
-#include "../src/ext/xslink.c"
+#include "../src/proto/xsteer/xsconf.c"
+#include "../src/proto/xsteer/xslink.c"
 
 static int fails;
 #define OK(what, cond) do { \

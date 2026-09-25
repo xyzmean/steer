@@ -1,5 +1,5 @@
 #!/bin/sh
-# Прогон стендов src/ext, которым нужен НАСТОЯЩИЙ mbedtls, а не заглушки из tests/stub:
+# Прогон стендов расширенной части, которым нужен НАСТОЯЩИЙ mbedtls, а не заглушки из tests/stub:
 #
 #   tests/xsloop.c     — рукопожатие Noise IK целиком: сборка ClientHello, ответ хаба,
 #                        подтверждение, отказ по аутентификации, затирание состояния.
@@ -12,17 +12,17 @@
 #                        входит серверная половина TLS 1.3 — та, которой в проекте не было
 #                        вовсе, и без которой до серверного Finished не доходил ни один стенд.
 #   tests/hubmatch.c   — арифметика записи в хабе: правило набора кадров в пачку против
-#                        объявленной строки воркера (I-070). Включает src/ext/xshub.c, отсюда
+#                        объявленной строки воркера (I-070). Включает src/proto/xsteer/xshub.c, отсюда
 #                        и mbedtls: цикл хаба тянет за собой reality.c и TLS 1.3.
 #   tests/devupmatch.c — подъём устройства туннеля: каждый отказ `ip` обязан быть назван, и
-#                        назван своим тоном (I-114). Включает src/ext/tunnel.c — оттуда та же
+#                        назван своим тоном (I-114). Включает src/tunnel/tunnel.c — оттуда та же
 #                        зависимость от mbedtls.
 #
 # В обычный `make test` они НЕ входят: там mbedtls нет по построению (R-014, см. ext-syntax),
-# а роутерная сборка src/ext идёт только docker'ом через build.sh. Из-за этого первые два стенда
+# а роутерная сборка расширенной части идёт только docker'ом через build.sh. Из-за этого первые два стенда
 # до запуска 42 не прогонялись НИ РАЗУ — и первый же прогон дал I-066 (xsloop был красным с
 # 18 августа) и I-067 (утечка 576 байт на попытку). Эта цель закрывает разрыв: проверяемость
-# src/ext хоть где-то, кроме релизной сборки (R-058).
+# расширенной части хоть где-то, кроме релизной сборки (R-058).
 #
 # Библиотека ищется в таком порядке, первое найденное выигрывает:
 #   1) STEER_MBEDTLS — install-префикс (include/ + lib/) или дерево исходников (include/ +
@@ -36,7 +36,7 @@
 # расширенный пакет: обвязка — build/ext-test-image.sh, шаг — в .github/workflows/release.yml
 # (R-063). Оттуда приходят STEER_MBEDTLS и CC="zig cc".
 #
-# ВЕРСИЯ. src/ext/reality.c писан под mbedtls 3.x и пользуется макросом MBEDTLS_PRIVATE:
+# ВЕРСИЯ. src/proto/tls/reality.c писан под mbedtls 3.x и пользуется макросом MBEDTLS_PRIVATE:
 # в 2.x его нет, поэтому нужна заглушка -D'MBEDTLS_PRIVATE(x)=x'; в 3.x доступ к приватным
 # полям открывает -DMBEDTLS_ALLOW_PRIVATE_ACCESS. Флаг выбирается по мажорной версии. Прогон
 # ПЕЧАТАЕТ версию, на которой шёл: зелёное на 2.28 НЕ равно зелёному в релизе — там docker
@@ -45,6 +45,9 @@
 set -e
 
 CC=${CC:-cc}
+# -I на все каталоги слоёв — из того же манифеста, что у сборки (build/sources.mk).
+. build/sources.sh
+STEER_INC="$(for d in $(profile_var INC_DIRS); do printf -- '-I%s ' "$d"; done)"
 BUILD=${BUILD:-build}
 mkdir -p "$BUILD"
 
@@ -118,7 +121,7 @@ echo "ext-test: ВНИМАНИЕ — релиз собирается docker'ом
 echo "ext-test:            не равно зелёному в релизе (R-058)."
 
 # ---- разбор X.509: отдельная библиотека там, где она отдельная -----------------
-# certverify.c зовёт mbedtls_x509_crt_* — единственное место в src/ext, где нужен разбор
+# certverify.c зовёт mbedtls_x509_crt_* — единственное место расширенной части, где нужен разбор
 # сертификатов, и появилось оно вместе с security=tls. В образе сборщика вся библиотека
 # сложена в один libmbedcrypto.a (build/ext-test-image.sh: объекты всех модулей в один
 # архив), и добавлять там нечего. В системной mbedtls она разделена на три —
@@ -150,9 +153,9 @@ rm -f "$x509p" "$x509p.c"
 
 # xsloop — рукопожатие целиком.
 echo "ext-test: собираю и прогоняю xsloop..."
-$CC -O2 -w -Isrc $MBED_INC "$PRIV" -o "$BUILD/xsloop" tests/xsloop.c \
-	src/ext/xshake.c src/ext/chello.c src/ext/xswire.c src/ext/reality.c \
-	src/ext/tls13.c src/ext/certverify.c src/ext/h2.c $MBED_LIB
+$CC -O2 -w $STEER_INC $MBED_INC "$PRIV" -o "$BUILD/xsloop" tests/xsloop.c \
+	src/proto/xsteer/xshake.c src/proto/tls/chello.c src/proto/xsteer/xswire.c src/proto/tls/reality.c \
+	src/proto/tls/tls13.c src/proto/tls/certverify.c src/proto/tls/h2.c $MBED_LIB
 "$BUILD/xsloop"
 
 # spokematch — освобождение ключей при неудаче, под AddressSanitizer.
@@ -198,12 +201,12 @@ echo "ext-test: собираю и прогоняю spokematch (ASan: ${ASAN:-н�
 # xslink.c в списке ОБЯЗАТЕЛЕН: командная строка клиента принимает и ссылку xs://, и файл
 # одним xs_conf_load_any, и живёт эта функция там. Без неё сборка стенда падает на компоновке,
 # то есть весь ext-test не доходит даже до первой проверки — а именно в нём и живёт ASan.
-$CC -O1 -g -w -Isrc $ASAN $MBED_INC "$PRIV" -o "$BUILD/spokematch" \
+$CC -O1 -g -w $STEER_INC $ASAN $MBED_INC "$PRIV" -o "$BUILD/spokematch" \
 	tests/spokematch.c \
-	src/ext/xsconn.c src/ext/xswire.c src/ext/xsepoch.c src/ext/xsroute.c \
-	src/ext/xsconf.c src/ext/xslink.c src/ext/xsstream.c src/ext/xshake.c src/ext/chello.c \
-	src/ext/reality.c src/ext/tls13.c src/ext/certverify.c src/ext/h2.c src/ext/tun.c src/obfs.c \
-	src/spec.c $MBED_LIB -lpthread
+	src/proto/xsteer/xsconn.c src/proto/xsteer/xswire.c src/proto/xsteer/xsepoch.c src/proto/xsteer/xsroute.c \
+	src/proto/xsteer/xsconf.c src/proto/xsteer/xslink.c src/proto/xsteer/xsstream.c src/proto/xsteer/xshake.c src/proto/tls/chello.c \
+	src/proto/tls/reality.c src/proto/tls/tls13.c src/proto/tls/certverify.c src/proto/tls/h2.c src/tunnel/tun.c src/proto/obfs/obfs.c \
+	src/model/spec.c $MBED_LIB -lpthread
 "$BUILD/spokematch"
 
 # vlessmatch — ветви отказа vless_connect, под тем же AddressSanitizer.
@@ -241,36 +244,36 @@ fi
 rm -f "$x509wp" "$x509wp.c"
 
 echo "ext-test: собираю и прогоняю vlessmatch (ASan: ${ASAN:-нет})..."
-$CC -O1 -g -w -Isrc $ASAN $MBED_INC "$PRIV" $X509W -o "$BUILD/vlessmatch" tests/vlessmatch.c \
-	src/ext/vless_proto.c src/ext/vision.c src/ext/tls13.c src/ext/certverify.c \
-	src/ext/reality.c src/ext/h2.c src/ext/tun.c src/ext/rtx.c src/ext/sub.c \
-	src/spec.c $MBED_LIB -lpthread
+$CC -O1 -g -w $STEER_INC $ASAN $MBED_INC "$PRIV" $X509W -o "$BUILD/vlessmatch" tests/vlessmatch.c \
+	src/proto/vless/vless_proto.c src/proto/vless/vision.c src/proto/tls/tls13.c src/proto/tls/certverify.c \
+	src/proto/tls/reality.c src/proto/tls/h2.c src/tunnel/tun.c src/tunnel/rtx.c src/proto/vless/sub.c \
+	src/model/spec.c $MBED_LIB -lpthread
 "$BUILD/vlessmatch"
 
 # androidroots — склейка каталога корней Android в файл для certverify (cert_roots в
 # client.c под STEER_ANDROID). Выпуск X.509 нужен тот же, что у случаев security=tls выше.
 echo "ext-test: собираю и прогоняю androidroots..."
-$CC -O1 -g -w -Isrc $MBED_INC "$PRIV" $X509W -o "$BUILD/androidroots" tests/androidroots.c \
-	src/ext/vless_proto.c src/ext/vision.c src/ext/tls13.c src/ext/certverify.c \
-	src/ext/reality.c src/ext/h2.c src/ext/tun.c src/ext/rtx.c src/ext/sub.c \
-	src/spec.c $MBED_LIB -lpthread
+$CC -O1 -g -w $STEER_INC $MBED_INC "$PRIV" $X509W -o "$BUILD/androidroots" tests/androidroots.c \
+	src/proto/vless/vless_proto.c src/proto/vless/vision.c src/proto/tls/tls13.c src/proto/tls/certverify.c \
+	src/proto/tls/reality.c src/proto/tls/h2.c src/tunnel/tun.c src/tunnel/rtx.c src/proto/vless/sub.c \
+	src/model/spec.c $MBED_LIB -lpthread
 "$BUILD/androidroots"
 
 # hubmatch — согласие правила набора пачки с размером строки воркера.
 echo "ext-test: собираю и прогоняю hubmatch..."
-$CC -O2 -w -Isrc $MBED_INC "$PRIV" -o "$BUILD/hubmatch" tests/hubmatch.c \
-	src/ext/xsconn.c src/ext/xswire.c src/ext/xsepoch.c src/ext/xsroute.c \
-	src/ext/xsconf.c src/ext/xslink.c src/ext/xsstream.c src/ext/xshake.c src/ext/chello.c \
-	src/ext/reality.c src/ext/tls13.c src/ext/certverify.c src/ext/h2.c src/ext/tun.c src/obfs.c \
-	src/spec.c $MBED_LIB -lpthread
+$CC -O2 -w $STEER_INC $MBED_INC "$PRIV" -o "$BUILD/hubmatch" tests/hubmatch.c \
+	src/proto/xsteer/xsconn.c src/proto/xsteer/xswire.c src/proto/xsteer/xsepoch.c src/proto/xsteer/xsroute.c \
+	src/proto/xsteer/xsconf.c src/proto/xsteer/xslink.c src/proto/xsteer/xsstream.c src/proto/xsteer/xshake.c src/proto/tls/chello.c \
+	src/proto/tls/reality.c src/proto/tls/tls13.c src/proto/tls/certverify.c src/proto/tls/h2.c src/tunnel/tun.c src/proto/obfs/obfs.c \
+	src/model/spec.c $MBED_LIB -lpthread
 "$BUILD/hubmatch"
 
 # devupmatch — подъём устройства туннеля называет свои отказы (I-114).
 echo "ext-test: собираю и прогоняю devupmatch..."
-$CC -O2 -w -Isrc $MBED_INC "$PRIV" -o "$BUILD/devupmatch" tests/devupmatch.c \
-	src/ext/client.c src/ext/vless_proto.c src/ext/vision.c src/ext/tls13.c src/ext/certverify.c \
-	src/ext/reality.c src/ext/h2.c src/ext/tun.c src/ext/rtx.c src/ext/sub.c \
-	src/spec.c $MBED_LIB -lpthread
+$CC -O2 -w $STEER_INC $MBED_INC "$PRIV" -o "$BUILD/devupmatch" tests/devupmatch.c \
+	src/proto/vless/client.c src/proto/vless/vless_proto.c src/proto/vless/vision.c src/proto/tls/tls13.c src/proto/tls/certverify.c \
+	src/proto/tls/reality.c src/proto/tls/h2.c src/tunnel/tun.c src/tunnel/rtx.c src/proto/vless/sub.c \
+	src/model/spec.c $MBED_LIB -lpthread
 "$BUILD/devupmatch"
 
 # probe — активное зондирование настоящим openssl s_client. Здесь, а не отдельной целью
@@ -283,18 +286,18 @@ $CC -O2 -w -Isrc $MBED_INC "$PRIV" -o "$BUILD/devupmatch" tests/devupmatch.c \
 # серверную половину из build/build-ext.sh; расходиться им негде — оба списка про один бинарник,
 # и стенд упадёт на неразрешённом имени, если половины разъедутся.
 #
-# И РАЗОШЛИСЬ. `src/srs.c` появился в движке 5 сентября, в этот список его не внесли, и с того
+# И РАЗОШЛИСЬ. `src/tools/srs.c` появился в движке 5 сентября, в этот список его не внесли, и с того
 # дня `make ext-test` не собирался вовсе — падал на `undefined reference to srs_dump`. Комментарий
 # выше при этом обещал обратное: «расходиться им негде». Обещание держалось на том, что кто-то
 # запустит цель, а её не запускали: она требует настоящей mbedtls и потому не входит в `make
 # test`. Урок ровно про это: барьер, который нужно ЗАПУСТИТЬ РУКАМИ, не барьер.
 echo "ext-test: собираю серверный бинарник для стенда зондирования..."
-$CC -O1 -w -Isrc $MBED_INC "$PRIV" -DSTEER_SERVER -o "$BUILD/steer-hub-native" \
-	src/steer.c src/spec.c src/dnsd.c src/failover.c src/aggregate.c src/obfs.c src/cli.c \
-	src/srs.c src/puff.c src/hwid.c src/ctl.c src/awg.c \
-	src/ext/xswire.c src/ext/xsconf.c src/ext/xslink.c src/ext/xsroute.c src/ext/chello.c src/ext/xshake.c \
-	src/ext/xsconn.c src/ext/xsstream.c src/ext/xsepoch.c src/ext/tls13.c src/ext/certverify.c src/ext/reality.c \
-	src/ext/tun.c src/ext/h2.c src/ext/xsadmin.c src/ext/xshub.c \
+$CC -O1 -w $STEER_INC $MBED_INC "$PRIV" -DSTEER_SERVER -o "$BUILD/steer-hub-native" \
+	src/daemon/steer.c src/model/spec.c src/dnsd/dnsd.c src/daemon/failover.c src/tools/aggregate.c src/proto/obfs/obfs.c src/cli/cli.c \
+	src/tools/srs.c src/tools/puff.c src/tools/hwid.c src/daemon/ctl.c src/kinds/awg.c \
+	src/proto/xsteer/xswire.c src/proto/xsteer/xsconf.c src/proto/xsteer/xslink.c src/proto/xsteer/xsroute.c src/proto/tls/chello.c src/proto/xsteer/xshake.c \
+	src/proto/xsteer/xsconn.c src/proto/xsteer/xsstream.c src/proto/xsteer/xsepoch.c src/proto/tls/tls13.c src/proto/tls/certverify.c src/proto/tls/reality.c \
+	src/tunnel/tun.c src/proto/tls/h2.c src/proto/xsteer/xsadmin.c src/proto/xsteer/xshub.c \
 	$MBED_LIB -lpthread
 echo "ext-test: прогоняю probe (зондирование порта хаба)..."
 BUILD="$BUILD" sh tests/probe.sh

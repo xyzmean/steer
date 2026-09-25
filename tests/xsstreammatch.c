@@ -19,7 +19,7 @@
 #include <sys/socket.h>
 #include <unistd.h>
 
-#include "../src/ext/xsstream.c"
+#include "../src/proto/xsteer/xsstream.c"
 
 static int fails;
 

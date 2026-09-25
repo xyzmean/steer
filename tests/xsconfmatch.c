@@ -18,7 +18,7 @@
 #include <string.h>
 #include <stdlib.h>
 
-#include "../src/ext/xsconf.c"
+#include "../src/proto/xsteer/xsconf.c"
 
 static int fails;
 

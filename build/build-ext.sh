@@ -9,7 +9,7 @@
 #   server                — движок, хаб xsteer. Едет в архив для VPS.
 #
 # Гейт стоит на СПИСКАХ ФАЙЛОВ, а не внутри их тел, и это важно: цель ext-syntax в Makefile
-# гоняет -fsyntax-only по маске src/ext/*.c, и файл, целиком спрятанный под #ifdef, проходил
+# гоняет -fsyntax-only по всем файлам расширенной части, и файл, целиком спрятанный под #ifdef, проходил
 # бы проверку «пустым» — то есть ровно тот откат, ради которого ext-syntax и появилась.
 # Поэтому цикл спицы живёт в xsclient.c, цикл хаба в xshub.c, а различаются только списки.
 #
@@ -20,7 +20,7 @@
 #
 # Пути к исходникам ниже АБСОЛЮТНЫЕ, и это не стиль: сборка делает cd в каталог mbedtls
 # (см. WORK), после чего относительный путь не находится — ошибка выглядела как
-# «FileNotFound: src/ext/tls13.c», то есть будто файла нет вовсе.
+# «FileNotFound: src/proto/tls/tls13.c», то есть будто файла нет вовсе.
 set -eu
 
 TARGET="$1"
@@ -40,7 +40,7 @@ ROLE="${5:-router}"
 REV="${6:-неизвестна}"
 
 MBED_INC=/opt/mbedtls/include
-EXT_INC=/src/src/ext
+EXT_INC=/src/src/proto/tls
 # Имя файла НЕ mbedtls_config.h, и это не вкусовщина.
 #
 # build_info.h делает `#include MBEDTLS_CONFIG_FILE` кавычками, а кавычки ищутся сначала
@@ -102,7 +102,7 @@ OPT=-O2
 # Итог: контекст AES, оказавшийся по адресу, кратному четырём, а не шестнадцати, роняет
 # setkey общей защитой памяти. Ловушка тихая — падение зависит от того, как сложился кадр
 # стека, — и стоила разбора с SIGSEGV по нулевому адресу. Наши контексты выровнены явно (см.
-# STEER_AES_ALIGN16 в src/ext/tgws.c); собственные контексты mbedtls живут в куче, а malloc и
+# STEER_AES_ALIGN16 в src/proto/tgws/tgws.c); собственные контексты mbedtls живут в куче, а malloc и
 # так даёт нужное выравнивание. Если когда-нибудь появится ещё один свой mbedtls_aes_context —
 # выравнивать его обязательно.
 #
@@ -172,10 +172,11 @@ case "$ROLE" in
   *) echo "неизвестная роль: $ROLE (router|server|tgws)" >&2; exit 2 ;;
 esac
 [ -n "${FILES:-}" ] || { echo "нет списка файлов для роли $ROLE" >&2; exit 2; }
+STEER_INC="$(for d in $(profile_var INC_DIRS); do printf -- '-I/src/%s ' "$d"; done)"
 
 # shellcheck disable=SC2086
 zig cc -target "$TARGET" ${MCPU:+-mcpu=$MCPU} -static $OPT -s \
-    -I"$MBED_INC" -I"$EXT_INC" $CFG $ROLEDEF -DSTEER_VERSION="\"$VERSION\"" \
+    -I"$MBED_INC" -I"$EXT_INC" $STEER_INC $CFG $ROLEDEF -DSTEER_VERSION="\"$VERSION\"" \
     -DSTEER_REV="\"$REV\"" \
     -o "$OUT" \
     $FILES \

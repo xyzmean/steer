@@ -10,7 +10,7 @@ MCPU="${2:-cortex_a53}"
 OUT="${3:-/src/build/bench}"
 
 MBED_INC=/opt/mbedtls/include
-EXT_INC=/src/src/ext
+EXT_INC=/src/src/proto/tls
 
 build() {  # СУФФИКС ДОП_ФЛАГИ
     suffix="$1"; extra="$2"

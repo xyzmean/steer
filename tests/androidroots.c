@@ -31,7 +31,7 @@
 #define STEER_STATE_DIR "/tmp/steer-androidroots/state"
 #define STEER_ANDROID_CA_DIRS "/tmp/steer-androidroots/nope", "/tmp/steer-androidroots/empty", \
                               "/tmp/steer-androidroots/cacerts"
-#include "../src/ext/client.c"
+#include "../src/proto/vless/client.c"
 
 #include "mbedtls/x509_crt.h"
 #include "mbedtls/pk.h"

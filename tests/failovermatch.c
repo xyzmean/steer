@@ -108,7 +108,7 @@ static int g_slept;
 static unsigned test_sleep(unsigned n) { (void)n; g_slept++; return 0; }
 #define sleep(n) test_sleep(n)
 
-#include "../src/spec.h"
+#include "../src/model/spec.h"
 
 /* Mock globals */
 size_t g_out_n = 0;
@@ -117,7 +117,7 @@ const char *g_state_dir = "/tmp";
 void load_spec(const char *path) { (void)path; }
 void registry_assign(void) {}
 
-/* Ход подъёма выхода читается из файла в state_dir (src/spec.c). Здесь он задаётся прямо:
+/* Ход подъёма выхода читается из файла в state_dir (src/model/spec.c). Здесь он задаётся прямо:
  * стенду нужен не разбор файла — его проверяет specmatch, — а поведение сторожа при каждом
  * из состояний. Особенно при «номер узла вне подписки»: ждать там нечего, и сторож обязан
  * это знать, а не обещать подъём. */
@@ -136,11 +136,11 @@ int ctnl_evict_mark(uint32_t val, uint32_t mask) {
     return g_ctnl_ret;
 }
 
-/* Выход kind=awg спрашивает ядро по netlink (src/awg.c); стенду сторожа ядро не нужно —
+/* Выход kind=awg спрашивает ядро по netlink (src/kinds/awg.c); стенду сторожа ядро не нужно —
  * здоровье устройств он задаёт своим швом g_health_probe, и до этих функций дело не доходит. */
 int awg_healthy(const struct output *o, const char *dev) { (void)o; (void)dev; return 1; }
 int awg_revive(const struct output *o, const char *dev) { (void)o; (void)dev; return 0; }
-#include "../src/failover.c"
+#include "../src/daemon/failover.c"
 
 #undef popen
 #undef pclose

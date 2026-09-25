@@ -22,7 +22,7 @@
  * проверкой после каждого случая, а не одним отчётом на выходе.
  *
  * КАК ЭТО РАБОТАЕТ БЕЗ УЗЛА И БЕЗ СЕТИ. Установление TCP вынесено в шов g_tcp_dial
- * (src/ext/client.c) — так же, как замер задержки в failover.c. Стенд отдаёт клиенту конец
+ * (src/proto/vless/client.c) — так же, как замер задержки в failover.c. Стенд отдаёт клиенту конец
  * socketpair, а на другом конце сам говорит серверную половину TLS 1.3: разбирает
  * ClientHello, достаёт из него key_share, считает X25519, выводит расписание ключей
  * рукопожатия по RFC 8446 §7.1 и шлёт зашифрованные EncryptedExtensions, при надобности
@@ -79,7 +79,7 @@
 /* Исходник целиком, а не компоновка: шов g_tcp_dial статический, и дотянуться до него
  * иначе значило бы объявить его в client.h — то есть завести в движке публичную точку
  * подмены ради стенда. Тот же приём, что в tests/devupmatch.c и tests/failovermatch.c. */
-#include "../src/ext/client.c"
+#include "../src/proto/vless/client.c"
 
 #include "mbedtls/hkdf.h"
 #include "mbedtls/md.h"
@@ -98,7 +98,7 @@
 int x25519_shared_ext(const unsigned char priv[32], const unsigned char peer[32],
                       unsigned char out[32]);
 
-/* Заглушки того, что живёт в src/steer.c: ни команд, ни устройств стенду не нужно. */
+/* Заглушки того, что живёт в src/daemon/steer.c: ни команд, ни устройств стенду не нужно. */
 int run_quiet(const char *const argv[]) { (void)argv; return 0; }
 void bind_device(struct output *o, const char *dev) { (void)o; (void)dev; }
 

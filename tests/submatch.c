@@ -12,7 +12,7 @@
  * догадкой. Значит usable + skipped + foreign обязано сходиться с числом ссылок в тексте
  * при любом их виде, включая те, которые парсер не осилил.
  *
- * Файл включает исходник (#include "../src/ext/sub.c") — тот же приём, что в dnsmatch.c
+ * Файл включает исходник (#include "../src/proto/vless/sub.c") — тот же приём, что в dnsmatch.c
  * и specmatch.c: он даёт доступ к статике и не требует ни сети, ни mbedtls, ни docker,
  * которых у make test нет (см. R-014). */
 #include <stdio.h>
@@ -20,13 +20,13 @@
 #include <signal.h>
 #include <unistd.h>
 
-#include "../src/ext/sub.c"
+#include "../src/proto/vless/sub.c"
 /* Вывод UUID живёт в vless_proto.c, а проверка пригодности — в sub.c, и стенду нужны
  * оба: ссылка из панели обязана и пройти проверку пригодности, и дать те самые 16 байт,
  * которые уедут в заголовок запроса. Исходник включается тем же приёмом, что и sub.c —
  * mbedtls он не требует (см. заголовок vless_proto.c), поэтому стенд остаётся в обычном
  * make test. */
-#include "../src/ext/vless_proto.c"
+#include "../src/proto/vless/vless_proto.c"
 
 static int g_pass, g_fail;
 

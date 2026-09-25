@@ -67,7 +67,7 @@ if [ ! -f "$WORK/.done" ]; then
         m=$(basename "$f" .c)
         case "$m" in net_sockets|debug|timing) continue ;; esac
         # shellcheck disable=SC2086
-        if ! "$CC" $OPT -w -c -I"$MBED/include" -I"$SRC/src/ext" $CFG "$f" -o "$WORK/$m.o" \
+        if ! "$CC" $OPT -w -c -I"$MBED/include" -I"$SRC/src/proto/tls" $CFG "$f" -o "$WORK/$m.o" \
                 2>"$WORK/$m.err"; then
             mb_failed="$mb_failed $m"
             echo "mbedtls: сборка модуля $m не удалась (SDK):" >&2
@@ -93,6 +93,7 @@ case "$ROLE" in
   *) echo "неизвестная роль: $ROLE (router|server)" >&2; exit 2 ;;
 esac
 [ -n "${FILES:-}" ] || { echo "нет списка файлов для роли $ROLE" >&2; exit 2; }
+STEER_INC="$(for d in $(profile_var INC_DIRS); do printf -- '-I%s/%s ' "$SRC" "$d"; done)"
 
 # -latomic ЗДЕСЬ НЕТ, и это следствие находки того же замера. Сначала gcc его потребовал: на
 # 32-битной цели атомарная операция над 64-битным словом не выражается одной командой и уходит в
@@ -106,7 +107,7 @@ esac
 # проект носит один файл на несколько выпусков. Числа и оговорки — в docs/xsteer.md.
 # shellcheck disable=SC2086
 "$CC" $OPT -w -static -s \
-    -I"$MBED/include" -I"$SRC/src/ext" $CFG $ROLEDEF \
+    -I"$MBED/include" -I"$SRC/src/proto/tls" $STEER_INC $CFG $ROLEDEF \
     -DSTEER_VERSION="\"$VERSION\"" -DSTEER_REV="\"$REV\"" \
     -o "$OUT" \
     $FILES "$WORK"/*.o -lpthread

@@ -29,7 +29,7 @@
  * dcmatch.c и warmmatch.c). Крипто подменено заглушками: до сети доезжает любой буфер, а
  * настоящий сборщик Hello тянул бы за собой mbedtls, которого в `make test` нет по
  * построению (см. ext-syntax в Makefile). */
-#include "../src/ext/tlsprobe.c"
+#include "../src/proto/tls/tlsprobe.c"
 
 #include <sys/wait.h>
 #include <fcntl.h>

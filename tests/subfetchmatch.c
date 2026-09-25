@@ -78,15 +78,15 @@ int run_quiet(const char *const argv[]) {
     return WIFEXITED(st) ? WEXITSTATUS(st) : -1;
 }
 
-/* Идентификатор и описание устройства переехали в src/hwid.c (он входит и в базовую
+/* Идентификатор и описание устройства переехали в src/tools/hwid.c (он входит и в базовую
  * сборку). Стенд подключает его напрямую — так же, как подключает subfetch.c: проверять
  * чистку значений заголовков надо там, где она живёт, а не через второй экземпляр. */
-#include "../src/hwid.c"
-#include "../src/ext/subfetch.c"
+#include "../src/tools/hwid.c"
+#include "../src/proto/vless/subfetch.c"
 /* base64 названия подписки и разбор узлов — из sub.c, той же функцией, которой их читает
  * подъём туннеля. Исходник включается тем же приёмом; mbedtls он не требует. */
-#include "../src/ext/sub.c"
-#include "../src/ext/vless_proto.c"
+#include "../src/proto/vless/sub.c"
+#include "../src/proto/vless/vless_proto.c"
 
 static int g_pass, g_fail;
 
@@ -168,7 +168,7 @@ static int has(const char *hay, const char *needle) { return strstr(hay, needle)
 
 /* ---- идентификатор устройства: проверки переехали ----------------------------------
  *
- * Были здесь и ушли в tests/hwidmatch.sh вместе с самим кодом (src/hwid.c). Причина не в
+ * Были здесь и ушли в tests/hwidmatch.sh вместе с самим кодом (src/tools/hwid.c). Причина не в
  * аккуратности: здесь они стояли на ПОДДЕЛЬНОМ sha256 и проверяли рецептуру по входу хеша —
  * «хешируется ровно splify2:<mac>, ни байтом больше». Это верная мысль при заглушке, но
  * слабее того, что можно проверить теперь: hwidmatch сверяет ГОТОВОЕ значение с `sha256sum`

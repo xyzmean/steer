@@ -13,17 +13,17 @@
  * mbedtls (здесь считается криптография), поэтому в make test стенд не входит.
  *
  *     cc -O2 -w -Isrc -I<mbedtls>/include -o build/xsloop tests/xsloop.c \
- *        src/ext/xshake.c src/ext/chello.c src/ext/xswire.c src/ext/reality.c \
- *        src/ext/tls13.c src/ext/h2.c <mbedtls>/library/libmbedcrypto.a
+ *        src/proto/xsteer/xshake.c src/proto/tls/chello.c src/proto/xsteer/xswire.c src/proto/tls/reality.c \
+ *        src/proto/tls/tls13.c src/proto/tls/h2.c <mbedtls>/library/libmbedcrypto.a
  */
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
 
-#include "../src/ext/xshake.h"
-#include "../src/ext/xswire.h"
-#include "../src/ext/chello.h"
-#include "../src/ext/reality.h"
+#include "../src/proto/xsteer/xshake.h"
+#include "../src/proto/xsteer/xswire.h"
+#include "../src/proto/tls/chello.h"
+#include "../src/proto/tls/reality.h"
 
 static int fails;
 

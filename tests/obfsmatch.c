@@ -30,7 +30,7 @@
  * ради одного символа сторожа с его сокетами значило бы проверять не то. */
 int run_quiet(const char *const argv[]) { (void)argv; return 0; }
 
-#include "../src/obfs.c"
+#include "../src/proto/obfs/obfs.c"
 
 static int fails;
 
