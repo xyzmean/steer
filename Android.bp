@@ -23,6 +23,7 @@ cc_defaults {
     stem: "steer",
     srcs: [
         "src/lib/run.c",
+        "src/lib/jsonw.c",
         "src/compile/groups.c",
         "src/compile/generate.c",
         "src/daemon/fwcheck.c",

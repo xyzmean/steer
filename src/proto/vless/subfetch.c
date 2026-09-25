@@ -51,6 +51,7 @@
 #include "vless.h"
 #include "subfetch.h"
 #include "hwid.h"
+#include "jsonw.h"
 
 /* Уровень в журнале — как в остальных файлах движка. Метка подсистемы «sub»: всё здесь
  * пишется при работе с подпиской. */
@@ -373,18 +374,6 @@ static int quota_save(const char *path, const char *hdrs, int keep, struct quota
 
 /* ---- печать ответа ---------------------------------------------------------------- */
 
-/* Строка JSON с экранированием. Имена подписок и ссылки приходят снаружи — кавычка в них
- * ломала бы весь ответ, а не только своё поле. */
-static void json_str(const char *s) {
-    putchar('"');
-    for (const unsigned char *p = (const unsigned char *)(s ? s : ""); *p; p++) {
-        if (*p == '"' || *p == '\\') { putchar('\\'); putchar(*p); }
-        else if (*p < 0x20) printf("\\u%04x", *p);
-        else putchar(*p);
-    }
-    putchar('"');
-}
-
 /* Остаток трафика в ответ. Поля — те же, что отдавал splify2 из этого же файла, чтобы
  * интерфейс видел один вид ответа независимо от того, кто его собрал.
  *
@@ -638,16 +627,16 @@ int cmd_sub_fetch(const char *url, const char *out_path, const char *info_path) 
     if (!http_get(url, tmp, hdrp, have_id ? id : NULL, 0, &sent)) {
         unlink(tmp); unlink(hdrp);
         printf("{\"ok\":false,\"error\":\"подписка не скачалась\",\"url\":");
-        json_str(url);
+        jsonw_str(stdout, url);
         printf(",\"hwid\":");
-        json_str(have_id ? id : "");
+        jsonw_str(stdout, have_id ? id : "");
         printf("}\n");
         return 1;
     }
     if (file_bytes(tmp) <= 0) {
         unlink(tmp); unlink(hdrp);
         printf("{\"ok\":false,\"error\":\"панель отдала пустой ответ\",\"url\":");
-        json_str(url);
+        jsonw_str(stdout, url);
         printf("}\n");
         return 1;
     }
@@ -726,20 +715,20 @@ int cmd_sub_fetch(const char *url, const char *out_path, const char *info_path) 
     const char *warn = device_warn(hdrs, sent);
 
     printf("{\"ok\":true,\"url\":");
-    json_str(eff);
+    jsonw_str(stdout, eff);
     printf(",\"path\":");
-    json_str(out_path);
+    jsonw_str(stdout, out_path);
     printf(",\"bytes\":%ld,\"usable\":%zu,\"skipped\":%zu,\"foreign\":%zu",
            file_bytes(out_path), usable, st.skipped, st.foreign);
     printf(",\"title\":");
-    json_str(title);
+    jsonw_str(stdout, title);
     printf(",\"hwid\":");
-    json_str(have_id ? id : "");
+    jsonw_str(stdout, have_id ? id : "");
     printf(",\"hwid_sent\":%s", sent ? "true" : "false");
     /* Сказанное панелью про устройство — в ответе, а не в журнале: человек нажал кнопку и
      * должен узнать там же, что скачалась заглушка, а не гадать позже по туннелю, который
      * «настроен и не работает». */
-    if (warn) { printf(",\"warn\":"); json_str(warn); }
+    if (warn) { printf(",\"warn\":"); jsonw_str(stdout, warn); }
     quota_json(&q);
     printf("}\n");
     unlink(hdrp);
@@ -806,12 +795,12 @@ int cmd_sub_quota(const char *url, const char *info_path) {
     printf("{\"ok\":true,\"asked\":%s", asked ? "true" : "false");
     if (!asked) {
         printf(",\"why\":");
-        json_str("панель не ответила");
+        jsonw_str(stdout, "панель не ответила");
     } else if (!q.have) {
         /* Две разные причины одним полем намеренно: интерфейс в обоих случаях говорит одно
          * и то же («панель не сообщает остаток»), а различить их можно в журнале. */
         printf(",\"why\":");
-        json_str("панель не сообщила остаток трафика");
+        jsonw_str(stdout, "панель не сообщила остаток трафика");
     }
     quota_json(&q);
     printf("}\n");

@@ -45,6 +45,7 @@
 #include "rtx.h"
 #include "tunnel.h"
 #include "spec.h"
+#include "jsonw.h"
 
 /* ---- журнал с уровнем --------------------------------------------------------
  *
@@ -2931,27 +2932,15 @@ static void underlay_setup(const struct output *o) {
     vless_set_sock_mark(out_underlay_mark(o ? o : &none), o && o->via[0]);
 }
 
-/* Строка JSON с экранированием. Имена узлов приходят из подписки и содержат что угодно —
- * кавычки в них ломали бы весь ответ, а не только своё поле. */
-static void json_str(const char *s) {
-    putchar('"');
-    for (const unsigned char *p = (const unsigned char *)s; *p; p++) {
-        if (*p == '"' || *p == '\\') { putchar('\\'); putchar(*p); }
-        else if (*p < 0x20) printf("\\u%04x", *p);
-        else putchar(*p);
-    }
-    putchar('"');
-}
-
 static void node_json(const struct vless_node *n, int index) {
     printf("{\"index\":%d,", index);
-    printf("\"name\":"); json_str(n->name);
-    printf(",\"host\":"); json_str(n->host);
+    printf("\"name\":"); jsonw_str(stdout, n->name);
+    printf(",\"host\":"); jsonw_str(stdout, n->host);
     printf(",\"port\":%u,\"type\":", n->port);
-    json_str(n->type);
-    printf(",\"security\":"); json_str(n->security);
+    jsonw_str(stdout, n->type);
+    printf(",\"security\":"); jsonw_str(stdout, n->security);
     printf(",\"vision\":%s", n->flow[0] ? "true" : "false");
-    if (n->mode[0]) { printf(",\"mode\":"); json_str(n->mode); }
+    if (n->mode[0]) { printf(",\"mode\":"); jsonw_str(stdout, n->mode); }
     printf("}");
 }
 
@@ -2965,9 +2954,9 @@ static void skipped_json(const struct vless_sub_stats *st) {
     for (size_t i = 0; i < st->reasons_n; i++) {
         if (i) putchar(',');
         printf("{\"reason\":");
-        json_str(st->reasons[i].reason);
+        jsonw_str(stdout, st->reasons[i].reason);
         printf(",\"count\":%zu,\"example\":", st->reasons[i].count);
-        json_str(st->reasons[i].example);
+        jsonw_str(stdout, st->reasons[i].example);
         printf("}");
     }
     printf("]");
@@ -2997,9 +2986,9 @@ int cmd_vless_nodes(const char *spec_path, const char *out_name) {
     if (rc) return rc;
 
     printf("{\"output\":");
-    json_str(by_file ? "" : out_name);
+    jsonw_str(stdout, by_file ? "" : out_name);
     printf(",\"sub_file\":");
-    json_str(by_file ? out_name : o->sub_file);
+    jsonw_str(stdout, by_file ? out_name : o->sub_file);
     /* `node` — прежнее поле: один выбранный номер либо -1. Выбор из нескольких узлов оно
      * выразить не может, поэтому при нём печатается -1, а сам выбор лежит в `chosen`. Старый
      * потребитель этого поля читает то же, что читал: «узел не назначен, ищем рабочий». */
@@ -3070,9 +3059,9 @@ int cmd_vless_probe(const char *spec_path, const char *out_name, int node, int t
     }
     int found = -1;
     printf("{\"output\":");
-    json_str(by_file ? "" : out_name);
+    jsonw_str(stdout, by_file ? "" : out_name);
     printf(",\"sub_file\":");
-    json_str(by_file ? out_name : o->sub_file);
+    jsonw_str(stdout, by_file ? out_name : o->sub_file);
     printf(",\"results\":[");
     for (size_t k = 0; k < sel_n; k++) {
         size_t i = (size_t)sel[k];
@@ -3081,12 +3070,12 @@ int cmd_vless_probe(const char *spec_path, const char *out_name, int node, int t
         int pr = vless_probe_timed(&g_nodes[i], timeout_s, why, sizeof(why), &hs, &ttfb);
         if (k) putchar(',');
         printf("{\"index\":%zu,\"name\":", i);
-        json_str(g_nodes[i].name);
+        jsonw_str(stdout, g_nodes[i].name);
         printf(",\"type\":");
-        json_str(g_nodes[i].type);
+        jsonw_str(stdout, g_nodes[i].type);
         printf(",\"ok\":%s,\"handshake_ms\":%d,\"ttfb_ms\":%d,\"why\":",
                pr == 0 ? "true" : "false", hs, ttfb);
-        json_str(why);
+        jsonw_str(stdout, why);
         printf("}");
         if (pr == 0) { found = (int)i; if (node < 0) break; }
     }

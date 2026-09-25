@@ -19,6 +19,7 @@
  * добавив в движок код ради теста. */
 #include "../src/lib/sindex.c"
 #include "../src/lib/nftnl.c"
+#include "../src/lib/jsonw.c"
 #include "../src/lib/ctnl.c"
 #include "../src/dnsd/rules.c"
 #include "../src/dnsd/wire.c"

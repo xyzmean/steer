@@ -119,9 +119,9 @@ $(BUILD)/diagsim: $(CORE_SRC) $(CORE_HDR) tests/vless-stub.c
 # SHA-256 движка против sha256sum оболочки. Отдельная цель, потому что стенду нужен ПОЛНЫЙ
 # хеш: в самом идентификаторе он обрезан до двадцати знаков, и расхождение в старших байтах
 # такой проверкой не поймать. Ни сети, ни mbedtls — файл вложенный и самодостаточный.
-$(BUILD)/hwidsum: tests/hwidsum.c src/tools/hwid.c src/tools/hwid.h
+$(BUILD)/hwidsum: tests/hwidsum.c src/tools/hwid.c src/tools/hwid.h src/lib/jsonw.c src/lib/jsonw.h
 	@mkdir -p $(BUILD)
-	$(CC) $(CFLAGS) -o $@ tests/hwidsum.c src/tools/hwid.c
+	$(CC) $(CFLAGS) -o $@ tests/hwidsum.c src/tools/hwid.c src/lib/jsonw.c
 
 # Синтаксическая проверка расширенного движка (R-014/I-024). Полная сборка расширенной части идёт
 # только в build.sh через docker с mbedtls, поэтому локальный make test оставался зелёным,

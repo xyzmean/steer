@@ -14,6 +14,7 @@
 #include <unistd.h>
 
 #include "hwid.h"
+#include "jsonw.h"
 
 const char *steer_env_or(const char *name, const char *dflt) {
     const char *v = getenv(name);
@@ -430,16 +431,6 @@ int steer_dev_id(char *out, size_t n) {
  *
  * Печатает и в базовой сборке. Прежде здесь стоял отказ «нужен пакет steer-extended», и он
  * был верен ровно пока читатель был один — панель подписки. */
-static void hwid_json_str(const char *s) {
-    putchar('"');
-    for (const unsigned char *p = (const unsigned char *)s; *p; p++) {
-        if (*p == '"' || *p == '\\') { putchar('\\'); putchar(*p); }
-        else if (*p < 0x20) printf("\\u%04x", *p);
-        else putchar(*p);
-    }
-    putchar('"');
-}
-
 int cmd_sub_hwid(void) {
     char id[64] = "";
     int ok = steer_hwid(id, sizeof id);
@@ -449,11 +440,11 @@ int cmd_sub_hwid(void) {
     /* Пустая строка значит «не из чего считать» — ни одного физического порта с постоянным
      * MAC. Тогда заголовок не уходит вовсе, и об этом говорит sub-fetch отдельным словом. */
     printf("{\"hwid\":");
-    hwid_json_str(ok ? id : "");
+    jsonw_str(stdout, ok ? id : "");
     printf(",\"os\":");
-    hwid_json_str(os);
+    jsonw_str(stdout, os);
     printf(",\"model\":");
-    hwid_json_str(model);
+    jsonw_str(stdout, model);
     printf("}\n");
     return 0;
 }
@@ -474,7 +465,7 @@ int cmd_dev_id(void) {
     char id[64] = "";
     int ok = steer_dev_id(id, sizeof id);
     printf("{\"tid\":");
-    hwid_json_str(ok ? id : "");
+    jsonw_str(stdout, ok ? id : "");
     printf("}\n");
     return 0;
 }

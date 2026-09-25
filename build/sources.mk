@@ -41,7 +41,7 @@ DNSD_SRC := src/lib/sindex.c src/lib/nftnl.c src/lib/ctnl.c \
 # src/daemon/steer.c нарезан на модули (docs/architecture.md, раздел 2, «Слои и каталоги»):
 # компиляция спеки в правила — в src/compile, остальное ядро — в src/daemon, порядок ниже
 # такой же, как был в steer.c (lib/run.c раньше всех — на него ссылаются и compile, и daemon).
-CORE_SRC := src/lib/run.c src/compile/groups.c src/compile/generate.c src/daemon/fwcheck.c \
+CORE_SRC := src/lib/run.c src/lib/jsonw.c src/compile/groups.c src/compile/generate.c src/daemon/fwcheck.c \
             src/daemon/apply.c src/daemon/status.c src/daemon/nftquery.c src/daemon/diag.c \
             src/daemon/explain.c src/daemon/supervise.c src/daemon/watch.c src/daemon/main.c \
             $(MODEL_SRC) $(DNSD_SRC) src/daemon/failover.c src/tools/aggregate.c src/proto/obfs/obfs.c \

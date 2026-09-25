@@ -10,6 +10,7 @@
 #include <linux/netfilter/nfnetlink.h>
 #include <linux/netfilter/nfnetlink_conntrack.h>
 #include "nlbuf.h"
+#include "jsonw.h"
 
 static const struct nlattr *ct_attr(const uint8_t *p, const uint8_t *end, int type) {
     if (!p) return NULL;
@@ -428,7 +429,6 @@ int ctnl_evict_mark(uint32_t val, uint32_t mask) {
 #define CONNS_MAX 2000
 
 struct conns_reg { char name[32]; uint32_t mark; };
-/* dlog_json_str определена в dlog.c, объявлена в dnsd_int.h — строка JSON у журнала имён. */
 
 struct ctnl_conns_ctx {
     FILE *out;
@@ -541,7 +541,7 @@ static int ctnl_conns_rec(const uint8_t *a, const uint8_t *end, uint8_t family, 
         if (x->reg[i].mark == field) { on = x->reg[i].name; break; }
     /* Имя выхода из спеки проверено name_ok, но реестр — файл на диске, и строку JSON из него
      * собирает тот же экранирующий писатель, что у журнала имён. */
-    if (on) dlog_json_str(out, on);
+    if (on) jsonw_str_ascii(out, on);
     else fputs("null", out);
     if (proto == IPPROTO_TCP) {
         const struct nlattr *pi = ct_attr(a, end, CTA_PROTOINFO);

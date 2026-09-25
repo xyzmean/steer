@@ -1,5 +1,6 @@
 #include "dnsd_int.h"
 #include "sindex.h"
+#include "jsonw.h"
 
 /* ---- журнал имён: `steer dns-log` (команда dns-log управляющего сокета) ----------------
  *
@@ -89,19 +90,6 @@ void dlog_note(const char *qname, int hit) {
     e->hit = (int16_t)hit;
 }
 
-void dlog_json_str(FILE *f, const char *s) {
-    fputc('"', f);
-    for (; *s; s++) {
-        unsigned char c = (unsigned char)*s;
-        /* Метка имени DNS — любые байты (parse_name_adv копирует их как есть): всё, что не
-         * печатный ASCII, идёт \u00XX, иначе один странный запрос сломал бы весь ответ. */
-        if (c == '"' || c == '\\') fprintf(f, "\\%c", c);
-        else if (c < 0x20 || c >= 0x7f) fprintf(f, "\\u%04x", c);
-        else fputc(c, f);
-    }
-    fputc('"', f);
-}
-
 static int dlog_cmp(const void *a, const void *b) {
     const struct dlog_ent *x = *(const struct dlog_ent *const *)a;
     const struct dlog_ent *y = *(const struct dlog_ent *const *)b;
@@ -124,14 +112,14 @@ static char *dlog_render(size_t *len) {
         const struct dlog_ent *e = ord[i];
         long ago = (long)(mono - e->last);
         fputs(i ? ",{\"name\":" : "{\"name\":", f);
-        dlog_json_str(f, e->name);
+        jsonw_str_ascii(f, e->name);
         fputs(",\"channel\":", f);
         /* Индекс вне таблицы быть не может (таблица каналов не пересобирается до выхода
          * резолвера — см. dch_signature), но граница сверяется всё равно. */
         if (e->hit >= 0 && (size_t)e->hit < g_dch_n) {
-            dlog_json_str(f, g_dch[e->hit].chan);
+            jsonw_str_ascii(f, g_dch[e->hit].chan);
             fputs(",\"out\":", f);
-            dlog_json_str(f, g_dch[e->hit].out);
+            jsonw_str_ascii(f, g_dch[e->hit].out);
         } else {
             fputs("null,\"out\":null", f);
         }

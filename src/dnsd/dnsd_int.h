@@ -258,7 +258,6 @@ void dch_build(void);
 void dch_sig_write(void);
 
 /* dlog.c */
-void dlog_json_str(FILE *f, const char *s);
 void dlog_note(const char *qname, int hit);
 void dlog_listen(void);
 void dlog_close(void);
