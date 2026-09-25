@@ -62,11 +62,10 @@ fi
 #
 # Собираются из ОДНИХ исходников: extended это те же файлы плюс src/ext и mbedtls.
 # Разные бинарники из разного набора файлов означали бы два места, где чинить одну ошибку.
-BASE_SRC="src/steer.c src/spec.c src/dnsd.c src/failover.c src/aggregate.c src/obfs.c src/cli.c src/srs.c src/puff.c src/hwid.c src/ctl.c src/awg.c"
-# Список файлов расширенной сборки живёт в build/build-ext.sh и только там: он запускается
-# отдельным процессом с тремя аргументами, ничего отсюда не наследует, и вторая копия списка
-# здесь молча расходилась бы с первой. Что списки не разошлись с самим каталогом src/ext,
-# проверяет tests/buildmatch.sh.
+# Списки файлов всех сборок — в build/sources.mk и только там; build/build-ext.sh читает тот же
+# манифест сам (он запускается отдельным процессом и отсюда ничего не наследует).
+. ./build/sources.sh
+BASE_SRC="$(profile_src base)" || exit 2
 
 ISAS="
 mipsel_24kc:mipsel-linux-musl:mips32r2+soft_float

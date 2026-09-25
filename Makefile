@@ -17,26 +17,26 @@ VERSION := $(shell cat VERSION 2>/dev/null || echo dev)
 REV     := $(shell git describe --tags --always --dirty 2>/dev/null)
 DEFS    := -DSTEER_VERSION='"$(VERSION)"' $(if $(REV),-DSTEER_REV='"$(REV)"',)
 
+# Списки исходников — из build/sources.mk, единственного места, где они перечислены
+# (его же читают build.sh и build/build-ext.sh). Заголовки ядра — зависимостью целиком:
+# список файлов сборки они не меняют, а пересобрать движок при их правке нужно всегда.
+include build/sources.mk
+CORE_HDR := $(wildcard src/*.h)
+
 .PHONY: all test clean ext-syntax ext-test snapshot-record
 all: $(BUILD)/steer
 
-$(BUILD)/steer: src/steer.c src/spec.c src/dnsd.c src/failover.c src/aggregate.c \
-                src/obfs.c src/cli.c src/srs.c src/puff.c src/hwid.c src/ctl.c src/awg.c src/ctl.h src/awg.h src/nlbuf.h src/spec.h src/obfs.h \
-                src/cli.h src/srs.h src/puff.h src/hwid.h src/paths.h VERSION
+$(BUILD)/steer: $(CORE_SRC) $(CORE_HDR) VERSION
 	@mkdir -p $(BUILD)
-	$(CC) $(CFLAGS) $(DEFS) -o $@ src/steer.c src/spec.c src/dnsd.c src/failover.c \
-	      src/aggregate.c src/obfs.c src/cli.c src/srs.c src/puff.c src/hwid.c src/ctl.c src/awg.c
+	$(CC) $(CFLAGS) $(DEFS) -o $@ $(CORE_SRC)
 
 # Сборка под Android — тот же движок с -DSTEER_ANDROID: своё поле метки (биты 22-27, в 0-21
 # пишет netd), свои каталоги (/data/misc/steer) и приоритет ip rule ниже лестницы netd. Здесь
 # она собирается хостовым компилятором ради стенда androidmatch: он проверяет, что сборка
 # вообще компилируется и что поле и пути у неё свои. Настоящая сборка под телефон — не здесь.
-$(BUILD)/steer-android: src/steer.c src/spec.c src/dnsd.c src/failover.c src/aggregate.c \
-                        src/obfs.c src/cli.c src/srs.c src/puff.c src/hwid.c src/ctl.c src/awg.c src/ctl.h src/awg.h src/nlbuf.h src/spec.h \
-                        src/obfs.h src/cli.h src/srs.h src/puff.h src/hwid.h src/paths.h VERSION
+$(BUILD)/steer-android: $(CORE_SRC) $(CORE_HDR) VERSION
 	@mkdir -p $(BUILD)
-	$(CC) $(CFLAGS) $(DEFS) -DSTEER_ANDROID -o $@ src/steer.c src/spec.c src/dnsd.c \
-	      src/failover.c src/aggregate.c src/obfs.c src/cli.c src/srs.c src/puff.c src/hwid.c src/ctl.c src/awg.c
+	$(CC) $(CFLAGS) $(DEFS) -DSTEER_ANDROID -o $@ $(CORE_SRC)
 
 test: all ext-syntax $(BUILD)/steer-android $(BUILD)/tgwssim $(BUILD)/dnsmatch $(BUILD)/specmatch $(BUILD)/specmatch-ext $(BUILD)/xswirematch $(BUILD)/xsconnmatch $(BUILD)/xsstreammatch $(BUILD)/tungromatch $(BUILD)/tunnelmatch $(BUILD)/tunnamematch $(BUILD)/xsconfmatch $(BUILD)/xslinkmatch $(BUILD)/xsroutematch $(BUILD)/chellomatch $(BUILD)/failovermatch $(BUILD)/dcmatch $(BUILD)/msgsplitmatch $(BUILD)/warmmatch $(BUILD)/upmatch $(BUILD)/tgwsfailmatch $(BUILD)/h2match $(BUILD)/xhupmatch $(BUILD)/submatch $(BUILD)/subfetchmatch $(BUILD)/fwmatch $(BUILD)/obfsmatch $(BUILD)/visionmatch $(BUILD)/tlsprobematch $(BUILD)/diagsim $(BUILD)/hwidsum $(BUILD)/awgmatch $(BUILD)/awgmatch-android
 	@sh tests/run.sh
@@ -97,25 +97,17 @@ snapshot-record: all $(BUILD)/steer-android $(BUILD)/tgwssim
 # мост заменён заглушкой (tests/tgws-stub.c), потому что настоящий тянет TLS и docker.
 # Проверяется не мост, а ruleset рядом с полным движком: свой бит метки, свой порт, свой ряд
 # таблиц, чужой реестр.
-$(BUILD)/tgwssim: src/steer.c src/spec.c src/dnsd.c src/failover.c src/aggregate.c \
-                  src/obfs.c src/cli.c src/srs.c src/puff.c src/hwid.c src/ctl.c src/awg.c src/ctl.h src/awg.h src/nlbuf.h src/spec.h src/cli.h \
-                  src/paths.h tests/tgws-stub.c VERSION
+$(BUILD)/tgwssim: $(CORE_SRC) $(CORE_HDR) tests/tgws-stub.c VERSION
 	@mkdir -p $(BUILD)
-	$(CC) $(CFLAGS) $(DEFS) -DSTEER_TGWS -o $@ src/steer.c src/spec.c src/dnsd.c \
-	      src/failover.c src/aggregate.c src/obfs.c src/cli.c src/srs.c src/puff.c src/hwid.c src/ctl.c src/awg.c \
-	      tests/tgws-stub.c
+	$(CC) $(CFLAGS) $(DEFS) -DSTEER_TGWS -o $@ $(CORE_SRC) tests/tgws-stub.c
 
 # Движок, собранный как расширенный, но без самой расширенной части: нужен стенду
 # diagmatch, потому что спеку с `kind: vless` базовая сборка отвергает парсером, а
 # проверять диагностику интереснее всего именно на VLESS-выходе. Три подкоманды
 # расширенной сборки заменены заглушками — см. tests/vless-stub.c.
-$(BUILD)/diagsim: src/steer.c src/spec.c src/dnsd.c src/failover.c src/aggregate.c \
-                  src/obfs.c src/cli.c src/srs.c src/puff.c src/hwid.c src/ctl.c src/awg.c src/ctl.h src/awg.h src/nlbuf.h src/spec.h src/cli.h \
-                  src/srs.h src/puff.h src/hwid.h src/paths.h tests/vless-stub.c
+$(BUILD)/diagsim: $(CORE_SRC) $(CORE_HDR) tests/vless-stub.c
 	@mkdir -p $(BUILD)
-	$(CC) $(CFLAGS) $(DEFS) -DSTEER_EXTENDED -o $@ src/steer.c src/spec.c src/dnsd.c \
-	      src/failover.c src/aggregate.c src/obfs.c src/cli.c src/srs.c src/puff.c src/hwid.c src/ctl.c src/awg.c \
-	      tests/vless-stub.c
+	$(CC) $(CFLAGS) $(DEFS) -DSTEER_EXTENDED -o $@ $(CORE_SRC) tests/vless-stub.c
 
 # SHA-256 движка против sha256sum оболочки. Отдельная цель, потому что стенду нужен ПОЛНЫЙ
 # хеш: в самом идентификаторе он обрезан до двадцати знаков, и расхождение в старших байтах
@@ -234,12 +226,9 @@ $(BUILD)/failovermatch: tests/failovermatch.c src/failover.c
 # Зависимость выхода от чужого firewall: fw_check судит о конфигурации по тексту дампа
 # nft, и проверить эвристику можно только примерами. Стенд включает исходник движка и
 # подменяет popen на чтение из памяти — см. tests/fwmatch.c.
-$(BUILD)/fwmatch: tests/fwmatch.c src/steer.c src/spec.c src/dnsd.c src/failover.c \
-                  src/aggregate.c src/obfs.c src/cli.c src/srs.c src/puff.c src/hwid.c src/ctl.c src/awg.c \
-                  src/spec.h src/cli.h src/srs.h
+$(BUILD)/fwmatch: tests/fwmatch.c $(CORE_SRC) $(CORE_HDR)
 	@mkdir -p $(BUILD)
-	$(CC) $(CFLAGS) -o $@ tests/fwmatch.c src/spec.c src/dnsd.c src/failover.c \
-	      src/aggregate.c src/obfs.c src/cli.c src/srs.c src/puff.c src/hwid.c src/ctl.c src/awg.c
+	$(CC) $(CFLAGS) -o $@ tests/fwmatch.c $(filter-out src/steer.c,$(CORE_SRC))
 
 # Управление потоком HTTP/2 проверяется в памяти: h2.c общается с сетью только через
 # struct h2_io, поэтому стенд подменяет его целиком. -Itests/stub нужен, чтобы не тянуть

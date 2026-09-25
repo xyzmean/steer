@@ -29,27 +29,50 @@ names() { sed 's|.*/||' | sort -u | tr '\n' ' '; }
 disk_base="$(ls src/*.c | names)"
 disk_ext="$(ls src/ext/*.c | names)"
 
-# ---- что перечислено в сборочных скриптах ----------------------------------
-# Пути в build-ext.sh абсолютные (внутри контейнера), в build.sh — относительные:
-# см. комментарий про cd в каталог mbedtls в build/build-ext.sh.
-# Списки в build-ext.sh теперь РАЗДЕЛЕНЫ по ролям (router и server), поэтому проверяется их
-# ОБЪЕДИНЕНИЕ: файл, не попавший ни в одну роль, не соберётся в релизе — и только в релизе,
-# на чужой машине. Снять проверку нельзя, она стоит на этой поломке.
-ext_ext="$(grep -o '/src/src/ext/[a-z0-9_]*\.c' build/build-ext.sh | names)"
-ext_base="$(grep -o '/src/src/[a-z0-9_]*\.c' build/build-ext.sh | names)"
-sh_base="$(grep '^BASE_SRC=' build.sh | grep -o 'src/[a-z0-9_]*\.c' | names)"
+# ---- что перечислено в манифесте -------------------------------------------
+# Сборочные списки живут в одном месте — build/sources.mk (см. его шапку); Makefile, build.sh,
+# build/build-ext.sh и рецепты SDK его читают. Сверяется ОБЪЕДИНЕНИЕ профилей с каталогом:
+# файл, не попавший ни в один профиль, не соберётся в релизе — и только в релизе, на чужой
+# машине. Снять проверку нельзя, она стоит на этой поломке.
+. build/sources.sh
+words() { tr ' ' '\n' | grep -v '^$'; }
+m_base="$(profile_src base | words | names)"
+m_ext="$( { profile_src extended; echo; profile_src server; echo; profile_src tgws; } | words |
+          grep '^src/ext/' | names)"
+check "sources.mk: профиль base — это весь src"            "$disk_base" "$m_base"
+check "sources.mk: профили покрывают весь src/ext"          "$disk_ext" "$m_ext"
 
-check "build/build-ext.sh перечисляет весь src/ext (объединение ролей)" "$disk_ext" "$ext_ext"
-
-# Общая часть обязана быть в ОБЕИХ ролях. Проверяется через то, что каждая ветка case
-# подставляет $XS_COMMON: иначе половина файлов уехала бы только в одну роль, и хаб (или
+# Ядро входит в КАЖДЫЙ профиль, а общая половина xsteer — в обе роли звезды: иначе хаб (или
 # пир) собрался бы без формата кадра — то есть не собрался бы вовсе.
-common_uses=$(grep -c 'EXT="\$XS_COMMON' build/build-ext.sh)
-check "общая часть xsteer входит в обе роли" "2" "$common_uses"
-check "build-ext.sh знает роль router" "1" "$(grep -c '^  router)' build/build-ext.sh)"
-check "build-ext.sh знает роль server" "1" "$(grep -c '^  server)' build/build-ext.sh)"
-check "build/build-ext.sh перечисляет весь src"     "$disk_base" "$ext_base"
-check "BASE_SRC в build.sh перечисляет весь src"    "$disk_base" "$sh_base"
+missing_in() {  # ПРОФИЛЬ СПИСОК -> файлы списка, которых в профиле нет
+    _mi_have=" $(profile_src "$1") "
+    for _mi_f in $2; do
+        case "$_mi_have" in *" $_mi_f "*) ;; *) printf '%s ' "$_mi_f" ;; esac
+    done
+}
+for p in extended server tgws android; do
+    check "sources.mk: профиль $p несёт всё ядро" "" "$(missing_in "$p" "$(profile_src base)")"
+done
+for p in extended server; do
+    check "sources.mk: общая часть xsteer входит в профиль $p" "" \
+        "$(missing_in "$p" "$(profile_var XS_COMMON_SRC)")"
+done
+
+# Сценарии сборки не перечисляют исходники сами: копия списка — ровно то, что расходилось
+# молча (у рецептов SDK и нативного к моменту перевода на манифест не хватало шести файлов).
+# Строки комментариев не считаются: в прозе пути упоминаются законно.
+for f in build.sh build/build-ext.sh build/build-ext-sdk.sh build/build-ext-native.sh; do
+    check "$f: исходники берёт из манифеста, а не перечисляет сам" "" \
+        "$(grep -v '^[[:space:]]*#' "$f" | grep -oE 'src/(ext/)?[a-z0-9_]+\.c' | tr '\n' ' ')"
+done
+check "Makefile: сборки движка берут ядро из манифеста" "0" \
+    "$(grep -c 'src/dnsd\.c src/failover\.c' Makefile; true)"
+
+# Android.bp: Soong чужих файлов не читает, поэтому список там остаётся — но сверяется с
+# профилем android, чтобы новый файл не собрался везде, кроме прошивки телефона.
+bp="$(grep -oE '"src/(ext/)?[a-z0-9_]+\.c"' Android.bp | tr -d '"' | sort -u | tr '\n' ' ')"
+check "Android.bp перечисляет ровно профиль android" \
+    "$(profile_src android | words | sort -u | tr '\n' ' ')" "$bp"
 
 # ---- переменная, которую никто не читает -----------------------------------
 # Присвоенная и ни разу не использованная переменная в сборочном скрипте — это список,
@@ -235,21 +258,12 @@ et_list="$(grep -v '^[[:space:]]*#' tests/ext-test.sh |
            grep -oE 'src/(ext/)?[a-z0-9_]+\.c' | sort -u)"
 check "стенды ext-test.sh компонуют всё, что включают" "" "$(closure_missing "$et_list")"
 
-# Роли build-ext.sh — каждая отдельно. Общая половина проверяется вместе с той ролью, в
-# которую входит, а не сама по себе: файл, нужный только клиентской половине, законно лежит
-# в EXT_ROUTER, и требовать его от роли server было бы неверно.
-bx_var() {  # ИМЯ ПЕРЕМЕННОЙ
-    sed -n "/^$1=\"/,/\"\$/p" build/build-ext.sh |
-        grep -oE '/src/src/(ext/)?[a-z0-9_]+\.c' | sed 's|^/src/||' | sort -u
-}
-bx_common="$(bx_var XS_COMMON)"
-bx_tgws="$(sed -n '/^  tgws)/,/ROLEDEF=/p' build/build-ext.sh |
-           grep -oE '/src/src/(ext/)?[a-z0-9_]+\.c' | sed 's|^/src/||' | sort -u)"
-check "build-ext.sh: роль router замкнута" "" \
-    "$(closure_missing "$bx_common $(bx_var EXT_ROUTER)")"
-check "build-ext.sh: роль server замкнута" "" \
-    "$(closure_missing "$bx_common $(bx_var EXT_SERVER)")"
-check "build-ext.sh: роль tgws замкнута" "" "$(closure_missing "$bx_tgws")"
+# Профили — каждый отдельно. Общая половина проверяется вместе с тем профилем, в который
+# входит, а не сама по себе: файл, нужный только клиентской половине, законно лежит в
+# EXT_ROUTER_SRC, и требовать его от профиля server было бы неверно.
+for p in extended server tgws android; do
+    check "sources.mk: профиль $p замкнут" "" "$(closure_missing "$(profile_src "$p" | words)")"
+done
 
 # ---- ревизия попадает во ВСЕ пути сборки --------------------------------------
 # Пути сборки движка три: Makefile (локально и стенды), build.sh (базовый пакет) и
@@ -341,36 +355,23 @@ check "install.sh берёт готовый бинарник, если он ря
 check "build.sh кладёт архив steer-obfs в out" "1" \
     "$(grep -c 'tar -C build -czf "\$OUT/steer-obfs' build.sh)"
 
-# Каждое слово в списках файлов build-ext.sh обязано быть существующим файлом .c.
+# Каждое слово в профилях обязано быть существующим файлом .c.
 #
 # Проверка ловит класс, который уже сломал релиз: строка списка кончалась ДВУМЯ обратными
 # слэшами, а в двойных кавычках это литеральный слэш — он уехал в линковщик отдельным
 # аргументом, и сборка падала с «ld.lld: error: cannot open \». Локально это не видно вовсе:
-# локально собирают прямыми командами cc, а не этим скриптом, поэтому первым узнаёт релиз.
-# Прежняя проверка (все файлы src/ext перечислены) такое пропускала: она искала имена файлов
-# в тексте, а не проверяла обратное — что в тексте нет ничего, кроме имён файлов.
-#
-# Разбор — состоянием, а не диапазоном sed: у однострочного присваивания начало и конец
-# совпадают, и `/^EXT_SERVER="/,/"$/` тянется до следующей строки с кавычкой, то есть до конца
-# файла. На этом первая версия проверки и попалась, объявив мусором весь case.
-lists="$(awk '
-    /^(XS_COMMON|EXT_ROUTER|EXT_SERVER)="/ {
-        line = $0; sub(/^[A-Z_]+="/, "", line); inlist = 1
-    }
-    inlist {
-        if (line == "") line = $0
-        if (line ~ /"$/) { sub(/"$/, "", line); print line; inlist = 0; line = ""; next }
-        sub(/\\$/, "", line); print line; line = ""; next
-    }
-' build/build-ext.sh)"
+# локально собирают прямыми командами cc, а не сценарием релиза, поэтому первым узнаёт релиз.
+# Проверяется обратное полноте: что в списке нет ничего, кроме имён существующих файлов.
 junk=''
-for w in $lists; do
-    case "$w" in
-        /src/src/*.c) [ -f "${w#/src/}" ] || junk="$junk $w" ;;
-        *) junk="$junk $w" ;;
-    esac
+for p in base extended server tgws android; do
+    for w in $(profile_src "$p"); do
+        case "$w" in
+            src/*.c) [ -f "$w" ] || junk="$junk $p:$w" ;;
+            *) junk="$junk $p:$w" ;;
+        esac
+    done
 done
-check "в списках build-ext.sh только существующие файлы .c" "" "$junk"
+check "в профилях sources.mk только существующие файлы .c" "" "$junk"
 
 # ---- установщик хаба xsteer ----------------------------------------------------
 # Хаб — вторая серверная половина, и у неё свой установщик с меню (пира приходят и уходят).

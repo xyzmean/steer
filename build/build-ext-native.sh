@@ -111,30 +111,24 @@ if [ ! -f "$WORK/.so-done" ]; then
     touch "$WORK/.so-done"
 fi
 
-XS_COMMON="$SRC/src/ext/xswire.c $SRC/src/ext/xsconf.c $SRC/src/ext/xslink.c $SRC/src/ext/xsroute.c \
-           $SRC/src/ext/chello.c $SRC/src/ext/xshake.c $SRC/src/ext/xsconn.c \
-           $SRC/src/ext/xsstream.c $SRC/src/ext/xsepoch.c \
-           $SRC/src/ext/tls13.c $SRC/src/ext/reality.c $SRC/src/ext/tun.c $SRC/src/ext/h2.c \
-           $SRC/src/ext/xsadmin.c"
-EXT_ROUTER="$SRC/src/ext/sub.c $SRC/src/ext/vless_proto.c $SRC/src/ext/vision.c \
-            $SRC/src/ext/client.c $SRC/src/ext/tunnel.c $SRC/src/ext/rtx.c \
-            $SRC/src/ext/xsclient.c $SRC/src/ext/subfetch.c"
-
+# Списки файлов — из build/sources.mk, одни на все сборки. До этого здесь жила своя копия,
+# и она отстала от релизной на шесть файлов (hwid, ctl, awg, certverify, tgws, tlsprobe):
+# рецепт не линковался вовсе, а заметить это было нечем.
+export SOURCES_MK="$SRC/build/sources.mk"
+. "$SRC/build/sources.sh"
 case "$ROLE" in
-  router) EXT="$XS_COMMON $EXT_ROUTER"; ROLEDEF="-DSTEER_EXTENDED" ;;
-  server) EXT="$XS_COMMON $SRC/src/ext/xshub.c"; ROLEDEF="-DSTEER_SERVER" ;;
+  router) FILES="$(profile_src extended "$SRC/")" && ROLEDEF="$(profile_var PROFILE_DEFS_extended)" ;;
+  server) FILES="$(profile_src server "$SRC/")" && ROLEDEF="$(profile_var PROFILE_DEFS_server)" ;;
   *) echo "неизвестная роль: $ROLE (router|server)" >&2; exit 2 ;;
 esac
+[ -n "${FILES:-}" ] || { echo "нет списка файлов для роли $ROLE" >&2; exit 2; }
 
 # shellcheck disable=SC2086
 "$CC" $OPT -w -s \
     -I"$MBED/include" -I"$SRC/src/ext" $ROLEDEF \
     -DSTEER_VERSION="\"$VERSION\"" -DSTEER_REV="\"$REV\"" \
     -o "$OUT" \
-    "$SRC"/src/steer.c "$SRC"/src/spec.c "$SRC"/src/dnsd.c "$SRC"/src/failover.c \
-    "$SRC"/src/aggregate.c "$SRC"/src/obfs.c "$SRC"/src/cli.c \
-    "$SRC"/src/srs.c "$SRC"/src/puff.c \
-    $EXT -L"$WORK" -lmbedcrypto -lpthread
+    $FILES -L"$WORK" -lmbedcrypto -lpthread
 
 printf '%s: %s байт\n' "$OUT" "$(stat -c %s "$OUT")"
 printf 'зависимости: '

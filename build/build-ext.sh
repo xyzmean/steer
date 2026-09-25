@@ -152,56 +152,31 @@ if [ ! -f .done ]; then
     fi
 fi
 
-# shellcheck disable=SC2086
 # -s обязателен: zig cc при -Os убирает отладочную информацию сам, при -O2 — оставляет,
 # и бинарник разом вырастает с 540 КБ до 4,9 МБ. На overlay в 6,9 МБ это разница между
 # «пакет ставится» и «места нет», причём отладочная информация на роутере не нужна никому.
-# Общее для обеих ролей: формат кадра, конфигурация, маршрутизация, рукопожатие, соединение
-# и то, на чём они стоят (TLS-записи, примитивы Reality, TUN). Расходиться на проводе этим
-# половинам негде — кода формата ровно один экземпляр, и это ровно та гарантия, которая
-# заменила прежнюю «один бинарник на две стороны» (см. server/README.md).
-# xsstream.c и xsepoch.c лежат в ОБЩЕЙ половине, а не в клиентской: рамка записей по
-# настоящему TCP и ратчет эпох нужны обеим сторонам звезды, и держать их у одной значило бы,
-# что вторую придётся писать заново — то есть двумя способами ошибиться в формате, который
-# обязан совпадать до байта.
-# certverify.c лежит в ОБЩЕЙ половине, хотя проверка цепочки нужна только клиенту: её зовёт
-# tls13.c, и зовёт безусловно, а не под #ifdef. Значит файл обязан быть везде, где
-# компилируется tls13.c, — то есть во всех трёх ролях. Внесённый только в EXT_ROUTER, он
-# оставил роли server и tgws с неопределёнными ссылками на cert_verify_server: сборка
-# роутерного пакета при этом шла как обычно, и заметить это было нечем, кроме релиза.
-XS_COMMON="/src/src/ext/xswire.c /src/src/ext/xsconf.c /src/src/ext/xslink.c /src/src/ext/xsroute.c \
-           /src/src/ext/chello.c /src/src/ext/xshake.c /src/src/ext/xsconn.c \
-           /src/src/ext/xsstream.c /src/src/ext/xsepoch.c \
-           /src/src/ext/tls13.c /src/src/ext/certverify.c \
-           /src/src/ext/reality.c /src/src/ext/tun.c /src/src/ext/h2.c \
-           /src/src/ext/xsadmin.c"
-EXT_ROUTER="/src/src/ext/sub.c /src/src/ext/vless_proto.c /src/src/ext/vision.c \
-            /src/src/ext/client.c /src/src/ext/tunnel.c /src/src/ext/rtx.c \
-            /src/src/ext/xsclient.c /src/src/ext/subfetch.c /src/src/ext/tgws.c /src/src/ext/tlsprobe.c"
-EXT_SERVER="/src/src/ext/xshub.c"
-
+# Списки файлов ролей — из build/sources.mk (профили extended, server, tgws), одни на все
+# сборки: Makefile, build.sh, этот скрипт и рецепты SDK читают один манифест.
+export SOURCES_MK=/src/build/sources.mk
+. /src/build/sources.sh
 case "$ROLE" in
-  router) EXT="$XS_COMMON $EXT_ROUTER"; ROLEDEF="-DSTEER_EXTENDED" ;;
+  router) FILES="$(profile_src extended /src/)" && ROLEDEF="$(profile_var PROFILE_DEFS_extended)" ;;
   # У серверной сборки STEER_EXTENDED НЕ определён нарочно: на VPS нет ни спеки, ни выходов,
   # ни каналов, и клиентские подкоманды там обязаны отказывать штатной заглушкой, а не
   # ссылаться на код, которого в этой сборке нет.
-  server) EXT="$XS_COMMON $EXT_SERVER"; ROLEDEF="-DSTEER_SERVER" ;;
+  server) FILES="$(profile_src server /src/)" && ROLEDEF="$(profile_var PROFILE_DEFS_server)" ;;
   # Мини-сборка для микропакета tgws: мост и то, на чём он стоит (записи TLS 1.3, примитивы
   # Reality для браузерного Hello), и больше ничего. Ни клиента VLESS, ни звезды xsteer, ни
   # подписки — их подкоманды отвечают штатной заглушкой, как в базовой сборке.
-  tgws) EXT="/src/src/ext/tls13.c /src/src/ext/certverify.c /src/src/ext/reality.c \
-             /src/src/ext/chello.c /src/src/ext/tgws.c /src/src/ext/tlsprobe.c"
-        ROLEDEF="-DSTEER_TGWS" ;;
-  *) echo "неизвестная роль: $ROLE (router|server)" >&2; exit 2 ;;
+  tgws) FILES="$(profile_src tgws /src/)" && ROLEDEF="$(profile_var PROFILE_DEFS_tgws)" ;;
+  *) echo "неизвестная роль: $ROLE (router|server|tgws)" >&2; exit 2 ;;
 esac
+[ -n "${FILES:-}" ] || { echo "нет списка файлов для роли $ROLE" >&2; exit 2; }
 
 # shellcheck disable=SC2086
 zig cc -target "$TARGET" ${MCPU:+-mcpu=$MCPU} -static $OPT -s \
     -I"$MBED_INC" -I"$EXT_INC" $CFG $ROLEDEF -DSTEER_VERSION="\"$VERSION\"" \
     -DSTEER_REV="\"$REV\"" \
     -o "$OUT" \
-    /src/src/steer.c /src/src/spec.c /src/src/dnsd.c /src/src/failover.c \
-    /src/src/aggregate.c /src/src/obfs.c /src/src/cli.c /src/src/srs.c /src/src/puff.c /src/src/hwid.c \
-    /src/src/ctl.c /src/src/awg.c \
-    $EXT \
+    $FILES \
     "$WORK"/*.o
