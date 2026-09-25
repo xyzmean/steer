@@ -86,11 +86,14 @@ check "apply в старой раскладке проходит" "0" "$?"
 check "apply называет раскладку" "1" "$(grep -c 'nftables старого ядра' "$tmp/err1")"
 check "в inet нет цепочек nat" "0" "$(nft list table inet steer | grep -c 'type nat')"
 check "nat — одна цепочка в ip" "1" "$(nft list table ip steer | grep -c 'type nat hook prerouting')"
-check "заворот DNS в ip" "1" "$(nft list chain ip steer prerouting_nat | grep -c 'redirect to :5300')"
+check "заворот DNS в ip" "1" "$(nft list chain ip steer prerouting_nat | grep -c 'udp dport 53 .*redirect to :5300')"
+check "заворот DNS по TCP в ip" "1" "$(nft list chain ip steer prerouting_nat | grep -c 'tcp dport 53 .*redirect to :5300')"
 check "dnat по карте в той же цепочке" "1" \
     "$(nft list chain ip steer prerouting_nat | grep -c 'dnat to ip daddr map @fakeip')"
 check "заворот DNS по IPv6 в ip6" "1" \
-    "$(nft list chain ip6 steer prerouting_nat 2>/dev/null | grep -c 'redirect to :5300')"
+    "$(nft list chain ip6 steer prerouting_nat 2>/dev/null | grep -c 'udp dport 53 .*redirect to :5300')"
+check "заворот DNS по IPv6 и TCP в ip6" "1" \
+    "$(nft list chain ip6 steer prerouting_nat 2>/dev/null | grep -c 'tcp dport 53 .*redirect to :5300')"
 check "доменный набор — со сроками и без interval" "1" \
     "$(nft list set inet steer vpn_dom | grep -c 'flags timeout')"
 check "префикс доменного канала — в половине _n" "1" \

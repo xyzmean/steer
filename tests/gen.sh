@@ -92,6 +92,8 @@ table inet steer {
         type nat hook prerouting priority dstnat; policy accept;
         ip saddr 192.168.1.0/24 udp dport 53 counter redirect to :5300
         meta nfproto ipv6 iifname "br-lan" udp dport 53 counter redirect to :5300
+        ip saddr 192.168.1.0/24 tcp dport 53 counter redirect to :5300
+        meta nfproto ipv6 iifname "br-lan" tcp dport 53 counter redirect to :5300
     }
 }
 EOF
@@ -334,6 +336,10 @@ check "realip needs no fake-IP translation" "0" "$(printf '%s\n' "$rout" | grep 
 # router's IPv6 resolver must not slip past the proxy.
 check "realip still redirects DNS on both families" "2" \
     "$(printf '%s\n' "$rout" | grep -c 'udp dport 53 counter redirect')"
+# TCP/53 так же: переспрос после усечённого ответа (TC=1) идёт по TCP, и мимо резолвера он
+# увёл бы имя от канала.
+check "realip redirects DNS over TCP on both families" "2" \
+    "$(printf '%s\n' "$rout" | grep -c 'tcp dport 53 counter redirect')"
 check "realip channel still has its set" "1" \
     "$(printf '%s\n' "$rout" | grep -c 'ip daddr @geo_dom')"
 
@@ -1122,6 +1128,9 @@ check "встречное правило висит на них же, но ка�
 check "DNS заворачивается по устройствам одним правилом" "1" \
     "$(printf '%s\n' "$lout" |
        grep -c 'iifname { "br-lan", "tailscale0", "ztrq4abcde" } udp dport 53 counter redirect')"
+check "TCP/53 заворачивается по тем же устройствам" "1" \
+    "$(printf '%s\n' "$lout" |
+       grep -c 'iifname { "br-lan", "tailscale0", "ztrq4abcde" } tcp dport 53 counter redirect')"
 check "и без пометки семейства" "0" \
     "$(printf '%s\n' "$lout" | grep 'udp dport 53' | grep -c 'nfproto')"
 # Ровно одно правило на канал, а не два: «или» внутри правила nft не выражается, и добавлять
