@@ -145,9 +145,13 @@ check "раздача: TCP/53 к резолверу, современная ра
     "$(c "$m2" 'iifname "rndis0" tcp dport 53 counter redirect to :5300')"
 check "раздача: TCP/53 к резолверу, старая раскладка без nat в ip6 (только ip)" "1" \
     "$(c "$l2" 'iifname "rndis0" tcp dport 53 counter redirect to :5300')"
-check "раздача: TCP/53 к резолверу, старая раскладка с nat в ip6 (ip и ip6)" "2" \
-    "$(c "$(STEER_NFT_COMPAT=legacy "$BIN" apply --dry-run --spec "$tmp/loc2.json" --state-dir "$tmp/state" 2>/dev/null)" \
-         'iifname "rndis0" tcp dport 53 counter redirect to :5300')"
+# Режим legacy спрашивает nat в ip6 у ядра пробой `nft -c`: под root с nft он есть, и правил два
+# (ip и ip6), а на машине без них (runner GitHub) проба отвечает «нет», и правило одно — только в
+# ip. Поэтому ожидание берётся у UDP/53 той же раскладки: TCP обязан стоять везде, где стоит UDP.
+lg="$(STEER_NFT_COMPAT=legacy "$BIN" apply --dry-run --spec "$tmp/loc2.json" --state-dir "$tmp/state" 2>/dev/null)"
+check "раздача: TCP/53 к резолверу, старая раскладка с nat в ip6 — там же, где UDP/53" \
+    "$(c "$lg" 'iifname "rndis0" udp dport 53 counter redirect to :5300')" \
+    "$(c "$lg" 'iifname "rndis0" tcp dport 53 counter redirect to :5300')"
 check "раздача: TCP/53 стоит сразу за UDP/53" "1" \
     "$(printf '%s\n' "$m2" | grep -A1 'iifname "rndis0" udp dport 53' | grep -c 'tcp dport 53')"
 check "поддельные адреса для соединений телефона переводятся на output" "1" \
