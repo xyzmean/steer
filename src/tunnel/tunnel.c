@@ -3095,6 +3095,15 @@ int cmd_vless_probe(const char *spec_path, const char *out_name, int node, int t
     return found >= 0 ? 0 : 1;
 }
 
+/* Ход перебора — в файл probe-<выход> (probe_report), только если о нём некому сказать иначе:
+ * у ребёнка демона с --supervise есть труба событий (evline_enabled), и демон знает то же из
+ * node/nonode/down — файл там не нужен никому, а флеш телефона изнашивает (probe.h). Снимается
+ * запись (probe_clear) в любом режиме: удалить отсутствующий файл ничего не пишет, а оставшийся
+ * от прежнего запуска под procd рассказывал бы про перебор, которого больше нет. */
+static void vl_probe_report(const char *out_name, enum probe_state st, int node, int total) {
+    if (!evline_enabled()) probe_report(out_name, st, node, total);
+}
+
 int cmd_vless(const char *spec_path, const char *out_name) {
     evline_open();
     struct output *o = NULL;
@@ -3108,7 +3117,7 @@ int cmd_vless(const char *spec_path, const char *out_name) {
         /* Приговор — не только в журнал. Диагностика без него говорила «устройства нет,
          * смотрите журнал движка», то есть отправляла человека искать то, что уже известно
          * здесь (I-100). total=0 отличает «узлов в подписке нет» от «ни один не ответил». */
-        probe_report(out_name, PROBE_FAILED, 0, 0);
+        vl_probe_report(out_name, PROBE_FAILED, 0, 0);
         evline_emit("down", "why", EVLINE_STR, "в подписке нет пригодных узлов",
                      (const char *)NULL);
         fprintf(stderr, LOG_W2 "в подписке нет пригодных узлов "
@@ -3140,7 +3149,7 @@ int cmd_vless(const char *spec_path, const char *out_name) {
          * на подписке из двадцати девяти живых узлов, где человек написал `node: 31`. Снято
          * с роутера; в запись теперь едет и номер, который он написал, и настоящее число
          * пригодных — по ним приговор читается без journal. */
-        probe_report(out_name, PROBE_NO_SUCH_NODE, o->vless.nodes_n ? o->vless.nodes[0] : -1, (int)cnt);
+        vl_probe_report(out_name, PROBE_NO_SUCH_NODE, o->vless.nodes_n ? o->vless.nodes[0] : -1, (int)cnt);
         evline_emit("nonode",
                      "node", EVLINE_INT, (long)(o->vless.nodes_n ? o->vless.nodes[0] : -1),
                      "total", EVLINE_INT, (long)cnt, (const char *)NULL);
@@ -3176,7 +3185,7 @@ int cmd_vless(const char *spec_path, const char *out_name) {
          * назвать чужое ожидание. */
         for (size_t i = 0; i < sel_n; i++) {
             char why[256];
-            probe_report(out_name, PROBE_RUNNING, (int)i + 1, (int)sel_n);
+            vl_probe_report(out_name, PROBE_RUNNING, (int)i + 1, (int)sel_n);
             evline_emit("node", "n", EVLINE_INT, (long)(i + 1), "total", EVLINE_INT, (long)sel_n,
                         (const char *)NULL);
             if (vless_probe(&nodes[sel[i]], 8, why, sizeof(why)) == 0) {
@@ -3188,7 +3197,7 @@ int cmd_vless(const char *spec_path, const char *out_name) {
         }
     }
     if (chosen < 0) {
-        probe_report(out_name, PROBE_FAILED, 0, (int)sel_n);
+        vl_probe_report(out_name, PROBE_FAILED, 0, (int)sel_n);
         evline_emit("down", "why", EVLINE_STR, "ни один узел подписки не отвечает",
                      (const char *)NULL);
         fprintf(stderr, LOG_W2 "ни один узел подписки не отвечает\n");

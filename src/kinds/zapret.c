@@ -452,9 +452,13 @@ static void zapret_emit(struct nft_rs *rs, const struct spec *sp, const struct o
  * запуск, что у init.d/steer по строкам zapret-instances, — `steer-nfqws <очередь> <файл ключей>`,
  * и то же условие: файла стратегии нет — поднимать нечем, и об этом одна строка при подсчёте
  * состава, а не отказ по кругу (см. zapret_instances выше). Номер очереди выводится из метки,
- * поэтому супервизору нужен реестр (marks). В подпись — очередь и путь файла ключей: их
- * обработчик берёт аргументами при старте. Содержимое файла подписью не ловится (новая
- * стратегия — reload_zapret у init.d), как и содержимое подписки у vless. */
+ * поэтому супервизору нужен реестр (marks). В подпись — очередь и путь файла ключей (их
+ * обработчик берёт аргументами при старте) и СОДЕРЖИМОЕ файла: обработчик читает ключи один раз,
+ * при старте, и новая стратегия без перезапуска не заработала бы. У init.d для этого есть
+ * reload_zapret; супервизор (демон с --supervise, `steer supervise`) считает подпись при каждой
+ * сверке — apply, reload, SIGHUP, — и перезапускает обработчик ровно того выхода, чья стратегия
+ * изменилась, без опроса файла по таймеру. Файл — несколько сотен байт, чтение на сверку ничего
+ * не стоит. */
 static int zapret_helper(const struct spec *sp, const struct output *o, struct kind_helper *h) {
     (void)sp;
     h->marks = 1;
@@ -470,6 +474,13 @@ static int zapret_helper(const struct spec *sp, const struct output *o, struct k
     snprintf(h->arg[1], sizeof(h->arg[1]), "%s", o->zp.opts);
     kind_sig_mix(&h->sig, &q, sizeof(q));
     kind_sig_mix(&h->sig, o->zp.opts, strlen(o->zp.opts));
+    FILE *f = fopen(o->zp.opts, "r");
+    if (f) {
+        char buf[1024];
+        size_t n;
+        while ((n = fread(buf, 1, sizeof(buf), f)) > 0) kind_sig_mix(&h->sig, buf, n);
+        fclose(f);
+    }
     return 0;
 }
 

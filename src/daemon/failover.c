@@ -200,6 +200,35 @@ static int xs_state_read(const char *dev, int *up, int *fresh) {
     return 1;
 }
 
+/* ---- источник здоровья помощника: файлы (fostate.h) ----------------------------------------
+ *
+ * Прежний путь, байт в байт те же вопросы: ход перебора узлов — запись probe-<выход>, которую
+ * пишет клиент vless (probe_report); туннель xsteer, поднятый netifd, — его файл состояния;
+ * оживление обфускатора — сигналом экземпляру procd (у прохода, restart здесь нет). Из записи
+ * перебора проходу нужно то же, что и раньше: «идёт перебор» и «номера нет в подписке».
+ * «Ни один узел не ответил» (PROBE_FAILED) проход не читал и не читает: устройства в этом случае
+ * нет, и приговор ему выносит наличие устройства. */
+static int files_state(struct fo_hsrc *s, const char *out, struct fo_hstate *h) {
+    (void)s;
+    struct probe_status pr = probe_read(out);
+    h->node = pr.node;
+    h->total = pr.total;
+    if (pr.state == PROBE_RUNNING) { h->st = FO_HS_PROBING; return 0; }
+    if (pr.state == PROBE_NO_SUCH_NODE) { h->st = FO_HS_NONODE; return 0; }
+    h->st = FO_HS_UNKNOWN;
+    return -1;
+}
+
+static int files_xsdev(struct fo_hsrc *s, const char *dev, int *up, int *fresh) {
+    (void)s;
+    return xs_state_read(dev, up, fresh);
+}
+
+static const struct fo_hsrc_ops files_hops = {
+    files_state, files_xsdev, NULL, "процесс туннеля должен подняться заново через procd",
+};
+struct fo_hsrc fo_hsrc_files = { &files_hops };
+
 /* Живо ли устройство. Выход передаётся, но решает не он: чем проверять, определяет вид
  * ВЛАДЕЛЬЦА устройства (см. device_owner ниже), и только у устройства без владельца это
  * совпадает с видом выхода, который его назвал.
@@ -1345,6 +1374,7 @@ struct fo_run {
     struct loop *l;
     struct spec *sp;
     struct fo_store *st;
+    struct fo_hsrc *hs;               /* источник здоровья помощников (fostate.h) */
     int verbose;
     fo_event_fn ev;
     void *ev_arg;
@@ -1507,17 +1537,25 @@ static int hp_start(struct fo_run *r, int kind, const struct output *o, const ch
         /* И туннель xsteer, поднятый netifd, — по тому же доводу, что у вида xsteer: мерить его
          * нечем, а число из пробы наружу означало бы не задержку туннеля, а наличие интернета у
          * хаба. */
-        if (xs_state_read(dev, NULL, NULL)) return 0;
+        if (r->hs->ops->xsdev(r->hs, dev, NULL, NULL)) return 0;
         return hp_tcp_next(r);
     }
     r->res = 0;
     if (!device_present(dev)) return 0;
     o = out_for_device(sp, o, dev);
+    /* Устройство создаёт наш процесс — сначала спросить о нём источник здоровья (fostate.h):
+     * «не поднят» — приговор без пробы, «поднят» — дальше прежняя мера устройства. */
+    if (out_engine_managed(o)) {
+        struct fo_hstate h;
+        if (r->hs->ops->state(r->hs, o->name, &h) == 0 && h.st != FO_HS_UNKNOWN &&
+            h.st != FO_HS_UP)
+            return 0;
+    }
     const struct kind_ops *k = kind_of(o);
     if (k->health) { r->res = k->health(sp, o, dev); return 0; }
     {
         int up = 0, fresh = 0;
-        if (xs_state_read(dev, &up, &fresh)) { r->res = fresh ? up : 1; return 0; }
+        if (r->hs->ops->xsdev(r->hs, dev, &up, &fresh)) { r->res = fresh ? up : 1; return 0; }
     }
     if (out_has_cap(o, KC_TCP_PROBE)) return hp_tcp_next(r);
     if (g_icmp_probe) { r->res = g_icmp_probe(dev); return 0; }
@@ -1669,6 +1707,7 @@ static struct fo_run *run_new(struct loop *l, struct spec *sp, struct fo_store *
     r->l = l;
     r->sp = sp;
     r->st = st;
+    r->hs = &fo_hsrc_files;
     r->verbose = verbose;
     r->ev = ev;
     r->ev_arg = ev_arg;
@@ -1715,6 +1754,10 @@ struct fo_run *fo_pass_start(struct loop *l, struct spec *sp, struct fo_store *s
 
 void fo_pass_abort(struct fo_run *r) {
     if (r) run_free(r);
+}
+
+void fo_pass_helpers(struct fo_run *r, struct fo_hsrc *hs) {
+    if (r) r->hs = hs ? hs : &fo_hsrc_files;
 }
 
 /* ---- шаг выхода: действия после решения (прежний хвост тела цикла failover_pass) ----------- */
@@ -2105,8 +2148,16 @@ static void fo_step(struct fo_run *r) {
              * отвечает «Interface not found», то есть сторож писал бы в журнал отказ вместо
              * починки. Чинить здесь нечего и не нам: упавшего клиента поднимает заново netifd,
              * как любой обработчик протокола, и дело сторожа то же, что и с нашими собственными
-             * процессами, — сказать и подождать. */
-            if (xs_state_read(dev, NULL, NULL)) {
+             * процессами, — сказать и подождать.
+             *
+             * Устройство, о чьём помощнике источнику здоровья есть что сказать, сюда не
+             * попадает: файл состояния по имени устройства мог остаться от прежнего запуска
+             * клиента выхода kind=xsteer (он назван по имени выхода, а имя устройства у такого
+             * выхода по умолчанию — то же). */
+            const struct output *ow = out_for_device(sp, ro, dev);
+            struct fo_hstate hst = { FO_HS_UNKNOWN, 0, 0 };
+            int hknown = out_engine_managed(ow) && r->hs->ops->state(r->hs, ow->name, &hst) == 0;
+            if (!hknown && r->hs->ops->xsdev(r->hs, dev, NULL, NULL)) {
                 fprintf(stderr, LOG_W "%s: не отвечает — клиента туннеля поднимет заново "
                                 "служба сети; жду\n", dev);
                 r->s = RV_WAIT_INIT;
@@ -2132,7 +2183,6 @@ static void fo_step(struct fo_run *r) {
              * ifdown/ifup: имя Endpoint разрешается заново (переезд сервера по DNS), настройка
              * ложится заново, а пропавшее устройство создаётся. Частоту уже ограничил
              * restart_allowed выше. */
-            const struct output *ow = out_for_device(sp, ro, dev);
             if (kind_of(ow)->revive) {
                 r->rv.ow = ow;
                 r->s = RV_KIND;
@@ -2152,18 +2202,17 @@ static void fo_step(struct fo_run *r) {
                  * Причину знает сам клиент и уже записал её (probe_report), поэтому здесь её
                  * не выводят заново, а читают. Спрашивается у ВЛАДЕЛЬЦА устройства — по той же
                  * причине, что и проба здоровья: в пуле разнородных туннелей запись пишет
-                 * клиент под своим именем, а не выход, который его назвал. */
-                const struct output *pr_own = device_owner(sp, dev);
-                struct probe_status pr = probe_read(pr_own ? pr_own->name : ro->name);
-                if (pr.state == PROBE_NO_SUCH_NODE) {
+                 * клиент под своим именем, а не выход, который его назвал. Откуда причина —
+                 * из записи клиента или из памяти демона, — решает источник здоровья
+                 * (fostate.h); сам вывод один. */
+                if (hknown && hst.st == FO_HS_NONODE) {
                     fprintf(stderr, LOG_W "%s: выбран узел %d, а пригодных в подписке %d — сам "
-                                    "не поднимется, поправьте номер узла\n", dev, pr.node,
-                            pr.total);
+                                    "не поднимется, поправьте номер узла\n", dev, hst.node,
+                            hst.total);
                     rv_done(r, 0);
                     continue;
                 }
-                fprintf(stderr, LOG_W "%s: не отвечает — процесс туннеля должен подняться "
-                                "заново через procd; жду\n", dev);
+                fprintf(stderr, LOG_W "%s: не отвечает — %s; жду\n", dev, r->hs->ops->respawn);
                 r->s = RV_WAIT_INIT;
                 continue;
             }
@@ -2193,7 +2242,15 @@ static void fo_step(struct fo_run *r) {
              * то есть interface, а у него помощник — ровно обфускатор, когда obfs настроен. */
             struct kind_helper hp = { .sig = KIND_SIG_INIT };
             const struct kind_ops *hk = kind_of(ro);
-            if (hk->helper && hk->helper(sp, ro, &hp) == 0) {
+            /* Помощник — ребёнок демона (--supervise): перезапускает его сам демон, без ubus
+             * и procd (источник здоровья, fostate.h). Пауза на подъём и ifdown/ifup — те же. */
+            int have_hp = hk->helper && hk->helper(sp, ro, &hp) == 0;
+            if (have_hp && r->hs->ops->restart &&
+                r->hs->ops->restart(r->hs, ro->name, hp.cmd) == 0) {
+                r->s = RV_UBUS_R;
+                continue;
+            }
+            if (have_hp) {
                 /* С запасом: имя выхода до 24 символов плюс обрамление JSON — иначе
                  * -Wformat-truncation справедливо ругается, а сборка здесь обязана быть без
                  * предупреждений (I-007). */

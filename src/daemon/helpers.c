@@ -36,8 +36,9 @@ long helpers_now_ms(void) {
  *
  * Поля по видам называет сам вид (kind_ops.helper в src/kinds): vless — файл подписки и выбор
  * узлов; xsteer — файл конфигурации и режим потока; tgws — домен точек; obfs у interface —
- * сервер и локальный адрес; zapret — очередь и файл ключей. Содержимое файлов (подписка
- * обновилась) подписью не ловится, как и на роутере: это отдельный повод со своим путём. */
+ * сервер и локальный адрес; zapret — очередь, файл ключей и его содержимое (новая стратегия —
+ * то, что init.d делает reload_zapret). Содержимое остальных файлов (подписка обновилась)
+ * подписью не ловится, как и на роутере: это отдельный повод со своим путём. */
 static unsigned long long helper_sig(const struct spec *sp, const struct output *o,
                                      const struct kind_helper *hp) {
     unsigned long long h = hp->sig;       /* поля вида уже подмешаны его kind_ops.helper */
@@ -133,6 +134,7 @@ void helpers_merge(struct helper_set *s, const struct helper *fresh, size_t fn) 
             take_params(&h[i], &fresh[k]);
             if (h[i].sig == fresh[k].sig) continue;
             h[i].sig = fresh[k].sig;
+            h[i].revive = 0;      /* причина перезапуска теперь — параметры */
             if (h[i].pid && !h[i].restart) {
                 h[i].restart = 1;
                 kill(h[i].pid, SIGTERM);
@@ -163,15 +165,17 @@ struct helper *helpers_exited(struct helper_set *s, pid_t pid, int st) {
         struct helper *h = &s->h[i];
         if (h->pid != pid) continue;
         h->pid = 0;
-        /* Погашен нами ради новых параметров — поднять сразу: это не падение, и ни пауза, ни её
-         * рост к нему не относятся. */
+        /* Погашен нами ради новых параметров (или по просьбе сторожа, supd_restart) — поднять
+         * сразу: это не падение, и ни пауза, ни её рост к нему не относятся. */
         if (h->restart) {
-            h->restart = 0;
+            int rv = h->revive;
+            h->restart = h->revive = 0;
             h->delay_ms = HELPERS_DELAY_MS;
             h->next_ms = 0;
             if (!h->gone)
-                fprintf(stderr, "steer[info] supervise: %s — параметры выхода "
-                                "изменились, поднимаю заново\n", hname(h, nb, sizeof(nb)));
+                fprintf(stderr, "steer[info] supervise: %s — %s, поднимаю заново\n",
+                        hname(h, nb, sizeof(nb)),
+                        rv ? "выход не отвечает" : "параметры выхода изменились");
             return h;
         }
         /* Проработал дольше минуты — пауза снова пять секунд. Эта пауза и ждётся сейчас, а

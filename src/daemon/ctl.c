@@ -838,6 +838,10 @@ static int job_start(struct conn *c, char *const argv[], int timeout_s, size_t o
     j->done = done;
     if (!j->tm && !(j->tm = loop_timer_new(s->l, job_timer, c))) return -1;
     int po[2], pe[2];
+    /* Ход перебора узлов vless из памяти супервизора (--supervise) — ребёнку в окружение: клиенты
+     * с трубой событий файлов probe-* не пишут, а diag подкомандой спрашивает probe_read. */
+    char pmem[1024];
+    supd_probe_env(s->d.sup, pmem, sizeof(pmem));
     if (pipe2(po, O_CLOEXEC) != 0) return -1;
     if (pipe2(pe, O_CLOEXEC) != 0) { close(po[0]); close(po[1]); return -1; }
     pid_t pid = fork();
@@ -856,6 +860,7 @@ static int job_start(struct conn *c, char *const argv[], int timeout_s, size_t o
         /* Сигналы цикла заблокированы, SIGPIPE игнорируется — и то и другое наследуется
          * через exec, а подкоманды рассчитывают на обычное поведение. */
         loop_child_reset();
+        if (pmem[0]) putenv(pmem);
         execv(s->cf.exe, argv);
         dprintf(2, LOG_W "не запустить %s: %s\n", s->cf.exe, strerror(errno));
         _exit(127);
