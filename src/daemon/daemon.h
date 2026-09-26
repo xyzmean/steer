@@ -51,6 +51,10 @@ int ctnl_conns_print(FILE *out);
 int dlog_print(FILE *out);
 
 int cmd_apply(const char *spec, int dry);
+/* Служебные подкоманды демона для apply-сверки (apply.c, recon.c): план — проверки и отпечатки
+ * частей без применения; применение — только названных частей. В справке их нет. */
+int cmd_apply_plan(int argc, char **argv);
+int cmd_apply_commit(int argc, char **argv);
 int cmd_status(const char *spec, int fast);
 int cmd_diag(const char *spec);
 int cmd_down(void);

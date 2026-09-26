@@ -404,7 +404,7 @@ check "subscribe: ответ с кодом 0 и отпечатком спеки"
 ctl apply < "$tmp/B.json" >/dev/null
 wait_for 'grep -q "\"ev\":\"applied\",\"by\":\"apply\"" "$tmp/sub1.out"' 5
 check "subscribe: после apply — событие applied (движок выключен — enabled false)" "1" \
-    "$(grep -c '^{"v":1,"ev":"applied","by":"apply","spec":"[0-9a-f]\{16\}","enabled":false}$' "$tmp/sub1.out")"
+    "$(grep -c '^{"v":1,"ev":"applied","by":"apply","spec":"[0-9a-f]\{16\}","enabled":false,"changed":{"ruleset":false,"routing":\[\],"helpers":\[\],"dnsd":false}}$' "$tmp/sub1.out")"
 check "  отпечаток — уже новой спеки" "yes" \
     "$([ "$(sed -n 's/.*"by":"apply","spec":"\([0-9a-f]*\)".*/\1/p' "$tmp/sub1.out")" != \
          "$(head -n 1 "$tmp/sub1.out" | sed -n 's/.*"spec":"\([0-9a-f]*\)".*/\1/p')" ] && echo yes || echo no)"

@@ -79,6 +79,7 @@ test: all ext-syntax $(BUILD)/steer-android $(BUILD)/steer-xk $(BUILD)/tgwssim $
 	@sh tests/supervisematch.sh
 	@sh tests/ctlmatch.sh
 	@sh tests/supdmatch.sh
+	@sh tests/reconmatch.sh
 	@sh tests/diagmatch.sh
 	@sh tests/statusmatch.sh
 	@sh tests/buildmatch.sh

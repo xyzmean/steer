@@ -78,6 +78,7 @@ cc_defaults {
         "src/daemon/loop.c",
         "src/daemon/state.c",
         "src/daemon/watchd.c",
+        "src/daemon/recon.c",
         "src/lib/rtnl.c",
         "src/daemon/foprobe.c",
         "src/daemon/gaiw.c",
