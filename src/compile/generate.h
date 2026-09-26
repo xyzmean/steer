@@ -21,12 +21,11 @@ int generate(const struct spec *sp, const struct groups *gr, FILE *f, struct err
  * дописывают в дерево то, что нужно одному выходу своего вида. */
 void nft_emit_zapret(struct nft_rs *rs, const struct spec *sp, const struct output *o);
 void nft_emit_tgws(struct nft_rs *rs, const struct spec *sp, const struct output *o);
-#ifdef STEER_ANDROID
-/* Части только телефона — будущий platform_ops. */
+/* Каналы на само устройство (plat()->local_channels, src/platform/platform.h): цепочки на хуке
+ * output. Код — здесь, у компилятора; платформа только говорит, бывают ли такие каналы. */
 int nft_emit_output_mark(struct nft_rs *rs, const struct spec *sp, const struct groups *gr,
                          struct err *e);
 void nft_emit_output_dns(struct nft_rs *rs, const struct spec *sp, const struct groups *gr);
-#endif
 
 void counters_load(void);
 int counter_find(const char *name, int down, unsigned long *p, unsigned long *b);

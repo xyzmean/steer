@@ -304,7 +304,7 @@ static int tun_up_queues(struct spoke *s, struct tun_dev *q, int want, const cha
                          int managed) {
     int n = tun_open(q, want, dev);
     if (n < 0) {
-        fprintf(stderr, LOG_W "нет " STEER_TUN_DEV " — " STEER_TUN_HINT "\n");
+        fprintf(stderr, LOG_W "нет %s — %s\n", plat()->tun_dev, plat()->tun_hint);
         return -1;
     }
     s->tun = q[0];
@@ -674,7 +674,7 @@ int cmd_xsteer(const char *spec_path, const char *out_name, const char *conf_pat
         sd.sec = &g_sc;
         sd.out_name = device;
         snprintf(sd.state_path, sizeof(sd.state_path), "%s/xsteer-%.40s.json",
-                 g_state_dir, device);
+                 steer_state_dir(), device);
         return spoke_run(&sd, device, device, 1, NULL);
     }
     return cmd_xsteer_spec(spec_path, out_name, conf_path, stream, stream_port);
@@ -739,7 +739,7 @@ static int cmd_xsteer_spec(const char *spec_path, const char *out_name, const ch
      * подъёмом), а этот — главный путь `steer xsteer <выход>` — остался. */
     s.mtu = xs_mtu_clamp(g_cf.mtu);
     snprintf(s.state_path, sizeof(s.state_path), "%s/xsteer-%.40s.json",
-             g_state_dir, o->name);
+             steer_state_dir(), o->name);
 
     /* Таблицу к устройству привязывает САМ процесс: apply прошёл раньше, дождаться
      * устройства снаружи нельзя, и момент готовности знает только тот, кто его создал. Тот
@@ -1851,7 +1851,7 @@ int cmd_xsteer_peers(const char *spec_path, const char *out_name, const char *co
      * — разбирать нечего, а склеивать два JSON в один значило бы завести формат, который
      * придётся согласовывать с интерфейсом отдельно. */
     char sp[320];
-    snprintf(sp, sizeof(sp), "%s/xsteer-%.40s.json", g_state_dir, o->name);
+    snprintf(sp, sizeof(sp), "%s/xsteer-%.40s.json", steer_state_dir(), o->name);
     FILE *f = fopen(sp, "r");
     if (!f) return 1;              /* состояния нет: рукопожатий не было */
     char line[1024];

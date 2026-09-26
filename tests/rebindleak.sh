@@ -31,7 +31,7 @@
 # Использование (root, unshare, ip, nft, ping):
 #   STEER=build/steer sh tests/rebindleak.sh
 # Поток собирается из tests/markflood.c компилятором хоста (или FLOOD=<бинарник>). Годится и
-# Android-сборка для хоста (-DSTEER_ANDROID с каталогами в /tmp, как в шапке local49.sh).
+# Android-сборка для хоста (-DSTEER_DEFAULT_PLATFORM=android с каталогами в /tmp, как в шапке local49.sh).
 #
 # На ядре 4.9 (стенд tools/vm49 хаба): у ip в образе нет veth — пары заводит помощник awg49-veth
 # (/root/vm49/awg), компилятора нет — поток приносится готовым, собранным musl статически:

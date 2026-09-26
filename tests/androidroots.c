@@ -2,7 +2,7 @@
  *
  * ЗАЧЕМ. На телефоне нет файла ca-bundle, который certverify.c читает на роутере: корни лежат
  * каталогом, по сертификату на файл, и каждый файл — это текст `openssl x509 -text`, за
- * которым идёт PEM. client.c под STEER_ANDROID склеивает первый найденный каталог в файл
+ * которым идёт PEM. client.c на телефоне склеивает первый найденный каталог в файл
  * состояния и отдаёт его certverify швом auth.roots (см. cert_roots в client.c). Если склейка
  * молча не работает, проверка security=tls на телефоне отвергает КАЖДЫЙ узел как «хранилище
  * корней не прочиталось», а на роутере этого не видно никогда — там путь другой.
@@ -23,14 +23,9 @@
 #include <dirent.h>
 #include <sys/stat.h>
 
-#ifndef STEER_ANDROID
-#define STEER_ANDROID
-#endif
-/* Каталог состояния и каталоги корней — свои, во временном месте: стенд не трогает ни /data,
- * ни /apex. */
-#define STEER_STATE_DIR "/tmp/steer-androidroots/state"
-#define STEER_ANDROID_CA_DIRS "/tmp/steer-androidroots/nope", "/tmp/steer-androidroots/empty", \
-                              "/tmp/steer-androidroots/cacerts"
+/* Платформа — телефон, каталоги корней — свои, во временном месте: и то и другое задаёт сборка
+ * в tests/ext-test.sh (-DSTEER_DEFAULT_PLATFORM=android и STEER_ANDROID_CA_DIRS, их читает
+ * src/platform/android.c). Каталог состояния стенд задаёт сам, ниже, тем же швом, что --state-dir. */
 #include "../src/proto/vless/client.c"
 
 #include "mbedtls/x509_crt.h"
@@ -108,8 +103,9 @@ int main(void) {
     fputs("-----BEGIN CERTIFICATE-----\nбрак\n-----END CERTIFICATE-----\n", h);
     fclose(h);
 
-    /* Каталог состояния — как его задаёт --state-dir (g_state_dir, spec.c). */
-    g_state_dir = "/tmp/steer-androidroots/state";
+    /* Каталог состояния — как его задаёт --state-dir (steer_set_state_dir, src/platform). */
+    check("платформа — телефон, с системным хранилищем корней", 1, plat()->ca_dirs != NULL);
+    steer_set_state_dir("/tmp/steer-androidroots/state");
     const char *p = cert_roots();
     check("склейка: путь выдан", 1, p != NULL);
     check("склейка: из третьего каталога (первого нет, второй пуст), в каталоге состояния", 0,

@@ -30,7 +30,7 @@ static void rt_tables_write(const struct spec *s);
 
 int registry_assign(struct spec *s, struct err *e) {
     char path[512];
-    snprintf(path, sizeof(path), "%s/registry", g_state_dir);
+    snprintf(path, sizeof(path), "%s/registry", steer_state_dir());
     FILE *f = fopen(path, "r");
     if (f) {
         char name[32];
@@ -64,7 +64,7 @@ int registry_assign(struct spec *s, struct err *e) {
      * ряда, — по ней место и занимается. Так реестр, доживший с прежней сборки,
      * переживает обновление без единой перетасовки: метка остаётся та, что уже стоит в
      * пакетах и правилах, а новые выходы просто садятся на свободные места. */
-    unsigned char taken[STEER_MARK_SLOTS];
+    unsigned char taken[MAX_OUTPUTS];   /* мест не больше MAX_OUTPUTS, см. STEER_MARK_SLOTS */
     memset(taken, 0, sizeof(taken));
     for (size_t i = 0; i < s->out_n; i++) {
         if (!s->out[i].mark) continue;
@@ -127,7 +127,7 @@ int registry_assign(struct spec *s, struct err *e) {
         fclose(f);
         if (hn == wn && memcmp(have, want, wn) == 0) return 0;
     }
-    mkdir(g_state_dir, 0755);
+    mkdir(steer_state_dir(), 0755);
     f = fopen(path, "w");
     if (!f) return 0;           /* best effort: apply still works, next boot re-assigns */
     fwrite(want, 1, wn, f);
@@ -157,20 +157,18 @@ int registry_assign(struct spec *s, struct err *e) {
  * Поэтому молча, без предупреждений: на busybox-ip имён нет вовсе, и жаловаться было бы не
  * на что. */
 static void rt_tables_write(const struct spec *s) {
-#ifdef STEER_ANDROID
-    /* На телефоне каталога iproute2 в /etc нет и быть не может: /etc там — ссылка в системный
-     * раздел только для чтения. Имена таблиц — удобство диагностики (см. выше), и отказ записи
-     * был бы тихим и так; но и mkdir в чужой системный каталог при каждом status пробовать
-     * незачем. */
-    return;
-#endif
+    /* Платформа без каталога имён (телефон: /etc там — ссылка в системный раздел только для
+     * чтения, src/platform/android.c) — и mkdir в чужой системный каталог при каждом status
+     * пробовать незачем. */
+    const char *dir = steer_rt_tables_dir();
+    if (!dir) return;
     char path[512];
     /* Файл — свой у каждой сборки: мини-сборка с тем же именем перезаписывала бы имена таблиц
      * полного движка своими. */
 #ifdef STEER_TGWS
-    snprintf(path, sizeof(path), "%s/stgws.conf", g_rt_tables_d);
+    snprintf(path, sizeof(path), "%s/stgws.conf", dir);
 #else
-    snprintf(path, sizeof(path), "%s/steer.conf", g_rt_tables_d);
+    snprintf(path, sizeof(path), "%s/steer.conf", dir);
 #endif
 
     char want[1024];
@@ -195,10 +193,10 @@ static void rt_tables_write(const struct spec *s) {
     /* Каталога может не быть: iproute2 создаёт его не всегда, а на busybox-сборке его нет
      * вовсе. mkdir по одному уровню — родителя (/etc/iproute2) тоже может не быть. */
     char parent[512];
-    snprintf(parent, sizeof(parent), "%s", g_rt_tables_d);
+    snprintf(parent, sizeof(parent), "%s", dir);
     char *slash = strrchr(parent, '/');
     if (slash && slash != parent) { *slash = '\0'; mkdir(parent, 0755); }
-    mkdir(g_rt_tables_d, 0755);
+    mkdir(dir, 0755);
     f = fopen(path, "w");
     if (!f) return;
     fwrite(want, 1, wn, f);

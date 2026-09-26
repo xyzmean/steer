@@ -38,13 +38,16 @@ $(BUILD)/steer: $(CORE_SRC) $(CORE_HDR) VERSION
 	@mkdir -p $(BUILD)
 	$(CC) $(CFLAGS) $(DEFS) -o $@ $(CORE_SRC)
 
-# Сборка под Android — тот же движок с -DSTEER_ANDROID: своё поле метки (биты 22-27, в 0-21
-# пишет netd), свои каталоги (/data/misc/steer) и приоритет ip rule ниже лестницы netd. Здесь
-# она собирается хостовым компилятором ради стенда androidmatch: он проверяет, что сборка
-# вообще компилируется и что поле и пути у неё свои. Настоящая сборка под телефон — не здесь.
+# Сборка под Android — тот же движок и те же исходники, у которого только умолчание выбора
+# платформы при запуске — телефон (-DSTEER_DEFAULT_PLATFORM=android, src/platform/platform.c):
+# своё поле метки (биты 22-27, в 0-21 пишет netd), свои каталоги (/data/misc/steer) и
+# приоритет ip rule ниже лестницы netd. Здесь она собирается хостовым компилятором ради стенда
+# androidmatch и снимка; тот же вывод обязан давать и обычный build/steer с STEER_PLATFORM=android
+# или --platform android — это сверяет tests/platmatch.sh. Настоящая сборка под телефон — не
+# здесь (Android.bp).
 $(BUILD)/steer-android: $(CORE_SRC) $(CORE_HDR) VERSION
 	@mkdir -p $(BUILD)
-	$(CC) $(CFLAGS) $(DEFS) -DSTEER_ANDROID -o $@ $(CORE_SRC)
+	$(CC) $(CFLAGS) $(DEFS) -DSTEER_DEFAULT_PLATFORM=android -o $@ $(CORE_SRC)
 
 test: all ext-syntax $(BUILD)/steer-android $(BUILD)/tgwssim $(BUILD)/dnsmatch $(BUILD)/specmatch $(BUILD)/specmatch-ext $(BUILD)/xswirematch $(BUILD)/xsconnmatch $(BUILD)/xsstreammatch $(BUILD)/tungromatch $(BUILD)/tunnelmatch $(BUILD)/tunnamematch $(BUILD)/xsconfmatch $(BUILD)/xslinkmatch $(BUILD)/xsroutematch $(BUILD)/chellomatch $(BUILD)/failovermatch $(BUILD)/irmatch $(BUILD)/irmatch-android $(BUILD)/dcmatch $(BUILD)/msgsplitmatch $(BUILD)/warmmatch $(BUILD)/upmatch $(BUILD)/tgwsfailmatch $(BUILD)/h2match $(BUILD)/xhupmatch $(BUILD)/submatch $(BUILD)/subfetchmatch $(BUILD)/fwmatch $(BUILD)/obfsmatch $(BUILD)/visionmatch $(BUILD)/tlsprobematch $(BUILD)/diagsim $(BUILD)/hwidsum $(BUILD)/awgmatch $(BUILD)/awgmatch-android
 	@sh tests/run.sh
@@ -57,6 +60,7 @@ test: all ext-syntax $(BUILD)/steer-android $(BUILD)/tgwssim $(BUILD)/dnsmatch $
 	@sh tests/applynft.sh
 	@sh tests/applynft-legacy.sh
 	@sh tests/androidmatch.sh
+	@sh tests/platmatch.sh
 	@sh tests/supervisematch.sh
 	@sh tests/ctlmatch.sh
 	@sh tests/diagmatch.sh
@@ -128,7 +132,7 @@ $(BUILD)/diagsim: $(CORE_SRC) $(KINDS_EXT_SRC) $(CORE_HDR) tests/vless-stub.c
 # такой проверкой не поймать. Ни сети, ни mbedtls — файл вложенный и самодостаточный.
 $(BUILD)/hwidsum: tests/hwidsum.c src/tools/hwid.c src/tools/hwid.h src/lib/jsonw.c src/lib/jsonw.h
 	@mkdir -p $(BUILD)
-	$(CC) $(CFLAGS) -o $@ tests/hwidsum.c src/tools/hwid.c src/lib/jsonw.c
+	$(CC) $(CFLAGS) -o $@ tests/hwidsum.c src/tools/hwid.c src/lib/jsonw.c $(PLATFORM_SRC)
 
 # Синтаксическая проверка расширенного движка (R-014/I-024). Полная сборка расширенной части идёт
 # только в build.sh через docker с mbedtls, поэтому локальный make test оставался зелёным,
@@ -170,16 +174,16 @@ $(BUILD)/dnsmatch: tests/dnsmatch.c $(DNSD_SRC) src/lib/sindex.h src/lib/nftnl.h
 # test` нет по построению.
 $(BUILD)/dcmatch: tests/dcmatch.c src/proto/tgws/tgws.c
 	@mkdir -p $(BUILD)
-	$(CC) $(CFLAGS) -Itests/stub -o $@ tests/dcmatch.c
+	$(CC) $(CFLAGS) -Itests/stub -o $@ tests/dcmatch.c $(PLATFORM_SRC)
 
 $(BUILD)/msgsplitmatch: tests/msgsplitmatch.c src/proto/tgws/tgws.c
 	@mkdir -p $(BUILD)
-	$(CC) $(CFLAGS) -Itests/stub -o $@ tests/msgsplitmatch.c
+	$(CC) $(CFLAGS) -Itests/stub -o $@ tests/msgsplitmatch.c $(PLATFORM_SRC)
 
 # Запас поднятых соединений — там же и по той же причине: warm_* статические.
 $(BUILD)/warmmatch: tests/warmmatch.c src/proto/tgws/tgws.c
 	@mkdir -p $(BUILD)
-	$(CC) $(CFLAGS) -Itests/stub -o $@ tests/warmmatch.c
+	$(CC) $(CFLAGS) -Itests/stub -o $@ tests/warmmatch.c $(PLATFORM_SRC)
 
 # Исходы пробы браузерным рукопожатием и то, как она их называет (I-272). Там же и по той же
 # причине: bind_local и hello12_build статические. Срок пробы подменён секундой — с шестью
@@ -193,7 +197,7 @@ $(BUILD)/tlsprobematch: tests/tlsprobematch.c src/proto/tls/tlsprobe.c src/proto
 # же причине: up_drop статическая.
 $(BUILD)/upmatch: tests/upmatch.c src/proto/tgws/tgws.c
 	@mkdir -p $(BUILD)
-	$(CC) $(CFLAGS) -Itests/stub -o $@ tests/upmatch.c
+	$(CC) $(CFLAGS) -Itests/stub -o $@ tests/upmatch.c $(PLATFORM_SRC)
 
 # Пути отказа моста, которых прогон настоящего бинаря не достаёт: длинная строка списка
 # запасных доменов, отказ источника случайности, отказ рукопожатия после разворота ключа
@@ -201,7 +205,7 @@ $(BUILD)/upmatch: tests/upmatch.c src/proto/tgws/tgws.c
 # той же причине: alt_init, ws_upgrade, tls_start и pump статические.
 $(BUILD)/tgwsfailmatch: tests/tgwsfailmatch.c src/proto/tgws/tgws.c
 	@mkdir -p $(BUILD)
-	$(CC) $(CFLAGS) -Itests/stub -o $@ tests/tgwsfailmatch.c
+	$(CC) $(CFLAGS) -Itests/stub -o $@ tests/tgwsfailmatch.c $(PLATFORM_SRC)
 
 $(BUILD)/specmatch: tests/specmatch.c $(MODEL_KINDS) src/kinds/awg.c src/model/spec.h
 	@mkdir -p $(BUILD)
@@ -237,7 +241,7 @@ $(BUILD)/awgmatch: tests/awgmatch.c src/kinds/awg.c src/kinds/awg.h src/lib/nlbu
 
 $(BUILD)/awgmatch-android: tests/awgmatch.c src/kinds/awg.c src/kinds/awg.h src/lib/nlbuf.h $(MODEL_KINDS) src/model/spec.h
 	@mkdir -p $(BUILD)
-	$(CC) $(CFLAGS) -DSTEER_ANDROID -o $@ tests/awgmatch.c $(MODEL_KINDS)
+	$(CC) $(CFLAGS) -DSTEER_DEFAULT_PLATFORM=android -o $@ tests/awgmatch.c $(MODEL_KINDS)
 
 # Виды — объектами (без awg.c и без парсера: стенд подменяет load_spec своей спекой).
 FAILOVERMATCH_KINDS := $(filter-out src/kinds/awg.c,$(KINDS_BASE_SRC)) $(KINDS_EXT_SRC)
@@ -252,12 +256,12 @@ $(BUILD)/irmatch: tests/irmatch.c tests/unit.h $(COMPILE_SRC) $(MODEL_KINDS) $(C
 
 $(BUILD)/irmatch-android: tests/irmatch.c tests/unit.h $(COMPILE_SRC) $(MODEL_KINDS) $(CORE_HDR)
 	@mkdir -p $(BUILD)
-	$(CC) $(CFLAGS) -DSTEER_ANDROID -o $@ tests/irmatch.c $(COMPILE_SRC) $(MODEL_KINDS)
+	$(CC) $(CFLAGS) -DSTEER_DEFAULT_PLATFORM=android -o $@ tests/irmatch.c $(COMPILE_SRC) $(MODEL_KINDS)
 
 $(BUILD)/failovermatch: tests/failovermatch.c src/daemon/failover.c src/daemon/daemon.h \
                         src/daemon/failover_int.h src/model/spec.h src/lib/err.c $(FAILOVERMATCH_KINDS)
 	@mkdir -p $(BUILD)
-	$(CC) $(CFLAGS) -o $@ tests/failovermatch.c src/daemon/failover.c src/lib/err.c $(FAILOVERMATCH_KINDS)
+	$(CC) $(CFLAGS) -o $@ tests/failovermatch.c src/daemon/failover.c src/lib/err.c $(FAILOVERMATCH_KINDS) $(PLATFORM_SRC)
 
 # Зависимость выхода от чужого firewall: fw_check судит о конфигурации по тексту дампа
 # nft, и проверить эвристику можно только примерами. Стенд включает исходник движка и
@@ -281,7 +285,7 @@ XHUPMATCH_SRC = src/proto/tls/h2.c src/proto/vless/vless_proto.c src/proto/vless
 $(BUILD)/xhupmatch: tests/xhupmatch.c src/proto/vless/client.c src/proto/vless/client.h src/proto/tls/h2.h $(XHUPMATCH_SRC)
 	@mkdir -p $(BUILD)
 	$(CC) $(CFLAGS) -Itests/stub -DSTEER_EXTENDED -o $@ tests/xhupmatch.c \
-		$(XHUPMATCH_SRC) -lpthread
+		$(XHUPMATCH_SRC) $(PLATFORM_SRC) -lpthread
 
 # Разбор подписки — единственное место, куда в движок попадает чужой текст из интернета.
 # Ни сети, ни mbedtls он не требует, поэтому стенд включает исходник напрямую и входит
@@ -312,7 +316,7 @@ $(BUILD)/subfetchmatch: tests/subfetchmatch.c src/proto/vless/subfetch.c src/pro
                   src/tools/hwid.c src/tools/hwid.h src/lib/jsonw.c src/lib/jsonw.h \
                   src/proto/vless/sub.c src/proto/vless/vless.h src/proto/vless/vless_proto.c src/proto/vless/vless_proto.h
 	@mkdir -p $(BUILD)
-	$(CC) $(CFLAGS) -Itests/stub -o $@ tests/subfetchmatch.c src/lib/jsonw.c
+	$(CC) $(CFLAGS) -Itests/stub -o $@ tests/subfetchmatch.c src/lib/jsonw.c $(PLATFORM_SRC)
 
 # Арифметика провода xsteer: заголовок записи, вывод nonce, окно приёма, пределы
 # соединения. Всё, что она считает, ломается МОЛЧА — пакет отбрасывается стеком той
@@ -345,7 +349,7 @@ $(BUILD)/xsstreammatch: tests/xsstreammatch.c src/proto/xsteer/xsstream.c src/pr
 # отключает выигрыш (не склеили ничего) — второе тут и случилось на живом прогоне.
 $(BUILD)/tungromatch: tests/tungromatch.c src/tunnel/tun.c src/tunnel/tun.h
 	@mkdir -p $(BUILD)
-	$(CC) $(CFLAGS) -o $@ tests/tungromatch.c
+	$(CC) $(CFLAGS) -o $@ tests/tungromatch.c $(PLATFORM_SRC)
 
 # Разбор пакетов туннеля VLESS на подменённом клиенте (I-320, I-321, I-322): tunnel.c
 # включается целиком, client.c подменён, поэтому mbedtls не нужна — заголовки из tests/stub,
@@ -365,7 +369,7 @@ $(BUILD)/tunnelmatch: tests/tunnelmatch.c src/tunnel/tunnel.c $(TUNNELMATCH_SRC)
 # всё равно входит: стенд, который надо позвать руками, не запускается никогда.
 $(BUILD)/tunnamematch: tests/tunnamematch.c src/tunnel/tun.c src/tunnel/tun.h
 	@mkdir -p $(BUILD)
-	$(CC) $(CFLAGS) -o $@ tests/tunnamematch.c
+	$(CC) $(CFLAGS) -o $@ tests/tunnamematch.c $(PLATFORM_SRC)
 
 # Разбор конфигурации xsteer — единственное место, куда в движок попадает текст, который
 # человек написал руками, поэтому разбор строгий, а стенд перечисляет каждый отказ.

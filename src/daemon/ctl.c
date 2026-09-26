@@ -109,13 +109,10 @@
 #include <sys/system_properties.h>
 #endif
 
-#include "paths.h"
+#include "platform.h"
 #include "ctl.h"
 
-/* Путь сокета по умолчанию. Под #ifndef, как корни в paths.h: сборка может задать свой. */
-#ifndef STEER_CTL_SOCK
-#define STEER_CTL_SOCK STEER_ETC_DIR "/steer.sock"
-#endif
+/* Путь сокета по умолчанию — путь платформы (ctl_sock, src/platform/platform.h). */
 /* Выключатель движка — то же свойство, за которым следит init (vendor/der/init/steerd.rc). */
 #define STEER_CTL_PROP "persist.der.steer.enabled"
 
@@ -157,7 +154,7 @@ struct ctl_conf {
     const char *sock;
     const char *spec;
     const char *state_dir;       /* NULL — умолчание движка, флаг подкомандам не передаётся */
-    const char *lists_dir;       /* куда put-file кладёт файлы (STEER_LISTS_DIR, --lists-dir) */
+    const char *lists_dir;       /* куда put-file кладёт файлы (lists_dir платформы, --lists-dir) */
     const char *allow_domain;    /* NULL или "" — по домену не пускать */
     uid_t allow_uid[CTL_ALLOW_UIDS];
     int allow_uid_n;
@@ -679,7 +676,7 @@ static void ctl_run_sub(const struct ctl_req *q, struct cbuf *r) {
 /* ---- apply и check ---------------------------------------------------------------------- */
 
 static const char *ctl_state_dir(const struct ctl_conf *cf) {
-    return cf->state_dir ? cf->state_dir : STEER_STATE_DIR;
+    return cf->state_dir ? cf->state_dir : plat()->state_dir;
 }
 
 /* Записать данные во временный файл РЯДОМ с целевым (тот же довод, что у spec_set в
@@ -1006,7 +1003,7 @@ static void ctl_do_reload(const struct ctl_req *q, struct cbuf *r) {
  * splify2 в каталог движка писать не может (SELinux: steerd_data_file ему закрыт целиком, см.
  * neverallow в vendor/der/sepolicy/private/steerd.te), и открывать его значило бы открыть и
  * спеку, и состояние. Поэтому файлы идут через ту же дверь, что спека: приложение скачивает
- * список, присылает его телом put-file, сервер кладёт его в STEER_LISTS_DIR, а в спеку
+ * список, присылает его телом put-file, сервер кладёт его в lists_dir платформы, а в спеку
  * приложение пишет путь, который вернул ответ.
  *
  * Разбор спеки этим не ограничен: спека с путями ВНЕ каталога списков по-прежнему законна
@@ -1226,7 +1223,9 @@ static void ctl_do_rm_file(const struct ctl_req *q, struct cbuf *r) {
  * подкоманда честно отказывает кодом 2, как vless-nodes. */
 static void ctl_do_sub_check(const struct ctl_req *q, struct cbuf *r) {
     char tmp[PATH_MAX];
-    if (ctl_write_tmp(STEER_TMP_DIR "/sub-check", q->body, q->body_n, tmp, sizeof(tmp)) != 0) {
+    char stem[PATH_MAX];
+    snprintf(stem, sizeof stem, "%s/sub-check", plat()->tmp_dir);
+    if (ctl_write_tmp(stem, q->body, q->body_n, tmp, sizeof(tmp)) != 0) {
         resp_error(r, "internal", "не удалось записать временный файл подписки");
         return;
     }
@@ -1383,17 +1382,20 @@ static void ctl_bad_flag(const char *cmd, const char *msg, const char *arg) {
 }
 
 void ctl_usage_flags(FILE *out) {
-    fputs("  --socket ФАЙЛ       управляющий сокет (по умолчанию " STEER_CTL_SOCK ")\n"
+    const struct platform_ops *p = plat();
+    fprintf(out,
+          "  --socket ФАЙЛ       управляющий сокет (по умолчанию %s)\n"
           "  --spec ФАЙЛ         ctl-serve: спека, которую читают и заменяют команды\n"
-          "                      (по умолчанию " STEER_ETC_DIR "/spec.json)\n"
-          "  --state-dir КАТАЛОГ ctl-serve: каталог состояния (по умолчанию " STEER_STATE_DIR ")\n"
+          "                      (по умолчанию %s)\n"
+          "  --state-dir КАТАЛОГ ctl-serve: каталог состояния (по умолчанию %s)\n"
           "  --allow-uid N       ctl-serve: пускать и этот uid (до восьми раз); root и system\n"
           "                      пускаются всегда\n"
           "  --allow-domain ИМЯ  ctl-serve: пускать процессы этого домена SELinux у владельца\n"
-          "                      устройства (по умолчанию splify2_app в сборке под Android;\n"
+          "                      устройства (по умолчанию splify2_app на платформе Android;\n"
           "                      пустое значение — не пускать по домену)\n"
           "  --lists-dir КАТАЛОГ ctl-serve: куда put-file кладёт файлы списков\n"
-          "                      (по умолчанию " STEER_LISTS_DIR ")\n", out);
+          "                      (по умолчанию %s)\n",
+          p->ctl_sock, p->spec_path, p->state_dir, p->lists_dir);
 }
 
 static int ctl_listen(const struct ctl_conf *cf, ino_t *ino) {
@@ -1440,12 +1442,10 @@ static int ctl_listen(const struct ctl_conf *cf, ino_t *ino) {
 
 int ctl_serve_main(int argc, char **argv) {
     static struct ctl_conf cf;
-    cf.sock = STEER_CTL_SOCK;
-    cf.spec = STEER_ETC_DIR "/spec.json";
-    cf.lists_dir = STEER_LISTS_DIR;
-#ifdef STEER_ANDROID
-    cf.allow_domain = "splify2_app";
-#endif
+    cf.sock = plat()->ctl_sock;
+    cf.spec = plat()->spec_path;
+    cf.lists_dir = plat()->lists_dir;
+    cf.allow_domain = plat()->ctl_allow_domain;
     for (int i = 0; i < argc; i++) {
         const char *f = argv[i];
         const char *v = i + 1 < argc ? argv[i + 1] : NULL;
@@ -1570,7 +1570,7 @@ int ctl_serve_main(int argc, char **argv) {
  * ответ сервера как есть (строка JSON). Код: 0 — ответ с "code":0 и без "error"; 1 — иной
  * ответ; 2 — ошибка вызова или нет соединения. */
 int ctl_client_main(int argc, char **argv) {
-    const char *sock = STEER_CTL_SOCK;
+    const char *sock = plat()->ctl_sock;
     int i = 0;
     for (; i < argc; i++) {
         if (!strcmp(argv[i], "--socket")) {

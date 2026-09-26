@@ -187,9 +187,9 @@ static void sup_start(struct sup_helper *h, const char *exe, const char *spec,
          * реестр меток (метку цели via), и разойдись каталоги — подпись в супервизоре считалась бы
          * по одной метке, а сокет помощника ставился бы по другой. */
         const char *argv[] = { exe, h->cmd, h->name, "--spec", spec, NULL, NULL, NULL };
-        if (strcmp(g_state_dir, STEER_STATE_DIR) != 0) {
+        if (strcmp(steer_state_dir(), plat()->state_dir) != 0) {
             argv[5] = "--state-dir";
-            argv[6] = g_state_dir;
+            argv[6] = steer_state_dir();
         }
         execv(exe, (char *const *)argv);
         _exit(127);
@@ -210,7 +210,7 @@ int cmd_supervise(const char *spec) {
         if (el <= 0) die("supervise: не найти свой исполняемый файл (%s)", strerror(errno));
         exe[el] = '\0';
     }
-    if (!spec) spec = STEER_ETC_DIR "/spec.json";
+    if (!spec) spec = plat()->spec_path;
 
     sigset_t set;
     sigemptyset(&set);

@@ -203,7 +203,7 @@ struct fwcheck fw_check(const char *device) {
     return r;
 }
 
-#ifndef STEER_ANDROID   /* на телефоне не зовётся — см. конец cmd_apply */
+/* Только на платформе с fw4 (plat()->fw4) — см. конец cmd_apply. */
 void report_traceroute_dep(const struct spec *sp) {
     if (!sp->traceroute_hops) return;
     /* Say the useless case out loud rather than leaving the operator to discover it
@@ -232,7 +232,6 @@ void report_traceroute_dep(const struct spec *sp) {
                         "firewall (not here): accept ct state untracked icmp type "
                         "time-exceeded towards %s\n", sp->lan_dev[0]);
 }
-#endif
 
 /* ЧУЖИЕ ПРАВИЛА НА БИТАХ 16-23 — предупреждение, а не отказ.
  *
@@ -302,7 +301,7 @@ int report_mark_overlap(void) {
     return n_said;
 }
 
-#ifndef STEER_ANDROID   /* на телефоне не зовётся — см. конец cmd_apply */
+/* Только на платформе с fw4 (plat()->fw4) — см. конец cmd_apply. */
 void report_output_deps(const struct spec *sp) {
     for (size_t i = 0; i < sp->out_n; i++) {
         if (!out_has_device(&sp->out[i])) continue;
@@ -339,5 +338,4 @@ void report_output_deps(const struct spec *sp) {
                     sp->out[i].name, sp->out[i].device);
     }
 }
-#endif
 

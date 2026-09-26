@@ -48,8 +48,8 @@ struct cli_flag {
 };
 
 static const struct cli_flag FLAGS[] = {
-    {"--spec",      NULL, "ФАЙЛ",       "спека каналов (по умолчанию " STEER_ETC_DIR "/spec.json)"},
-    {"--state-dir", NULL, "КАТАЛОГ",    "каталог состояния (по умолчанию " STEER_STATE_DIR ")"},
+    {"--spec",      NULL, "ФАЙЛ",       "спека каналов (по умолчанию {etc}/spec.json)"},
+    {"--state-dir", NULL, "КАТАЛОГ",    "каталог состояния (по умолчанию {state})"},
     {"--dry-run",   NULL, NULL,         "напечатать готовый ruleset и ничего не применять"},
     {"--verbose",   "-v", NULL,         "рассказывать по шагам, что проверяется"},
     {"--kind",      NULL, "ВИД",        "только выходы этого вида: direct, interface, vless, xsteer, zapret, tgws, awg"},
@@ -64,7 +64,7 @@ static const struct cli_flag FLAGS[] = {
     {"--listen",    NULL, "ПОРТ",       "порт поддельного TCP, который слушает сервер"},
     {"--forward",   NULL, "АДРЕС:ПОРТ", "куда отдавать распакованные датаграммы"},
     {"--config",    NULL, "ФАЙЛ",       "конфигурация xsteer в стиле wg "
-                                        "(по умолчанию " STEER_ETC_DIR "/xsteer/hub.conf)"},
+                                        "(по умолчанию {etc}/xsteer/hub.conf)"},
     {"--device",    NULL, "ИМЯ",        "готовое устройство TUN: им владеет netifd, "
                                         "движок только открывает его"},
     {"--out",       NULL, "ФАЙЛ",       "куда положить скачанное"},
@@ -422,7 +422,7 @@ static const struct cli_cmd CMDS[] = {
 {"xsteer", "Звезда xsteer", "[<выход>]",
  "поднять клиент xsteer: для выхода спеки или для готового устройства",
  "С именем выхода: читает конфигурацию в стиле wg (по умолчанию\n"
- STEER_ETC_DIR "/xsteer/<выход>.conf), сам создаёт TUN и сам привязывает к нему таблицу\n"
+ "{etc}/xsteer/<выход>.conf), сам создаёт TUN и сам привязывает к нему таблицу\n"
  "маршрутизации выхода. Так его поднимает procd для выхода kind=xsteer.\n"
  "\n"
  "Без имени выхода: спека не читается вовсе, нужны --config и --device. Устройством в\n"
@@ -599,6 +599,18 @@ static void pad_to(FILE *out, const char *s, int width) {
     while (n++ < width) fputc(' ', out);
 }
 
+/* Текст справки с путями платформы. Корни в строках таблиц записаны знаками {etc} и {state}, а
+ * подставляются при печати: платформу движок выбирает при запуске (src/platform/platform.h), и
+ * литерал её знать не может — а справка на телефоне обязана называть его пути, не роутерные. */
+static void put_text(FILE *out, const char *s) {
+    const struct platform_ops *p = plat();
+    while (*s) {
+        if (!strncmp(s, "{etc}", 5)) { fputs(p->etc_dir, out); s += 5; }
+        else if (!strncmp(s, "{state}", 7)) { fputs(p->state_dir, out); s += 7; }
+        else fputc(*s++, out);
+    }
+}
+
 static void print_flags(FILE *out, const char *list) {
     for (size_t i = 0; i < FLAGS_N; i++) {
         if (!flag_listed(list, FLAGS[i].name)) continue;
@@ -611,7 +623,9 @@ static void print_flags(FILE *out, const char *list) {
                      FLAGS[i].value ? " " : "", FLAGS[i].value ? FLAGS[i].value : "");
         fputs("  ", out);
         pad_to(out, left, 24);
-        fprintf(out, " %s\n", FLAGS[i].help);
+        fputc(' ', out);
+        put_text(out, FLAGS[i].help);
+        fputc('\n', out);
     }
 }
 
@@ -637,11 +651,15 @@ static void help_all(FILE *out) {
 #endif
         fputc('\n', out);
     }
-    fputs("\nСправка и версия:\n"
+    fprintf(out, "\nСправка и версия:\n"
           "  help [команда]  подробности: что делает команда и какие у неё флаги\n"
           "  version         версия движка и вариант сборки\n"
           "\n"
-          "Подробности по команде: steer help apply   (то же самое: steer apply --help)\n", out);
+          "Платформа: %s (есть %s). Выбирается сама; --platform ИМЯ при любой команде\n"
+          "задаёт её явно.\n"
+          "\n"
+          "Подробности по команде: steer help apply   (то же самое: steer apply --help)\n",
+          plat()->name, plat_names());
 #ifndef STEER_EXTENDED
     fputs("\nЭто базовая сборка: команды, помеченные [steer-extended], откажутся работать.\n"
           "VLESS/Reality есть в пакете steer-extended — он ставится вместо этого и умеет всё то же.\n"
@@ -653,7 +671,11 @@ static void help_cmd(FILE *out, const struct cli_cmd *c) {
     fprintf(out, "steer %s — %s\n\n", c->name, c->brief);
     fputs("Использование:\n", out);
     print_synopsis(out, c);
-    if (c->detail) fprintf(out, "\n%s\n", c->detail);
+    if (c->detail) {
+        fputc('\n', out);
+        put_text(out, c->detail);
+        fputc('\n', out);
+    }
     if (!c->passthru && c->flags[0]) {
         fputs("\nФлаги:\n", out);
         print_flags(out, c->flags);
@@ -733,7 +755,7 @@ static int cli_int(const char *flag, const char *s, int lo, int hi) {
 void cli_parse(const struct cli_cmd *cmd, int argc, char **argv, int from,
                struct cli_args *out) {
     memset(out, 0, sizeof *out);
-    out->spec = STEER_ETC_DIR "/spec.json";
+    out->spec = plat()->spec_path;
     /* Умолчание по узлу — «до первого рабочего»: то же решение, что принимает подъём
      * выхода, поэтому проверка отвечает на вопрос «что будет, если применить». */
     out->node = -1;

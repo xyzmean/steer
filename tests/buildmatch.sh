@@ -136,9 +136,10 @@ for f in src/daemon/main.c src/daemon/failover.c src/lib/sindex.c src/lib/nftnl.
     n=$(grep -c 'fprintf(stderr, "steer: ' "$f" 2>/dev/null); [ -n "$n" ] || n=0
     [ "$n" -gt 0 ] && bare="$bare$f:$n "
 done
-# main.c: шесть законных строк — четыре отказа «этого нет в этой сборке» (VLESS, клиент
-# xsteer, хаб xsteer, служебные команды xsteer), «флаги идут после команды» и неизвестное
-# слово у tgws-probe (I-316) — последние два суть разбор аргументов. Все они
+# main.c: восемь законных строк — четыре отказа «этого нет в этой сборке» (VLESS, клиент
+# xsteer, хаб xsteer, служебные команды xsteer), «флаги идут после команды», неизвестное
+# слово у tgws-probe (I-316) и два отказа флага --platform (без значения, нет такой
+# платформы) — последние четыре суть разбор аргументов. Все они
 # заканчиваются кодом 2 и до журнала не доходят, о чём сказано в контракте §5. Больше ни в
 # одном файле голых быть не должно.
 #
@@ -149,7 +150,7 @@ done
 # (см. шапку srs.h), то есть до журнала эти строки не доходят так же, как die(). Ровно одна
 # строка того же файла печатается при УДАВШЕМСЯ разборе — про пропущенные подсети IPv6, — и
 # у неё уровень есть; проверка ниже сторожит именно это различие.
-check "голых «steer: » ровно столько, сколько отказов вызывающему" "src/daemon/main.c:6 src/tools/srs.c:23 " "$bare"
+check "голых «steer: » ровно столько, сколько отказов вызывающему" "src/daemon/main.c:8 src/tools/srs.c:23 " "$bare"
 # Строка, которая печатается при успехе, обязана иметь уровень: разбор удался, значит это
 # журнал во время работы, а не отказ вызывающему.
 check "предупреждение об IPv6 в srs идёт с уровнем" "1" \
@@ -676,6 +677,33 @@ done
 # шёл с одним MSS, и потеря первого SYN оставляла сессию без масштаба окна (I-292).
 check "src/proto/obfs/obfs.c: оба SYN с OBFS_SYN_OPTS" "2" "$(grep -c 'TH_SYN, NULL, 0, OBFS_SYN_OPTS)' src/proto/obfs/obfs.c)"
 check "src/proto/obfs/obfs.c: SYN с голым MSS не осталось" "0" "$(grep -c 'TH_SYN, NULL, 0, 1)' src/proto/obfs/obfs.c)"
+
+# ---- правило 2 (docs/architecture.md, раздел 2): платформа — модуль, выбираемый при запуске ----
+#
+# Решение владельца: «Отличия телефона от роутера лежат в platform/android.c и platform/openwrt.c
+# за одной таблицей struct platform_ops. Один бинарник сам определяет, где он запущен, а
+# --platform переопределяет выбор для стендов. #ifdef STEER_ANDROID в общем коде нет.» До этого
+# шага развилка по STEER_ANDROID стояла в двух десятках файлов, и третья платформа превратила бы
+# каждую в развилку на три ветки. Теперь общий код спрашивает признак у plat(), а умолчание
+# выбора задаёт ключ -DSTEER_DEFAULT_PLATFORM (Makefile, Android.bp). Условная компиляция по
+# STEER_ANDROID — в любом виде (#ifdef, #ifndef, defined(…)) — законна разве что в src/platform.
+# Комментарии не в счёт — тот же приём, что у правил 5 и 6.
+platbad=""
+for f in $(find src \( -name '*.c' -o -name '*.h' \) ! -path 'src/platform/*'); do
+    n=$(grep -vE '^[[:space:]]*(\*|//|/\*)' "$f" | \
+        grep -cE '^[[:space:]]*#[[:space:]]*(if|ifdef|ifndef|elif)\>.*\<STEER_ANDROID\>')
+    [ -n "$n" ] || n=0
+    [ "$n" -gt 0 ] && platbad="$platbad$f:$n "
+done
+check "в src нет условной компиляции по STEER_ANDROID вне src/platform (правило 2)" "" "$platbad"
+# Сборки задают платформу умолчанием, а не старым ключом, который больше никто не читает (и на
+# который src/platform/platform.c отвечает #error).
+check "Android.bp: умолчание платформы — телефон" "1" \
+    "$(grep -c '"-DSTEER_DEFAULT_PLATFORM=android"' Android.bp)"
+check "Android.bp и Makefile не передают снятый ключ -DSTEER_ANDROID" "0" \
+    "$(grep -hvE '^[[:space:]]*(#|//)' Android.bp Makefile build/sources.mk | grep -cE -- '-DSTEER_ANDROID\>'; true)"
+check "Makefile: build/steer-android — та же сборка с умолчанием android" "1" \
+    "$(grep -c -- '-DSTEER_DEFAULT_PLATFORM=android -o \$@ \$(CORE_SRC)$' Makefile)"
 
 # ---- правило 6 (docs/architecture.md, раздел 2): спека — значение, а не глобалы ------------
 #

@@ -61,7 +61,7 @@
  * `--fast` никогда не отвечает пустотой.
  */
 void status_snap_path(char *buf, size_t n) {
-    snprintf(buf, n, "%s/status.json", g_state_dir);
+    snprintf(buf, n, "%s/status.json", steer_state_dir());
 }
 
 /* Снимок больше этого не бывает: сотня выходов и сотня каналов — это единицы килобайт.
@@ -256,7 +256,7 @@ int cmd_status(const char *spec, int fast) {
     char snap[256], tmp[288];
     status_snap_path(snap, sizeof snap);
     snprintf(tmp, sizeof tmp, "%s.new", snap);
-    mkdir(g_state_dir, 0755);
+    mkdir(steer_state_dir(), 0755);
     FILE *f = fopen(tmp, "w");
     if (!f) { status_emit(&cfg, &gr, stdout); return 0; }
     status_emit(&cfg, &gr, f);

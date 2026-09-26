@@ -395,7 +395,11 @@ int main(void) {
     check("kind awg без conf — годен", 0,
           spec_str("\"outputs\":{\"nl\":{\"kind\":\"awg\",\"on_fail\":\"drop\"}},\"channels\":[]"));
     check_str("  устройство — имя выхода", "nl", g_spec.out[0].device);
-    check_str("  conf по умолчанию из имени выхода", STEER_ETC_DIR "/awg/nl.conf", g_spec.out[0].awg.conf);
+    {
+        char want[256];
+        snprintf(want, sizeof want, "%s/awg/nl.conf", plat()->etc_dir);
+        check_str("  conf по умолчанию из имени выхода", want, g_spec.out[0].awg.conf);
+    }
     check("  выход с устройством и меткой", 1, out_has_device(&g_spec.out[0]) && out_needs_mark(&g_spec.out[0]));
     check("  устройство заводит движок", 1, out_engine_managed(&g_spec.out[0]));
     check("  masquerade ему нужен (не self_natting)", 0, out_self_natting(&g_spec.out[0]));
@@ -424,20 +428,16 @@ int main(void) {
                  "\"d\":{\"kind\":\"direct\"}},\"channels\":[]");
         g_spec.out[1].mark = 0x00300000;
         uint32_t mk = 0xdead;
-#ifdef STEER_SELF_MARK
-        uint32_t self = STEER_SELF_MARK;
-#else
-        uint32_t self = 0;
-#endif
+        uint32_t self = STEER_SELF_MARK;          /* платформы: на роутере 0 */
         check("без via — метка «сам движок» (на роутере 0)", 0, awg_sock_mark(&g_spec, NULL, &mk));
         check("  значение", (long)self, (long)mk);
         check("via на выход с меткой — его метка", 0, awg_sock_mark(&g_spec, "up", &mk));
-#ifdef STEER_TUNNEL_BIT
-        /* Телефон: к метке цели — бит «собственный трафик туннеля» (заворот DNS его пропускает). */
-        check("  значение (с битом туннеля)", 0x10300000, (long)mk);
-#else
-        check("  значение", 0x00300000, (long)mk);
-#endif
+        if (STEER_TUNNEL_BIT)
+            /* Телефон: к метке цели — бит «собственный трафик туннеля» (заворот DNS его
+             * пропускает). */
+            check("  значение (с битом туннеля)", 0x10300000, (long)mk);
+        else
+            check("  значение", 0x00300000, (long)mk);
         check("via на direct — как без via", 0, (awg_sock_mark(&g_spec, "d", &mk), (long)(mk != self)));
         check("via на несуществующий выход — отказ", -1, awg_sock_mark(&g_spec, "nope", &mk));
     }

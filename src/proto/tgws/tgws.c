@@ -261,8 +261,9 @@ static void dc_table_init(void) {
     for (size_t i = 0; i < sizeof(DC_BUILTIN) / sizeof(DC_BUILTIN[0]); i++)
         dc_add(DC_BUILTIN[i].ip, DC_BUILTIN[i].dc, DC_BUILTIN[i].media);
 
+    char dflt[512];
     const char *path = getenv("STEER_TGWS_DCMAP");
-    if (!path) path = STEER_ETC_DIR "/tgws-dc.conf";
+    if (!path) path = plat_etc_path(dflt, sizeof dflt, "tgws-dc.conf");
     FILE *f = fopen(path, "r");
     if (!f) return;
     char line[128];
@@ -361,8 +362,9 @@ static void dom_cool(const char *d, time_t until) {
 }
 
 static void alt_init(void) {
+    char dflt[512];
     const char *path = getenv("STEER_TGWS_DOMAINS");
-    if (!path) path = STEER_ETC_DIR "/tgws-domains.lst";
+    if (!path) path = plat_etc_path(dflt, sizeof dflt, "tgws-domains.lst");
     FILE *f = fopen(path, "r");
     if (!f) return;
     /* Слишком длинное имя НАЗЫВАЕТСЯ и пропускается, а не урезается (I-155). Урезанное имя —
@@ -483,8 +485,9 @@ static int route_idx(int dc, int media) {
 
 static void route_init(void) {
     memset(g_route, 0, sizeof(g_route));
+    char dflt[512];
     const char *path = getenv("STEER_TGWS_ROUTE");
-    if (!path) path = STEER_ETC_DIR "/tgws-route.conf";
+    if (!path) path = plat_etc_path(dflt, sizeof dflt, "tgws-route.conf");
     FILE *f = fopen(path, "r");
     if (!f) return;
     char line[224];

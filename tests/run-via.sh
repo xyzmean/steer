@@ -32,12 +32,12 @@
 #
 # Движок — расширенная сборка с mbedtls 3.x и src/kinds/awg.c, статикой musl (glibc не даёт потокам
 # туннеля стек в 128 КБ при их __thread-буферах — pthread_create отвечает EINVAL). Для
-# Android-сборки на обычном Linux: -DSTEER_ANDROID и каталоги в /tmp (-DSTEER_TMP_DIR,
+# Android-сборки на обычном Linux: -DSTEER_DEFAULT_PLATFORM=android и каталоги в /tmp (-DSTEER_TMP_DIR,
 # -DSTEER_STATE_DIR, -DSTEER_ETC_DIR, как в шапке local49.sh) плюс -DSTEER_TUN_DEV='"/dev/net/tun"'.
 #
 # Использование:
 #   STEER=<расширенный движок> sh tests/run-via.sh router
-#   STEER=<расширенный движок, собранный с -DSTEER_ANDROID> STEER_NFT_COMPAT=legacy-min \
+#   STEER=<расширенный движок, собранный с -DSTEER_DEFAULT_PLATFORM=android> STEER_NFT_COMPAT=legacy-min \
 #       sh tests/run-via.sh android
 # Нужны root, ip netns, nft, python3, wget; в режиме android — iptables и setpriv.
 set -eu

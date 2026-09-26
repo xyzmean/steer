@@ -21,10 +21,8 @@ void fwcheck_reset_cache(void);
 /* Чем объяснять совпадение адреса — доменным списком, адресным или обоими (explain.c);
  * отдельной функцией ради стенда tests/fwmatch.c, см. её шапку там же. */
 const char *explain_set_phrase(const char *addr, int has_files, int has_domains);
-#ifndef STEER_ANDROID
 void report_traceroute_dep(const struct spec *sp);
 void report_output_deps(const struct spec *sp);
-#endif
 
 /* Путь снимка состояния status — снимает apply.c, пишет и отдаёт status.c. */
 void status_snap_path(char *buf, size_t n);
@@ -45,8 +43,6 @@ int failover_loop(const char *spec, int verbose, int period);
 int cmd_failover(const char *spec, int verbose);   /* failover.c */
 void probe_rule_cleanup(void);   /* failover.c */
 
-#ifdef STEER_ANDROID
-void android_masq_ensure(const struct spec *sp);
-#endif
+void iptables_masq_ensure(const struct spec *sp);   /* apply.c, plat()->iptables_masq */
 
 #endif

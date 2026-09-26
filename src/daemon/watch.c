@@ -99,18 +99,18 @@ int failover_loop(const char *spec, int verbose, int period) {
         if (pid == 0) {
             if (piped) close(pfd[0]);
             int rc = cmd_failover(spec, verbose);
-#ifdef STEER_ANDROID
-            /* Свой экземпляр спеки (правило 6): та, что cmd_failover уже разобрал, живёт в
+            /* masquerade правилом iptables (телефон): netd при перезапуске перестраивает
+             * iptables, и наши правила пропадают — вернуть их (iptables_masq_ensure в apply.c).
+             * Свой экземпляр спеки (правило 6): та, что cmd_failover уже разобрал, живёт в
              * его собственном static struct spec и наружу не смотрит. Дочерний процесс за
              * миг до этого прошёл этим же load_spec внутри cmd_failover — если спека была
              * годной там, второй разбор здесь не откажет; не откажет — просто не подметём
              * masquerade в этом проходе, тем же кругом починится в следующем. */
-            {
+            if (plat()->iptables_masq) {
                 static struct spec cfg;
                 struct err e2 = {0};
-                if (load_spec(spec, &cfg, &e2) == 0) android_masq_ensure(&cfg);
+                if (load_spec(spec, &cfg, &e2) == 0) iptables_masq_ensure(&cfg);
             }
-#endif
             if (piped) awg_hs_send(pfd[1]);
             exit(rc);
         }
@@ -123,13 +123,11 @@ int failover_loop(const char *spec, int verbose, int period) {
         } else
             fprintf(stderr, "steer[warn] failover: fork: %s\n", strerror(errno));
         if (piped) close(pfd[0]);
-#ifndef STEER_ANDROID
-        /* На роутере проход сам делает ifdown/ifup мёртвому интерфейсу, и события за время
-         * прохода — его же следы: реагировать на них значило бы будить себя по кругу. На
-         * телефоне сторож интерфейсы не трогает (только ждёт), и событие за время прохода —
-         * настоящее: например, TUN, который как раз поднял помощник выхода. */
-        if (ev >= 0) failover_events_drain(ev);
-#endif
+        /* На роутере (plat()->netifd) проход сам делает ifdown/ifup мёртвому интерфейсу, и
+         * события за время прохода — его же следы: реагировать на них значило бы будить себя
+         * по кругу. На телефоне сторож интерфейсы не трогает (только ждёт), и событие за время
+         * прохода — настоящее: например, TUN, который как раз поднял помощник выхода. */
+        if (plat()->netifd && ev >= 0) failover_events_drain(ev);
 
         /* Ждать период ИЛИ событие. poll на монотонном времени: во сне устройства ожидание
          * стоит и не будит его. Событие — не повод бежать сразу: смена сети приходит пачкой

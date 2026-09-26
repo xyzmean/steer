@@ -1102,7 +1102,7 @@ static int resolve_peers(struct awg_conf *c, const char *dev, int loud, int v4on
 
 #define REG_MAX (MAX_OUTPUTS * 2)
 
-static void reg_path(char *buf, size_t n) { snprintf(buf, n, "%s/awg-devices", g_state_dir); }
+static void reg_path(char *buf, size_t n) { snprintf(buf, n, "%s/awg-devices", steer_state_dir()); }
 
 static size_t reg_read(char dst[][IFNAMSIZ]) {
     char path[512];
@@ -1124,7 +1124,7 @@ static void reg_write(char devs[][IFNAMSIZ], size_t n) {
     char path[512], tmp[544];
     reg_path(path, sizeof path);
     snprintf(tmp, sizeof tmp, "%s.new", path);
-    mkdir(g_state_dir, 0755);
+    mkdir(steer_state_dir(), 0755);
     FILE *f = fopen(tmp, "w");
     if (!f) return;
     for (size_t i = 0; i < n; i++) fprintf(f, "%s\n", devs[i]);
@@ -1132,7 +1132,7 @@ static void reg_write(char devs[][IFNAMSIZ], size_t n) {
 }
 
 static void sig_path(const char *dev, char *buf, size_t n) {
-    snprintf(buf, n, "%s/awg-%s.sig", g_state_dir, dev);
+    snprintf(buf, n, "%s/awg-%s.sig", steer_state_dir(), dev);
 }
 
 static int sig_read(const char *dev, struct awg_sig *g) {
@@ -1210,7 +1210,7 @@ static int hs_get(const char *dev, struct hs_sample *out) {
         return -1;
     }
     char p[512];
-    snprintf(p, sizeof p, "%s/awg-%s.hs", g_state_dir, dev);
+    snprintf(p, sizeof p, "%s/awg-%s.hs", steer_state_dir(), dev);
     FILE *f = fopen(p, "r");
     if (!f) return -1;
     int ok = fscanf(f, "%llu %llu %ld %d", &out->tx, &out->rx, &out->t, &out->v) == 4;
@@ -1231,7 +1231,7 @@ static void hs_put(const char *dev, const struct hs_sample *s) {
         return;
     }
     char p[512];
-    snprintf(p, sizeof p, "%s/awg-%s.hs", g_state_dir, dev);
+    snprintf(p, sizeof p, "%s/awg-%s.hs", steer_state_dir(), dev);
     FILE *f = fopen(p, "w");
     if (!f) return;
     fprintf(f, "%llu %llu %ld %d\n", s->tx, s->rx, s->t, s->v);
@@ -1293,7 +1293,7 @@ static void dev_state_drop(const char *dev) {
     char p[512];
     sig_path(dev, p, sizeof p);
     unlink(p);
-    snprintf(p, sizeof p, "%s/awg-%s.hs", g_state_dir, dev);
+    snprintf(p, sizeof p, "%s/awg-%s.hs", steer_state_dir(), dev);
     unlink(p);
 }
 
@@ -1736,7 +1736,7 @@ static int awg_parse(struct output *o, const struct out_keys *k, struct err *e) 
     /* Путь к файлу — тем же порядком, что у xsteer: по умолчанию из имени выхода, иначе
      * абсолютный и годный к JSON (печатается в status и diag). */
     if (!o->awg.conf[0])
-        snprintf(o->awg.conf, sizeof(o->awg.conf), STEER_ETC_DIR "/awg/%.200s.conf", o->name);
+        snprintf(o->awg.conf, sizeof(o->awg.conf), "%s/awg/%.200s.conf", plat()->etc_dir, o->name);
     else if (o->awg.conf[0] != '/' || !label_ok(o->awg.conf))
         return err_set(e, "outputs.%s: conf должен быть абсолютным путём без кавычек", o->name);
     return 0;

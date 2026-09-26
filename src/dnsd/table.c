@@ -69,7 +69,7 @@ static void dch_signature(FILE *out) {
 /* Путь подписи. Рядом с остальным состоянием, тем же швом --state-dir: стенду нужно писать
  * её в песочницу, а не в /var/lib роутера, на котором он идёт. */
 static void dch_sig_path(char *dst, size_t n) {
-    snprintf(dst, n, "%s/dnsd.sig", g_state_dir);
+    snprintf(dst, n, "%s/dnsd.sig", steer_state_dir());
 }
 
 /* Записать подпись — атомарно, через файл рядом. Обрыв на середине оставил бы обрубок,

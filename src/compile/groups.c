@@ -219,7 +219,6 @@ int group_is_local(const struct group *g) {
     return g->from_n && from_is_local(g->from[0]);
 }
 
-#ifdef STEER_ANDROID
 int has_local(const struct groups *gr) {
     for (size_t i = 0; i < gr->n; i++) if (group_is_local(&gr->g[i])) return 1;
     return 0;
@@ -239,8 +238,6 @@ int has_via(const struct spec *sp) {
     for (size_t i = 0; i < sp->out_n; i++) if (sp->out[i].via[0]) return 1;
     return 0;
 }
-
-#endif
 
 /* Похожа ли строка на адрес или префикс IPv4. Только форма, без проверки диапазонов:
  * нам надо отличить «1.2.3.0/24» от «amazon.com», а не проверять корректность маски —

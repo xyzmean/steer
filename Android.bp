@@ -6,10 +6,13 @@
 // first version, so it is the module named "steer" that vendor/der/config/der.mk installs; the
 // base build stays as steer_base for trees without mbedtls.
 //
-// Both are compiled with -DSTEER_ANDROID (mark field above netd's bits, ip rule priorities
-// below netd's ladder, directories under /data/misc/steer, /dev/tun — see src/model/spec.h and
-// src/lib/paths.h). The engine calls `nft -f`, `ip` and `iptables` as external programs and finds
-// them through init's default PATH, which includes /system_ext/bin (nft) and /system/bin.
+// Both are compiled with -DSTEER_DEFAULT_PLATFORM=android. The platform is chosen at run time
+// (src/platform/platform.c) and the code of both platforms is in every binary; the define only
+// makes the phone the default, so the binary behaves as the phone wherever it runs (mark field
+// above netd's bits, ip rule priorities below netd's ladder, directories under
+// /data/misc/steer, /dev/tun — see src/platform/android.c). The engine calls `nft -f`, `ip`
+// and `iptables` as external programs and finds them through init's default PATH, which
+// includes /system_ext/bin (nft) and /system/bin.
 //
 // Installed in system_ext/bin/der/ rather than system_ext/bin/: every domain may list
 // /system_ext/bin (system_file:dir r_dir_perms), and the directory der/ carries its own SELinux
@@ -41,6 +44,9 @@ cc_defaults {
         "src/daemon/main.c",
         "src/lib/jsonr.c",
         "src/lib/tmpfile.c",
+        "src/platform/platform.c",
+        "src/platform/openwrt.c",
+        "src/platform/android.c",
         "src/model/parse.c",
         "src/model/registry.c",
         "src/model/probe.c",
@@ -76,6 +82,7 @@ cc_defaults {
     local_include_dirs: [
         "src/lib",
         "src/model",
+        "src/platform",
         "src/compile",
         "src/daemon",
         "src/kinds",
@@ -90,7 +97,7 @@ cc_defaults {
         "src/proto/tgws",
     ],
     cflags: [
-        "-DSTEER_ANDROID",
+        "-DSTEER_DEFAULT_PLATFORM=android",
         // Keep in step with VERSION (build.sh and the Makefile read it from
         // there; Soong cannot read a file into a define).
         "-DSTEER_VERSION=\"1.5.8\"",

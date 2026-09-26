@@ -99,8 +99,10 @@ static int g_up_pool6[UP_POOL];
 static int g_up_pool6_n;              /* открытые сокеты g_up_pool6 — первые g_up_pool6_n */
 static int16_t g_txmap[65536];
 
-#ifdef STEER_ANDROID
 /* ПЕРЕСПРОС С МЕТКОЙ СЕТИ ИСХОДНОГО ЗАПРОСА (только Android, только origdst).
+ *
+ * Где это есть: на платформе, где собственный трафик движка метится (plat()->self_mark не
+ * ноль, src/platform/android.c). На роутере сокеты наверх не метятся вовсе.
  *
  * Зачем. netd метит каждый сокет fwmark'ом (Fwmark.h: номер сети — биты 0-15, explicitly
  * selected — 16, protectedFromVpn — 17, права — 18-19, uidBillingDone — 20), и маршрут на
@@ -141,10 +143,9 @@ static unsigned up_mark_for(uint32_t ctmark, int have) {
 }
 
 static void up_mark_set(int fd, unsigned *cur, unsigned want) {
-    if (*cur == want) return;
+    if (!STEER_SELF_MARK || *cur == want) return;
     if (setsockopt(fd, SOL_SOCKET, SO_MARK, &want, sizeof(want)) == 0) *cur = want;
 }
-#endif
 
 static uint16_t rand16(void) {
     uint16_t v = 0;
@@ -545,16 +546,12 @@ static int dns_query(uint8_t *buf, ssize_t n, struct sockaddr_storage from, sock
         if (up.sa.sa_family == AF_INET6) {
             int i = rand16() % g_up_pool6_n;
             ufd = g_up_pool6[i];
-#ifdef STEER_ANDROID
             up_mark_set(ufd, &g_up_mark6[i], up_mark_for(ctmark, have_mark));
-#endif
         } else {
             int i = rand16() % UP_POOL;
             ufd = g_up_pool[i];
             if (ufd < 0) ufd = g_up_fd;
-#ifdef STEER_ANDROID
             else up_mark_set(ufd, &g_up_mark[i], up_mark_for(ctmark, have_mark));
-#endif
         }
     }
     (void)ctmark; (void)have_mark;
@@ -1183,16 +1180,15 @@ static int tcpu_open(struct pending *p, const uint8_t *q, size_t n, const union 
     uint8_t *fq = fd >= 0 ? malloc(n + 2) : NULL;
     if (fd >= 0 && !fq) why = "нет памяти";
     if (fd >= 0 && fq) {
-#ifdef STEER_ANDROID
         /* Та же метка, что у переспроса по UDP (up_mark_for): поля netd исходного соединения —
          * чтобы запрос ушёл сетью, по которой спрашивал клиент, — и «сам движок» в поле
          * движка, без которого заворот TCP/53 на output вернул бы наш же запрос к нам. Ставится
-         * до connect: SYN уже идёт по маршруту этой метки. */
-        unsigned mk = up_mark_for(ctmark, have_mark);
-        setsockopt(fd, SOL_SOCKET, SO_MARK, &mk, sizeof(mk));
-#else
-        (void)ctmark; (void)have_mark;
-#endif
+         * до connect: SYN уже идёт по маршруту этой метки. Только там, где свой трафик
+         * метится (STEER_SELF_MARK не ноль). */
+        if (STEER_SELF_MARK) {
+            unsigned mk = up_mark_for(ctmark, have_mark);
+            setsockopt(fd, SOL_SOCKET, SO_MARK, &mk, sizeof(mk));
+        }
         int one = 1;
         setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
         int rc = connect(fd, &up->sa, up->sa.sa_family == AF_INET6 ? sizeof(up->v6)
@@ -1560,17 +1556,16 @@ int run_proxy(int listen_port, int upstream_port) {
     g_up_port = upstream_port;
     up.sin_port = htons((uint16_t)upstream_port);
     up.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
-#ifdef STEER_ANDROID
-    /* Собственный запрос наверх помечен значением «сам движок» (STEER_SELF_MARK в spec.h):
-     * заворот DNS на output берёт всех, включая root, — DnsResolver шлёт запросы приложений от
-     * root, — и без метки наш же запрос к серверу сети завернулся бы обратно к нам. */
-    {
+    /* Собственный запрос наверх помечен значением «сам движок» (STEER_SELF_MARK, marks.h) —
+     * там, где оно есть: заворот DNS на output берёт всех, включая root, — DnsResolver шлёт
+     * запросы приложений от root, — и без метки наш же запрос к серверу сети завернулся бы
+     * обратно к нам. */
+    if (STEER_SELF_MARK) {
         unsigned mk = STEER_SELF_MARK;
         if (setsockopt(g_up_fd, SOL_SOCKET, SO_MARK, &mk, sizeof(mk)) != 0)
             fprintf(stderr, "steer[warn] dnsd: SO_MARK на сокете наверх не встал (%s) — "
                             "запросы наверх завернутся к резолверу по кругу\n", strerror(errno));
     }
-#endif
     /* В режиме origdst серверы наверху разные — сокет не connect'нут (см. g_origdst). */
     if (!g_origdst && connect(g_up_fd, (struct sockaddr *)&up, sizeof(up)) != 0) {
         perror("upstream connect");
@@ -1592,11 +1587,11 @@ int run_proxy(int listen_port, int upstream_port) {
             if (fd < 0) continue;
             struct sockaddr_in any = { .sin_family = AF_INET };
             if (bind(fd, (struct sockaddr *)&any, sizeof(any)) != 0) { close(fd); continue; }
-#ifdef STEER_ANDROID
-            unsigned mk = STEER_SELF_MARK;
-            setsockopt(fd, SOL_SOCKET, SO_MARK, &mk, sizeof(mk));
-            g_up_mark[i] = mk;
-#endif
+            if (STEER_SELF_MARK) {
+                unsigned mk = STEER_SELF_MARK;
+                setsockopt(fd, SOL_SOCKET, SO_MARK, &mk, sizeof(mk));
+                g_up_mark[i] = mk;
+            }
             g_up_pool[i] = fd;
             struct epoll_event pev = {0};
             pev.events = EPOLLIN;
@@ -1613,11 +1608,11 @@ int run_proxy(int listen_port, int upstream_port) {
             struct sockaddr_in6 any6 = { .sin6_family = AF_INET6 };
             if (bind(fd, (struct sockaddr *)&any6, sizeof(any6)) != 0) { close(fd); break; }
             int k = g_up_pool6_n++;
-#ifdef STEER_ANDROID
-            unsigned mk = STEER_SELF_MARK;
-            setsockopt(fd, SOL_SOCKET, SO_MARK, &mk, sizeof(mk));
-            g_up_mark6[k] = mk;
-#endif
+            if (STEER_SELF_MARK) {
+                unsigned mk = STEER_SELF_MARK;
+                setsockopt(fd, SOL_SOCKET, SO_MARK, &mk, sizeof(mk));
+                g_up_mark6[k] = mk;
+            }
             g_up_pool6[k] = fd;
             struct epoll_event pev = {0};
             pev.events = EPOLLIN;
