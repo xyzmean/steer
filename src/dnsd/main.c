@@ -204,6 +204,9 @@ int dnsd_main(int argc, char **argv) {
     int listen_port = 5300;
     int upstream_port = 53;
     const char *spec = plat()->spec_path;
+    /* Куда переспрашивать по умолчанию — свойство платформы (platform.h, dnsd_origdst): на
+     * телефоне на 127.0.0.1:53 никого нет. Флаг --upstream-origdst включает то же явно. */
+    g_origdst = plat()->dnsd_origdst;
 
     for (int i = 0; i < argc; i++) {
         if (strcmp(argv[i], "--selftest") == 0) {

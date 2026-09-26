@@ -48,8 +48,13 @@ static uint32_t fakeip_index_to_addr(size_t idx) { return FAKEIP_POOL_BASE + (ui
  * a count-based index, `a -> .3` alone in the file makes the fourth new domain
  * allocate .3 as well — two domains on ONE fake IP, whose DNAT entry then points
  * at whichever was inserted last, i.e. one of them silently reaches the other's
- * site. */
-size_t g_fakeip_next;
+ * site.
+ *
+ * Starts at 1, not 0: index 0 is 198.18.0.0 — the network address of the pool, which some
+ * stacks and tools treat as unusable (found on Cuttlefish, Android 16). The last index is
+ * skipped for the same reason (see the exhaustion check in fakeip_lookup_or_alloc). An old
+ * state file that already maps a domain to .0 is loaded as is — no migration. */
+size_t g_fakeip_next = 1;
 
 static int fakeip_table_add(struct fakeip_table *t, const char *domain, uint32_t addr) {
     if (t->n == t->cap) {
@@ -210,7 +215,7 @@ int fakeip_lookup_or_alloc(const char *domain_in, uint32_t *out_addr) {
         *out_addr = g_fakeip.entries[at].addr;
         return 0;
     }
-    if (g_fakeip_next >= FAKEIP_POOL_SIZE) {
+    if (g_fakeip_next >= FAKEIP_POOL_SIZE - 1) {   /* последний — широковещательный пула */
         /* Пул кончился: домен уйдёт клиенту реальным адресом, то есть МИМО канала, в
          * который его положил человек. Молчать об этом нельзя — снаружи это «правило
          * перестало работать», и связать это с пулом нечем. */

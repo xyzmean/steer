@@ -102,6 +102,7 @@ const struct platform_ops plat_openwrt = {
     .iptables_masq = 0,
     .lan_bridge = 1,
     .warn_iptables_nat = 1,
+    .dnsd_origdst = 0,                /* наверх — dnsmasq роутера на петле */
     .ctl_allow_domain = NULL,
 
     .os_release = "/etc/openwrt_release",
