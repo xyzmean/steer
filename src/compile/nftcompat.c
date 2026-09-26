@@ -112,3 +112,35 @@ int nft_compat(void) {
     cached = r;
     return r;
 }
+
+/* Составной интервальный набор (ipv4_addr . inet_proto . inet_service, flags interval,timeout):
+ * примет ли его ядро. Нужен только каналам, у списка которых сужение СМЕШАННОЕ (набор .srs, где
+ * часть подсетей — «udp 50000-65535», часть — без сужения, см. src/model/srsplan.c): такой
+ * список ложится в ядро одним набором и одним правилом. Интервалы в составном ключе (pipapo)
+ * есть с Linux 5.6; на старой раскладке (4.9) их нет заведомо, а на 5.2-5.5 раскладка
+ * современная, но набор не примется — поэтому для современной спрашивается ядро, пробной
+ * таблицей через `nft -c`. Нет — канал делится на группы по сужению, как раньше делились
+ * каналы с разными портами.
+ *
+ * Спрашивается лениво — только когда такой канал есть, — и один раз на процесс. STEER_NFT_CONCAT
+ * (0 или 1) переопределяет ответ для стендов; STEER_NFT_COMPAT=modern без него значит «да»
+ * (стенды генератора ядра не спрашивают вовсе), legacy и legacy-min — «нет». */
+int nft_concat_ok(void) {
+    static int cached = -1;
+    if (cached >= 0) return cached;
+    const char *o = getenv("STEER_NFT_CONCAT");
+    if (o && (!strcmp(o, "0") || !strcmp(o, "1"))) return cached = o[0] == '1';
+    if (nft_compat() & NFTC_LEGACY) return cached = 0;
+    const char *e = getenv("STEER_NFT_COMPAT");
+    if (e && !strcmp(e, "modern")) return cached = 1;
+    char text[512];
+    snprintf(text, sizeof(text),
+             "table inet %s_nprobe {\n"
+             "    set s {\n"
+             "        type ipv4_addr . inet_proto . inet_service\n"
+             "        flags interval,timeout\n"
+             "        elements = { 192.0.2.0/24 . 0-255 . 0-65535 }\n"
+             "    }\n"
+             "}\n", nft_table());
+    return cached = nft_check_text(text) == 1;
+}

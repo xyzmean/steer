@@ -38,6 +38,7 @@
 #include "obfs.h"
 #include "cli.h"
 #include "srs.h"
+#include "srsread.h"
 #include "ctl.h"
 #include "daemon.h"
 #include "groups.h"

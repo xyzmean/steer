@@ -148,14 +148,27 @@ struct nft_set *ir_map_add(struct nft_table *t, const char *name, const char *ke
     return s;
 }
 
-static void ir_set_src(struct nft_set *s, enum nft_elk k, const char *str) {
-    if (!s || !s->o.table) return;
+static struct nft_elsrc *ir_set_src(struct nft_set *s, enum nft_elk k, const char *str) {
+    if (!s || !s->o.table) return NULL;
     struct nft_elsrc *e = ir_alloc(s->o.table->rs, sizeof(*e));
-    if (!e) return;
+    if (!e) return NULL;
     e->k = k;
     e->s = ir_strdup(s->o.table->rs, str);
     *s->els_tail = e;
     s->els_tail = &e->next;
+    return e;
+}
+
+void *ir_mem(struct nft_rs *rs, size_t n) { return ir_alloc(rs, n); }
+
+void ir_set_srs(struct nft_set *s, const char *path, const struct ir_srs *src) {
+    struct nft_elsrc *e = ir_set_src(s, NFT_EL_SRS, path);
+    if (e) e->p = src;
+}
+
+void ir_set_mixed(struct nft_set *s, const struct ir_mixed *m) {
+    struct nft_elsrc *e = ir_set_src(s, NFT_EL_MIXED, "");
+    if (e) e->p = m;
 }
 
 void ir_set_value(struct nft_set *s, const char *v) { ir_set_src(s, NFT_EL_VALUE, v); }

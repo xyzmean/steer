@@ -12,7 +12,10 @@
 #include <arpa/inet.h>
 #include <netinet/in.h>
 
+#include <stdlib.h>
+
 #include "spec.h"
+#include "srs.h"
 #include "ir.h"
 
 #define LOG_W "steer[warn] apply: "
@@ -50,6 +53,225 @@ static size_t emit_elements(FILE *f, const char *path, size_t already) {
     }
     fclose(in);
     return n - already;
+}
+
+/* ---- подсети набора .srs (NFT_EL_SRS) -------------------------------------------------------
+ * Потоком, как адресный список: читатель отдаёт префиксы по одному (srs_walk), и в памяти не
+ * лежит ничего, кроме окна распаковки. Имена набора не читаются вовсе — их берёт резолвер. */
+struct srs_pr { FILE *f; size_t n; int excl; };
+
+static int srs_pr_cb(void *ctx, const struct srs_elem *el) {
+    struct srs_pr *p = ctx;
+    if (el->kind != SRS_EL_CIDR || el->family != 4 || el->excl != p->excl) return 0;
+    /* Та же запись, что у srs-read: набор, подключённый ключом, и набор, разложенный в списки,
+     * дают один и тот же текст. */
+    char b[24];
+    snprintf(b, sizeof(b), "%u.%u.%u.%u/%d", el->addr[0], el->addr[1], el->addr[2],
+             el->addr[3], el->plen);
+    if (p->n) fputs(", ", p->f);
+    fputs(b, p->f);
+    p->n++;
+    return 0;
+}
+
+static size_t emit_srs(FILE *f, const char *path, const struct ir_srs *src, size_t already) {
+    struct srs_pr p = { f, already, src->excl };
+    struct err e = {0};
+    /* Не отказ: разбор набора уже прошёл (check_address_lists), и сюда попадают только гонкой —
+     * файл заменили между проверкой и печатью. Пропадут подсети одного набора, про это сказано. */
+    if (srs_walk(src->set, SRS_EL_CIDR, src->sel, srs_pr_cb, &p, &e) != 0)
+        fprintf(stderr, LOG_W "%s — его подсети в набор правил не попали\n",
+                e.msg[0] ? e.msg : path);
+    return p.n - already;
+}
+
+/* ---- составной набор (NFT_EL_MIXED) ----------------------------------------------------------
+ *
+ * Ключ — адрес . протокол . порты, и ядро НЕ ПРИНИМАЕТ пересекающихся элементов: `10.0.0.0/8 .
+ * 17 . 1-100` и `10.1.0.0/16 . 17 . 50-60` отвергаются целиком (EEXIST), auto-merge сливает
+ * только точные повторы. А пересечения здесь обычны: подсеть без сужения из собственного
+ * списка канала и та же подсеть с «udp 50000-65535» из набора, два списка одного хостинга.
+ *
+ * Поэтому элементы собираются в память и раскладываются заново: проход по адресной оси, на
+ * каждом отрезке — множество действующих сужений, и оно печатается НЕПЕРЕСЕКАЮЩИМИСЯ ящиками
+ * «протокол × порты» (l4_union_boxes). Соседние отрезки с одинаковым множеством сливаются.
+ * Память — 32 байта на подсеть, и только у составного набора: он бывает лишь у канала со
+ * смешанным сужением, а у обычного набора элементы по-прежнему идут потоком. */
+struct mx_ev { uint64_t pos; uint16_t l4; int16_t d; };
+struct mx {
+    struct mx_ev *ev;
+    size_t n, cap;
+    const struct l4match *l4s[64];
+    size_t nl4;
+    int over;
+};
+
+static int mx_l4(struct mx *m, const struct l4match *l4) {
+    for (size_t i = 0; i < m->nl4; i++)
+        if (m->l4s[i] == l4 || l4match_same(m->l4s[i], l4)) return (int)i;
+    if (m->nl4 == 64) { m->over = 1; return -1; }
+    m->l4s[m->nl4] = l4;
+    return (int)m->nl4++;
+}
+
+static int mx_add(struct mx *m, uint32_t lo, uint32_t hi, int l4) {
+    if (l4 < 0) return 0;
+    if (m->n + 2 > m->cap) {
+        size_t cap = m->cap ? m->cap * 2 : 1024;
+        struct mx_ev *e = realloc(m->ev, cap * sizeof(*e));
+        if (!e) return -1;
+        m->ev = e;
+        m->cap = cap;
+    }
+    m->ev[m->n++] = (struct mx_ev){ lo, (uint16_t)l4, 1 };
+    m->ev[m->n++] = (struct mx_ev){ (uint64_t)hi + 1, (uint16_t)l4, -1 };
+    return 0;
+}
+
+struct mx_srs { struct mx *m; const struct l4match *eff; };
+static int mx_srs_cb(void *ctx, const struct srs_elem *el) {
+    struct mx_srs *c = ctx;
+    if (el->kind != SRS_EL_CIDR || el->family != 4 || el->excl) return 0;
+    uint32_t a = ((uint32_t)el->addr[0] << 24) | ((uint32_t)el->addr[1] << 16) |
+                 ((uint32_t)el->addr[2] << 8) | el->addr[3];
+    uint32_t span = el->plen >= 32 ? 0 : (el->plen <= 0 ? 0xFFFFFFFFu : (0xFFFFFFFFu >> el->plen));
+    return mx_add(c->m, a, a | span, mx_l4(c->m, &c->eff[el->clause])) ? -1 : 0;
+}
+
+/* Адресная строка списка → диапазон: «a.b.c.d», «a.b.c.d/n», «a-b». 0 — не адрес. */
+static int line_range(const char *p, uint32_t *lo, uint32_t *hi) {
+    char buf[64];
+    size_t n = strcspn(p, " \t");
+    if (n >= sizeof(buf)) return 0;
+    memcpy(buf, p, n);
+    buf[n] = '\0';
+    char *dash = strchr(buf, '-'), *slash = strchr(buf, '/');
+    struct in_addr a, b;
+    if (dash) {
+        *dash = '\0';
+        if (inet_pton(AF_INET, buf, &a) != 1 || inet_pton(AF_INET, dash + 1, &b) != 1) return 0;
+        *lo = ntohl(a.s_addr);
+        *hi = ntohl(b.s_addr);
+        return *lo <= *hi;
+    }
+    int plen = 32;
+    if (slash) {
+        *slash = '\0';
+        char *end = NULL;
+        long v = strtol(slash + 1, &end, 10);
+        if (!end || *end || v < 0 || v > 32) return 0;
+        plen = (int)v;
+    }
+    if (inet_pton(AF_INET, buf, &a) != 1) return 0;
+    uint32_t span = plen >= 32 ? 0 : (plen <= 0 ? 0xFFFFFFFFu : (0xFFFFFFFFu >> plen));
+    *lo = ntohl(a.s_addr) & ~span;
+    *hi = *lo | span;
+    return 1;
+}
+
+static int ev_cmp(const void *a, const void *b) {
+    const struct mx_ev *x = a, *y = b;
+    return x->pos < y->pos ? -1 : x->pos > y->pos;
+}
+
+static void addr_text(uint32_t lo, uint32_t hi, char *dst, size_t n) {
+    uint32_t span = hi - lo;
+    int aligned = ((span + 1u) & span) == 0 && (lo & span) == 0;   /* степень двойки и выровнен */
+    if (lo == 0 && hi == 0xFFFFFFFFu) aligned = 1;
+    if (aligned) {
+        int plen = 32;
+        while (plen > 0 && (span >> (32 - plen)) != 0) plen--;
+        if (lo == 0 && hi == 0xFFFFFFFFu) plen = 0;
+        if (plen == 32)
+            snprintf(dst, n, "%u.%u.%u.%u", lo >> 24, (lo >> 16) & 255, (lo >> 8) & 255, lo & 255);
+        else
+            snprintf(dst, n, "%u.%u.%u.%u/%d", lo >> 24, (lo >> 16) & 255, (lo >> 8) & 255,
+                     lo & 255, plen);
+        return;
+    }
+    snprintf(dst, n, "%u.%u.%u.%u-%u.%u.%u.%u", lo >> 24, (lo >> 16) & 255, (lo >> 8) & 255,
+             lo & 255, hi >> 24, (hi >> 16) & 255, (hi >> 8) & 255, hi & 255);
+}
+
+/* Один отрезок адресов с множеством сужений act — непересекающимися ящиками. */
+static void mx_print(FILE *f, const struct mx *m, uint64_t lo, uint64_t hi, uint64_t act,
+                     size_t *written) {
+    const struct l4match *ms[64];
+    size_t k = 0;
+    for (size_t b = 0; b < m->nl4; b++) if (act & (1ULL << b)) ms[k++] = m->l4s[b];
+    struct l4box box[L4BOX_MAX];
+    size_t nb = l4_union_boxes(ms, k, box);
+    char at[40], bt[48];
+    addr_text((uint32_t)lo, (uint32_t)hi, at, sizeof(at));
+    for (size_t j = 0; j < nb; j++) {
+        l4_box_text(&box[j], bt, sizeof(bt));
+        fprintf(f, (*written)++ ? ", %s . %s" : "        elements = { %s . %s", at, bt);
+    }
+}
+
+static void emit_mixed(FILE *f, const struct ir_mixed *mix) {
+    struct mx m;
+    memset(&m, 0, sizeof(m));
+    for (size_t i = 0; i < mix->n; i++) {
+        const struct ir_mixed_src *s = &mix->v[i];
+        if (s->set) {
+            struct mx_srs c = { &m, s->eff };
+            struct err e = {0};
+            if (srs_walk(s->set, SRS_EL_CIDR, s->sel, mx_srs_cb, &c, &e) != 0)
+                fprintf(stderr, LOG_W "%s — его подсети в набор правил не попали\n",
+                        e.msg[0] ? e.msg : s->path);
+            continue;
+        }
+        FILE *in = fopen(s->path, "r");
+        if (!in) {
+            fprintf(stderr, LOG_W "%s: список исчез во время сборки набора правил\n", s->path);
+            continue;
+        }
+        int l4 = mx_l4(&m, s->l4);
+        char line[512];
+        while (fgets(line, sizeof(line), in)) {
+            char *nl = strpbrk(line, "\r\n");
+            if (nl) *nl = '\0';
+            char *p = line;
+            while (*p == ' ' || *p == '\t') p++;
+            if (!*p || *p == '#' || *p == ';' || !spec_line_is_addr(p)) continue;
+            uint32_t lo, hi;
+            if (line_range(p, &lo, &hi) && mx_add(&m, lo, hi, l4) != 0) break;
+        }
+        fclose(in);
+    }
+    if (m.over)
+        fprintf(stderr, LOG_W "составной набор: вариантов сужения больше 64 — лишние не вошли\n");
+    qsort(m.ev, m.n, sizeof(m.ev[0]), ev_cmp);
+    int cnt[64] = {0};
+    uint64_t act = 0, prev = 0;
+    struct { uint64_t lo, hi, act; int have; } pend = { 0, 0, 0, 0 };
+    size_t written = 0;
+    for (size_t i = 0; i <= m.n; ) {
+        uint64_t pos = i < m.n ? m.ev[i].pos : ((uint64_t)1 << 32);
+        /* Отрезок [prev, pos) с множеством act — к отложенному, если продолжает его. */
+        if (pos > prev && act) {
+            if (pend.have && pend.act == act && pend.hi + 1 == prev) {
+                pend.hi = pos - 1;
+            } else {
+                if (pend.have) mx_print(f, &m, pend.lo, pend.hi, pend.act, &written);
+                pend.lo = prev;
+                pend.hi = pos - 1;
+                pend.act = act;
+                pend.have = 1;
+            }
+        }
+        if (i == m.n) break;
+        for (; i < m.n && m.ev[i].pos == pos; i++) {
+            int l = m.ev[i].l4;
+            cnt[l] += m.ev[i].d;
+            if (cnt[l] > 0) act |= 1ULL << l; else act &= ~(1ULL << l);
+        }
+        prev = pos;
+    }
+    if (pend.have) mx_print(f, &m, pend.lo, pend.hi, pend.act, &written);
+    if (written) fprintf(f, " }\n");
+    free(m.ev);
 }
 
 /* КАРТА ПОДМЕНЫ fake→real ЗАСЕВАЕТСЯ ПРЯМО В НАБОРЕ ПРАВИЛ — из файла состояния резолвера
@@ -124,6 +346,7 @@ static void print_elements(FILE *f, const struct nft_set *s) {
     int list = 0;
     for (const struct nft_elsrc *e = s->els; e; e = e->next) {
         if (e->k == NFT_EL_FAKEIP_STATE) emit_fakeip_elements(f, e->s);
+        else if (e->k == NFT_EL_MIXED) emit_mixed(f, e->p);
         else list = 1;
     }
     if (!list) return;
@@ -131,6 +354,7 @@ static void print_elements(FILE *f, const struct nft_set *s) {
     size_t written = 0;
     for (const struct nft_elsrc *e = s->els; e; e = e->next) {
         if (e->k == NFT_EL_ADDR_FILE) written += emit_elements(f, e->s, written);
+        else if (e->k == NFT_EL_SRS) written += emit_srs(f, e->s, e->p, written);
         else if (e->k == NFT_EL_VALUE) {
             if (written++) fputs(", ", f);
             fputs(e->s, f);

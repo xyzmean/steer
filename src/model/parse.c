@@ -5,6 +5,7 @@
 #include <string.h>
 #include <arpa/inet.h>
 #include "spec.h"
+#include "srsplan.h"
 #include "awg.h"   /* имя устройства kind=awg — static inline, без awg.c */
 #include "obfs.h"
 
@@ -135,6 +136,16 @@ int l4match_same(const struct l4match *a, const struct l4match *b) {
  *
  * Считается по sp->ch в порядке спеки, поэтому компилятор и резолвер получают одно и то же
  * число, не сговариваясь. */
+/* Различные сужения клауз наборов, которых нет среди сужений каналов, — в порядке появления. */
+struct l4seen { const struct spec *sp; struct l4match *v; size_t n; };
+static void l4seen_add(void *ctx, const struct l4match *m) {
+    struct l4seen *c = ctx;
+    for (size_t i = 0; i < c->sp->ch_n; i++)
+        if (!l4match_empty(&c->sp->ch[i].l4) && l4match_same(&c->sp->ch[i].l4, m)) return;
+    for (size_t k = 0; k < c->n; k++) if (l4match_same(&c->v[k], m)) return;
+    if (c->n < 256) c->v[c->n++] = *m;
+}
+
 static int l4_disc(const struct spec *sp, const struct l4match *m) {
     if (l4match_empty(m)) return 0;
     int idx = 0;
@@ -148,10 +159,20 @@ static int l4_disc(const struct spec *sp, const struct l4match *m) {
         idx++;
         if (l4match_same(c, m)) return idx;
     }
-    /* Недостижимо: сужение приходит из этого же массива. Возвращать здесь нуль значило бы
+    /* Сужение не из канала — значит из набора .srs (у клаузы набора своё сужение, см.
+     * src/model/srsplan.c). Такие нумеруются ПОСЛЕ сужений каналов, в порядке каналов, файлов и
+     * клауз: номера каналов тогда не сдвигаются от того, что в спеке появился набор, и имена
+     * наборов у прежних каналов — а от них зависит перенос счётчиков — остаются прежними. */
+    static struct l4match seen[256];
+    struct l4seen c = { sp, seen, 0 };
+    for (size_t i = 0; i < sp->ch_n; i++)
+        if (sp->ch[i].srs_n) srs_chan_l4_each(&sp->ch[i], l4seen_add, &c);
+    for (size_t k = 0; k < c.n; k++)
+        if (l4match_same(&seen[k], m)) return idx + 1 + (int)k;
+    /* Недостижимо: сужение приходит из спеки или её наборов. Возвращать здесь нуль значило бы
      * отдать имя без суффикса, то есть ровно то слияние наборов, от которого функция и
      * заведена, — поэтому число, которого ни у кого нет. */
-    return idx + 1;
+    return idx + 1 + (int)c.n;
 }
 
 void group_set_name(const struct spec *sp, char *dst, size_t n, const char *out, const char *kind,
@@ -177,6 +198,27 @@ void group_set_name(const struct spec *sp, char *dst, size_t n, const char *out,
     /* Выход обрезается ещё сильнее: суффиксов теперь два, а предел в 32 символа тот же. */
     snprintf(dst, n, "%.14s_%s_c%d%s_p%d", out, kind, from_disc(sp, from, from_n),
              rip ? "r" : "", pd);
+}
+
+/* Имя СОСТАВНОГО набора канала со смешанным сужением (src/model/srsplan.c): у элементов свои
+ * протокол и порты, поэтому сужения в имени нет — только выход, вид, клиенты и режим, как у
+ * группы без сужения, и свой хвост «_m», чтобы с ней не совпасть. Выход обрезается до 16:
+ * имя обязано уложиться в 31 символ (старые ядра). */
+void group_set_name_mixed(const struct spec *sp, char *dst, size_t n, const char *out,
+                          const char *kind, const char (*from)[64], size_t from_n, int realip) {
+    int rip = realip && !strcmp(kind, "dom");
+    snprintf(dst, n, "%.16s_%s_c%d%s_m", out, kind, from_disc(sp, from, from_n), rip ? "r" : "");
+}
+
+/* Имя доп. группы канала — клауз набора с условиями, которых у канала нет (клиент, приложение,
+ * исключения-подсети): номер id задаёт раскладка (номер канала * 100 + порядковый), и рядом с
+ * ним остаётся место на «_x» набора исключений. */
+void group_set_name_extra(const struct spec *sp, char *dst, size_t n, const char *out,
+                          const char *kind, const char (*from)[64], size_t from_n, int realip,
+                          unsigned id) {
+    int rip = realip && !strcmp(kind, "dom");
+    snprintf(dst, n, "%.12s_%s_c%d%s_e%u", out, kind, from_disc(sp, from, from_n),
+             rip ? "r" : "", id);
 }
 
 /* «443» или «50000-65535» → диапазон портов.
@@ -606,7 +648,7 @@ static int parse_channels(struct js *j, struct spec *s, struct err *e) {
         struct channel c = {0};
         /* Какой из двух форм записаны списки совпадения — как у device/devices: заданы обе
          * значит половина написанного человеком молча не действует. */
-        int pf_one = 0, pf_many = 0, df_one = 0, df_many = 0;
+        int pf_one = 0, pf_many = 0, df_one = 0, df_many = 0, sf_one = 0, sf_many = 0;
         if (js_lit(j, '{') != 0) return err_set(e, "channels: expected an object", NULL);
         js_ws(j);
         while (*j->p != '}') {
@@ -702,6 +744,31 @@ static int parse_channels(struct js *j, struct spec *s, struct err *e) {
                         if (sl == (size_t)-1) return -1;
                         c.domains_n = sl;
                     }
+                    /* Наборы sing-box (`.srs`) — полноценный источник списка: имена из них
+                     * берёт резолвер, подсети — компилятор, сужение по протоколу и портам
+                     * применяется к каналу само (src/model/srs.c, src/compile/groups.c). Форма —
+                     * та же пара, что у prefixes_file/prefixes_files. Содержимое здесь не
+                     * читается: разбор спеки не открывает списков, их открывает тот, кому они
+                     * нужны. */
+                    else if (!strcmp(mk, "srs_file")) {
+                        if (sf_many) return err_set(e, "channels.%s: srs_file рядом с srs_files", c.name);
+                        sf_one = 1;
+                        char one[256];
+                        int r = js_str(j, one, sizeof(one), e);
+                        if (r != 0 && e->msg[0]) return -1;
+                        if (r == 0) {
+                            const char *kept = keep(one, e);
+                            if (!kept) return -1;
+                            c.srs_files[0] = kept;
+                            c.srs_n = 1;
+                        }
+                    } else if (!strcmp(mk, "srs_files")) {
+                        if (sf_one) return err_set(e, "channels.%s: srs_files рядом с srs_file", c.name);
+                        sf_many = 1;
+                        size_t sl = str_list(j, c.srs_files, MAX_FILES, e);
+                        if (sl == (size_t)-1) return -1;
+                        c.srs_n = sl;
+                    }
                     else if (!strcmp(mk, "mode")) {
                         char m[16];
                         if (js_str(j, m, sizeof(m), e) != 0 && e->msg[0]) return -1;
@@ -782,7 +849,7 @@ static int parse_channels(struct js *j, struct spec *s, struct err *e) {
          * намеренно. «Канал ловит по портам» выразить нечем: правило без `ip daddr @набор`
          * безусловно, то есть udp 50000-65535 ко ВСЕМУ интернету уехало бы в туннель. Порты
          * без списка адресов — это недописанная настройка, и отказ на ней прежний. */
-        if (!c.prefixes_n && !c.domains_n && !c.any)
+        if (!c.prefixes_n && !c.domains_n && !c.srs_n && !c.any)
             return err_set(e, "channel %s matches nothing (want prefixes_files, domains_files or any)", c.name);
         /* Адреса и домены в одном правиле — МОЖНО.
          *
@@ -1285,7 +1352,7 @@ int load_spec(const char *path, struct spec *s, struct err *e) {
          * починка с провода», а у правила на одно устройство цена ошибки — один хозяин, и он
          * же её заметит. Ровно эта пара («весь трафик телефона в туннель» и «этот ноутбук не
          * маршрутизируем») и просилась. */
-        if (c->any && !c->prefixes_n && !c->domains_n && !c->allow_all && !c->dev_scope)
+        if (c->any && !c->prefixes_n && !c->domains_n && !c->srs_n && !c->allow_all && !c->dev_scope)
             return err_set(e, "канал %s забирает ВЕСЬ трафик в туннель. Если это правда нужно, "
                 "добавьте \"allow_all\": true — иначе выберите список", c->name);
 

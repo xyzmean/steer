@@ -1,5 +1,6 @@
 #include "dnsd_int.h"
 #include "nftnl.h"
+#include "srs.h"
 
 /* ---------------------------------------------------------------------- */
 /* fake-IP pool: one stable, exclusive synthetic IPv4 per matched domain    */
@@ -272,6 +273,60 @@ void fakeip_entry_set_real(const char *domain, uint32_t real_host) {
  * missing element is exactly the post-restart state and is harmless. */
 const char *g_fakeip_map = "fakeip";
 
+/* ---- адрес имени в наборе канала -------------------------------------------------------------
+ *
+ * Обычный набор — адрес. Составной (канал со смешанным сужением, src/model/srsplan.c) — адрес
+ * . протокол . порты: имя попадает туда с сужением тех правил канала, с которыми совпало, а
+ * если совпало с несколькими — их объединением, разложенным на непересекающиеся ящики (ядро не
+ * принимает в составной набор пересекающиеся элементы). */
+static size_t dch_boxes(size_t i, const char *domain, struct nftlk_box *out) {
+    static const struct l4match none;
+    const struct dchan *d = &g_dch[i];
+    const struct l4match *ms[64];
+    size_t k = 0;
+    if (ruleset_match(&d->rules, domain)) ms[k++] = &none;
+    for (size_t p = 0; p < d->parts_n && k < 64; p++)
+        if (ruleset_match(&d->parts[p].rules, domain) &&
+            !(d->parts[p].has_excl && ruleset_match(&d->parts[p].excl, domain)))
+            ms[k++] = &d->parts[p].l4;
+    /* Правила сменились с тех пор, как адрес туда лёг (удаление после перечитывания): прежнего
+     * сужения уже не узнать — берётся полный ящик, лучшее, что можно сделать. */
+    if (!k) ms[k++] = &none;
+    struct l4box b[L4BOX_MAX];
+    size_t n = l4_union_boxes(ms, k, b);
+    for (size_t j = 0; j < n; j++) {
+        out[j].plo = b[j].plo;
+        out[j].phi = b[j].phi;
+        out[j].lo = b[j].lo;
+        out[j].hi = b[j].hi;
+    }
+    return n;
+}
+
+int dch_add(size_t i, const char *domain, uint32_t addr_host, uint32_t ttl) {
+    if (!g_dch[i].composite) return nft_add_element(g_dch[i].set, addr_host, ttl);
+    struct nftlk_box b[L4BOX_MAX];
+    size_t n = dch_boxes(i, domain, b);
+    int rc = 0;
+    for (size_t j = 0; j < n; j++)
+        if (nft_concat_element(1, g_dch[i].set, addr_host, &b[j], ttl) != 0) rc = -1;
+    return rc;
+}
+
+void dch_del(size_t i, const char *domain, uint32_t addr_host) {
+    if (!g_dch[i].composite) {
+        uint32_t k_net = htonl(addr_host);
+        int drc = nftlk_elem_msg(NFT_MSG_DELSETELEM, g_nft_table, g_dch[i].set,
+                                 &k_net, g_nft_sets_interval, NULL, 0);
+        if (drc != 0 && drc != -ENOENT && dbg())
+            fprintf(stderr, "nftlk: channel-move delete from %s rc=%d\n", g_dch[i].set, drc);
+        return;
+    }
+    struct nftlk_box b[L4BOX_MAX];
+    size_t n = dch_boxes(i, domain, b);
+    for (size_t j = 0; j < n; j++) nft_concat_element(0, g_dch[i].set, addr_host, &b[j], 0);
+}
+
 void fakeip_route_set(const char *domain, uint64_t want) {
     long at = fakeip_find(domain);
     if (at < 0) return;
@@ -295,7 +350,7 @@ void fakeip_route_set(const char *domain, uint64_t want) {
         g_fakeip.entries[at].route_asserted = now;
         for (size_t i = 0; i < g_dch_n; i++)
             if (want & (1ULL << i))
-                nft_add_element(g_dch[i].set, g_fakeip.entries[at].addr, 0);
+                dch_add(i, domain, g_fakeip.entries[at].addr, 0);
         return;
     }
 
@@ -304,19 +359,14 @@ void fakeip_route_set(const char *domain, uint64_t want) {
      * (перезапуск, или элемент туда и не лёг). */
     for (size_t i = 0; i < g_dch_n; i++) {
         if (!(old & (1ULL << i)) || (want & (1ULL << i))) continue;
-        uint32_t k_net = htonl(g_fakeip.entries[at].addr);
-        int drc = nftlk_elem_msg(NFT_MSG_DELSETELEM, g_nft_table, g_dch[i].set,
-                                 &k_net, g_nft_sets_interval, NULL, 0);
-        if (drc != 0 && drc != -ENOENT && dbg())
-            fprintf(stderr, "nftlk: channel-move delete from %s rc=%d\n",
-                    g_dch[i].set, drc);
+        dch_del(i, domain, g_fakeip.entries[at].addr);
     }
 
     /* И кладём во все, где его ещё нет, постоянным элементом. EEXIST — уже
      * желаемое состояние. */
     for (size_t i = 0; i < g_dch_n; i++)
         if ((want & (1ULL << i)) && !(old & (1ULL << i)))
-            nft_add_element(g_dch[i].set, g_fakeip.entries[at].addr, 0);
+            dch_add(i, domain, g_fakeip.entries[at].addr, 0);
     g_fakeip.entries[at].sets = want;
     g_fakeip.entries[at].route_asserted = time(NULL);
 }

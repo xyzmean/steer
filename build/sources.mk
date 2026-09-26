@@ -40,7 +40,7 @@ INC_DIRS  := $(CORE_DIRS) $(EXT_DIRS)
 PLATFORM_SRC := src/platform/platform.c src/platform/openwrt.c src/platform/android.c
 
 MODEL_SRC := $(PLATFORM_SRC) src/lib/err.c src/lib/jsonr.c src/lib/tmpfile.c src/model/parse.c src/model/registry.c \
-             src/model/probe.c src/compile/nftcompat.c
+             src/model/probe.c src/compile/nftcompat.c src/lib/puff.c src/model/srs.c src/model/srsplan.c
 
 # Резолвер: src/dnsd/dnsd.c был один файл, теперь — DNSD_SRC. lib/sindex.c, lib/nftnl.c,
 # lib/ctnl.c родились из того же файла (хеш-индекс строк, транзакции nf_tables по netlink,
@@ -81,7 +81,7 @@ CORE_SRC := src/lib/run.c src/lib/jsonw.c src/lib/evline.c src/compile/groups.c 
             src/daemon/apply.c src/daemon/status.c src/daemon/nftquery.c src/daemon/diag.c \
             src/daemon/explain.c src/daemon/helpers.c src/daemon/supervise.c src/daemon/supd.c src/daemon/watch.c src/daemon/main.c \
             $(MODEL_SRC) $(DNSD_SRC) src/daemon/failover.c src/tools/aggregate.c src/proto/obfs/obfs.c \
-            src/cli/cli.c src/tools/srs.c src/tools/puff.c src/tools/hwid.c src/daemon/ctl.c \
+            src/cli/cli.c src/tools/srsread.c src/tools/hwid.c src/daemon/ctl.c \
             src/daemon/conns.c src/daemon/loop.c src/daemon/state.c src/daemon/watchd.c \
             src/lib/rtnl.c src/daemon/foprobe.c src/daemon/gaiw.c $(KINDS_BASE_SRC)
 

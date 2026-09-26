@@ -205,6 +205,59 @@ static int set_scan(const char *set, const char *addr) {
     return hit;
 }
 
+/* Составной набор (адрес . протокол . порты, канал со смешанным сужением): запрос одного
+ * элемента требует протокол и порт, а спрошен только адрес, поэтому — дамп набора, и из каждого
+ * элемента первое поле сравнивается с адресом. В desc — что именно совпало («udp 50000-65535»
+ * через запятую); пусто при совпадении без сужения (протоколы 0-255, порты 0-65535). */
+static int set_scan_mixed(const char *set, const char *addr, char *desc, size_t dn, int *narrow) {
+    desc[0] = '\0';
+    *narrow = 0;
+    for (const char *q = set; *q; q++)
+        if (!((*q >= 'a' && *q <= 'z') || (*q >= 'A' && *q <= 'Z') ||
+              (*q >= '0' && *q <= '9') || *q == '_' || *q == '-'))
+            return 0;
+    uint32_t qlo, qhi;
+    if (!ipv4_span(addr, &qlo, &qhi)) return 0;
+    char cmd[256];
+    snprintf(cmd, sizeof(cmd), "nft list set inet %s %.64s 2>/dev/null", nft_table(), set);
+    FILE *p = popen(cmd, "r");
+    if (!p) return 0;
+    int in = 0, hit = 0, full = 0, c;
+    char el[200];
+    size_t en = 0, dk = 0;
+    const char *key = "elements = {";
+    size_t kpos = 0;
+    while ((c = fgetc(p)) != EOF) {
+        if (!in) {
+            kpos = (c == key[kpos]) ? kpos + 1 : (c == key[0] ? 1 : 0);
+            if (!key[kpos]) in = 1;
+            continue;
+        }
+        if (c != ',' && c != '}') {
+            if (en + 1 < sizeof(el) && !(en == 0 && (c == ' ' || c == '\t' || c == '\n'))) el[en++] = (char)c;
+            continue;
+        }
+        el[en] = '\0';
+        en = 0;
+        /* «адрес . протокол . порты [timeout …]» */
+        char a[64], pr[32], po[32];
+        if (sscanf(el, "%63s . %31s . %31s", a, pr, po) == 3) {
+            uint32_t lo, hi;
+            if (ipv4_span(a, &lo, &hi) && lo <= qlo && qhi <= hi) {
+                hit = 1;
+                if (!strcmp(pr, "0-255") && !strcmp(po, "0-65535")) full = 1;
+                else if (dk + strlen(pr) + strlen(po) + 4 < dn) {
+                    dk += (size_t)snprintf(desc + dk, dn - dk, "%s%s %s", dk ? ", " : "", pr, po);
+                }
+            }
+        }
+        if (c == '}') break;
+    }
+    pclose(p);
+    *narrow = hit && !full;
+    return hit;
+}
+
 /* Есть ли адрес в наборе: одиночным `nft get element`, а на старом ядре, где его нет, —
  * разбором дампа (set_scan). На современном ядре путь прежний, один запуск nft. */
 static int set_lookup(const char *set, const char *elem, const char *addr) {
@@ -261,7 +314,10 @@ int explain_emit(const struct spec *cfg, const struct groups *gr, const char *wh
         addr = resolved;
     }
     for (size_t i = 0; i < gr->n; i++) {
-        int hit = !gr->g[i].files_n && !gr->g[i].domains;   /* an `any` group */
+        /* Сужение составного набора — то, что совпало в его элементах (set_scan_mixed). */
+        char mdesc[256] = "";
+        int mnarrow = 0;
+        int hit = !gr->g[i].files_n && !gr->g[i].srs_n && !gr->g[i].domains;   /* an `any` group */
         /* Domain channels own a set too — it is just filled by the resolver. Asking
          * only the prefix channels made explain answer "no channel matches" for
          * every fake IP, i.e. exactly the addresses a user is most likely to ask
@@ -275,7 +331,17 @@ int explain_emit(const struct spec *cfg, const struct groups *gr, const char *wh
                 fprintf(stderr, "checking %.63s\n", gr->g[i].name);
             snprintf(setname, sizeof(setname), "%.63s", gr->g[i].name);
             snprintf(elem, sizeof(elem), "{ %s }", addr);
-            hit = set_lookup(setname, elem, addr);
+            if (gr->g[i].composite)
+                hit = set_scan_mixed(setname, addr, mdesc, sizeof(mdesc), &mnarrow);
+            else
+                hit = set_lookup(setname, elem, addr);
+            /* Исключения-подсети доп. группы (набор «x.com, но не эти адреса»): адрес в них —
+             * значит этот канал его не берёт, смотрим следующий. */
+            if (hit && gr->g[i].xcidr) {
+                char xn[80];
+                snprintf(xn, sizeof(xn), "%.63s_x", gr->g[i].name);
+                if (set_lookup(xn, elem, addr)) hit = 0;
+            }
             /* Старая раскладка: у доменной группы вторая половина набора, с префиксами. */
             if (!hit && legacy_may_have_static(&gr->g[i])) {
                 nft_static_set_name(setname, sizeof(setname), gr->g[i].name);
@@ -291,7 +357,8 @@ int explain_emit(const struct spec *cfg, const struct groups *gr, const char *wh
             return 2;
         }
         fprintf(out, "%s -> %s \"%s\" -> output \"%s\"", addr,
-               explain_set_phrase(addr, gr->g[i].files_n > 0, gr->g[i].domains),
+               explain_set_phrase(addr, gr->g[i].files_n > 0 || group_srs_v4(&gr->g[i]),
+                                  gr->g[i].domains),
                gr->g[i].name, o->name);
         if (out_has_device(o))
             fprintf(out, " -> dev %s (mark 0x%08x, table %d)\n", o->device, o->mark, o->table);
@@ -302,6 +369,12 @@ int explain_emit(const struct spec *cfg, const struct groups *gr, const char *wh
          * ответить правдой наполовину: человек, выясняющий, почему TCP к 104.16.0.1 идёт
          * напрямую, получил бы подтверждение, что канал его забирает. Отдельной строкой,
          * чтобы первая осталась той же, что была, — её читают и глазами, и разбором. */
+        if (mnarrow)
+            fprintf(out, "      канал сужен: только %s — остальной трафик к этому адресу "
+                   "идёт мимо канала\n", mdesc);
+        if (gr->g[i].xsrc_n)
+            fprintf(out, "      правило набора ограничено клиентами (source_ip_cidr): "
+                   "подсетей %zu — остальные клиенты идут мимо\n", gr->g[i].xsrc_n);
         if (!l4match_empty(gr->g[i].l4)) {
             /* С запасом на предел MAX_PORTS: шестнадцать диапазонов вида «50000-65535» с
              * разделителями — это 217 байт, и обрезанное пояснение было бы хуже полного. */

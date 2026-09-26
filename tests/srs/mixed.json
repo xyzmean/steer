@@ -1,0 +1,5 @@
+{ "rules": [
+  { "domain_suffix": ["mixed.example"] },
+  { "network": ["udp"], "ip_cidr": ["198.51.100.0/24", "203.0.113.0/25"], "port_range": ["50000:65535"] },
+  { "network": ["udp"], "ip_cidr": ["192.0.2.0/24"], "port_range": ["19000:20000"] },
+  { "ip_cidr": ["198.51.100.128/25"] } ] }

@@ -74,7 +74,7 @@ int legacy_has_ip6(void) { return has_ip6(g_nftc); }
  * check_address_lists в apply), поэтому спрашивают вторую половину у всякой доменной группы с
  * адресными списками; нет её в ядре — ответ «набора нет», и он просто не прибавляется. */
 int legacy_may_have_static(const struct group *g) {
-    return NFT_LEGACY && g->domains && g->files_n;
+    return NFT_LEGACY && g->domains && (g->files_n || group_srs_v4(g));
 }
 
 /* ---- 1. доменный набор надвое -------------------------------------------------------------

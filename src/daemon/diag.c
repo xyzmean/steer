@@ -163,6 +163,34 @@ static const char *list_finds_resolver(const char *path, char *found, size_t fou
     return who;
 }
 
+/* То же для набора sing-box: его подсети назначения (клаузы, попавшие в группу), потоком. */
+struct srs_resolver { const char *who; char *found; size_t found_sz; };
+
+static int srs_resolver_cb(void *ctx, const struct srs_elem *el) {
+    struct srs_resolver *r = ctx;
+    if (el->kind != SRS_EL_CIDR || el->family != 4 || el->excl) return 0;
+    uint32_t net = ((uint32_t)el->addr[0] << 24) | ((uint32_t)el->addr[1] << 16) |
+                   ((uint32_t)el->addr[2] << 8) | el->addr[3];
+    uint32_t mask = el->plen <= 0 ? 0 : 0xFFFFFFFFu << (32 - el->plen);
+    for (size_t i = 0; i < sizeof(RESOLVERS) / sizeof(RESOLVERS[0]); i++) {
+        uint32_t a, m32;
+        if (!parse_prefix(RESOLVERS[i].addr, &a, &m32)) continue;
+        if ((a & mask) != net) continue;
+        snprintf(r->found, r->found_sz, "%u.%u.%u.%u/%d", el->addr[0], el->addr[1],
+                 el->addr[2], el->addr[3], el->plen);
+        r->who = RESOLVERS[i].who;
+        return 1;                           /* нашли — дальше не читаем */
+    }
+    return 0;
+}
+
+static const char *srs_finds_resolver(const struct srs_psel *ps, char *found, size_t found_sz) {
+    struct srs_resolver r = { NULL, found, found_sz };
+    struct err e = {0};
+    srs_walk(ps->set, SRS_EL_CIDR, ps->sel, srs_resolver_cb, &r, &e);
+    return r.who;
+}
+
 /* Пропускает ли мост кадры через ip-хуки netfilter: 1 — да, 0 — нет, -1 — не знаем.
  *
  * Файл существует ровно тогда, когда загружен модуль br_netfilter: sysctl-и регистрирует он,
@@ -222,7 +250,7 @@ int cmd_diag(const char *spec) {
      *    правило на месте, трафик мимо, и по status этого не видно. */
     for (size_t i = 0; i < gr.n; i++) {
         struct group *g = &gr.g[i];
-        if (!g->files_n && !g->domains) continue;
+        if (!g->files_n && !g->srs_n && !g->domains) continue;
         long n = set_count(g->name);
         /* Старая раскладка: префиксы доменной группы лежат во второй половине набора (<имя>_n,
          * см. generate). Адресов у канала — сумма обеих. */
@@ -237,11 +265,11 @@ int cmd_diag(const char *spec) {
             snprintf(what, sizeof(what), "канал %.48s: набора в ядре нет", g->name);
             snprintf(why, sizeof(why), "apply не довёл набор до ядра — примените заново");
             diag("set", "fail", what, why);
-        } else if (n == 0 && g->files_n) {
+        } else if (n == 0 && (g->files_n || group_srs_v4(g))) {
             snprintf(what, sizeof(what), "канал %.48s: набор пуст", g->name);
             snprintf(why, sizeof(why),
                      "списков %zu, но в ядре ни одного адреса — списки не скачались "
-                     "или в них нет адресных строк", g->files_n);
+                     "или в них нет адресных строк", g->files_n + g->srs_n);
             diag("set", "fail", what, why);
         } else if (n == 0) {
             snprintf(what, sizeof(what), "канал %.48s: набор пока пуст", g->name);
@@ -363,7 +391,7 @@ int cmd_diag(const char *spec) {
             if (sp->out[i].on_fail == FAIL_DROP) drops++;
         int dom_only = 1;
         for (size_t i = 0; i < gr.n; i++)
-            if (gr.g[i].files_n) dom_only = 0;
+            if (gr.g[i].files_n || group_srs_v4(&gr.g[i])) dom_only = 0;
         if (drops)
             diag("ipv6", "fail", "IPv6 наружу работает, а каналы его не разбирают",
                  "выход с on_fail=drop останавливает только IPv4: то, что должно быть "
@@ -408,6 +436,8 @@ int cmd_diag(const char *spec) {
         const char *who = NULL;
         for (size_t k = 0; k < gr.g[i].files_n && !who; k++)
             who = list_finds_resolver(gr.g[i].files[k], found, sizeof(found));
+        for (size_t k = 0; k < gr.g[i].srs_n && !who; k++)
+            who = srs_finds_resolver(gr.g[i].srs[k], found, sizeof(found));
         if (!who) continue;
         /* Буферы с запасом: строки русские, в UTF-8 это два байта на букву, и обрезка по
          * границе буфера разрубила бы букву посередине. Ровно этим ломался вывод при первом

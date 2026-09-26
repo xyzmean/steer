@@ -1,0 +1,25 @@
+{ "rules": [
+  { "type": "logical", "mode": "or", "rules": [
+      { "domain_suffix": ["or-a.example"] },
+      { "ip_cidr": ["198.51.100.0/24"] } ] },
+  { "type": "logical", "mode": "and", "rules": [
+      { "domain_suffix": ["x.example"] },
+      { "domain": ["y.x.example"], "invert": true } ] },
+  { "type": "logical", "mode": "and", "rules": [
+      { "ip_cidr": ["203.0.113.0/24"] },
+      { "network": ["udp"] },
+      { "port_range": ["1000:2000"] },
+      { "port": [1500], "invert": true } ] },
+  { "ip_cidr": ["192.0.2.0/24"], "source_ip_cidr": ["192.168.1.0/28"] },
+  { "package_name": ["org.telegram.messenger"], "ip_cidr": ["149.154.160.0/20"] },
+  { "package_name": ["com.example.app"] },
+  { "process_name": ["curl"], "domain": ["proc.example"] },
+  { "domain": ["inv.example"], "invert": true },
+  { "type": "logical", "mode": "and", "rules": [
+      { "domain": ["a.example"] },
+      { "ip_cidr": ["10.9.0.0/16"] } ] },
+  { "type": "logical", "mode": "and", "rules": [
+      { "ip_cidr": ["10.10.0.0/16"] },
+      { "ip_cidr": ["10.10.1.0/24"], "invert": true } ] },
+  { "network": ["tcp"] },
+  { "domain_keyword": ["kw"], "domain_regex": ["^re\\.example$"] } ] }

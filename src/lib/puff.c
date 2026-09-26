@@ -838,3 +838,263 @@ int puff(unsigned char *dest,           /* pointer to destination pointer */
     }
     return err;
 }
+
+/* ======================================================================================
+ * ДОПИСАНО В STEER (изменённая версия, лицензия puff требует это отметить явно).
+ *
+ * Потоковая распаковка: puff() выше пишет весь результат в один буфер, потому что ссылки
+ * назад у DEFLATE адресуют уже распакованное. Но дальше 32 КБ они не бывают, поэтому хватает
+ * окна в 32 КБ по кругу — и тогда набор правил sing-box на сотни тысяч элементов читается
+ * кусками, а не распаковывается в память целиком (src/model/srs.c).
+ *
+ * Вход по-прежнему лежит в памяти целиком (это сжатый файл, он в разы меньше), поэтому
+ * приостанавливаться приходится только на выходе: между символами или посреди копии по ссылке.
+ * Нехватка ВХОДА — это испорченный файл, а не «подожди», и longjmp для неё не нужен: чтение за
+ * концом ставит флаг ошибки и отдаёт нули, флаг проверяется после каждого символа.
+ *
+ * Adler-32 распакованного считается здесь же — его сверяет вызывающий с хвостом zlib-обёртки.
+ * ====================================================================================== */
+#include <string.h>
+
+static int ps_bits(struct puff_stream *s, int need)
+{
+    long val = s->bitbuf;
+    while (s->bitcnt < need) {
+        if (s->incnt >= s->inlen) { s->err = 2; return 0; }
+        val |= (long)(s->in[s->incnt++]) << s->bitcnt;
+        s->bitcnt += 8;
+    }
+    s->bitbuf = (int)(val >> need);
+    s->bitcnt -= need;
+    return (int)(val & ((1L << need) - 1));
+}
+
+/* Тот же быстрый разбор, что decode() выше, но без longjmp: нехватка входа — флаг ошибки. */
+static int ps_decode(struct puff_stream *s, const short *count, const short *symbol)
+{
+    int len, code, first, cnt, index, bitbuf, left;
+    const short *next;
+
+    bitbuf = s->bitbuf;
+    left = s->bitcnt;
+    code = first = index = 0;
+    len = 1;
+    next = count + 1;
+    while (1) {
+        while (left--) {
+            code |= bitbuf & 1;
+            bitbuf >>= 1;
+            cnt = *next++;
+            if (code - cnt < first) {
+                s->bitbuf = bitbuf;
+                s->bitcnt = (s->bitcnt - len) & 7;
+                return symbol[index + (code - first)];
+            }
+            index += cnt;
+            first += cnt;
+            first <<= 1;
+            code <<= 1;
+            len++;
+        }
+        left = (MAXBITS + 1) - len;
+        if (left == 0)
+            break;
+        if (s->incnt >= s->inlen) { s->err = 2; return -1; }
+        bitbuf = s->in[s->incnt++];
+        if (left > 8)
+            left = 8;
+    }
+    return -10;
+}
+
+static int ps_construct(short *count, short *symbol, const short *length, int n)
+{
+    struct huffman h;
+    h.count = count;
+    h.symbol = symbol;
+    return construct(&h, length, n);
+}
+
+static int ps_fixed(struct puff_stream *s)
+{
+    short lengths[FIXLCODES];
+    int symbol;
+    for (symbol = 0; symbol < 144; symbol++) lengths[symbol] = 8;
+    for (; symbol < 256; symbol++) lengths[symbol] = 9;
+    for (; symbol < 280; symbol++) lengths[symbol] = 7;
+    for (; symbol < FIXLCODES; symbol++) lengths[symbol] = 8;
+    ps_construct(s->lencnt, s->lensym, lengths, FIXLCODES);
+    for (symbol = 0; symbol < MAXDCODES; symbol++) lengths[symbol] = 5;
+    ps_construct(s->distcnt, s->distsym, lengths, MAXDCODES);
+    return 0;
+}
+
+static int ps_dynamic(struct puff_stream *s)
+{
+    int nlen, ndist, ncode, index, err;
+    short lengths[MAXCODES];
+    static const short order[19] =
+        {16, 17, 18, 0, 8, 7, 9, 6, 10, 5, 11, 4, 12, 3, 13, 2, 14, 1, 15};
+
+    nlen = ps_bits(s, 5) + 257;
+    ndist = ps_bits(s, 5) + 1;
+    ncode = ps_bits(s, 4) + 4;
+    if (s->err) return -2;
+    if (nlen > MAXLCODES || ndist > MAXDCODES) return -3;
+    for (index = 0; index < ncode; index++)
+        lengths[order[index]] = (short)ps_bits(s, 3);
+    for (; index < 19; index++)
+        lengths[order[index]] = 0;
+    if (s->err) return -2;
+    err = ps_construct(s->lencnt, s->lensym, lengths, 19);
+    if (err != 0) return -4;
+    index = 0;
+    while (index < nlen + ndist) {
+        int symbol, len;
+        symbol = ps_decode(s, s->lencnt, s->lensym);
+        if (s->err) return -2;
+        if (symbol < 0) return symbol;
+        if (symbol < 16)
+            lengths[index++] = (short)symbol;
+        else {
+            len = 0;
+            if (symbol == 16) {
+                if (index == 0) return -5;
+                len = lengths[index - 1];
+                symbol = 3 + ps_bits(s, 2);
+            }
+            else if (symbol == 17)
+                symbol = 3 + ps_bits(s, 3);
+            else
+                symbol = 11 + ps_bits(s, 7);
+            if (s->err) return -2;
+            if (index + symbol > nlen + ndist) return -6;
+            while (symbol--)
+                lengths[index++] = (short)len;
+        }
+    }
+    if (lengths[256] == 0) return -9;
+    err = ps_construct(s->lencnt, s->lensym, lengths, nlen);
+    if (err && (err < 0 || nlen != s->lencnt[0] + s->lencnt[1])) return -7;
+    err = ps_construct(s->distcnt, s->distsym, lengths + nlen, ndist);
+    if (err && (err < 0 || ndist != s->distcnt[0] + s->distcnt[1])) return -8;
+    return 0;
+}
+
+void puff_stream_init(struct puff_stream *s, const unsigned char *src, unsigned long srclen)
+{
+    memset(s, 0, sizeof(*s));
+    s->in = src;
+    s->inlen = srclen;
+    s->adler_a = 1;
+}
+
+/* Один байт на выход: в окно, в буфер вызывающего и в Adler-32. */
+#define PS_EMIT(s, b, dst, got) do {                                          \
+        unsigned char b_ = (unsigned char)(b);                                \
+        (s)->win[(s)->wpos & (PUFF_WINDOW - 1)] = b_;                         \
+        (s)->wpos++;                                                          \
+        (s)->total++;                                                         \
+        (s)->adler_a = ((s)->adler_a + b_) % 65521u;                          \
+        (s)->adler_b = ((s)->adler_b + (s)->adler_a) % 65521u;                \
+        (dst)[(got)++] = b_;                                                  \
+    } while (0)
+
+long puff_stream_read(struct puff_stream *s, unsigned char *dst, unsigned long n)
+{
+    static const short lens[29] = {
+        3, 4, 5, 6, 7, 8, 9, 10, 11, 13, 15, 17, 19, 23, 27, 31,
+        35, 43, 51, 59, 67, 83, 99, 115, 131, 163, 195, 227, 258};
+    static const short lext[29] = {
+        0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 2, 2, 2, 2,
+        3, 3, 3, 3, 4, 4, 4, 4, 5, 5, 5, 5, 0};
+    static const short dists[30] = {
+        1, 2, 3, 4, 5, 7, 9, 13, 17, 25, 33, 49, 65, 97, 129, 193,
+        257, 385, 513, 769, 1025, 1537, 2049, 3073, 4097, 6145,
+        8193, 12289, 16385, 24577};
+    static const short dext[30] = {
+        0, 0, 0, 0, 1, 1, 2, 2, 3, 3, 4, 4, 5, 5, 6, 6,
+        7, 7, 8, 8, 9, 9, 10, 10, 11, 11,
+        12, 12, 13, 13};
+    unsigned long got = 0;
+
+    if (s->err) return -1;
+    while (got < n) {
+        if (s->copy_len) {
+            unsigned char b = s->win[(s->wpos - s->copy_dist) & (PUFF_WINDOW - 1)];
+            PS_EMIT(s, b, dst, got);
+            s->copy_len--;
+            continue;
+        }
+        if (s->phase == PS_DONE)
+            break;
+        if (s->phase == PS_HDR) {
+            if (s->last) { s->phase = PS_DONE; break; }
+            s->last = ps_bits(s, 1);
+            int type = ps_bits(s, 2);
+            if (s->err) return -1;
+            if (type == 0) {
+                s->bitbuf = 0;
+                s->bitcnt = 0;
+                if (s->incnt + 4 > s->inlen) { s->err = 2; return -1; }
+                unsigned len = s->in[s->incnt] | ((unsigned)s->in[s->incnt + 1] << 8);
+                unsigned nlen = s->in[s->incnt + 2] | ((unsigned)s->in[s->incnt + 3] << 8);
+                s->incnt += 4;
+                if ((len ^ 0xffffu) != nlen) { s->err = -2; return -1; }
+                s->stored_left = len;
+                s->phase = PS_STORED;
+            } else if (type == 1) {
+                ps_fixed(s);
+                s->phase = PS_CODES;
+            } else if (type == 2) {
+                int rc = ps_dynamic(s);
+                if (rc != 0) { if (!s->err) s->err = rc; return -1; }
+                s->phase = PS_CODES;
+            } else {
+                s->err = -1;
+                return -1;
+            }
+            continue;
+        }
+        if (s->phase == PS_STORED) {
+            if (!s->stored_left) { s->phase = PS_HDR; continue; }
+            if (s->incnt >= s->inlen) { s->err = 2; return -1; }
+            PS_EMIT(s, s->in[s->incnt], dst, got);
+            s->incnt++;
+            s->stored_left--;
+            continue;
+        }
+        /* PS_CODES */
+        int symbol = ps_decode(s, s->lencnt, s->lensym);
+        if (s->err) return -1;
+        if (symbol < 0) { s->err = symbol; return -1; }
+        if (symbol < 256) {
+            PS_EMIT(s, symbol, dst, got);
+        } else if (symbol == 256) {
+            s->phase = PS_HDR;
+        } else {
+            symbol -= 257;
+            if (symbol >= 29) { s->err = -10; return -1; }
+            unsigned len = (unsigned)lens[symbol] + (unsigned)ps_bits(s, lext[symbol]);
+            symbol = ps_decode(s, s->distcnt, s->distsym);
+            if (s->err) return -1;
+            if (symbol < 0 || symbol >= 30) { s->err = symbol < 0 ? symbol : -10; return -1; }
+            unsigned dist = (unsigned)dists[symbol] + (unsigned)ps_bits(s, dext[symbol]);
+            if (s->err) return -1;
+            if (dist > s->total || dist > PUFF_WINDOW) { s->err = -11; return -1; }
+            s->copy_len = len;
+            s->copy_dist = dist;
+        }
+    }
+    return (long)got;
+}
+
+int puff_stream_done(const struct puff_stream *s)
+{
+    return s->phase == PS_DONE && !s->copy_len && !s->err;
+}
+
+unsigned long puff_stream_adler(const struct puff_stream *s)
+{
+    return (s->adler_b << 16) | s->adler_a;
+}

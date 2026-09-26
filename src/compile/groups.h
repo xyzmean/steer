@@ -8,6 +8,7 @@
 
 #include <stddef.h>
 #include "spec.h"
+#include "srsplan.h"
 
 /* ---- coalescing: one interface, at most two sets ---------------------------
  *
@@ -70,7 +71,39 @@ struct group {
     /* Which channels fed it — reported so a counter still has names behind it. */
     const char *members[MAX_CHANNELS];
     size_t members_n;
+
+    /* ---- наборы sing-box (srs_files, раскладка — src/model/srsplan.c) ---------------------
+     *
+     * srs — клаузы наборов, попавшие в группу (указатели в раскладку, которую держит struct
+     * groups): их подсети v4 компилятор кладёт в набор сам, потоком, имена берёт резолвер.
+     * srs_addrs — сколько подсетей v4 из них (как addrs у списков). */
+    const struct srs_psel **srs;
+    size_t srs_n, srs_cap;
+    size_t srs_addrs;
+    /* Составной набор (ipv4_addr . inet_proto . inet_service): у списка канала смешанное
+     * сужение, и у каждого элемента оно своё — правило одно, без x_l4. files_l4 — сужение, с
+     * которым идут адреса каждого файла files (параллельно files). */
+    int composite;
+    const struct l4match **files_l4;
+    /* Доп. группа канала — клаузы набора с условиями, которых у канала нет: номер в имени
+     * (0 — обычная группа), второе «ip saddr» (source_ip_cidr), исключения-подсети — набор
+     * «<имя>_x». */
+    unsigned extra;
+    const struct srs_pfx4 *xsrc;
+    size_t xsrc_n;
+    int xcidr;
 };
+
+/* Есть ли в группе подсети v4 из наборов sing-box (без подсчёта — по разметке клауз). */
+static inline int group_srs_v4(const struct group *g) {
+    for (size_t i = 0; i < g->srs_n; i++) if (g->srs[i]->has_v4) return 1;
+    return 0;
+}
+
+/* Есть ли у группы набор адресов (правило с поиском в нём), а не «весь трафик». */
+static inline int group_has_set(const struct group *g) {
+    return g->files_n || g->srs_n || g->domains || g->emptied;
+}
 
 
 /* Группы одного разбора спеки — результат build_groups. До 1.7 они лежали в глобале
@@ -83,6 +116,10 @@ struct group {
 struct groups {
     struct group g[MAX_CHANNELS];
     size_t n;
+    /* Раскладки каналов с наборами sing-box: группы указывают в них (l4, srs), поэтому они
+     * живут столько же, сколько группы, и отдаются groups_free. */
+    struct srs_plan plans[MAX_CHANNELS];
+    size_t plans_n;
 };
 
 /* build_groups/check_address_lists возвращают код ошибки, а не завершают процесс — правило 5,

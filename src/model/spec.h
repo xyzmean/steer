@@ -294,6 +294,11 @@ struct channel {
     size_t prefixes_n;
     const char *domains_files[MAX_FILES];
     size_t domains_n;
+    /* Наборы правил sing-box (`.srs`): и имена, и подсети, и сужение в одном файле. Читает их
+     * не разбор спеки, а те, кому нужно содержимое: компилятор (подсети и сужение — src/compile/
+     * groups.c) и резолвер (имена — src/dnsd/table.c); общий читатель — src/model/srs.c. */
+    const char *srs_files[MAX_FILES];
+    size_t srs_n;
     /* fake-IP (default) or real-IP for a domain channel. See dnsd.c: fake-IP is
      * precise per domain but makes every traceroute hop show the fake address,
      * because the kernel rewrites ICMP errors to look like they came from the
@@ -600,6 +605,13 @@ void group_set_name(const struct spec *sp, char *dst, size_t n, const char *out,
 /* Одно ли сужение у двух каналов. Нужна компилятору: протокол и порты входят в ключ
  * слияния групп наравне с выходом и списком клиентов — см. build_groups в steer.c. */
 int l4match_same(const struct l4match *a, const struct l4match *b);
+/* Имена наборов канала с наборами .srs: составного (смешанное сужение) и доп. группы (клаузы с
+ * условиями, которых у канала нет) — см. parse.c и src/model/srsplan.c. */
+void group_set_name_mixed(const struct spec *sp, char *dst, size_t n, const char *out,
+                          const char *kind, const char (*from)[64], size_t from_n, int realip);
+void group_set_name_extra(const struct spec *sp, char *dst, size_t n, const char *out,
+                          const char *kind, const char (*from)[64], size_t from_n, int realip,
+                          unsigned id);
 /* Разбор спеки — правило 5 (docs/architecture.md, раздел 2): модель ошибку ВОЗВРАЩАЕТ, а не
  * завершает процесс сама. 0 — разобрано, *s заполнен (см. правило 6 у struct spec выше); -1 —
  * отказ, текст в e->msg. Завершает процесс только вызывающий, дошедший до точки входа:
