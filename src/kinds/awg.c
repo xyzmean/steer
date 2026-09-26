@@ -1759,7 +1759,7 @@ static void awg_status(FILE *out, const struct spec *sp, const struct output *o)
 
 const struct kind_ops kind_awg = {
     .name = "awg",
-    .caps = KC_DEVICE | KC_MARK | KC_CTMARK | KC_ENGINE_OWNED | KC_OVER | KC_SKIP_ZAPRET,
+    .caps = KC_DEVICE | KC_MARK | KC_CTMARK | KC_ENGINE_OWNED | KC_OVER | KC_SKIP_ZAPRET | KC_IPV6,
     .parse = awg_parse,
     .health = awg_health,
     /* Чинится не ожиданием: процесса, который поднял бы туннель заново, нет — устройство живёт в

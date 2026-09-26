@@ -450,7 +450,7 @@ static void zapret_emit(struct nft_rs *rs, const struct spec *sp, const struct o
 
 const struct kind_ops kind_zapret = {
     .name = "zapret",
-    .caps = KC_MARK | KC_CTMARK | KC_SKIP_ZAPRET,
+    .caps = KC_MARK | KC_CTMARK | KC_SKIP_ZAPRET | KC_IPV6,
     .keys = KK_OPTS,
     .parse = zapret_parse,
     .check = zapret_check,

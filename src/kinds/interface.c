@@ -158,7 +158,7 @@ static int iface_helper(const struct spec *sp, const struct output *o, struct ki
 
 const struct kind_ops kind_interface = {
     .name = "interface",
-    .caps = KC_DEVICE | KC_MARK | KC_CTMARK | KC_SKIP_ZAPRET,
+    .caps = KC_DEVICE | KC_MARK | KC_CTMARK | KC_SKIP_ZAPRET | KC_IPV6,
     .keys = KK_OBFS,
     .caps_of = iface_caps_of,
     .novia = "interface без obfs",
