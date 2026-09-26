@@ -1037,7 +1037,7 @@ if [ -f "$wrap" ]; then
     # супервизор заводится раньше применения при старте (--apply).
     check "обработчики поднимаются раньше apply при старте" "1" \
         "$([ "$(grep -n 'if (!supd_start(&S.d' src/daemon/ctl.c | cut -d: -f1)" \
-             -lt "$(grep -n 'if (S.d.have) boot_apply(&S)' src/daemon/ctl.c | cut -d: -f1)" ] \
+             -lt "$(grep -n 'boot_apply(&S)' src/daemon/ctl.c | cut -d: -f1)" ] \
            && echo 1 || echo 0)"
 
     # А теперь ПОВЕДЕНИЕ, а не наличие строк: обёртка запускается с подставным nfqws (шов

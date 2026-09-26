@@ -605,8 +605,9 @@ int cmd_apply(const char *spec, int dry) {
 struct recon_args {
     const char *spec, *state_dir;
     int nftc;                  /* -1 — спросить ядро */
-    int ruleset, awg, masq;
+    int ruleset, awg, masq, masq_ensure;
     const char *route, *drop;  /* через запятую; NULL — нет */
+    const char *rule;          /* только правило выхода, таблицу не трогать (починка демона) */
 };
 
 static void recon_args_parse(int argc, char **argv, struct recon_args *a, const char *who) {
@@ -621,11 +622,13 @@ static void recon_args_parse(int argc, char **argv, struct recon_args *a, const 
         else if (!strcmp(k, "--nftc") && v) a->nftc = atoi(v);
         else if (!strcmp(k, "--route") && v) a->route = v;
         else if (!strcmp(k, "--drop") && v) a->drop = v;
+        else if (!strcmp(k, "--rule") && v) a->rule = v;
         else {
             val = 0;
             if (!strcmp(k, "--ruleset")) a->ruleset = 1;
             else if (!strcmp(k, "--awg")) a->awg = 1;
             else if (!strcmp(k, "--masq")) a->masq = 1;
+            else if (!strcmp(k, "--masq-ensure")) a->masq_ensure = 1;
             else {
                 fprintf(stderr, "steer %s: непонятное слово %s\n", who, k);
                 exit(2);
@@ -768,7 +771,13 @@ static int name_in_list(const char *list, const char *name) {
  *              cleanup_stale_routing);
  *   --awg      настроить устройства kind=awg (awg_apply_all — поверх, живые сессии не рвутся) и
  *              снять устройства убранных выходов;
- *   --masq     masquerade выходов на телефоне (iptables_masq_sync).
+ *   --masq     masquerade выходов на телефоне (iptables_masq_sync);
+ *   --rule     вернуть только правило этих выходов (rule_ensure), таблицу не трогая, — починка
+ *              демона после чужого удаления правил (src/daemon/rulewd.c): таблица выхода в этот
+ *              момент цела, и в ней может стоять запрет сторожа (on_fail=drop), который
+ *              перепривязка к устройству (--route) сняла бы до следующего прохода;
+ *   --masq-ensure  вернуть недостающий masquerade, не снимая стоящего (iptables_masq_ensure):
+ *              после перезапуска netd, а не после смены спеки.
  * Новый набор правил приходит с пустым набором «пущен напрямую», а выходы, которых --route не
  * касается, в него не попадут сами: их отметка возвращается здесь по таблице выхода. */
 int cmd_apply_commit(int argc, char **argv) {
@@ -812,7 +821,16 @@ int cmd_apply_commit(int argc, char **argv) {
         if (!e) break;
         p = e + 1;
     }
+    for (size_t i = 0; i < cfg.out_n; i++) {
+        const struct output *o = &cfg.out[i];
+        if (name_in_list(a.rule, o->name) && out_has_device(o)) rule_ensure(o->mark, o->table);
+    }
     if (a.masq && plat()->iptables_masq) iptables_masq_sync(&cfg);
+    else if (a.masq_ensure && plat()->iptables_masq) iptables_masq_ensure(&cfg);
+    /* Починка (только --rule и --masq-ensure) — не применение: снимок status описывает то же, что
+     * и до неё, а отчёты apply о зависимостях и итоговая строка в журнале демона были бы
+     * повтором последнего apply. */
+    if (!a.ruleset && !a.route && !a.drop && !a.awg && !a.masq) return 0;
     apply_done_reports(&cfg);
     return 0;
 }

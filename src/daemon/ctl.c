@@ -108,7 +108,11 @@
  * БАТАРЕЯ. Демон спит в epoll_wait без срока: таймеры цикла взводятся только на время
  * запроса, ребёнка или отложенного закрытия и снимаются вместе с ними. Проснуться его может
  * только соединение, вывод ребёнка, сигнал или такой таймер. Стенд tests/ctlmatch.sh меряет
- * это числом добровольных переключений контекста в тишине.
+ * это числом добровольных переключений контекста в тишине. С --watch таймеров больше (период
+ * сторожа, снимок status) — но только пока движок включён: выключенный движок не держит ни
+ * одного таймера и ни одного сокета событий сети (srv_set_enabled), и демон не просыпается сам
+ * вовсе (стенд tests/daemonmatch.sh). Таймеры — CLOCK_MONOTONIC (loop.c): во сне устройства
+ * они стоят, не будят его и не догоняют пачкой; wakelock демон не берёт.
  *
  * ГДЕ СОКЕТ. /data/misc/steer/steer.sock, создаёт его сам сервер. Почему не опция `socket` у
  * init (сокет в /dev/socket, как у netd): каталог /dev/socket может листать любой домен
@@ -154,6 +158,7 @@
 #include "watchd.h"
 #include "helpers.h"
 #include "recon.h"
+#include "rulewd.h"
 #include "ctl.h"
 
 /* Путь сокета по умолчанию — путь платформы (ctl_sock, src/platform/platform.h). */
@@ -400,7 +405,9 @@ static void ctl_prop_cb(void *cookie, const char *name, const char *value, uint3
  * обслуживать (резолвер, сторож), init при выключенном не держит. Включат — init применит
  * сохранённую спеку сам (steerd.rc).
  *
- * Вне bionic свойств нет; там это шов стенда STEER_CTL_ENABLED=0, по умолчанию «включён». */
+ * Вне bionic свойств нет; там это швы стенда: STEER_CTL_ENABLED=0 — выключен на всё время
+ * процесса; STEER_CTL_ENABLED_FILE=ФАЙЛ — выключатель, который стенд переключает на ходу, как
+ * приложение свойство (первый байт «0» — выключен, файла нет — включён). По умолчанию «включён». */
 static int ctl_enabled(void) {
 #ifdef __BIONIC__
     char v[PROP_VALUE_MAX] = "";
@@ -409,7 +416,18 @@ static int ctl_enabled(void) {
     return !strcmp(v, "1");
 #else
     const char *e = getenv("STEER_CTL_ENABLED");
-    return !(e && !strcmp(e, "0"));
+    if (e && !strcmp(e, "0")) return 0;
+    const char *fp = getenv("STEER_CTL_ENABLED_FILE");
+    if (fp && *fp) {
+        char b = '1';
+        int fd = open(fp, O_RDONLY | O_CLOEXEC);
+        if (fd >= 0) {
+            if (read(fd, &b, 1) != 1) b = '1';
+            close(fd);
+        }
+        return b != '0';
+    }
+    return 1;
 #endif
 }
 
@@ -522,6 +540,7 @@ struct conn {
     int committed;            /* apply-commit запускался */
     int rcode;                /* код reload */
     int boot;                 /* применение при старте (--apply): соединения нет, итог — в журнал */
+    int repair;               /* починка правил (rulewd.c): соединения нет, итог — в журнал */
 };
 
 struct ctl_srv {
@@ -538,6 +557,8 @@ struct ctl_srv {
     struct watchd *watch;     /* сторож выходов; NULL — без --watch */
     struct recon_state rec;   /* что демон применил сам (apply-сверка, recon.c) */
     struct loop_timer *snap_tm;   /* освежение снимка status (с --watch), см. srv_snap */
+    struct rulewd *rules;     /* страж правил выходов (с --watch); NULL — без него */
+    int on;                   /* движок включён — как сказали последние apply, reload, SIGHUP */
 };
 
 static void mem_version(struct conn *c, struct cbuf *r);
@@ -553,6 +574,7 @@ static void st_check(struct conn *c);
 static void st_reload(struct conn *c);
 static void st_sub_check(struct conn *c);
 static void st_subscribe(struct conn *c);
+static void st_repair(struct conn *c);
 
 /* ТАБЛИЦА — единственное, что сервер умеет. Команда, которой здесь нет, не исполняется ни в
  * каком виде: слова запроса никогда не становятся именем подкоманды, в argv идут только
@@ -697,6 +719,8 @@ static void lock_release(struct ctl_srv *s) {
         s->hup_pending = 0;
         srv_spec_changed(s, "hup", ctl_enabled(), NULL, 1, NULL);
     }
+    /* Проверка правил, отложенная до конца своей операции (rulewd.h). */
+    rulewd_kick(s->rules);
 }
 
 static void conn_events(struct conn *c, uint32_t ev) {
@@ -1093,7 +1117,9 @@ static void srv_snap(struct loop *l, struct loop_timer *t, void *arg) {
             fclose(f);
         }
     }
-    loop_timer_set(t, CTL_SNAP_MS);
+    /* Выключенному движку снимок не нужен (и пробуждение раз в пять минут — тоже): таймер
+     * заведёт srv_set_enabled, когда движок включат. */
+    if (s->on) loop_timer_set(t, CTL_SNAP_MS);
 }
 
 /* ---- apply и check ---------------------------------------------------------------------- */
@@ -1158,6 +1184,22 @@ static void changed_json(struct cbuf *b, const struct recon_diff *d, const struc
     cb_fmt(b, "],\"dnsd\":%s}", ch && ch->dnsd ? "true" : "false");
 }
 
+/* Положение выключателя — после apply, reload и SIGHUP (их и зовёт init, включая и выключая
+ * движок). Выключенный движок не держит ни одного таймера цикла: ни прохода сторожа, ни снимка
+ * status, ни стража правил — демон спит в epoll_wait без срока до запроса по сокету (требование
+ * батареи телефона; стенд daemonmatch считает переключения контекста). Включили — всё заводится
+ * снова. */
+static void srv_set_enabled(struct ctl_srv *s, int on) {
+    on = !!on;
+    watchd_enable(s->watch, on);
+    rulewd_enable(s->rules, on);
+    if (s->snap_tm) {
+        if (!on) loop_timer_stop(s->snap_tm);
+        else if (!s->on || !loop_timer_armed(s->snap_tm)) loop_timer_set(s->snap_tm, CTL_SNAP_MS);
+    }
+    s->on = on;
+}
+
 /* Спека на диске изменилась (apply, reload, SIGHUP) — перечитать её в память и сказать
  * подписчикам. Удалось — супервизор сверяет помощников и таблицу резолвера, событие applied с
  * отпечатком и полем changed; нет — spec-error, а в памяти остаётся прежняя спека: демон
@@ -1189,6 +1231,8 @@ static void srv_spec_changed(struct ctl_srv *s, const char *by, int enabled,
     }
     if (changed && cj.p) cb_put(changed, cj.p, cj.n);
     free(cj.p);
+    /* После watchd_spec_changed: включённый сейчас сторож проходит сразу, а не через успокоение. */
+    srv_set_enabled(s, enabled);
 }
 
 /* argv проверки кандидата: `apply --dry-run --spec ПУТЬ [--state-dir …]`. */
@@ -1562,6 +1606,9 @@ static void reload_begin(struct conn *c) {
 
 static void reload_done(struct conn *c) {
     srv_spec_changed(c->srv, "reload", ctl_enabled(), &c->diff, c->watch, &c->resp);
+    /* Стартовое применение кончилось — удачно или нет: теперь первый проход сторожа (см.
+     * «ПЕРВЫЙ ПРОХОД — ПОСЛЕ СТАРТОВОГО APPLY» в watchd.c). */
+    if (c->boot) watchd_release(c->srv->watch);
     conn_reply(c);
 }
 
@@ -2326,9 +2373,9 @@ static void srv_hup(struct loop *l, int signo, void *arg) {
  * интерфейса трогает только изменившееся, а не ставит всё заново (наборы, которые наполнил
  * резолвер, при этом не опустошаются). Идёт в очереди изменяющих команд — apply, пришедший по
  * сокету сразу после старта, подождёт его. */
-static void boot_apply(struct ctl_srv *s) {
+static int boot_apply(struct ctl_srv *s) {
     struct conn *c = calloc(1, sizeof(*c));
-    if (!c) return;
+    if (!c) return -1;
     c->srv = s;
     c->fd = -1;
     c->hup = 1;          /* ответ отдавать некому: conn_reply освобождает соединение */
@@ -2339,6 +2386,100 @@ static void boot_apply(struct ctl_srv *s) {
     c->next = s->conns;
     s->conns = c;
     resp_begin(&c->resp, "reload");
+    conn_exec(c);
+    return 0;
+}
+
+/* ---- починка правил выходов (страж правил, rulewd.c) --------------------------------------------
+ *
+ * Страж увидел, что правила выхода нет, а таблица его занята, — правило сняли не мы (netd при
+ * перезапуске, чужой `ip rule flush`). Починка — изменяющая команда без соединения, как стартовое
+ * применение: встаёт в ту же очередь (apply, пришедший по сокету, её подождёт, и наоборот) и не
+ * видна в таблице команд — приложению её не позвать. Что чинить, решается заново в начале:
+ * пока починка ждала очереди, apply мог уже всё поставить. */
+static const struct ctl_cmd CTL_REPAIR = {"repair", NULL, NULL, st_repair, 0, 0, 0, {{0}}, 0, 0, 1};
+
+static void repair_done(struct conn *c, int code) {
+    struct ctl_srv *s = c->srv;
+    struct job *j = &c->job;
+    int masq = plat()->iptables_masq != 0;
+    if (code != 0 || j->timed_out) {
+        cb_utf8_trim(&j->err);
+        fprintf(stderr, LOG_W "правила выходов (%s) вернуть не удалось (код %d)%s%.*s", c->tmp,
+                code, j->err.n ? ":\n" : "\n", (int)j->err.n, j->err.p ? j->err.p : "");
+    } else {
+        fprintf(stderr, LOG_I "правила выходов сняты снаружи — возвращены: %s%s\n", c->tmp,
+                masq ? " (и masquerade)" : "");
+        if (j->err.n) fprintf(stderr, "%.*s", (int)j->err.n, j->err.p);
+        struct cbuf f = {0};
+        cb_str(&f, ",\"outputs\":[");
+        int first = 1;
+        for (char *p = c->tmp; *p; ) {
+            char *e = strchr(p, ',');
+            size_t l = e ? (size_t)(e - p) : strlen(p);
+            if (!first) cb_str(&f, ",");
+            cb_json(&f, p, l);
+            first = 0;
+            if (!e) break;
+            p = e + 1;
+        }
+        cb_fmt(&f, "],\"masq\":%s", masq ? "true" : "false");
+        steerd_emit(&s->d, "repaired", f.p ? f.p : "");
+        free(f.p);
+        /* Остальную маршрутизацию выходов сверит сторож — внеочередным проходом. */
+        watchd_spec_changed(s->watch);
+    }
+    conn_reply(c);
+}
+
+static void st_repair(struct conn *c) {
+    struct ctl_srv *s = c->srv;
+    if (!s->on || !s->d.have || rulewd_missing(s->d.sp, c->tmp, sizeof(c->tmp)) <= 0) {
+        conn_reply(c);
+        return;
+    }
+    char *av[12];
+    size_t n = 0;
+    av[n++] = s->cf.exe;
+    av[n++] = "apply-commit";
+    av[n++] = "--spec";
+    av[n++] = (char *)s->cf.spec;
+    if (s->cf.state_dir) { av[n++] = "--state-dir"; av[n++] = (char *)s->cf.state_dir; }
+    av[n++] = "--rule";
+    av[n++] = c->tmp;
+    av[n++] = "--masq-ensure";
+    av[n] = NULL;
+    if (job_start(c, av, 60, CTL_ERR_MAX, CTL_ERR_MAX, repair_done) != 0) {
+        fprintf(stderr, LOG_W "правила выходов (%s): не удалось запустить движок\n", c->tmp);
+        conn_reply(c);
+    }
+}
+
+/* Обратный вызов стража: поставить починку в очередь изменяющих команд. Уже ждёт или идёт —
+ * вторая незачем. */
+static void srv_repair(void *arg) {
+    struct ctl_srv *s = arg;
+    for (struct conn *c = s->conns; c; c = c->next)
+        if (c->repair) return;
+    struct conn *c = calloc(1, sizeof(*c));
+    if (!c) return;
+    c->srv = s;
+    c->fd = -1;
+    c->hup = 1;
+    c->repair = 1;
+    c->job.po = c->job.pe = -1;
+    c->q.cmd = &CTL_REPAIR;
+    c->q.cf = &s->cf;
+    c->next = s->conns;
+    s->conns = c;
+    resp_begin(&c->resp, "repair");
+    if (s->lock_owner) {
+        c->st = C_WAIT;
+        struct conn **pp = &s->lockq;
+        while (*pp) pp = &(*pp)->qnext;
+        *pp = c;
+        return;
+    }
     conn_exec(c);
 }
 
@@ -2496,12 +2637,18 @@ int ctl_serve_main(int argc, char **argv) {
     loop_signal(S.l, SIGTERM, srv_term, &S);
     loop_signal(S.l, SIGINT, srv_term, &S);
     loop_signal(S.l, SIGHUP, srv_hup, &S);
+    S.on = ctl_enabled();
     if (cf->watch) {
         struct watchd_conf wc = { cf->watch_period ? cf->watch_period : 60, ctl_enabled,
                                   srv_busy, &S };
-        S.watch = watchd_start(&S.d, &wc);
+        /* С --apply первый проход — после стартового применения (watchd_release в reload_done). */
+        S.watch = watchd_start(&S.d, &wc, S.on, cf->apply && S.d.have);
         if (!S.watch) { fprintf(stderr, LOG_W "сторож: нет памяти\n"); return 1; }
-        if ((S.snap_tm = loop_timer_new(S.l, srv_snap, &S))) loop_timer_set(S.snap_tm, CTL_SNAP_MS);
+        S.snap_tm = loop_timer_new(S.l, srv_snap, &S);
+        if (S.snap_tm && S.on) loop_timer_set(S.snap_tm, CTL_SNAP_MS);
+        struct rulewd_conf rc = { srv_busy, srv_repair, &S };
+        S.rules = rulewd_start(&S.d, &rc, S.on);
+        if (!S.rules) { fprintf(stderr, LOG_W "страж правил: нет памяти\n"); return 1; }
     }
     if (cf->supervise) {
         struct supd_conf sc = { ctl_enabled, cf->dnsd_flags };
@@ -2510,8 +2657,8 @@ int ctl_serve_main(int argc, char **argv) {
     fprintf(stderr, LOG_I "слушаю %s%s%s\n", cf->sock, cf->watch ? ", сторожу выходы" : "",
             cf->supervise ? ", держу помощников" : "");
     if (cf->apply) {
-        if (S.d.have) boot_apply(&S);
-        else fprintf(stderr, LOG_W "спеки нет — применять при старте нечего\n");
+        if (!S.d.have) fprintf(stderr, LOG_W "спеки нет — применять при старте нечего\n");
+        else if (boot_apply(&S) != 0) watchd_release(S.watch);
     }
     return loop_run(S.l);
 }
