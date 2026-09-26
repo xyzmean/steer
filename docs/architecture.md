@@ -677,5 +677,7 @@ on_fail=drop, перезапуск procd после kill -9 (apply при ста
   чем поднять службу.
 - splify2 после apply шлёт сигналы экземплярам procd `vless_*`/`obfs_*`, которых больше нет;
   после автообновления подписки ему нужно звать `/etc/init.d/steer reload`.
+- Правки splify2 под 1.8 и `.srs` (`srs_file` вместо раскладки, reload после обновления
+  подписки, без сигналов `vless_*`/`obfs_*`) отложены: владелец велел splify2 пока не трогать.
 - Не проверены на VM: помощники vless/xsteer/obfs/zapret/tgws под --supervise (нет серверов),
   триггер `config.change network`, установка пакетом apk.
