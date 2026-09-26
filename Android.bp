@@ -71,6 +71,8 @@ cc_defaults {
         "src/tools/hwid.c",
         "src/daemon/ctl.c",
         "src/daemon/conns.c",
+        "src/daemon/loop.c",
+        "src/daemon/state.c",
         "src/kinds/kind.c",
         "src/kinds/direct.c",
         "src/kinds/interface.c",

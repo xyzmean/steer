@@ -60,10 +60,6 @@ void aggregate_usage_flags(FILE *out);
 /* Подпись таблицы доменных каналов: ею init-скрипт решает, хватит ли резолверу SIGHUP или
  * нужен перезапуск с пятисекундной паузой procd. Живёт в dnsd.c — там таблица. */
 int dnsd_sig_print(const char *spec, FILE *out);
-/* Соединения с меткой движка (дамп ctnetlink) — src/daemon/conns.c, тем же разговором с
- * ctnetlink, что у ctnl.c; журнал имён работающего резолвера отдаёт сам резолвер, dlog.c. */
-int ctnl_conns_print(FILE *out);
-int dlog_print(FILE *out);
 /* Клиент VLESS есть только в расширенной сборке (steer-extended). В базовой команда
  * отвечает внятным отказом, а не отсутствует: «неизвестная команда» на steer vless
  * заставила бы искать опечатку вместо того, чтобы поставить нужный пакет. */
@@ -272,7 +268,8 @@ int main(int argc, char **argv) {
         if (c->passthru) {
             fputs("\nФлаги:\n", stdout);
             if (!strcmp(cmd, "fit")) aggregate_usage_flags(stdout);
-            else if (!strcmp(cmd, "ctl-serve") || !strcmp(cmd, "ctl")) ctl_usage_flags(stdout);
+            else if (!strcmp(cmd, "daemon") || !strcmp(cmd, "ctl-serve") || !strcmp(cmd, "ctl"))
+                ctl_usage_flags(stdout);
             else dnsd_usage_flags(stdout);
         }
         return 0;
@@ -282,7 +279,10 @@ int main(int argc, char **argv) {
      * Такие команды помечены в таблице как passthru и получают argv как есть. */
     if (c->passthru) {
         if (!strcmp(cmd, "fit")) return aggregate_main(argc - 1, argv + 1);
-        if (!strcmp(cmd, "ctl-serve")) return ctl_serve_main(argc - 2, argv + 2);
+        /* ctl-serve — прежнее имя демона: под ним его запускает сервис телефона
+         * (vendor/der, init/steerd.rc), и оно остаётся синонимом. */
+        if (!strcmp(cmd, "daemon") || !strcmp(cmd, "ctl-serve"))
+            return ctl_serve_main(argc - 2, argv + 2);
         if (!strcmp(cmd, "ctl")) return ctl_client_main(argc - 2, argv + 2);
         return dnsd_main(argc - 2, argv + 2);
     }

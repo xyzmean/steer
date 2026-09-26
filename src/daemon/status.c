@@ -74,7 +74,7 @@ void status_snap_path(char *buf, size_t n) {
  * `cached` дописывается ПЕРЕД закрывающей скобкой, а не в начало: так порядок полей ответа
  * остаётся тем же, каким его видят все нынешние читатели, и `{"schema":1,...` по-прежнему
  * первое, что стоит в строке. */
-static int status_from_snapshot(void) {
+int status_fast(FILE *out) {
     char snap[256];
     status_snap_path(snap, sizeof snap);
     FILE *f = fopen(snap, "r");
@@ -88,8 +88,8 @@ static int status_from_snapshot(void) {
     /* Проверка формы, а не доверие имени файла: оборванная запись оставила бы обрубок,
      * и отдать его значило бы выдать половину JSON за ответ движка. */
     if (n < 3 || buf[0] != '{' || buf[n - 1] != '}') return -1;
-    fwrite(buf, 1, n - 1, stdout);
-    fputs(",\"cached\":true}\n", stdout);
+    fwrite(buf, 1, n - 1, out);
+    fputs(",\"cached\":true}\n", out);
     return 0;
 }
 
@@ -225,22 +225,45 @@ static void status_emit(const struct spec *sp, const struct groups *gr, FILE *ou
     fprintf(out, "]}\n");
 }
 
-/* Полный ответ: посчитать, запомнить и напечатать.
+/* Полный ответ: посчитать, запомнить и напечатать в out.
  *
  * Снимок пишется через временный файл и rename, как и всё прочее состояние: оборванная
  * запись поверх прежнего снимка оставила бы обрубок, а `--fast` тогда отдавал бы половину
  * ответа. Не записалось (нет места, каталог только для чтения) — печатаем и молчим об этом:
  * снимок это УСКОРЕНИЕ, и терять из-за него сам ответ было бы обменом наоборот.
  *
- * Печатается ФАЙЛ, а не второй проход печати: обход выходов читает /sys, а счётчики — живую
- * цепочку nft, и второй проход дал бы в снимке и на экране два разных мгновения. */
+ * Ответ собирается в памяти один раз, и те же байты идут и в снимок, и в out: обход выходов
+ * читает /sys, а счётчики — живую цепочку nft, и второй проход дал бы в снимке и в ответе два
+ * разных мгновения. Этим же путём отвечает демон (status из памяти, src/daemon/ctl.c) — то
+ * есть его ответ и ответ подкоманды собирает один и тот же код, байт в байт. */
+void status_answer(const struct spec *sp, const struct groups *gr, FILE *out) {
+    char *mem = NULL;
+    size_t n = 0;
+    FILE *m = open_memstream(&mem, &n);
+    if (!m) { status_emit(sp, gr, out); return; }
+    status_emit(sp, gr, m);
+    if (fclose(m) != 0 || !mem) { free(mem); status_emit(sp, gr, out); return; }
+
+    char snap[256], tmp[288];
+    status_snap_path(snap, sizeof snap);
+    snprintf(tmp, sizeof tmp, "%s.new", snap);
+    mkdir(steer_state_dir(), 0755);
+    FILE *f = fopen(tmp, "w");
+    if (f) {
+        int ok = fwrite(mem, 1, n, f) == n;
+        if (fclose(f) != 0 || !ok || rename(tmp, snap) != 0) unlink(tmp);
+    }
+    fwrite(mem, 1, n, out);
+    free(mem);
+}
+
 int cmd_status(const char *spec, int fast) {
     static struct spec cfg;
     static struct groups gr;
     /* Запомненное — раньше разбора спеки: смысл `--fast` в том, чтобы не делать работу
      * вовсе. Спека при этом не читается, то есть негодная спека `--fast` не ломает — он
      * отвечает тем, что было применено, пока она была годной. */
-    if (fast && status_from_snapshot() == 0) return 0;
+    if (fast && status_fast(stdout) == 0) return 0;
 
     /* Правило 5, docs/architecture.md, раздел 2: err_die здесь довершает то, что раньше делал
      * die() изнутри load_spec/build_groups. */
@@ -252,25 +275,6 @@ int cmd_status(const char *spec, int fast) {
      * Без этого пул, уведённый сторожем на запасное устройство, отдавался бы интерфейсу
      * основным устройством с `up: false`: рабочий выход, нарисованный сломанным. */
     outputs_adopt_active(&cfg);
-
-    char snap[256], tmp[288];
-    status_snap_path(snap, sizeof snap);
-    snprintf(tmp, sizeof tmp, "%s.new", snap);
-    mkdir(steer_state_dir(), 0755);
-    FILE *f = fopen(tmp, "w");
-    if (!f) { status_emit(&cfg, &gr, stdout); return 0; }
-    status_emit(&cfg, &gr, f);
-    if (fclose(f) != 0 || rename(tmp, snap) != 0) {
-        unlink(tmp);
-        status_emit(&cfg, &gr, stdout);
-        return 0;
-    }
-    f = fopen(snap, "r");
-    if (!f) { status_emit(&cfg, &gr, stdout); return 0; }
-    char buf[8192];
-    size_t n;
-    while ((n = fread(buf, 1, sizeof buf, f)) > 0) fwrite(buf, 1, n, stdout);
-    fclose(f);
+    status_answer(&cfg, &gr, stdout);
     return 0;
 }
-

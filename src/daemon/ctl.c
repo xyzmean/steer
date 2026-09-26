@@ -1,4 +1,5 @@
-/* Управляющий сокет движка: `steer ctl-serve` (сервер) и `steer ctl` (клиент для отладки).
+/* Управляющий сокет движка: демон `steer daemon` (он же `steer ctl-serve` — прежнее имя, под
+ * которым его запускает сервис телефона) и `steer ctl` (клиент для отладки).
  *
  * ЗАЧЕМ. На роутере управляющий слой splify2 зовёт движок как программу: rpcd исполняет
  * `steer status`, кладёт спеку в /etc/steer и зовёт `steer apply`. На телефоне так нельзя.
@@ -12,6 +13,9 @@
  * ПРОТОКОЛ (версия 1; то же самое для автора моста в приложении — в docs/ctl.md).
  *
  *   Одно соединение — один запрос и один ответ, затем сервер закрывает соединение.
+ *   Исключение одно — subscribe: после ответа соединение остаётся открытым, и демон пишет в
+ *   него события, строка JSON на событие ({"v":1,"ev":"applied",…}). Это расширение версии 1,
+ *   а не новая версия: прежние команды и их ответы не изменились ни в одном байте.
  *
  *   Запрос — строка ASCII до 512 байт с '\n' в конце: имя команды и её слова через ОДИН
  *   пробел. У команд с телом (apply, check, put-file) последнее слово — длина тела в байтах
@@ -43,13 +47,28 @@
  * не требуется полузакрытия сокета (у LocalSocket Android оно есть, но лишнее условие
  * совместимости — лишний способ сломаться).
  *
- * ИСПОЛНЕНИЕ — fork+exec самого себя с нужной подкомандой и захватом вывода. Не вызов
- * функций в процессе сервера, и доводов три. (1) Команды движка загружают спеку в
- * глобальные массивы, и второй load_spec в том же процессе склеил бы два чтения — тот же
- * довод, что у failover_loop и supervise. (2) Сбой команды — die() с exit, утечка, зависание
- * на nft — задевает только её процесс: сервер продолжает принимать. (3) Ответ приложению —
- * ровно то, что человек увидит, набрав ту же подкоманду руками в adb root shell, то есть
- * одна правда на двоих, а не вторая реализация status «для сокета».
+ * ИСПОЛНЕНИЕ. Демон — один процесс с одним циклом событий (loop.h): слушающий сокет,
+ * соединения, трубы детей, сигналы и таймеры — всё в одном epoll, и без событий он спит без
+ * срока. Команды делятся на два рода.
+ *
+ *   В процессе, из памяти: version, status, explain, conns, dns-log и файлы списков. Спеку и
+ *   группы демон держит в памяти (state.h) — прочитанными при старте и перечитанными после
+ *   apply и reload, — поэтому status и explain не читают спеку на каждый вызов и не платят
+ *   запуском движка. Ответ при этом ровно тот же, что у подкоманды: его печатает тот же код
+ *   (status_answer, explain_emit, ctnl_conns_print, dlog_print) — в поток в памяти, а не в
+ *   stdout, — а stderr на время команды перенаправлен в файл в памяти. Одна правда на двоих,
+ *   как и прежде, только без второго процесса.
+ *
+ *   Через ребёнка: apply, check, diag, vless-probe, vless-nodes, sub-check и reload (его
+ *   dnsd-sig) — работа ядра или долгий срок. Ребёнок — fork+exec самого себя с подкомандой, в
+ *   своей группе процессов; его stdout и stderr — неблокирующие трубы в том же epoll, выход —
+ *   через signalfd, срок — таймером цикла. Пока ребёнок работает, демон отвечает остальным:
+ *   долгий vless-probe больше не держит status. Сбой в ребёнке (die, зависание на nft) по-
+ *   прежнему задевает только его.
+ *
+ *   Изменяющие команды (apply, check, reload, rm-file) идут по одной: следующая ждёт в очереди
+ *   демона, пока не кончится предыдущая. Раньше это делал flock на ctl.lock между процессами-
+ *   обработчиками; теперь обработчик один, и очередь — его собственная.
  *
  * КОГО ПУСКАТЬ. Первый замок — SELinux: connectto к steerd разрешён splify2_app, и кроме него
  * к сокету может прийти разве что root (su на userdebug) и init. Второй замок — здесь, по
@@ -66,15 +85,17 @@
  * не даёт вторичным пользователям настройки сети устройства.
  *
  * ПРЕДЕЛЫ. Не больше четырёх запросов одновременно (пятому — busy сразу, не очередь: очередь
- * держала бы соединения открытыми на неопределённое время); строка 512 байт, тело 1 МиБ (файл
- * списка — 16 МиБ); пять
- * секунд на запрос; у каждой команды свой срок исполнения, по истечении — SIGKILL всей группе
- * процессов команды (nft и ip, которых она запустила, тоже). Сервер обслуживает соединение в
- * отдельном процессе, поэтому медленный или молчащий клиент держит только свой процесс.
+ * держала бы соединения открытыми на неопределённое время); подписчиков — не больше восьми, и
+ * они в четыре запроса не входят. Строка 512 байт, тело 1 МиБ (файл списка — 16 МиБ); пять
+ * секунд на запрос; у каждой команды через ребёнка свой срок, по истечении — SIGKILL всей
+ * группе процессов команды (nft и ip, которых она запустила, тоже). Медленный или молчащий
+ * клиент демон не держит: чтение и запись неблокирующие, со сроками, а очередь событий
+ * подписчика ограничена — не успевающего читать демон отключает.
  *
- * БАТАРЕЯ. Сервер спит в ppoll без срока: ни таймеров, ни периодических действий. Проснуться
- * его может только соединение или сигнал. Сроки запроса и команды существуют лишь пока идёт
- * запрос и считаются на CLOCK_MONOTONIC.
+ * БАТАРЕЯ. Демон спит в epoll_wait без срока: таймеры цикла взводятся только на время
+ * запроса, ребёнка или отложенного закрытия и снимаются вместе с ними. Проснуться его может
+ * только соединение, вывод ребёнка, сигнал или такой таймер. Стенд tests/ctlmatch.sh меряет
+ * это числом добровольных переключений контекста в тишине.
  *
  * ГДЕ СОКЕТ. /data/misc/steer/steer.sock, создаёт его сам сервер. Почему не опция `socket` у
  * init (сокет в /dev/socket, как у netd): каталог /dev/socket может листать любой домен
@@ -95,7 +116,6 @@
 #include <unistd.h>
 #include <fcntl.h>
 #include <signal.h>
-#include <poll.h>
 #include <time.h>
 #include <dirent.h>
 #include <limits.h>
@@ -104,12 +124,19 @@
 #include <sys/un.h>
 #include <sys/stat.h>
 #include <sys/wait.h>
-#include <sys/file.h>
+#include <sys/epoll.h>
+#include <sys/syscall.h>
 #ifdef __BIONIC__
 #include <sys/system_properties.h>
 #endif
 
 #include "platform.h"
+#include "spec.h"
+#include "groups.h"
+#include "cli.h"
+#include "daemon.h"
+#include "loop.h"
+#include "state.h"
 #include "ctl.h"
 
 /* Путь сокета по умолчанию — путь платформы (ctl_sock, src/platform/platform.h). */
@@ -122,7 +149,7 @@
  * настройки человека, и мегабайта ей хватает с многократным запасом; списки же бывают
  * по несколько мегабайт (антизапретный список подсетей, крупные доменные списки издателя
  * в текстовом виде), и общий предел в 1 МиБ отрезал бы ровно те файлы, ради которых команда
- * заведена. Предел остаётся: тело читается в память обработчика целиком (так оно проверяется
+ * заведена. Предел остаётся: тело читается в память демона целиком (так оно проверяется
  * по объявленной длине до записи на диск), и без него один запрос мог бы попросить у
  * телефона сколько угодно памяти. 16 МиБ — с запасом больше самого крупного списка каталога
  * splify2-lists и всё ещё мелочь для памяти телефона на время одного запроса.
@@ -139,14 +166,28 @@
 #define CTL_ERR_MAX     (64 * 1024)
 #define CTL_CLIENTS_MAX 4
 #define CTL_REQ_MS      5000
-/* Последняя страховка процесса-обработчика: если что-то в нём зависнет мимо всех сроков
- * (блокировка apply, которую держит зависший сосед), он умирает сам, а клиент видит закрытое
- * соединение. Больше самого длинного срока команды (apply) с запасом на ожидание блокировки. */
-#define CTL_HANDLER_S   900
+/* Сколько ждать, пока клиент заберёт ответ (раньше — SO_SNDTIMEO обработчика), и сколько
+ * дочитывать непрочитанный остаток запроса после ответа (см. conn_drain). */
+#define CTL_SEND_MS     5000
+#define CTL_DRAIN_MS    1000
+/* ПОДПИСЧИКИ. Восемь — с запасом на приложение (экран и фоновая служба) и отладку из adb;
+ * больше незачем, а каждый — открытый дескриптор и очередь в памяти демона.
+ *
+ * Очередь событий подписчика — 32 КиБ поверх буфера сокета (его демон уменьшает до 16 КиБ,
+ * чтобы очередь, которую он видит, и была той, что ограничена). Событие — сотня байт, и
+ * событий в минуту единицы: подписчик, отставший на три сотни событий, не читает вовсе, и
+ * держать для него память дальше значило бы дать одному зависшему клиенту расти в демоне без
+ * предела. Переполнение — отключить: подписчик переподключится и спросит status заново, это
+ * честнее, чем тихо выбрасывать события из середины потока. */
+#define CTL_SUBS_MAX    8
+#define CTL_SUBQ_MAX    (32 * 1024)
+#define CTL_SUB_SNDBUF  (16 * 1024)
 #define CTL_ALLOW_UIDS  8
 #define CTL_AID_SYSTEM  1000
 #define CTL_USER_RANGE  100000   /* AID_USER_OFFSET: uid = пользователь * 100000 + приложение */
 
+/* daemon.h заводит LOG_W с меткой apply; у сокета своя метка. */
+#undef LOG_W
 #define LOG_W "steer[warn] ctl: "
 #define LOG_I "steer[info] ctl: "
 
@@ -237,48 +278,7 @@ static void cb_json(struct cbuf *b, const char *s, size_t n) {
 
 static void cb_jstr(struct cbuf *b, const char *s) { cb_json(b, s, strlen(s)); }
 
-/* ---- время и ввод-вывод со сроком ---------------------------------------------------- */
-
-static long ctl_now_ms(void) {
-    struct timespec t;
-    clock_gettime(CLOCK_MONOTONIC, &t);
-    return (long)t.tv_sec * 1000L + t.tv_nsec / 1000000L;
-}
-
-/* Прочитать ровно n байт до срока. 0 — прочитано, -1 — обрыв или срок. */
-static int ctl_read_full(int fd, char *buf, size_t n, long deadline) {
-    size_t got = 0;
-    while (got < n) {
-        long left = deadline - ctl_now_ms();
-        if (left <= 0) return -1;
-        struct pollfd p = { fd, POLLIN, 0 };
-        int r = poll(&p, 1, (int)left);
-        if (r < 0 && errno == EINTR) continue;
-        if (r <= 0) return -1;
-        ssize_t m = read(fd, buf + got, n - got);
-        if (m < 0 && (errno == EINTR || errno == EAGAIN)) continue;
-        if (m <= 0) return -1;
-        got += (size_t)m;
-    }
-    return 0;
-}
-
-/* Строка запроса — по байту: строка короткая, запросы редки, а чтение по байту не
- * захватывает начало тела, которое пришлось бы потом возвращать. 0 — есть строка (без '\n'),
- * -1 — обрыв или срок, -2 — длиннее предела. */
-static int ctl_read_line(int fd, char *line, size_t cap, long deadline) {
-    size_t n = 0;
-    for (;;) {
-        char c;
-        if (ctl_read_full(fd, &c, 1, deadline) != 0) return -1;
-        if (c == '\n') break;
-        if (n + 1 >= cap) return -2;
-        line[n++] = c;
-    }
-    if (n && line[n - 1] == '\r') n--;
-    line[n] = '\0';
-    return 0;
-}
+/* ---- ввод-вывод ------------------------------------------------------------------------ */
 
 static int ctl_write_all(int fd, const char *s, size_t n) {
     while (n) {
@@ -315,9 +315,8 @@ static void resp_run(struct cbuf *r, int code, struct cbuf *out, struct cbuf *er
     if (out->trunc || err->trunc) cb_str(r, ",\"truncated\":true");
 }
 
-static void resp_send(int c, struct cbuf *r) {
-    cb_str(r, "}\n");
-    if (r->p) ctl_write_all(c, r->p, r->n);
+static void resp_bool(struct cbuf *r, const char *k, int v) {
+    cb_fmt(r, ",\"%s\":%s", k, v ? "true" : "false");
 }
 
 /* Закрыть соединение, не оставив в нём непрочитанного запроса.
@@ -328,27 +327,19 @@ static void resp_send(int c, struct cbuf *r) {
  * исключение (у LocalSocket Android — IOException). Так закрывался бы каждый отказ: слишком
  * длинная строка, тело больше предела, busy — всё это отвечается, не дочитав запрос. Поэтому:
  * полузакрыть запись (клиент видит конец ответа), дочитать и выбросить то, что он успел
- * прислать, и только потом закрыть. wait_ms — сколько ждать остатка: обработчик может
- * позволить себе секунду, сам сервер (denied, busy) — нет, он дочитывает только то, что уже
- * пришло. Дочитывается не больше двух пределов тела файла: отвергнутое как слишком большое
- * тело put-file (больше 16 МиБ) клиент шлёт целиком, прежде чем читать ответ, и сброс на
- * середине его записи он увидел бы ошибкой записи, а не нашим too-large. По локальному
- * сокету это десятки миллисекунд; дальше — секунда срока, и хватит. */
-static void ctl_close(int c, int wait_ms) {
+ * прислать, и только потом закрыть. Отвеченное соединение дочитывается в цикле событий со
+ * сроком в секунду (conn_drain); отказ при приёме (denied, busy) — здесь, только то, что уже
+ * пришло: ждать ради того, кого не пустили, демону незачем. Дочитывается не больше двух
+ * пределов тела файла: отвергнутое как слишком большое тело put-file (больше 16 МиБ) клиент
+ * шлёт целиком, прежде чем читать ответ, и сброс на середине его записи он увидел бы ошибкой
+ * записи, а не нашим too-large. По локальному сокету это десятки миллисекунд; дальше —
+ * секунда срока, и хватит. */
+static void ctl_close_now(int c) {
     shutdown(c, SHUT_WR);
-    long deadline = ctl_now_ms() + wait_ms;
     size_t total = 0;
     char buf[16384];
     while (total < 2 * (size_t)CTL_FILE_MAX) {
-        long left = deadline - ctl_now_ms();
-        if (wait_ms > 0) {
-            if (left <= 0) break;
-            struct pollfd p = { c, POLLIN, 0 };
-            int r = poll(&p, 1, (int)left);
-            if (r < 0 && errno == EINTR) continue;
-            if (r <= 0) break;
-        }
-        ssize_t m = recv(c, buf, sizeof(buf), wait_ms > 0 ? 0 : MSG_DONTWAIT);
+        ssize_t m = recv(c, buf, sizeof(buf), MSG_DONTWAIT);
         if (m < 0 && errno == EINTR) continue;
         if (m <= 0) break;
         total += (size_t)m;
@@ -356,106 +347,19 @@ static void ctl_close(int c, int wait_ms) {
     close(c);
 }
 
-/* Отказ одной строкой — для тех, кого не пустили или кому некогда: процесса-обработчика у
- * них нет, отвечает сам сервер. Ответ короче буфера сокета, запись не блокирует. */
-static void ctl_refuse(int c, const char *cmd, const char *err, const char *msg) {
+/* Отказ одной строкой — для тех, кого не пустили или кому некогда: соединения у них нет,
+ * отвечает сам приём. Ответ короче буфера сокета, запись не блокирует. */
+static void ctl_refuse_now(int c, const char *err, const char *msg) {
     struct cbuf r = {0};
-    resp_begin(&r, cmd);
+    resp_begin(&r, NULL);
     resp_error(&r, err, msg);
-    resp_send(c, &r);
+    cb_str(&r, "}\n");
+    if (r.p) {
+        ssize_t w;
+        do w = send(c, r.p, r.n, MSG_NOSIGNAL | MSG_DONTWAIT); while (w < 0 && errno == EINTR);
+    }
     free(r.p);
-}
-
-/* ---- исполнение подкоманды ------------------------------------------------------------- */
-
-/* Запустить движок с argv, собрать stdout и stderr, ждать не дольше timeout_s. Возвращает
- * код возврата (убитой сигналом — 128 + номер, как в shell) или -1, если запустить не
- * удалось. *timed_out — команда убита по сроку. */
-static int ctl_exec(const char *exe, char *const argv[], int timeout_s,
-                    struct cbuf *out, struct cbuf *err, int *timed_out) {
-    int po[2], pe[2];
-    *timed_out = 0;
-    if (pipe2(po, O_CLOEXEC) != 0) return -1;
-    if (pipe2(pe, O_CLOEXEC) != 0) { close(po[0]); close(po[1]); return -1; }
-    pid_t pid = fork();
-    if (pid < 0) {
-        close(po[0]); close(po[1]); close(pe[0]); close(pe[1]);
-        return -1;
-    }
-    if (pid == 0) {
-        /* Своя группа процессов: по сроку убивается и то, что команда успела запустить
-         * (nft, ip, iptables), а не только она сама. */
-        setpgid(0, 0);
-        int nul = open("/dev/null", O_RDONLY);
-        if (nul >= 0) dup2(nul, 0);
-        dup2(po[1], 1);
-        dup2(pe[1], 2);
-        /* Игнорирование SIGPIPE наследуется через exec, а подкоманды рассчитывают на
-         * обычное поведение. */
-        signal(SIGPIPE, SIG_DFL);
-        sigset_t none;
-        sigemptyset(&none);
-        sigprocmask(SIG_SETMASK, &none, NULL);
-        execv(exe, argv);
-        dprintf(2, LOG_W "не запустить %s: %s\n", exe, strerror(errno));
-        _exit(127);
-    }
-    close(po[1]);
-    close(pe[1]);
-    long deadline = ctl_now_ms() + (long)timeout_s * 1000L;
-    struct pollfd p[2] = { { po[0], POLLIN, 0 }, { pe[0], POLLIN, 0 } };
-    int open_n = 2, killed = 0;
-    char buf[16384];
-    while (open_n > 0) {
-        long left = deadline - ctl_now_ms();
-        if (left <= 0) {
-            if (killed) break;          /* убита, а трубы держит кто-то вне группы — хватит */
-            kill(-pid, SIGKILL);
-            kill(pid, SIGKILL);
-            killed = 1;
-            *timed_out = 1;
-            deadline = ctl_now_ms() + 2000;
-            continue;
-        }
-        int r = poll(p, 2, (int)left);
-        if (r < 0 && errno == EINTR) continue;
-        if (r < 0) break;
-        for (int k = 0; k < 2; k++) {
-            if (p[k].fd < 0 || !p[k].revents) continue;
-            ssize_t m = read(p[k].fd, buf, sizeof(buf));
-            if (m > 0) cb_put(k ? err : out, buf, (size_t)m);
-            else if (m == 0 || (errno != EINTR && errno != EAGAIN)) {
-                close(p[k].fd);
-                p[k].fd = -1;
-                open_n--;
-            }
-        }
-    }
-    for (int k = 0; k < 2; k++) if (p[k].fd >= 0) close(p[k].fd);
-
-    /* Трубы закрыты — почти всегда это и есть выход команды. Ждём его без блокировки
-     * навсегда: команда, закрывшая вывод и оставшаяся жить, не должна держать ответ. */
-    int st = 0;
-    long nap = 1;
-    for (;;) {
-        pid_t w = waitpid(pid, &st, WNOHANG);
-        if (w == pid) break;
-        if (w < 0 && errno != EINTR) return -1;
-        if (ctl_now_ms() >= deadline) {
-            if (killed) { waitpid(pid, &st, 0); break; }
-            kill(-pid, SIGKILL);
-            kill(pid, SIGKILL);
-            killed = 1;
-            *timed_out = 1;
-            deadline = ctl_now_ms() + 2000;
-        }
-        struct timespec ts = { 0, nap * 1000000L };
-        nanosleep(&ts, NULL);
-        if (nap < 50) nap *= 2;
-    }
-    if (WIFEXITED(st)) return WEXITSTATUS(st);
-    if (WIFSIGNALED(st)) return 128 + WTERMSIG(st);
-    return -1;
+    ctl_close_now(c);
 }
 
 /* ---- выключатель движка ---------------------------------------------------------------- */
@@ -504,22 +408,29 @@ struct ctl_arg {
     long lo, hi;
 };
 
-struct ctl_req;
-typedef void (*ctl_fn)(const struct ctl_req *q, struct cbuf *r);
+struct conn;
+/* В процессе: ответ дописан в r к возврату. */
+typedef void (*ctl_fn)(struct conn *c, struct cbuf *r);
+/* Свой порядок шагов (обычно с детьми): ответ отдаёт conn_reply, когда шаги кончатся. */
+typedef void (*ctl_start)(struct conn *c);
 
 struct ctl_cmd {
     const char *name;
-    const char *sub;          /* подкоманда движка; NULL — своя обработка (fn) */
-    ctl_fn fn;
+    const char *sub;          /* подкоманда движка для общего случая «через ребёнка» */
+    ctl_fn fn;                /* исполняется в процессе демона */
+    ctl_start start;          /* свои шаги */
     /* Предел тела в байтах; 0 — тела нет. Не 0 — после строки идёт тело, последнее слово
      * строки — его длина. Предел у каждой команды свой: спеке хватает мегабайта, файлу
      * списка — нет (см. CTL_FILE_MAX). */
     long body;
     int argmin, argmax;
     struct ctl_arg args[3];
-    int timeout_s;
+    int timeout_s;            /* срок ребёнка (sub) */
     int spec;                 /* передать подкоманде --spec и --state-dir сервера */
+    int lock;                 /* изменяющая: идёт по одной (очередь демона) */
 };
+
+struct ctl_srv;
 
 struct ctl_req {
     const struct ctl_cmd *cmd;
@@ -530,51 +441,121 @@ struct ctl_req {
     size_t body_n;
 };
 
-static void ctl_do_apply(const struct ctl_req *q, struct cbuf *r);
-static void ctl_do_check(const struct ctl_req *q, struct cbuf *r);
-static void ctl_do_reload(const struct ctl_req *q, struct cbuf *r);
-static void ctl_do_put_file(const struct ctl_req *q, struct cbuf *r);
-static void ctl_do_list_files(const struct ctl_req *q, struct cbuf *r);
-static void ctl_do_rm_file(const struct ctl_req *q, struct cbuf *r);
-static void ctl_do_sub_check(const struct ctl_req *q, struct cbuf *r);
+/* Ребёнок команды. Один на соединение: шаги apply идут друг за другом, не вместе. */
+typedef void (*job_done_fn)(struct conn *c, int code);
+struct job {
+    pid_t pid;
+    int po, pe;               /* трубы stdout и stderr; -1 — закрыта */
+    int running, reaped, status, killed, timed_out;
+    struct cbuf out, err;
+    struct loop_timer *tm;
+    job_done_fn done;
+};
+
+enum conn_state {
+    C_REQ,        /* читаем строку и тело */
+    C_WAIT,       /* изменяющая команда ждёт своей очереди */
+    C_RUN,        /* исполняется (ребёнок или шаги) */
+    C_SEND,       /* отдаём ответ */
+    C_DRAIN,      /* ответ отдан, дочитываем остаток запроса перед закрытием */
+    C_SUB,        /* подписчик: соединение открыто, пишем события */
+};
+
+struct conn {
+    struct conn *next;        /* все соединения демона */
+    struct conn *qnext;       /* очередь изменяющих команд */
+    struct ctl_srv *srv;
+    int fd;
+    enum conn_state st;
+    int counted;              /* входит в четыре одновременных запроса */
+    int hup;                  /* собеседник ушёл, пока команда шла: ответ отдавать некому */
+    int eof;                  /* подписчик закрыл свою половину — читать больше нечего */
+    struct loop_timer *tm;    /* срок запроса, отдачи или дочитывания */
+    char line[CTL_LINE_MAX + 1];
+    size_t line_n;
+    int have_line;
+    struct ctl_req q;
+    char *body;
+    size_t body_got, body_want;
+    /* Ответ, пока строится; потом — то, что уходит в сокет с позиции off. У подписчика —
+     * очередь событий. */
+    struct cbuf resp;
+    size_t off;
+    size_t drained;
+    struct job job;
+    /* Между шагами apply/check/reload. */
+    char tmp[PATH_MAX];
+    struct cbuf old;
+    int had_old;
+    pid_t dn[8];
+    int dn_n;
+    void (*after_reload)(struct conn *c);
+    struct steerd_sub sub;
+};
+
+struct ctl_srv {
+    struct ctl_conf cf;
+    struct steerd d;
+    struct loop *l;
+    int lfd;
+    ino_t ino;
+    struct loop_timer *accept_tm;
+    struct conn *conns;
+    int active, subs;
+    struct conn *lock_owner, *lockq;
+    int hup_pending;
+};
+
+static void mem_version(struct conn *c, struct cbuf *r);
+static void mem_status(struct conn *c, struct cbuf *r);
+static void mem_explain(struct conn *c, struct cbuf *r);
+static void mem_conns(struct conn *c, struct cbuf *r);
+static void mem_dns_log(struct conn *c, struct cbuf *r);
+static void ctl_do_put_file(struct conn *c, struct cbuf *r);
+static void ctl_do_list_files(struct conn *c, struct cbuf *r);
+static void ctl_do_rm_file(struct conn *c, struct cbuf *r);
+static void st_apply(struct conn *c);
+static void st_check(struct conn *c);
+static void st_reload(struct conn *c);
+static void st_sub_check(struct conn *c);
+static void st_subscribe(struct conn *c);
 
 /* ТАБЛИЦА — единственное, что сервер умеет. Команда, которой здесь нет, не исполняется ни в
  * каком виде: слова запроса никогда не становятся именем подкоманды, в argv идут только
  * проверенные по виду аргументы на заранее назначенных местах.
  *
- * Новая команда поверх готовой подкоманды движка — одна строка. Так вошли соединения (conns —
- * дамп conntrack с меткой движка, cmd_conns в dnsd.c) и журнал резолвера (dns-log — кольцо
- * недавних имён в памяти dnsd, dlog_* там же): у каждой есть подкоманда, и то, что приложение
- * видит через сокет, человек получает тем же `steer conns` в adb root shell.
+ * Новая команда поверх готовой подкоманды движка — одна строка с sub: она исполняется
+ * ребёнком, и то, что приложение видит через сокет, человек получает той же подкомандой в adb
+ * root shell. Команда, ответ которой демон может собрать из памяти, — строка с fn: ответ
+ * собирает тот же код, что печатает подкоманда (см. «ИСПОЛНЕНИЕ» в шапке).
  *
  * Файлы списков (put-file, list-files, rm-file) — своя обработка, без подкоманды: это работа
- * с каталогом, которую делает сам обработчик, и подкоманда ради неё была бы вторым путём
- * записи в каталог, которым никто, кроме сервера, не пользуется.
+ * с каталогом, которую делает сам демон, и подкоманда ради неё была бы вторым путём записи в
+ * каталог, которым никто, кроме сервера, не пользуется.
  *
- * Сроки: status и explain — десятки миллисекунд на роутере, срок с запасом на медленное
- * хранилище телефона; diag вдвое дороже status; vless-probe без номера узла перебирает
- * узлы подписки по очереди, каждый со своим --timeout; conns — один дамп conntrack (на
- * телефоне сотни записей, ядро отдаёт их за миллисекунды), dns-log — один запрос к резолверу,
- * который отвечает из памяти. */
+ * Сроки детей: diag — вдвое дороже status (30 с с запасом на медленное хранилище телефона);
+ * vless-probe без номера узла перебирает узлы подписки по очереди, каждый со своим --timeout;
+ * check и apply — свои (см. st_check, st_apply). */
 static const struct ctl_cmd CTL_CMDS[] = {
-    {"version",     "version",     NULL, 0, 0, 0, {{0}}, 5, 0},
-    {"status",      "status",      NULL, 0, 0, 1, {{CA_LIT, "--fast", "fast", 0, 0}}, 15, 1},
-    {"diag",        "diag",        NULL, 0, 0, 0, {{0}}, 30, 1},
-    {"explain",     "explain",     NULL, 0, 1, 1, {{CA_TARGET, NULL, NULL, 0, 0}}, 15, 1},
-    {"vless-nodes", "vless-nodes", NULL, 0, 1, 1, {{CA_NAME, NULL, NULL, 0, 0}}, 15, 1},
-    {"vless-probe", "vless-probe", NULL, 0, 1, 3,
+    {"version",     NULL, mem_version, NULL, 0, 0, 0, {{0}}, 0, 0, 0},
+    {"status",      NULL, mem_status, NULL, 0, 0, 1, {{CA_LIT, "--fast", "fast", 0, 0}}, 0, 0, 0},
+    {"diag",        "diag", NULL, NULL, 0, 0, 0, {{0}}, 30, 1, 0},
+    {"explain",     NULL, mem_explain, NULL, 0, 1, 1, {{CA_TARGET, NULL, NULL, 0, 0}}, 0, 0, 0},
+    {"vless-nodes", "vless-nodes", NULL, NULL, 0, 1, 1, {{CA_NAME, NULL, NULL, 0, 0}}, 15, 1, 0},
+    {"vless-probe", "vless-probe", NULL, NULL, 0, 1, 3,
         {{CA_NAME, NULL, NULL, 0, 0},
          {CA_INT, "--node", NULL, -1, 9999},
-         {CA_INT, "--timeout", NULL, 1, 30}}, 180, 1},
-    {"check",       NULL, ctl_do_check,  CTL_BODY_MAX, 0, 0, {{0}}, 0, 1},
-    {"apply",       NULL, ctl_do_apply,  CTL_BODY_MAX, 0, 0, {{0}}, 0, 1},
-    {"reload",      NULL, ctl_do_reload, 0, 0, 0, {{0}}, 0, 1},
-    {"conns",       "conns",       NULL, 0, 0, 0, {{0}}, 15, 1},
-    {"dns-log",     "dns-log",     NULL, 0, 0, 0, {{0}}, 10, 1},
-    {"put-file",    NULL, ctl_do_put_file, CTL_FILE_MAX, 1, 1, {{CA_FILE, NULL, NULL, 0, 0}}, 0, 0},
-    {"list-files",  NULL, ctl_do_list_files, 0, 0, 0, {{0}}, 0, 0},
-    {"rm-file",     NULL, ctl_do_rm_file, 0, 1, 1, {{CA_FILE, NULL, NULL, 0, 0}}, 0, 0},
-    {"sub-check",   NULL, ctl_do_sub_check, CTL_FILE_MAX, 0, 0, {{0}}, 0, 0},
+         {CA_INT, "--timeout", NULL, 1, 30}}, 180, 1, 0},
+    {"check",       NULL, NULL, st_check,  CTL_BODY_MAX, 0, 0, {{0}}, 0, 1, 1},
+    {"apply",       NULL, NULL, st_apply,  CTL_BODY_MAX, 0, 0, {{0}}, 0, 1, 1},
+    {"reload",      NULL, NULL, st_reload, 0, 0, 0, {{0}}, 0, 1, 1},
+    {"conns",       NULL, mem_conns, NULL, 0, 0, 0, {{0}}, 0, 0, 0},
+    {"dns-log",     NULL, mem_dns_log, NULL, 0, 0, 0, {{0}}, 0, 0, 0},
+    {"put-file",    NULL, ctl_do_put_file, NULL, CTL_FILE_MAX, 1, 1, {{CA_FILE, NULL, NULL, 0, 0}}, 0, 0, 0},
+    {"list-files",  NULL, ctl_do_list_files, NULL, 0, 0, 0, {{0}}, 0, 0, 0},
+    {"rm-file",     NULL, ctl_do_rm_file, NULL, 0, 1, 1, {{CA_FILE, NULL, NULL, 0, 0}}, 0, 0, 1},
+    {"sub-check",   NULL, NULL, st_sub_check, CTL_FILE_MAX, 0, 0, {{0}}, 0, 0, 0},
+    {"subscribe",   NULL, NULL, st_subscribe, 0, 0, 0, {{0}}, 0, 0, 0},
 };
 
 static const struct ctl_cmd *ctl_lookup(const char *name) {
@@ -657,20 +638,384 @@ static size_t ctl_argv(const struct ctl_req *q, const char *sub, char **av, size
     return n;
 }
 
-/* Общий случай: исполнить подкоманду и отдать её код и вывод. */
-static void ctl_run_sub(const struct ctl_req *q, struct cbuf *r) {
-    char *av[16];
-    ctl_argv(q, q->cmd->sub, av, sizeof(av) / sizeof(av[0]));
-    struct cbuf out = { .max = CTL_OUT_MAX }, err = { .max = CTL_ERR_MAX };
-    int to = 0;
-    int code = ctl_exec(q->cf->exe, av, q->cmd->timeout_s, &out, &err, &to);
-    if (code < 0) resp_error(r, "internal", "не удалось запустить движок");
-    else {
-        resp_run(r, code, &out, &err);
-        if (to) resp_error(r, "timeout", "команда не уложилась в свой срок и остановлена");
+/* ---- соединения: ответ, отдача, дочитывание ---------------------------------------------- */
+
+static void conn_free(struct conn *c);
+static void conn_exec(struct conn *c);
+static void conn_ev(struct loop *l, int fd, uint32_t ev, void *arg);
+
+/* Изменяющая команда кончилась: следующая из очереди — сейчас же. SIGHUP, пришедший, пока
+ * шла команда, перечитывает спеку после неё: перечитывание пишет реестр меток, как и
+ * dry-run, и вперемешку с чужим apply им нельзя. */
+static void srv_spec_changed(struct ctl_srv *s, const char *by, int enabled);
+
+static void lock_release(struct ctl_srv *s) {
+    s->lock_owner = NULL;
+    struct conn *n = s->lockq;
+    if (n) {
+        s->lockq = n->qnext;
+        n->qnext = NULL;
+        conn_exec(n);
+        return;
     }
+    if (s->hup_pending) {
+        s->hup_pending = 0;
+        srv_spec_changed(s, "hup", ctl_enabled());
+    }
+}
+
+static void conn_events(struct conn *c, uint32_t ev) {
+    if (!c->hup) loop_fd_mod(c->srv->l, c->fd, ev);
+}
+
+/* Отдать, сколько сокет примет. 0 — всё отдано или ждём EPOLLOUT; -1 — соединение закрыто
+ * (освобождено здесь же — трогать c после этого нельзя). */
+static int conn_flush(struct conn *c) {
+    int progress = 0;
+    while (c->off < c->resp.n) {
+        ssize_t w = send(c->fd, c->resp.p + c->off, c->resp.n - c->off, MSG_NOSIGNAL | MSG_DONTWAIT);
+        if (w > 0) { c->off += (size_t)w; progress = 1; continue; }
+        if (w < 0 && errno == EINTR) continue;
+        if (w < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+            if (c->st == C_SEND && progress) loop_timer_set(c->tm, CTL_SEND_MS);
+            conn_events(c, EPOLLOUT | (c->st == C_SUB && !c->eof ? EPOLLIN : 0));
+            return 0;
+        }
+        conn_free(c);
+        return -1;
+    }
+    if (c->st == C_SUB) {
+        c->resp.n = c->off = 0;
+        conn_events(c, c->eof ? 0 : EPOLLIN);
+        return 0;
+    }
+    /* Ответ отдан целиком: полузакрыть запись (клиент видит конец ответа) и дочитать то, что
+     * он ещё шлёт, — см. «Закрыть соединение, не оставив…». */
+    shutdown(c->fd, SHUT_WR);
+    c->st = C_DRAIN;
+    c->drained = 0;
+    loop_timer_set(c->tm, CTL_DRAIN_MS);
+    conn_events(c, EPOLLIN);
+    return 0;
+}
+
+static void conn_drain(struct conn *c) {
+    char buf[16384];
+    for (;;) {
+        ssize_t m = recv(c->fd, buf, sizeof(buf), MSG_DONTWAIT);
+        if (m < 0 && errno == EINTR) continue;
+        if (m < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) return;
+        if (m <= 0) { conn_free(c); return; }
+        c->drained += (size_t)m;
+        if (c->drained >= 2 * (size_t)CTL_FILE_MAX) { conn_free(c); return; }
+    }
+}
+
+/* Ответ готов (в c->resp без закрывающей скобки) — отдать. Снимает блокировку изменяющих
+ * команд, если она у этого соединения. */
+static void conn_reply(struct conn *c) {
+    struct ctl_srv *s = c->srv;
+    if (s->lock_owner == c) lock_release(s);
+    if (c->hup) { conn_free(c); return; }
+    cb_str(&c->resp, "}\n");
+    c->st = C_SEND;
+    c->off = 0;
+    loop_timer_set(c->tm, CTL_SEND_MS);
+    conn_flush(c);
+}
+
+/* Отказ посреди запроса: всё, что успели дописать в ответ, выбрасывается. */
+static void conn_refuse(struct conn *c, const char *cmd, const char *err, const char *msg) {
+    c->resp.n = 0;
+    c->resp.trunc = 0;
+    resp_begin(&c->resp, cmd);
+    resp_error(&c->resp, err, msg);
+    conn_reply(c);
+}
+
+/* ---- ребёнок ------------------------------------------------------------------------------ */
+
+static void job_check(struct conn *c) {
+    struct job *j = &c->job;
+    if (!j->running || j->po >= 0 || j->pe >= 0 || !j->reaped) return;
+    j->running = 0;
+    loop_timer_stop(j->tm);
+    int st = j->status, code = -1;
+    if (WIFEXITED(st)) code = WEXITSTATUS(st);
+    else if (WIFSIGNALED(st)) code = 128 + WTERMSIG(st);
+    j->done(c, code);
+}
+
+static void job_close_pipe(struct conn *c, int *fd) {
+    if (*fd < 0) return;
+    loop_fd_del(c->srv->l, *fd);
+    close(*fd);
+    *fd = -1;
+}
+
+static void job_pipe(struct loop *l, int fd, uint32_t ev, void *arg) {
+    (void)l; (void)ev;
+    struct conn *c = arg;
+    struct job *j = &c->job;
+    int *pfd = fd == j->po ? &j->po : &j->pe;
+    struct cbuf *b = fd == j->po ? &j->out : &j->err;
+    char buf[16384];
+    for (;;) {
+        ssize_t m = read(fd, buf, sizeof(buf));
+        if (m > 0) { cb_put(b, buf, (size_t)m); continue; }
+        if (m < 0 && errno == EINTR) continue;
+        if (m < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) return;
+        job_close_pipe(c, pfd);
+        break;
+    }
+    job_check(c);
+}
+
+static void job_child(struct loop *l, pid_t pid, int status, void *arg) {
+    (void)l; (void)pid;
+    struct conn *c = arg;
+    c->job.reaped = 1;
+    c->job.status = status;
+    job_check(c);
+}
+
+/* Срок. Первый раз — SIGKILL всей группе команды и ещё две секунды на то, чтобы трубы
+ * закрылись; второй — трубы держит кто-то вне группы, хватит ждать: закрыть их самим. */
+static void job_timer(struct loop *l, struct loop_timer *t, void *arg) {
+    (void)l; (void)t;
+    struct conn *c = arg;
+    struct job *j = &c->job;
+    if (!j->running) return;
+    if (!j->killed) {
+        kill(-j->pid, SIGKILL);
+        if (!j->reaped) kill(j->pid, SIGKILL);
+        j->killed = 1;
+        j->timed_out = 1;
+        loop_timer_set(j->tm, 2000);
+        return;
+    }
+    job_close_pipe(c, &j->po);
+    job_close_pipe(c, &j->pe);
+    job_check(c);
+}
+
+/* Запустить движок с argv: вывод копится в job.out/job.err (с пределами outmax/errmax), по
+ * выходу — done(c, код) (убитый сигналом — 128 + номер, как в shell). -1 — запустить не
+ * удалось (done не будет). */
+static int job_start(struct conn *c, char *const argv[], int timeout_s, size_t outmax,
+                     size_t errmax, job_done_fn done) {
+    struct ctl_srv *s = c->srv;
+    struct job *j = &c->job;
+    free(j->out.p);
+    free(j->err.p);
+    memset(&j->out, 0, sizeof(j->out));
+    memset(&j->err, 0, sizeof(j->err));
+    j->out.max = outmax;
+    j->err.max = errmax;
+    j->reaped = j->killed = j->timed_out = j->status = 0;
+    j->po = j->pe = -1;
+    j->done = done;
+    if (!j->tm && !(j->tm = loop_timer_new(s->l, job_timer, c))) return -1;
+    int po[2], pe[2];
+    if (pipe2(po, O_CLOEXEC) != 0) return -1;
+    if (pipe2(pe, O_CLOEXEC) != 0) { close(po[0]); close(po[1]); return -1; }
+    pid_t pid = fork();
+    if (pid < 0) {
+        close(po[0]); close(po[1]); close(pe[0]); close(pe[1]);
+        return -1;
+    }
+    if (pid == 0) {
+        /* Своя группа процессов: по сроку убивается и то, что команда успела запустить
+         * (nft, ip, iptables), а не только она сама. */
+        setpgid(0, 0);
+        int nul = open("/dev/null", O_RDONLY);
+        if (nul >= 0) dup2(nul, 0);
+        dup2(po[1], 1);
+        dup2(pe[1], 2);
+        /* Сигналы цикла заблокированы, SIGPIPE игнорируется — и то и другое наследуется
+         * через exec, а подкоманды рассчитывают на обычное поведение. */
+        loop_child_reset();
+        execv(s->cf.exe, argv);
+        dprintf(2, LOG_W "не запустить %s: %s\n", s->cf.exe, strerror(errno));
+        _exit(127);
+    }
+    close(po[1]);
+    close(pe[1]);
+    /* Неблокирующим — только наш конец: у ребёнка stdout обычный. */
+    fcntl(po[0], F_SETFL, fcntl(po[0], F_GETFL) | O_NONBLOCK);
+    fcntl(pe[0], F_SETFL, fcntl(pe[0], F_GETFL) | O_NONBLOCK);
+    j->pid = pid;
+    j->po = po[0];
+    j->pe = pe[0];
+    j->running = 1;
+    if (loop_fd_add(s->l, j->po, EPOLLIN, job_pipe, c) != 0) { close(j->po); j->po = -1; }
+    if (loop_fd_add(s->l, j->pe, EPOLLIN, job_pipe, c) != 0) { close(j->pe); j->pe = -1; }
+    loop_child(s->l, pid, job_child, c);
+    loop_timer_set(j->tm, (long)timeout_s * 1000L);
+    return 0;
+}
+
+/* Общий случай: подкоманда целиком — её код и вывод. */
+static void sub_done(struct conn *c, int code) {
+    struct job *j = &c->job;
+    if (code < 0) { resp_error(&c->resp, "internal", "не удалось дождаться движка"); conn_reply(c); return; }
+    resp_run(&c->resp, code, &j->out, &j->err);
+    if (j->timed_out) resp_error(&c->resp, "timeout", "команда не уложилась в свой срок и остановлена");
+    conn_reply(c);
+}
+
+static void st_sub(struct conn *c) {
+    char *av[16];
+    ctl_argv(&c->q, c->q.cmd->sub, av, sizeof(av) / sizeof(av[0]));
+    if (job_start(c, av, c->q.cmd->timeout_s, CTL_OUT_MAX, CTL_ERR_MAX, sub_done) != 0) {
+        resp_error(&c->resp, "internal", "не удалось запустить движок");
+        conn_reply(c);
+    }
+}
+
+/* ---- в процессе: stdout в память, stderr в файл в памяти -------------------------------- *
+ *
+ * Ответ команды в процессе должен быть тем же, что у подкоманды, — и stdout, и stderr: у conns
+ * причина отказа («нет модуля nf_conntrack_netlink») лежит именно в stderr, и приложение её
+ * показывает. stdout печатается в поток open_memstream (функции ответа принимают FILE*), а
+ * stderr на время команды — дескриптор 2, перенаправленный в memfd: так в ответ попадает и
+ * то, что пишет глубоко вложенный код (виды выходов, nft в popen со своим stderr), без
+ * протаскивания второго потока через всё дерево. Демон однопоточный, и на время команды
+ * других записей в журнал у него нет. Нет memfd (ядро старше 3.17) — удалённый временный файл
+ * в каталоге состояния; нет и его — stderr остаётся в журнале, а в ответе пусто. */
+struct mem_run {
+    FILE *f;
+    char *p;
+    size_t n;
+    int saved, fd;
+};
+
+static int cap_fd(void) {
+#ifdef SYS_memfd_create
+    int fd = (int)syscall(SYS_memfd_create, "steer-ctl", 1u /* MFD_CLOEXEC */);
+    if (fd >= 0) return fd;
+#endif
+    char t[PATH_MAX];
+    snprintf(t, sizeof(t), "%s/.ctl-err-XXXXXX", steer_state_dir());
+    int fd2 = mkostemp(t, O_CLOEXEC);
+    if (fd2 >= 0) unlink(t);
+    return fd2;
+}
+
+static FILE *mem_begin(struct mem_run *m) {
+    memset(m, 0, sizeof(*m));
+    m->saved = m->fd = -1;
+    m->f = open_memstream(&m->p, &m->n);
+    if (!m->f) return NULL;
+    fflush(stderr);
+    m->fd = cap_fd();
+    if (m->fd >= 0) {
+        m->saved = fcntl(2, F_DUPFD_CLOEXEC, 3);
+        if (m->saved < 0 || dup2(m->fd, 2) < 0) {
+            if (m->saved >= 0) close(m->saved);
+            close(m->fd);
+            m->saved = m->fd = -1;
+        }
+    }
+    return m->f;
+}
+
+static void mem_end(struct mem_run *m, struct cbuf *r, int code) {
+    struct cbuf out = { .max = CTL_OUT_MAX }, err = { .max = CTL_ERR_MAX };
+    fflush(stderr);
+    if (m->saved >= 0) {
+        dup2(m->saved, 2);
+        close(m->saved);
+        char buf[16384];
+        ssize_t k;
+        if (lseek(m->fd, 0, SEEK_SET) == 0)
+            while ((k = read(m->fd, buf, sizeof(buf))) > 0) cb_put(&err, buf, (size_t)k);
+        close(m->fd);
+    }
+    fclose(m->f);
+    if (m->p) cb_put(&out, m->p, m->n);
+    free(m->p);
+    resp_run(r, code, &out, &err);
     free(out.p);
     free(err.p);
+}
+
+/* Отказ разбора спеки — тем же текстом, что err_die у подкоманды. */
+static int mem_no_spec(const struct steerd *d) {
+    fprintf(stderr, "%s%s\n", "steer: ", d->err);
+    return 2;
+}
+
+static void mem_version(struct conn *c, struct cbuf *r) {
+    (void)c;
+    struct mem_run m;
+    FILE *f = mem_begin(&m);
+    if (!f) { resp_error(r, "internal", "нет памяти под ответ"); return; }
+    cli_version(f);
+    mem_end(&m, r, 0);
+}
+
+/* status из памяти: спека и группы — демона, а то, что меняется без спеки (устройство,
+ * выбранное сторожем, /sys, счётчики nft, реестр), читается на каждый вызов, как у подкоманды.
+ * fast — запомненный снимок, как `status --fast`. */
+static void mem_status(struct conn *c, struct cbuf *r) {
+    struct steerd *d = &c->srv->d;
+    struct mem_run m;
+    FILE *f = mem_begin(&m);
+    if (!f) { resp_error(r, "internal", "нет памяти под ответ"); return; }
+    int code = 0;
+    if (c->q.argc > 0 && status_fast(f) == 0) {
+        /* запомненное отдано */
+    } else if (!d->have) {
+        code = mem_no_spec(d);
+    } else {
+        memcpy(d->view, d->sp, sizeof(*d->view));
+        outputs_adopt_active(d->view);
+        /* Дамп ruleset для fw_check — один на процесс подкоманды; у демона процесс один на
+         * всё время, и дамп берётся заново на каждый ответ. */
+        fwcheck_reset_cache();
+        status_answer(d->view, d->gr, f);
+    }
+    mem_end(&m, r, code);
+}
+
+static void mem_explain(struct conn *c, struct cbuf *r) {
+    struct steerd *d = &c->srv->d;
+    const char *what = c->q.argv[0];
+    struct mem_run m;
+    FILE *f = mem_begin(&m);
+    if (!f) { resp_error(r, "internal", "нет памяти под ответ"); return; }
+    int code;
+    /* Тот же порядок проверок, что у подкоманды (main.c): форма аргумента, затем спека. */
+    if (!addr_ok(what) && !looks_like_name(what)) {
+        fprintf(stderr, "%s%s%s\n", "steer: ", "это не адрес и не имя: ", what);
+        code = 2;
+    } else if (!d->have) {
+        code = mem_no_spec(d);
+    } else {
+        code = explain_emit(d->sp, d->gr, what, f);
+    }
+    mem_end(&m, r, code);
+}
+
+static void mem_conns(struct conn *c, struct cbuf *r) {
+    (void)c;
+    struct mem_run m;
+    FILE *f = mem_begin(&m);
+    if (!f) { resp_error(r, "internal", "нет памяти под ответ"); return; }
+    int code = ctnl_conns_print(f);
+    mem_end(&m, r, code);
+}
+
+/* Журнал резолвера — разговор с его сокетом (dlog_print): он отвечает из памяти, за
+ * миллисекунды; зависший резолвер держит демон не дольше трёх секунд срока чтения. */
+static void mem_dns_log(struct conn *c, struct cbuf *r) {
+    (void)c;
+    struct mem_run m;
+    FILE *f = mem_begin(&m);
+    if (!f) { resp_error(r, "internal", "нет памяти под ответ"); return; }
+    int code = dlog_print(f);
+    mem_end(&m, r, code);
 }
 
 /* ---- apply и check ---------------------------------------------------------------------- */
@@ -718,82 +1063,168 @@ static int ctl_read_file(const char *path, struct cbuf *b, size_t max) {
     return 1;
 }
 
-/* Блокировка изменяющих команд: два apply подряд из двух экранов приложения не должны
- * писать спеку и грузить правила вперемешку. flock, а не своя логика: снимается ядром со
- * смертью процесса, то есть убитый по сроку обработчик соседа не запирает. */
-static int ctl_lock(const struct ctl_conf *cf) {
-    char p[PATH_MAX];
-    snprintf(p, sizeof(p), "%s/ctl.lock", ctl_state_dir(cf));
-    int fd = open(p, O_RDWR | O_CREAT | O_CLOEXEC, 0600);
-    if (fd < 0) return -1;
-    while (flock(fd, LOCK_EX) != 0) {
-        if (errno != EINTR) { close(fd); return -1; }
+/* Спека на диске изменилась (apply, reload, SIGHUP) — перечитать её в память и сказать
+ * подписчикам. Удалось — событие applied с отпечатком; нет — spec-error, а в памяти остаётся
+ * прежняя спека: демон продолжает отвечать по последней годной. */
+static void srv_spec_changed(struct ctl_srv *s, const char *by, int enabled) {
+    char f[2560];
+    if (steerd_load(&s->d) == 0) {
+        snprintf(f, sizeof(f), ",\"by\":\"%s\",\"spec\":\"%s\",\"enabled\":%s", by, s->d.fp,
+                 enabled ? "true" : "false");
+        steerd_emit(&s->d, "applied", f);
+        return;
     }
-    return fd;
+    fprintf(stderr, LOG_W "спека не прочитана (%s): %s\n", by, s->d.err);
+    char m[2304];
+    steerd_json_str(m, sizeof(m), s->d.err);
+    snprintf(f, sizeof(f), ",\"by\":\"%s\",\"message\":%s", by, m);
+    steerd_emit(&s->d, "spec-error", f);
 }
 
-static void resp_bool(struct cbuf *r, const char *k, int v) {
-    cb_fmt(r, ",\"%s\":%s", k, v ? "true" : "false");
-}
-
-/* Проверить кандидата тем же разбором, что и apply: `apply --dry-run` по временному файлу.
- * Так же поступает интерфейс роутера перед записью спеки (splify2, m-spec.sh): компилятор —
- * единственный судья, он же будет это применять. Текст набора правил (stdout) не нужен и не
- * копится; stderr — предупреждения и причина отказа — идёт в ответ. */
-static int ctl_dry_run(const struct ctl_req *q, const char *path, struct cbuf *err, int *to) {
-    struct cbuf out = { .max = 1 };
-    char *av[10];
+/* argv проверки кандидата: `apply --dry-run --spec ПУТЬ [--state-dir …]`. */
+static void dry_argv(struct conn *c, const char *path, char **av) {
     size_t n = 0;
-    av[n++] = (char *)q->cf->exe;
+    av[n++] = c->srv->cf.exe;
     av[n++] = "apply";
     av[n++] = "--dry-run";
     av[n++] = "--spec";
     av[n++] = (char *)path;
-    if (q->cf->state_dir) { av[n++] = "--state-dir"; av[n++] = (char *)q->cf->state_dir; }
+    if (c->srv->cf.state_dir) { av[n++] = "--state-dir"; av[n++] = (char *)c->srv->cf.state_dir; }
     av[n] = NULL;
-    int code = ctl_exec(q->cf->exe, av, 120, &out, err, to);
-    free(out.p);
-    return code;
 }
 
-static void ctl_reload_into(const struct ctl_conf *cf, struct cbuf *r);
+static void check_done(struct conn *c, int code) {
+    struct cbuf none = {0};
+    unlink(c->tmp);
+    if (code < 0) { resp_error(&c->resp, "internal", "не удалось дождаться движка"); conn_reply(c); return; }
+    resp_run(&c->resp, code, &none, &c->job.err);
+    if (c->job.timed_out) resp_error(&c->resp, "timeout", "проверка не уложилась в свой срок и остановлена");
+    conn_reply(c);
+}
 
 /* check — проверить присланную спеку и ничего не менять: для кнопки «Проверить» и для
- * предупреждений до сохранения.
+ * предупреждений до сохранения. Кандидат — во временный файл рядом со спекой и `apply
+ * --dry-run` по нему; текст набора правил (stdout) не нужен и не копится, stderr —
+ * предупреждения и причина отказа — идёт в ответ.
  *
- * Под той же блокировкой, что apply, хотя спеку не трогает: dry-run не чисто читающий — он
- * раздаёт выходам метки в реестре каталога состояния (registry_assign в cmd_apply), и проверка,
+ * Идёт в очереди изменяющих, хотя спеку не трогает: dry-run не чисто читающий — он раздаёт
+ * выходам метки в реестре каталога состояния (registry_assign в cmd_apply), и проверка,
  * идущая одновременно с чужим apply, писала бы реестр посреди его применения. */
-static void ctl_do_check(const struct ctl_req *q, struct cbuf *r) {
-    char tmp[PATH_MAX];
-    int lk = ctl_lock(q->cf);
-    if (lk < 0) {
-        resp_error(r, "internal", "не удалось взять блокировку в каталоге состояния");
+static void st_check(struct conn *c) {
+    if (ctl_write_tmp(c->srv->cf.spec, c->q.body, c->q.body_n, c->tmp, sizeof(c->tmp)) != 0) {
+        resp_error(&c->resp, "internal", "не удалось записать временный файл спеки");
+        conn_reply(c);
         return;
     }
-    if (ctl_write_tmp(q->cf->spec, q->body, q->body_n, tmp, sizeof(tmp)) != 0) {
-        resp_error(r, "internal", "не удалось записать временный файл спеки");
-        close(lk);
-        return;
+    char *av[10];
+    dry_argv(c, c->tmp, av);
+    if (job_start(c, av, 120, 1, CTL_ERR_MAX, check_done) != 0) {
+        unlink(c->tmp);
+        resp_error(&c->resp, "internal", "не удалось запустить движок");
+        conn_reply(c);
     }
-    struct cbuf out = {0}, err = { .max = CTL_ERR_MAX };
-    int to = 0;
-    int code = ctl_dry_run(q, tmp, &err, &to);
-    unlink(tmp);
-    close(lk);
-    if (code < 0) resp_error(r, "internal", "не удалось запустить движок");
-    else {
-        resp_run(r, code, &out, &err);
-        if (to) resp_error(r, "timeout", "проверка не уложилась в свой срок и остановлена");
-    }
-    free(out.p);
-    free(err.p);
 }
 
-/* apply — приложение присылает спеку ЦЕЛИКОМ; сервер проверяет её, атомарно кладёт на место
- * и применяет. Порядок и доводы:
+static void reload_begin(struct conn *c);
+static void apply_done(struct conn *c, int code);
+
+static void apply_finish(struct conn *c) {
+    srv_spec_changed(c->srv, "apply", 1);
+    conn_reply(c);
+}
+
+/* Шаг 2 apply: проверка прошла. */
+static void apply_dry(struct conn *c, int code) {
+    struct ctl_srv *s = c->srv;
+    struct job *j = &c->job;
+    struct cbuf none = {0};
+    const char *spec = s->cf.spec;
+    if (code != 0 || j->timed_out) {
+        unlink(c->tmp);
+        if (code < 0) { resp_error(&c->resp, "internal", "не удалось дождаться движка"); conn_reply(c); return; }
+        resp_run(&c->resp, code, &none, &j->err);
+        resp_bool(&c->resp, "saved", 0);
+        resp_bool(&c->resp, "applied", 0);
+        if (j->timed_out) resp_error(&c->resp, "timeout", "проверка не уложилась в свой срок и остановлена");
+        conn_reply(c);
+        return;
+    }
+    free(c->old.p);
+    memset(&c->old, 0, sizeof(c->old));
+    c->had_old = ctl_read_file(spec, &c->old, 4 * CTL_BODY_MAX);
+    if (rename(c->tmp, spec) != 0) {
+        unlink(c->tmp);
+        resp_error(&c->resp, "internal", "не удалось заменить спеку");
+        conn_reply(c);
+        return;
+    }
+    ctl_fsync_dir(spec);
+
+    if (!ctl_enabled()) {
+        resp_run(&c->resp, 0, &none, &j->err);
+        resp_bool(&c->resp, "saved", 1);
+        resp_bool(&c->resp, "applied", 0);
+        resp_bool(&c->resp, "enabled", 0);
+        srv_spec_changed(s, "apply", 0);
+        conn_reply(c);
+        return;
+    }
+    char *av[10];
+    size_t n = 0;
+    av[n++] = s->cf.exe;
+    av[n++] = "apply";
+    av[n++] = "--spec";
+    av[n++] = (char *)spec;
+    if (s->cf.state_dir) { av[n++] = "--state-dir"; av[n++] = (char *)s->cf.state_dir; }
+    av[n] = NULL;
+    if (job_start(c, av, 300, CTL_OUT_MAX, CTL_ERR_MAX, apply_done) != 0) apply_done(c, -1);
+}
+
+/* Шаг 3 apply: ядро приняло набор — или нет, и тогда прежняя спека возвращается на место. */
+static void apply_done(struct conn *c, int code) {
+    struct ctl_srv *s = c->srv;
+    struct job *j = &c->job;
+    const char *spec = s->cf.spec;
+    if (code != 0 || j->timed_out) {
+        int rolled = 0;
+        if (c->had_old == 1) {
+            char t2[PATH_MAX];
+            if (ctl_write_tmp(spec, c->old.p, c->old.n, t2, sizeof(t2)) == 0) {
+                if (rename(t2, spec) == 0) rolled = 1;
+                else unlink(t2);
+            }
+        } else if (c->had_old == 0) {
+            rolled = unlink(spec) == 0;
+        }
+        if (rolled) ctl_fsync_dir(spec);
+        else cb_str(&j->err, LOG_W "прежнюю спеку вернуть не удалось — на диске новая\n");
+        fprintf(stderr, LOG_W "apply отвергнут (код %d)%s\n", code,
+                rolled ? " — прежняя спека возвращена" : "");
+        resp_run(&c->resp, code < 0 ? 127 : code, &j->out, &j->err);
+        resp_bool(&c->resp, "saved", !rolled);
+        resp_bool(&c->resp, "applied", 0);
+        resp_bool(&c->resp, "enabled", 1);
+        resp_bool(&c->resp, "rolled_back", rolled);
+        if (j->timed_out) resp_error(&c->resp, "timeout", "применение не уложилось в свой срок и остановлено");
+        /* Вернуть не удалось — на диске новая спека, и память идёт за диском (молча: в ядре
+         * она не стоит, события applied нет). */
+        if (!rolled) steerd_load(&s->d);
+        conn_reply(c);
+        return;
+    }
+    fprintf(stderr, LOG_I "спека применена\n");
+    resp_run(&c->resp, 0, &j->out, &j->err);
+    resp_bool(&c->resp, "saved", 1);
+    resp_bool(&c->resp, "applied", 1);
+    resp_bool(&c->resp, "enabled", 1);
+    c->after_reload = apply_finish;
+    reload_begin(c);
+}
+
+/* apply — приложение присылает спеку ЦЕЛИКОМ; демон проверяет её, атомарно кладёт на место и
+ * применяет. Порядок и доводы:
  *
- *   1. Блокировка (см. ctl_lock).
+ *   1. Очередь изменяющих команд (см. «ИСПОЛНЕНИЕ» в шапке).
  *   2. Кандидат — во временный файл рядом со спекой и `apply --dry-run` по нему. Отказ —
  *      временный файл удаляется, spec.json не тронут; в ответе код и stderr проверки,
  *      "saved":false.
@@ -807,94 +1238,22 @@ static void ctl_do_check(const struct ctl_req *q, struct cbuf *r) {
  *      "saved":false, "rolled_back":true.
  *   6. Успех — перечитать спеку резолвером и супервизором (как reload), "reload" в ответе.
  *
- * Сторожу (failover --loop) сигнал не нужен: каждый его проход — новый процесс, который
- * читает спеку заново. */
-static void ctl_do_apply(const struct ctl_req *q, struct cbuf *r) {
-    const char *spec = q->cf->spec;
-    int lk = ctl_lock(q->cf);
-    if (lk < 0) {
-        resp_error(r, "internal", "не удалось взять блокировку в каталоге состояния");
+ * После п. 4 и п. 6 демон перечитывает спеку в память и шлёт подписчикам applied. Сторожу
+ * (failover --loop) сигнал не нужен: каждый его проход — новый процесс, который читает спеку
+ * заново. */
+static void st_apply(struct conn *c) {
+    if (ctl_write_tmp(c->srv->cf.spec, c->q.body, c->q.body_n, c->tmp, sizeof(c->tmp)) != 0) {
+        resp_error(&c->resp, "internal", "не удалось записать временный файл спеки");
+        conn_reply(c);
         return;
     }
-    char tmp[PATH_MAX];
-    struct cbuf out = { .max = CTL_OUT_MAX }, err = { .max = CTL_ERR_MAX }, old = {0};
-    int to = 0;
-    if (ctl_write_tmp(spec, q->body, q->body_n, tmp, sizeof(tmp)) != 0) {
-        resp_error(r, "internal", "не удалось записать временный файл спеки");
-        goto done;
-    }
-    int code = ctl_dry_run(q, tmp, &err, &to);
-    if (code != 0 || to) {
-        unlink(tmp);
-        if (code < 0) { resp_error(r, "internal", "не удалось запустить движок"); goto done; }
-        resp_run(r, code, &out, &err);
-        resp_bool(r, "saved", 0);
-        resp_bool(r, "applied", 0);
-        if (to) resp_error(r, "timeout", "проверка не уложилась в свой срок и остановлена");
-        goto done;
-    }
-    int had_old = ctl_read_file(spec, &old, 4 * CTL_BODY_MAX);
-    if (rename(tmp, spec) != 0) {
-        unlink(tmp);
-        resp_error(r, "internal", "не удалось заменить спеку");
-        goto done;
-    }
-    ctl_fsync_dir(spec);
-
-    int en = ctl_enabled();
-    if (!en) {
-        resp_run(r, 0, &out, &err);
-        resp_bool(r, "saved", 1);
-        resp_bool(r, "applied", 0);
-        resp_bool(r, "enabled", 0);
-        goto done;
-    }
-    err.n = 0;
-    err.trunc = 0;
-    if (err.p) err.p[0] = '\0';
     char *av[10];
-    size_t n = 0;
-    av[n++] = (char *)q->cf->exe;
-    av[n++] = "apply";
-    av[n++] = "--spec";
-    av[n++] = (char *)spec;
-    if (q->cf->state_dir) { av[n++] = "--state-dir"; av[n++] = (char *)q->cf->state_dir; }
-    av[n] = NULL;
-    code = ctl_exec(q->cf->exe, av, 300, &out, &err, &to);
-    if (code != 0 || to) {
-        int rolled = 0;
-        if (had_old == 1) {
-            char t2[PATH_MAX];
-            if (ctl_write_tmp(spec, old.p, old.n, t2, sizeof(t2)) == 0) {
-                if (rename(t2, spec) == 0) rolled = 1;
-                else unlink(t2);
-            }
-        } else if (had_old == 0) {
-            rolled = unlink(spec) == 0;
-        }
-        if (rolled) ctl_fsync_dir(spec);
-        else cb_str(&err, LOG_W "прежнюю спеку вернуть не удалось — на диске новая\n");
-        fprintf(stderr, LOG_W "apply отвергнут (код %d)%s\n", code,
-                rolled ? " — прежняя спека возвращена" : "");
-        resp_run(r, code < 0 ? 127 : code, &out, &err);
-        resp_bool(r, "saved", !rolled);
-        resp_bool(r, "applied", 0);
-        resp_bool(r, "enabled", 1);
-        resp_bool(r, "rolled_back", rolled);
-        if (to) resp_error(r, "timeout", "применение не уложилось в свой срок и остановлено");
-        goto done;
+    dry_argv(c, c->tmp, av);
+    if (job_start(c, av, 120, 1, CTL_ERR_MAX, apply_dry) != 0) {
+        unlink(c->tmp);
+        resp_error(&c->resp, "internal", "не удалось запустить движок");
+        conn_reply(c);
     }
-    fprintf(stderr, LOG_I "спека применена\n");
-    resp_run(r, 0, &out, &err);
-    resp_bool(r, "saved", 1);
-    resp_bool(r, "applied", 1);
-    resp_bool(r, "enabled", 1);
-    ctl_reload_into(q->cf, r);
-done:
-    free(out.p);
-    free(err.p);
-    free(old.p);
-    close(lk);
 }
 
 /* ---- reload ------------------------------------------------------------------------------ */
@@ -945,54 +1304,68 @@ static void ctl_rstrip(struct cbuf *b) {
 /* Перечитать спеку резолвером и супервизором помощников — поле "reload" ответа.
  *
  * РЕЗОЛВЕР — тем же решением, что init-скрипт роутера (files/etc/init.d/steer, reload_dnsd):
- * подпись таблицы каналов по новой спеке (`steer dnsd-sig`) сравнивается с той, что резолвер
- * положил в dnsd.sig при запуске. Совпали — SIGHUP: списки перечитываются без потери
+ * подпись таблицы каналов по новой спеке (`steer dnsd-sig`, ребёнком) сравнивается с той, что
+ * резолвер положил в dnsd.sig при запуске. Совпали — SIGHUP: списки перечитываются без потери
  * запросов. Разошлись или подписи нет — SIGTERM: состав каналов HUP не пересобирает, а init
  * поднимает вышедший сервис заново (он не oneshot). "hup" | "restart" | "none" (не запущен).
  *
  * СУПЕРВИЗОР — SIGHUP: сверить состав помощников со спекой; помощник выхода, у которого
- * изменились параметры, перезапускается им же (см. cmd_supervise). "hup" | "none". */
-static void ctl_reload_into(const struct ctl_conf *cf, struct cbuf *r) {
+ * изменились параметры, перезапускается им же (см. cmd_supervise). "hup" | "none".
+ *
+ * Кончив, зовёт c->after_reload. */
+static void reload_finish(struct conn *c, const char *dn) {
     pid_t pids[8];
-    const char *dn = "none", *sv = "none";
-    int k = ctl_find(cf->exe, "dnsd", pids, 8);
-    if (k > 0) {
-        char *av[8];
-        size_t n = 0;
-        av[n++] = (char *)cf->exe;
-        av[n++] = "dnsd-sig";
-        av[n++] = "--spec";
-        av[n++] = (char *)cf->spec;
-        if (cf->state_dir) { av[n++] = "--state-dir"; av[n++] = (char *)cf->state_dir; }
-        av[n] = NULL;
-        struct cbuf now = { .max = CTL_OUT_MAX }, e = { .max = CTL_ERR_MAX }, run = {0};
-        int to = 0;
-        int code = ctl_exec(cf->exe, av, 30, &now, &e, &to);
-        char sp[PATH_MAX];
-        snprintf(sp, sizeof(sp), "%s/dnsd.sig", ctl_state_dir(cf));
-        int have = ctl_read_file(sp, &run, CTL_OUT_MAX) == 1;
-        ctl_rstrip(&now);
-        ctl_rstrip(&run);
-        int same = code == 0 && !to && have && run.n && now.n == run.n &&
-                   !memcmp(now.p, run.p, now.n);
-        for (int i = 0; i < k; i++) kill(pids[i], same ? SIGHUP : SIGTERM);
-        dn = same ? "hup" : "restart";
-        free(now.p);
-        free(e.p);
-        free(run.p);
-    }
-    k = ctl_find(cf->exe, "supervise", pids, 8);
+    const char *sv = "none";
+    int k = ctl_find(c->srv->cf.exe, "supervise", pids, 8);
     for (int i = 0; i < k; i++) kill(pids[i], SIGHUP);
     if (k > 0) sv = "hup";
-    cb_fmt(r, ",\"reload\":{\"dnsd\":\"%s\",\"outputs\":\"%s\"}", dn, sv);
+    cb_fmt(&c->resp, ",\"reload\":{\"dnsd\":\"%s\",\"outputs\":\"%s\"}", dn, sv);
+    c->after_reload(c);
 }
 
-static void ctl_do_reload(const struct ctl_req *q, struct cbuf *r) {
-    int lk = ctl_lock(q->cf);
-    cb_str(r, ",\"code\":0");
-    resp_bool(r, "enabled", ctl_enabled());
-    ctl_reload_into(q->cf, r);
-    if (lk >= 0) close(lk);
+static void reload_sig(struct conn *c, int code) {
+    struct job *j = &c->job;
+    struct cbuf run = {0};
+    char sp[PATH_MAX];
+    snprintf(sp, sizeof(sp), "%s/dnsd.sig", ctl_state_dir(&c->srv->cf));
+    int have = ctl_read_file(sp, &run, CTL_OUT_MAX) == 1;
+    ctl_rstrip(&j->out);
+    ctl_rstrip(&run);
+    int same = code == 0 && !j->timed_out && have && run.n && j->out.n == run.n &&
+               !memcmp(j->out.p, run.p, run.n);
+    for (int i = 0; i < c->dn_n; i++) kill(c->dn[i], same ? SIGHUP : SIGTERM);
+    free(run.p);
+    reload_finish(c, same ? "hup" : "restart");
+}
+
+static void reload_begin(struct conn *c) {
+    struct ctl_srv *s = c->srv;
+    c->dn_n = ctl_find(s->cf.exe, "dnsd", c->dn, 8);
+    if (c->dn_n <= 0) { reload_finish(c, "none"); return; }
+    char *av[8];
+    size_t n = 0;
+    av[n++] = s->cf.exe;
+    av[n++] = "dnsd-sig";
+    av[n++] = "--spec";
+    av[n++] = (char *)s->cf.spec;
+    if (s->cf.state_dir) { av[n++] = "--state-dir"; av[n++] = (char *)s->cf.state_dir; }
+    av[n] = NULL;
+    if (job_start(c, av, 30, CTL_OUT_MAX, CTL_ERR_MAX, reload_sig) != 0) {
+        memset(&c->job.out, 0, sizeof(c->job.out));
+        reload_sig(c, -1);
+    }
+}
+
+static void reload_done(struct conn *c) {
+    srv_spec_changed(c->srv, "reload", ctl_enabled());
+    conn_reply(c);
+}
+
+static void st_reload(struct conn *c) {
+    cb_str(&c->resp, ",\"code\":0");
+    resp_bool(&c->resp, "enabled", ctl_enabled());
+    c->after_reload = reload_done;
+    reload_begin(c);
 }
 
 /* ---- файлы списков: put-file, list-files, rm-file --------------------------------------------
@@ -1016,13 +1389,12 @@ static void ctl_do_reload(const struct ctl_req *q, struct cbuf *r) {
  * либо прежний файл целиком, либо новый целиком, но не обрубок на середине записи. Имя
  * временного файла начинается с точки, а имя от приложения точкой начинаться не может
  * (CA_FILE): совпасть им негде, и list-files точечные имена не показывает. Временный файл,
- * оставшийся от обработчика, убитого посреди записи, убирает сервер при старте
- * (ctl_lists_sweep) — в это время ни одного обработчика ещё нет, и убрать чужой живой файл
- * нельзя.
+ * оставшийся от демона, убитого посреди записи, убирает он же при старте (ctl_lists_sweep) —
+ * в это время ни одной записи ещё не идёт, и убрать чужой живой файл нельзя.
  *
- * Блокировка apply (ctl.lock) put-file не берёт: замена файла атомарна, и apply, идущий
- * рядом, прочтёт прежний или новый — то же, что при записи до или после него. rm-file её
- * берёт: он сверяется с сохранённой спекой, и сверка имеет смысл, только пока спеку никто не
+ * Очередь изменяющих команд put-file не ждёт: замена файла атомарна, и apply, идущий рядом,
+ * прочтёт прежний или новый — то же, что при записи до или после него. rm-file идёт в ней:
+ * он сверяется с сохранённой спекой, и сверка имеет смысл, только пока спеку никто не
  * меняет (см. ctl_do_rm_file). */
 
 /* Сколько файлов и байт в каталоге списков, не считая временных и файла skip (его put-file
@@ -1056,7 +1428,8 @@ static void ctl_lists_sweep(const char *dir) {
 
 /* put-file <имя> <длина> + тело — положить файл в каталог списков.
  * Ответ: "code":0, "name", "size" (байт) и "path" — полный путь, который пишется в спеку. */
-static void ctl_do_put_file(const struct ctl_req *q, struct cbuf *r) {
+static void ctl_do_put_file(struct conn *c, struct cbuf *r) {
+    const struct ctl_req *q = &c->q;
     const char *dir = q->cf->lists_dir, *name = q->argv[0];
     /* Каталог — при первом put, 0700: владелец движок, остальным (и shell) в нём делать нечего,
      * как в state и tmp. Родитель (каталог спеки) создан init-ом. */
@@ -1113,7 +1486,8 @@ static int ctl_name_cmp(const void *a, const void *b) {
 /* list-files — что лежит в каталоге списков: "files":[{"name","size","mtime"}], по имени.
  * mtime — секунды Unix (время последнего put-file этого имени). Каталога ещё нет — пустой
  * список: для приложения это то же самое, что «ничего не залито». */
-static void ctl_do_list_files(const struct ctl_req *q, struct cbuf *r) {
+static void ctl_do_list_files(struct conn *c, struct cbuf *r) {
+    const struct ctl_req *q = &c->q;
     const char *dir = q->cf->lists_dir;
     cb_str(r, ",\"code\":0,\"dir\":");
     cb_jstr(r, dir);
@@ -1171,18 +1545,14 @@ static int ctl_spec_mentions(const struct cbuf *spec, const char *path) {
  * который не прошёл и вернул прежнюю спеку) — движок, который перестаёт подниматься: init
  * применяет сохранённую спеку на каждой загрузке и после каждого перезапуска netd, а спека с
  * пропавшим файлом списка к применению уже не годится, и резолвер перестаёт узнавать имена
- * канала. Проверка — под блокировкой apply: пока она взята, спеку никто не заменит, и «не
- * упомянут» остаётся правдой до самого unlink. */
-static void ctl_do_rm_file(const struct ctl_req *q, struct cbuf *r) {
+ * канала. Команда идёт в очереди изменяющих: пока она исполняется, apply ждёт, и «не упомянут»
+ * остаётся правдой до самого unlink. */
+static void ctl_do_rm_file(struct conn *c, struct cbuf *r) {
+    const struct ctl_req *q = &c->q;
     const char *name = q->argv[0];
     char path[PATH_MAX];
     if ((size_t)snprintf(path, sizeof(path), "%s/%s", q->cf->lists_dir, name) >= sizeof(path)) {
         resp_error(r, "internal", "слишком длинный путь каталога списков");
-        return;
-    }
-    int lk = ctl_lock(q->cf);
-    if (lk < 0) {
-        resp_error(r, "internal", "не удалось взять блокировку в каталоге состояния");
         return;
     }
     struct cbuf spec = {0};
@@ -1206,7 +1576,14 @@ static void ctl_do_rm_file(const struct ctl_req *q, struct cbuf *r) {
         }
     }
     free(spec.p);
-    close(lk);
+}
+
+static void sub_check_done(struct conn *c, int code) {
+    unlink(c->tmp);
+    if (code < 0) { resp_error(&c->resp, "internal", "не удалось дождаться движка"); conn_reply(c); return; }
+    resp_run(&c->resp, code, &c->job.out, &c->job.err);
+    if (c->job.timed_out) resp_error(&c->resp, "timeout", "разбор подписки не уложился в свой срок и остановлен");
+    conn_reply(c);
 }
 
 /* sub-check <длина> + тело — разобрать присланный файл подписки, ничего не сохраняя: сколько
@@ -1214,119 +1591,304 @@ static void ctl_do_rm_file(const struct ctl_req *q, struct cbuf *r) {
  * файлом выхода: скачав её, логика показывает человеку «пригодно 12, пропущено 3 — ws не
  * поддерживается» и решает, заливать ли (put-file).
  *
- * Разбирает не сервер, а `steer vless-nodes <файл>` — та же подкоманда, тем же разбором
- * (vless_parse_sub), что и подъём выхода: второй разбор «для проверки» разошёлся бы с тем,
- * которым узлы потом поднимаются. Тело кладётся во временный файл каталога времянок движка
- * (путь абсолютный — по нему vless-nodes отличает файл от имени выхода) и удаляется сразу
- * после разбора. В ответе — код и вывод подкоманды как есть; поле sub_file в её JSON — имя
- * этого временного файла, для приложения оно ничего не значит. В базовой сборке (без VLESS)
- * подкоманда честно отказывает кодом 2, как vless-nodes. */
-static void ctl_do_sub_check(const struct ctl_req *q, struct cbuf *r) {
-    char tmp[PATH_MAX];
+ * Разбирает не демон, а `steer vless-nodes <файл>` ребёнком — та же подкоманда, тем же
+ * разбором (vless_parse_sub), что и подъём выхода: второй разбор «для проверки» разошёлся бы с
+ * тем, которым узлы потом поднимаются. Тело кладётся во временный файл каталога времянок
+ * движка (путь абсолютный — по нему vless-nodes отличает файл от имени выхода) и удаляется
+ * сразу после разбора. В ответе — код и вывод подкоманды как есть; поле sub_file в её JSON —
+ * имя этого временного файла, для приложения оно ничего не значит. В базовой сборке (без
+ * VLESS) подкоманда честно отказывает кодом 2, как vless-nodes. */
+static void st_sub_check(struct conn *c) {
     char stem[PATH_MAX];
     snprintf(stem, sizeof stem, "%s/sub-check", plat()->tmp_dir);
-    if (ctl_write_tmp(stem, q->body, q->body_n, tmp, sizeof(tmp)) != 0) {
-        resp_error(r, "internal", "не удалось записать временный файл подписки");
+    if (ctl_write_tmp(stem, c->q.body, c->q.body_n, c->tmp, sizeof(c->tmp)) != 0) {
+        resp_error(&c->resp, "internal", "не удалось записать временный файл подписки");
+        conn_reply(c);
         return;
     }
-    char *av[4] = { (char *)q->cf->exe, "vless-nodes", tmp, NULL };
-    struct cbuf out = { .max = CTL_OUT_MAX }, err = { .max = CTL_ERR_MAX };
-    int to = 0;
-    int code = ctl_exec(q->cf->exe, av, 15, &out, &err, &to);
-    unlink(tmp);
-    if (code < 0) resp_error(r, "internal", "не удалось запустить движок");
-    else {
-        resp_run(r, code, &out, &err);
-        if (to) resp_error(r, "timeout", "разбор подписки не уложился в свой срок и остановлен");
+    char *av[4] = { c->srv->cf.exe, "vless-nodes", c->tmp, NULL };
+    if (job_start(c, av, 15, CTL_OUT_MAX, CTL_ERR_MAX, sub_check_done) != 0) {
+        unlink(c->tmp);
+        resp_error(&c->resp, "internal", "не удалось запустить движок");
+        conn_reply(c);
     }
-    free(out.p);
-    free(err.p);
 }
 
-/* ---- обработка соединения ------------------------------------------------------------------ */
-
-static void ctl_handle(int c, const struct ctl_conf *cf) {
-    alarm(CTL_HANDLER_S);
-    struct timeval tv = { 5, 0 };
-    setsockopt(c, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
-    long deadline = ctl_now_ms() + CTL_REQ_MS;
-    char line[CTL_LINE_MAX + 1];
-    int st = ctl_read_line(c, line, sizeof(line), deadline);
-    if (st == -2) { ctl_refuse(c, NULL, "too-large", "строка запроса длиннее 512 байт"); return; }
-    if (st < 0) {
-        ctl_refuse(c, NULL, "bad-request", "запрос не пришёл целиком за 5 секунд");
+/* ---- subscribe ------------------------------------------------------------------------------
+ *
+ * Подписчик — соединение, которое после ответа не закрывается: демон дописывает в него
+ * события (steerd_emit, state.h), строка JSON на событие. Ответ на сам subscribe — обычная
+ * строка {"v":1,"cmd":"subscribe","code":0,"spec":"<отпечаток>"}: с чем подписчик начинает.
+ *
+ * Очередь событий — тот же буфер, что у ответа, с пределом CTL_SUBQ_MAX: запись неблокирующая,
+ * что сокет не принял, ждёт EPOLLOUT; событие, которое не влезло бы, отключает подписчика
+ * (см. CTL_SUBQ_MAX). Что подписчик пишет после subscribe, демон читает и выбрасывает; конец
+ * его записи (shutdown) — не уход: `steer ctl subscribe` полузакрывает запись сразу после
+ * запроса и ждёт событий. Уход — это EPOLLHUP или ошибка записи. */
+static void sub_push(struct steerd_sub *sb, const char *line, size_t n) {
+    struct conn *c = sb->arg;
+    size_t pending = c->resp.n - c->off;
+    if (pending + n > CTL_SUBQ_MAX) {
+        fprintf(stderr, LOG_W "подписчик не забирает события (в очереди %zu байт) — отключён\n",
+                pending);
+        conn_free(c);
         return;
     }
+    if (c->off) {
+        memmove(c->resp.p, c->resp.p + c->off, pending);
+        c->resp.n = pending;
+        c->off = 0;
+    }
+    cb_put(&c->resp, line, n);
+    conn_flush(c);
+}
+
+static void st_subscribe(struct conn *c) {
+    struct ctl_srv *s = c->srv;
+    if (s->subs >= CTL_SUBS_MAX) {
+        resp_error(&c->resp, "busy", "подписчиков уже восемь — повторите позже");
+        conn_reply(c);
+        return;
+    }
+    if (c->counted) { c->counted = 0; s->active--; }
+    s->subs++;
+    c->st = C_SUB;
+    loop_timer_stop(c->tm);
+    int sb = CTL_SUB_SNDBUF;
+    setsockopt(c->fd, SOL_SOCKET, SO_SNDBUF, &sb, sizeof(sb));
+    cb_str(&c->resp, ",\"code\":0");
+    if (s->d.have) cb_fmt(&c->resp, ",\"spec\":\"%s\"", s->d.fp);
+    cb_str(&c->resp, "}\n");
+    c->off = 0;
+    c->sub.push = sub_push;
+    c->sub.arg = c;
+    steerd_sub_add(&s->d, &c->sub);
+    conn_flush(c);
+}
+
+/* ---- запрос ------------------------------------------------------------------------------------ */
+
+/* Строка запроса пришла целиком: разобрать слова, проверить их по таблице, завести тело.
+ * 0 — можно читать тело или исполнять; -1 — отказ уже отдан. */
+static int conn_parse(struct conn *c) {
     char *tok[6];
     int nt = 0;
-    for (char *s = line; nt < 6; ) {
+    for (char *s = c->line; nt < 6; ) {
         char *sp = strchr(s, ' ');
         if (sp) *sp = '\0';
         tok[nt++] = s;
         if (!sp) break;
         s = sp + 1;
-        if (nt == 6) { ctl_refuse(c, NULL, "bad-request", "слишком много слов в запросе"); return; }
+        if (nt == 6) { conn_refuse(c, NULL, "bad-request", "слишком много слов в запросе"); return -1; }
     }
     for (int i = 0; i < nt; i++)
-        if (!tok[i][0]) { ctl_refuse(c, NULL, "bad-request", "пустое слово: слова разделяются одним пробелом"); return; }
+        if (!tok[i][0]) { conn_refuse(c, NULL, "bad-request", "пустое слово: слова разделяются одним пробелом"); return -1; }
     const struct ctl_cmd *cmd = ctl_lookup(tok[0]);
-    if (!cmd) { ctl_refuse(c, NULL, "unknown-command", "такой команды нет"); return; }
+    if (!cmd) { conn_refuse(c, NULL, "unknown-command", "такой команды нет"); return -1; }
 
-    struct ctl_req q;
-    memset(&q, 0, sizeof(q));
-    q.cmd = cmd;
-    q.cf = cf;
+    memset(&c->q, 0, sizeof(c->q));
+    c->q.cmd = cmd;
+    c->q.cf = &c->srv->cf;
     int na = nt - 1;
     size_t blen = 0;
     if (cmd->body) {
-        if (na < 1) { ctl_refuse(c, cmd->name, "bad-request", "нужна длина тела последним словом"); return; }
+        if (na < 1) { conn_refuse(c, cmd->name, "bad-request", "нужна длина тела последним словом"); return -1; }
         const char *w = tok[nt - 1];
         size_t wl = strlen(w);
         if (wl > 10 || strspn(w, "0123456789") != wl) {
-            ctl_refuse(c, cmd->name, "bad-request", "длина тела — десятичное число байт");
-            return;
+            conn_refuse(c, cmd->name, "bad-request", "длина тела — десятичное число байт");
+            return -1;
         }
         unsigned long long v = strtoull(w, NULL, 10);
         if (v > (unsigned long long)cmd->body) {
             char m[64];
             snprintf(m, sizeof(m), "тело больше %ld МиБ", cmd->body / (1024 * 1024));
-            ctl_refuse(c, cmd->name, "too-large", m);
-            return;
+            conn_refuse(c, cmd->name, "too-large", m);
+            return -1;
         }
         blen = (size_t)v;
         na--;
     }
     if (na < cmd->argmin || na > cmd->argmax) {
-        ctl_refuse(c, cmd->name, "bad-request", "не то число слов у команды");
-        return;
+        conn_refuse(c, cmd->name, "bad-request", "не то число слов у команды");
+        return -1;
     }
     for (int i = 0; i < na; i++) {
         const char *why = ctl_arg_bad(&cmd->args[i], tok[i + 1]);
-        if (why) { ctl_refuse(c, cmd->name, "bad-request", why); return; }
-        q.argv[i] = tok[i + 1];
+        if (why) { conn_refuse(c, cmd->name, "bad-request", why); return -1; }
+        c->q.argv[i] = tok[i + 1];     /* указывают в c->line — живёт до конца соединения */
     }
-    q.argc = na;
-    char *body = NULL;
+    c->q.argc = na;
     if (cmd->body) {
-        body = malloc(blen + 1);
-        if (!body) { ctl_refuse(c, cmd->name, "internal", "нет памяти под тело"); return; }
-        if (ctl_read_full(c, body, blen, deadline) != 0) {
-            free(body);
-            ctl_refuse(c, cmd->name, "bad-request", "тело не пришло целиком за 5 секунд");
+        c->body = malloc(blen + 1);
+        if (!c->body) { conn_refuse(c, cmd->name, "internal", "нет памяти под тело"); return -1; }
+        c->body_want = blen;
+        c->body_got = 0;
+    }
+    return 0;
+}
+
+/* Запрос прочитан: исполнить сейчас или встать в очередь изменяющих. */
+static void conn_dispatch(struct conn *c) {
+    struct ctl_srv *s = c->srv;
+    loop_timer_stop(c->tm);
+    /* Пока команда идёт, из сокета не читаем: всё, что клиент пришлёт сверх запроса, дочитает
+     * conn_drain после ответа. Уход клиента (EPOLLHUP) epoll сообщает и так. */
+    conn_events(c, 0);
+    if (c->body) {
+        c->body[c->body_got] = '\0';
+        c->q.body = c->body;
+        c->q.body_n = c->body_got;
+    }
+    resp_begin(&c->resp, c->q.cmd->name);
+    if (c->q.cmd->lock && s->lock_owner) {
+        c->st = C_WAIT;
+        struct conn **pp = &s->lockq;
+        while (*pp) pp = &(*pp)->qnext;
+        *pp = c;
+        return;
+    }
+    conn_exec(c);
+}
+
+static void conn_exec(struct conn *c) {
+    const struct ctl_cmd *k = c->q.cmd;
+    if (k->lock) c->srv->lock_owner = c;
+    c->st = C_RUN;
+    if (k->fn) { k->fn(c, &c->resp); conn_reply(c); }
+    else if (k->start) k->start(c);
+    else st_sub(c);
+}
+
+/* Читать запрос, сколько пришло. Строка — кусками, и то, что пришло за '\n', — начало тела:
+ * обработчик больше не читает по байту (там это было ради того, чтобы не захватить тело), —
+ * лишнее просто переносится в тело. */
+static void conn_read_req(struct conn *c) {
+    char buf[4096];
+    for (;;) {
+        if (c->have_line) {
+            size_t want = c->body_want - c->body_got;
+            if (!want) { conn_dispatch(c); return; }
+            ssize_t m = recv(c->fd, c->body + c->body_got, want, MSG_DONTWAIT);
+            if (m < 0 && errno == EINTR) continue;
+            if (m < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) return;
+            if (m < 0) { conn_free(c); return; }
+            if (m == 0) {
+                conn_refuse(c, c->q.cmd->name, "bad-request", "тело не пришло целиком за 5 секунд");
+                return;
+            }
+            c->body_got += (size_t)m;
+            continue;
+        }
+        ssize_t m = recv(c->fd, buf, sizeof(buf), MSG_DONTWAIT);
+        if (m < 0 && errno == EINTR) continue;
+        if (m < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) return;
+        if (m < 0) { conn_free(c); return; }
+        if (m == 0) { conn_refuse(c, NULL, "bad-request", "запрос не пришёл целиком за 5 секунд"); return; }
+        char *nl = memchr(buf, '\n', (size_t)m);
+        size_t take = nl ? (size_t)(nl - buf) : (size_t)m;
+        if (c->line_n + take > CTL_LINE_MAX) {
+            conn_refuse(c, NULL, "too-large", "строка запроса длиннее 512 байт");
             return;
         }
-        body[blen] = '\0';
-        q.body = body;
-        q.body_n = blen;
+        memcpy(c->line + c->line_n, buf, take);
+        c->line_n += take;
+        if (!nl) continue;
+        if (c->line_n && c->line[c->line_n - 1] == '\r') c->line_n--;
+        c->line[c->line_n] = '\0';
+        c->have_line = 1;
+        if (conn_parse(c) != 0) return;
+        if (!c->q.cmd->body) { conn_dispatch(c); return; }
+        size_t rest = (size_t)m - take - 1;
+        if (rest > c->body_want) rest = c->body_want;
+        memcpy(c->body, nl + 1, rest);
+        c->body_got = rest;
     }
+}
 
-    struct cbuf r = {0};
-    resp_begin(&r, cmd->name);
-    if (cmd->fn) cmd->fn(&q, &r);
-    else ctl_run_sub(&q, &r);
-    resp_send(c, &r);
-    free(r.p);
-    free(body);
+static void conn_timer(struct loop *l, struct loop_timer *t, void *arg) {
+    (void)l; (void)t;
+    struct conn *c = arg;
+    switch (c->st) {
+    case C_REQ:
+        if (c->have_line)
+            conn_refuse(c, c->q.cmd->name, "bad-request", "тело не пришло целиком за 5 секунд");
+        else
+            conn_refuse(c, NULL, "bad-request", "запрос не пришёл целиком за 5 секунд");
+        break;
+    case C_SEND:
+    case C_DRAIN:
+        conn_free(c);
+        break;
+    default:
+        break;
+    }
+}
+
+static void conn_ev(struct loop *l, int fd, uint32_t ev, void *arg) {
+    (void)fd;
+    struct conn *c = arg;
+    int gone = (ev & (EPOLLHUP | EPOLLERR)) != 0;
+    switch (c->st) {
+    case C_REQ:
+        conn_read_req(c);
+        break;
+    case C_WAIT:
+    case C_RUN:
+        /* Клиент ушёл, пока команда шла или ждала очереди. Ждущему — выйти из очереди сразу;
+         * идущую — довести (apply посреди шагов не бросают), а ответ не отдавать. Дескриптор
+         * снимается с epoll: иначе HUP будил бы демон на каждом обороте до конца команды. */
+        if (!gone) break;
+        if (c->st == C_WAIT) { conn_free(c); break; }
+        loop_fd_del(l, c->fd);
+        c->hup = 1;
+        break;
+    case C_SEND:
+        if (ev & EPOLLOUT) conn_flush(c);
+        else if (gone) conn_free(c);
+        break;
+    case C_DRAIN:
+        conn_drain(c);
+        break;
+    case C_SUB:
+        if (ev & EPOLLOUT) { if (conn_flush(c) != 0) break; }
+        if (ev & EPOLLIN) {
+            char buf[512];
+            for (;;) {
+                ssize_t m = recv(c->fd, buf, sizeof(buf), MSG_DONTWAIT);
+                if (m > 0) continue;
+                if (m < 0 && errno == EINTR) continue;
+                if (m == 0) {
+                    c->eof = 1;
+                    conn_events(c, c->off < c->resp.n ? EPOLLOUT : 0);
+                }
+                break;
+            }
+        }
+        if (gone) conn_free(c);
+        break;
+    }
+}
+
+static void conn_free(struct conn *c) {
+    struct ctl_srv *s = c->srv;
+    if (c->st == C_SUB) { steerd_sub_del(&s->d, &c->sub); s->subs--; }
+    if (c->counted) s->active--;
+    for (struct conn **pp = &s->lockq; *pp; pp = &(*pp)->qnext)
+        if (*pp == c) { *pp = c->qnext; break; }
+    for (struct conn **pp = &s->conns; *pp; pp = &(*pp)->next)
+        if (*pp == c) { *pp = c->next; break; }
+    if (s->lock_owner == c) lock_release(s);
+    if (!c->hup) loop_fd_del(s->l, c->fd);
+    close(c->fd);
+    loop_timer_free(c->tm);
+    loop_timer_free(c->job.tm);
+    free(c->job.out.p);
+    free(c->job.err.p);
+    free(c->resp.p);
+    free(c->old.p);
+    free(c->body);
+    free(c);
 }
 
 /* ---- кого пускать ---------------------------------------------------------------------------- */
@@ -1369,11 +1931,75 @@ static int ctl_peer_ok(int c, const struct ctl_conf *cf, char *who, size_t wn) {
 
 /* ---- сервер ------------------------------------------------------------------------------------ */
 
-static volatile sig_atomic_t g_ctl_chld, g_ctl_term;
+static void srv_accept_resume(struct loop *l, struct loop_timer *t, void *arg) {
+    (void)t;
+    struct ctl_srv *s = arg;
+    loop_fd_mod(l, s->lfd, EPOLLIN);
+}
 
-static void ctl_on_sig(int s) {
-    if (s == SIGCHLD) g_ctl_chld = 1;
-    else g_ctl_term = 1;
+static void srv_accept(struct loop *l, int fd, uint32_t ev, void *arg) {
+    (void)ev;
+    struct ctl_srv *s = arg;
+    for (;;) {
+        int c = accept4(fd, NULL, NULL, SOCK_CLOEXEC | SOCK_NONBLOCK);
+        if (c < 0) {
+            if (errno == EINTR || errno == ECONNABORTED) continue;
+            /* Нехватка дескрипторов или памяти не проходит сама за микросекунду, а соединение
+             * так и ждёт в очереди — epoll будил бы демон сразу же, и он крутился бы вхолостую.
+             * Приём снимается на 200 мс; в обычной работе сюда не попасть. */
+            if (errno != EAGAIN && errno != EWOULDBLOCK) {
+                loop_fd_mod(l, fd, 0);
+                loop_timer_set(s->accept_tm, 200);
+            }
+            return;
+        }
+        char who[320];
+        if (!ctl_peer_ok(c, &s->cf, who, sizeof(who))) {
+            fprintf(stderr, LOG_W "отказ: %s\n", who);
+            ctl_refuse_now(c, "denied", "этому процессу управлять движком нельзя");
+            continue;
+        }
+        if (s->active >= CTL_CLIENTS_MAX) {
+            ctl_refuse_now(c, "busy", "сервер занят другими запросами — повторите позже");
+            continue;
+        }
+        struct conn *n = calloc(1, sizeof(*n));
+        if (n) {
+            n->srv = s;
+            n->fd = c;
+            n->job.po = n->job.pe = -1;
+            n->tm = loop_timer_new(l, conn_timer, n);
+        }
+        if (!n || !n->tm || loop_fd_add(l, c, EPOLLIN, conn_ev, n) != 0) {
+            if (n) loop_timer_free(n->tm);
+            free(n);
+            ctl_refuse_now(c, "internal", "не удалось начать обработку запроса");
+            continue;
+        }
+        n->st = C_REQ;
+        n->counted = 1;
+        s->active++;
+        n->next = s->conns;
+        s->conns = n;
+        loop_timer_set(n->tm, CTL_REQ_MS);
+    }
+}
+
+static void srv_term(struct loop *l, int signo, void *arg) {
+    (void)signo;
+    struct ctl_srv *s = arg;
+    struct stat sb;
+    if (s->ino && stat(s->cf.sock, &sb) == 0 && sb.st_ino == s->ino) unlink(s->cf.sock);
+    loop_stop(l, 0);
+}
+
+/* SIGHUP — перечитать спеку в память, как после reload (без сигналов резолверу и супервизору:
+ * им говорит reload). Идёт ли изменяющая команда — после неё (lock_release). */
+static void srv_hup(struct loop *l, int signo, void *arg) {
+    (void)l; (void)signo;
+    struct ctl_srv *s = arg;
+    if (s->lock_owner) s->hup_pending = 1;
+    else srv_spec_changed(s, "hup", ctl_enabled());
 }
 
 static void ctl_bad_flag(const char *cmd, const char *msg, const char *arg) {
@@ -1385,15 +2011,15 @@ void ctl_usage_flags(FILE *out) {
     const struct platform_ops *p = plat();
     fprintf(out,
           "  --socket ФАЙЛ       управляющий сокет (по умолчанию %s)\n"
-          "  --spec ФАЙЛ         ctl-serve: спека, которую читают и заменяют команды\n"
+          "  --spec ФАЙЛ         daemon: спека, которую читают и заменяют команды\n"
           "                      (по умолчанию %s)\n"
-          "  --state-dir КАТАЛОГ ctl-serve: каталог состояния (по умолчанию %s)\n"
-          "  --allow-uid N       ctl-serve: пускать и этот uid (до восьми раз); root и system\n"
+          "  --state-dir КАТАЛОГ daemon: каталог состояния (по умолчанию %s)\n"
+          "  --allow-uid N       daemon: пускать и этот uid (до восьми раз); root и system\n"
           "                      пускаются всегда\n"
-          "  --allow-domain ИМЯ  ctl-serve: пускать процессы этого домена SELinux у владельца\n"
+          "  --allow-domain ИМЯ  daemon: пускать процессы этого домена SELinux у владельца\n"
           "                      устройства (по умолчанию splify2_app на платформе Android;\n"
           "                      пустое значение — не пускать по домену)\n"
-          "  --lists-dir КАТАЛОГ ctl-serve: куда put-file кладёт файлы списков\n"
+          "  --lists-dir КАТАЛОГ daemon: куда put-file кладёт файлы списков\n"
           "                      (по умолчанию %s)\n",
           p->ctl_sock, p->spec_path, p->state_dir, p->lists_dir);
 }
@@ -1402,7 +2028,7 @@ static int ctl_listen(const struct ctl_conf *cf, ino_t *ino) {
     struct sockaddr_un a;
     memset(&a, 0, sizeof(a));
     a.sun_family = AF_UNIX;
-    if (strlen(cf->sock) >= sizeof(a.sun_path)) ctl_bad_flag("ctl-serve", "слишком длинный путь сокета", cf->sock);
+    if (strlen(cf->sock) >= sizeof(a.sun_path)) ctl_bad_flag("daemon", "слишком длинный путь сокета", cf->sock);
     snprintf(a.sun_path, sizeof(a.sun_path), "%s", cf->sock);
 
     /* Прежний файл: живой сервер за ним — отказ стартовать (второй сервер отнял бы сокет у
@@ -1441,123 +2067,70 @@ static int ctl_listen(const struct ctl_conf *cf, ino_t *ino) {
 }
 
 int ctl_serve_main(int argc, char **argv) {
-    static struct ctl_conf cf;
-    cf.sock = plat()->ctl_sock;
-    cf.spec = plat()->spec_path;
-    cf.lists_dir = plat()->lists_dir;
-    cf.allow_domain = plat()->ctl_allow_domain;
+    static struct ctl_srv S;
+    struct ctl_conf *cf = &S.cf;
+    cf->sock = plat()->ctl_sock;
+    cf->spec = plat()->spec_path;
+    cf->lists_dir = plat()->lists_dir;
+    cf->allow_domain = plat()->ctl_allow_domain;
     for (int i = 0; i < argc; i++) {
         const char *f = argv[i];
         const char *v = i + 1 < argc ? argv[i + 1] : NULL;
         if (!strcmp(f, "--socket") || !strcmp(f, "--spec") || !strcmp(f, "--state-dir") ||
             !strcmp(f, "--allow-uid") || !strcmp(f, "--allow-domain") ||
             !strcmp(f, "--lists-dir")) {
-            if (!v) ctl_bad_flag("ctl-serve", "у флага нет значения", f);
+            if (!v) ctl_bad_flag("daemon", "у флага нет значения", f);
             i++;
-            if (!strcmp(f, "--socket")) cf.sock = v;
-            else if (!strcmp(f, "--spec")) cf.spec = v;
-            else if (!strcmp(f, "--state-dir")) cf.state_dir = v;
-            else if (!strcmp(f, "--allow-domain")) cf.allow_domain = v;
-            else if (!strcmp(f, "--lists-dir")) cf.lists_dir = v;
+            if (!strcmp(f, "--socket")) cf->sock = v;
+            else if (!strcmp(f, "--spec")) cf->spec = v;
+            else if (!strcmp(f, "--state-dir")) cf->state_dir = v;
+            else if (!strcmp(f, "--allow-domain")) cf->allow_domain = v;
+            else if (!strcmp(f, "--lists-dir")) cf->lists_dir = v;
             else {
                 char *e = NULL;
                 unsigned long u = strtoul(v, &e, 10);
-                if (!*v || *e || u > 0xfffffffful) ctl_bad_flag("ctl-serve", "--allow-uid: нужно число", v);
-                if (cf.allow_uid_n >= CTL_ALLOW_UIDS) ctl_bad_flag("ctl-serve", "--allow-uid больше восьми раз", NULL);
-                cf.allow_uid[cf.allow_uid_n++] = (uid_t)u;
+                if (!*v || *e || u > 0xfffffffful) ctl_bad_flag("daemon", "--allow-uid: нужно число", v);
+                if (cf->allow_uid_n >= CTL_ALLOW_UIDS) ctl_bad_flag("daemon", "--allow-uid больше восьми раз", NULL);
+                cf->allow_uid[cf->allow_uid_n++] = (uid_t)u;
             }
             continue;
         }
-        ctl_bad_flag("ctl-serve", "неизвестный флаг", f);
+        ctl_bad_flag("daemon", "неизвестный флаг", f);
     }
-    ssize_t el = readlink("/proc/self/exe", cf.exe, sizeof(cf.exe) - 1);
+    ssize_t el = readlink("/proc/self/exe", cf->exe, sizeof(cf->exe) - 1);
     if (el <= 0) { fprintf(stderr, LOG_W "не найти свой исполняемый файл\n"); return 1; }
-    cf.exe[el] = '\0';
+    cf->exe[el] = '\0';
+    /* Команды в процессе (status, conns, dns-log) читают каталог состояния сами — тот же,
+     * что подкомандам передаётся флагом. */
+    if (cf->state_dir) steer_set_state_dir(cf->state_dir);
 
+    /* Запись в ушедший сокет — ошибка send (MSG_NOSIGNAL), а не смерть демона; SIGPIPE
+     * игнорируется ещё и ради записи, которую делает код в процессе. Детям он возвращается
+     * (loop_child_reset). */
     signal(SIGPIPE, SIG_IGN);
-    struct sigaction sa;
-    memset(&sa, 0, sizeof(sa));
-    sa.sa_handler = ctl_on_sig;
-    sigaction(SIGCHLD, &sa, NULL);
-    sigaction(SIGTERM, &sa, NULL);
-    sigaction(SIGINT, &sa, NULL);
-    sigset_t blk, open_set;
-    sigemptyset(&blk);
-    sigaddset(&blk, SIGCHLD);
-    sigaddset(&blk, SIGTERM);
-    sigaddset(&blk, SIGINT);
-    sigprocmask(SIG_BLOCK, &blk, NULL);
-    sigemptyset(&open_set);
-
-    ino_t ino = 0;
-    int s = ctl_listen(&cf, &ino);
+    S.l = loop_new();
+    if (!S.l) { fprintf(stderr, LOG_W "цикл событий: %s\n", strerror(errno)); return 1; }
+    S.lfd = ctl_listen(cf, &S.ino);
     /* После ctl_listen: живой соседний сервер там уже дал бы отказ стартовать, и временные
      * файлы его обработчиков не тронуты. */
-    ctl_lists_sweep(cf.lists_dir);
-    fprintf(stderr, LOG_I "слушаю %s\n", cf.sock);
-    int active = 0;
-    for (;;) {
-        struct pollfd p = { s, POLLIN, 0 };
-        /* Сигналы открыты только на время сна: флаги ставятся атомарно с пробуждением, и
-         * SIGCHLD между проверкой и сном не теряется. Срока у сна нет. */
-        int r = ppoll(&p, 1, NULL, &open_set);
-        if (g_ctl_chld) {
-            g_ctl_chld = 0;
-            while (waitpid(-1, NULL, WNOHANG) > 0) if (active > 0) active--;
-        }
-        if (g_ctl_term) {
-            struct stat sb;
-            if (ino && stat(cf.sock, &sb) == 0 && sb.st_ino == ino) unlink(cf.sock);
-            return 0;
-        }
-        if (r <= 0 || !(p.revents & POLLIN)) continue;
-        for (;;) {
-            int c = accept4(s, NULL, NULL, SOCK_CLOEXEC);
-            if (c < 0) {
-                /* Нехватка дескрипторов или памяти не проходит сама за микросекунду, а
-                 * соединение так и ждёт в очереди — ppoll вернулся бы сразу, и сервер крутился
-                 * бы вхолостую. Короткая пауза вместо этого; в обычной работе сюда не попасть. */
-                if (errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR &&
-                    errno != ECONNABORTED) {
-                    struct timespec ts = { 0, 200000000L };
-                    nanosleep(&ts, NULL);
-                }
-                break;
-            }
-            char who[320];
-            if (!ctl_peer_ok(c, &cf, who, sizeof(who))) {
-                fprintf(stderr, LOG_W "отказ: %s\n", who);
-                ctl_refuse(c, NULL, "denied", "этому процессу управлять движком нельзя");
-                ctl_close(c, 0);
-                continue;
-            }
-            if (active >= CTL_CLIENTS_MAX) {
-                ctl_refuse(c, NULL, "busy", "сервер занят другими запросами — повторите позже");
-                ctl_close(c, 0);
-                continue;
-            }
-            pid_t pid = fork();
-            if (pid == 0) {
-                close(s);
-                signal(SIGCHLD, SIG_DFL);
-                signal(SIGTERM, SIG_DFL);
-                signal(SIGINT, SIG_DFL);
-                sigset_t none;
-                sigemptyset(&none);
-                sigprocmask(SIG_SETMASK, &none, NULL);
-                ctl_handle(c, &cf);
-                ctl_close(c, 1000);
-                _exit(0);
-            }
-            if (pid < 0) {
-                ctl_refuse(c, NULL, "internal", "не удалось начать обработку запроса");
-                ctl_close(c, 0);
-            } else {
-                active++;
-                close(c);
-            }
-        }
+    ctl_lists_sweep(cf->lists_dir);
+    if (steerd_init(&S.d, S.l, cf->spec, cf->state_dir) != 0) {
+        fprintf(stderr, LOG_W "нет памяти под спеку\n");
+        return 1;
     }
+    /* Спека не прочиталась — демон всё равно работает: apply через сокет её и исправляет, а
+     * status до тех пор отвечает тем же отказом, что подкоманда. */
+    if (steerd_load(&S.d) != 0) fprintf(stderr, LOG_W "спека не прочитана: %s\n", S.d.err);
+    S.accept_tm = loop_timer_new(S.l, srv_accept_resume, &S);
+    if (!S.accept_tm || loop_fd_add(S.l, S.lfd, EPOLLIN, srv_accept, &S) != 0) {
+        fprintf(stderr, LOG_W "цикл событий: %s\n", strerror(errno));
+        return 1;
+    }
+    loop_signal(S.l, SIGTERM, srv_term, &S);
+    loop_signal(S.l, SIGINT, srv_term, &S);
+    loop_signal(S.l, SIGHUP, srv_hup, &S);
+    fprintf(stderr, LOG_I "слушаю %s\n", cf->sock);
+    return loop_run(S.l);
 }
 
 /* ---- клиент ------------------------------------------------------------------------------------ */
@@ -1567,7 +2140,8 @@ int ctl_serve_main(int argc, char **argv) {
  * put-file — из файла, названного последним словом (`steer ctl put-file ИМЯ ФАЙЛ`; «-» —
  * стандартный ввод): имя в каталоге списков и путь на машине, откуда файл берётся, — разные
  * вещи, и имя из пути не выводится, чтобы залить /sdcard/x.txt под именем yt.lst. Печатает
- * ответ сервера как есть (строка JSON). Код: 0 — ответ с "code":0 и без "error"; 1 — иной
+ * ответ сервера как есть (строка JSON); у subscribe — строки событий по мере прихода, пока
+ * демон не закроет соединение. Код: 0 — ответ с "code":0 и без "error"; 1 — иной
  * ответ; 2 — ошибка вызова или нет соединения. */
 int ctl_client_main(int argc, char **argv) {
     const char *sock = plat()->ctl_sock;
@@ -1627,14 +2201,23 @@ int ctl_client_main(int argc, char **argv) {
     ssize_t m;
     /* ECONNRESET после ответа — не ошибка: сервер отказал, не дочитав запрос (см. ctl_close),
      * а ответ уже прочитан. */
-    while ((m = read(s, buf, sizeof(buf))) > 0 || (m < 0 && errno == EINTR))
-        if (m > 0) cb_put(&resp, buf, (size_t)m);
+    /* subscribe — поток событий до закрытия: печатать по мере прихода, а не в конце. В
+     * памяти копится только первая строка (ответ на сам subscribe) — по ней код выхода. */
+    int stream = cmd && cmd->start == st_subscribe;
+    while ((m = read(s, buf, sizeof(buf))) > 0 || (m < 0 && errno == EINTR)) {
+        if (m <= 0) continue;
+        if (!stream) { cb_put(&resp, buf, (size_t)m); continue; }
+        fwrite(buf, 1, (size_t)m, stdout);
+        fflush(stdout);
+        if (!memchr(resp.p ? resp.p : "", '\n', resp.n)) cb_put(&resp, buf, (size_t)m);
+    }
     close(s);
     if (!resp.n) { fprintf(stderr, "steer: ctl: сервер закрыл соединение без ответа\n"); return 2; }
-    fwrite(resp.p, 1, resp.n, stdout);
+    if (!stream) fwrite(resp.p, 1, resp.n, stdout);
     int ok = strstr(resp.p, ",\"code\":0,") && !strstr(resp.p, "\"error\":");
     free(req.p);
     free(body.p);
     free(resp.p);
     return ok ? 0 : 1;
 }
+

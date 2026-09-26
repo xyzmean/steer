@@ -6,6 +6,10 @@
  * ровно те же, только "static" снят там, где вызов теперь идёт из другого файла. */
 
 #include <stddef.h>
+#include <stdio.h>
+
+struct spec;
+struct groups;
 
 /* Уровень в журнале — см. одноимённые макросы в failover.c и obfs.c. Метка подсистемы здесь
  * «apply»: строки с ней пишутся при компиляции и применении спеки. */
@@ -31,6 +35,20 @@ void status_snap_path(char *buf, size_t n);
  * (разбор аргумента explain) и diag.c/explain.c. */
 int addr_ok(const char *a);
 int looks_like_name(const char *s);
+
+/* Ответы status и explain — в поток, по спеке и группам, которые держит вызывающий: подкоманда
+ * читает спеку сама, демон отдаёт свою из памяти (src/daemon/ctl.c). status_answer пишет и
+ * снимок для --fast; status_fast — запомненный ответ (-1 — снимка нет). explain_emit
+ * возвращает код подкоманды explain. */
+void status_answer(const struct spec *sp, const struct groups *gr, FILE *out);
+int status_fast(FILE *out);
+int explain_emit(const struct spec *sp, const struct groups *gr, const char *what, FILE *out);
+
+/* Соединения с меткой движка (дамп ctnetlink) — src/daemon/conns.c, тем же разговором с
+ * ctnetlink, что у ctnl.c; журнал имён работающего резолвера отдаёт сам резолвер, dlog.c. Оба
+ * печатают в поток: подкоманда — в stdout, демон — в память (src/daemon/ctl.c). */
+int ctnl_conns_print(FILE *out);
+int dlog_print(FILE *out);
 
 int cmd_apply(const char *spec, int dry);
 int cmd_status(const char *spec, int fast);

@@ -103,7 +103,14 @@ static int dns_ask(const char *name, char *out, size_t out_n) {
     setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof tv);
     struct sockaddr_in a = { .sin_family = AF_INET, .sin_port = htons(DNS_PORT) };
     a.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
-    if (sendto(fd, q, n, 0, (struct sockaddr *)&a, sizeof a) < 0) { close(fd); return -1; }
+    /* connect, а не sendto: у присоединённого сокета ICMP «порт закрыт» приходит ошибкой
+     * recv сразу, и незапущенный резолвер — ответ немедленно, а не через две секунды срока.
+     * explain исполняет и демон (src/daemon/ctl.c), в своём цикле, и две секунды впустую — это
+     * две секунды, когда он не отвечает никому. */
+    if (connect(fd, (struct sockaddr *)&a, sizeof a) != 0 || send(fd, q, n, 0) < 0) {
+        close(fd);
+        return -1;
+    }
 
     unsigned char r[1024];
     ssize_t rn = recv(fd, r, sizeof r, 0);
@@ -215,6 +222,12 @@ int cmd_explain(const char *spec, const char *what) {
     if (load_spec(spec, &cfg, &e) < 0) err_die(&e);
     if (registry_assign(&cfg, &e) < 0) err_die(&e);
     if (build_groups(&cfg, &gr, &e) < 0) err_die(&e);
+    return explain_emit(&cfg, &gr, what, stdout);
+}
+
+/* Сам ответ — в поток out, по спеке и группам вызывающего: подкоманда читает спеку сама,
+ * демон отдаёт свою из памяти. Код — тот, с которым кончается подкоманда. */
+int explain_emit(const struct spec *cfg, const struct groups *gr, const char *what, FILE *out) {
     g_nftc = nft_compat();
 
     /* Имя сначала превращаем в адрес — и печатаем, во что именно. Без этой строки человек
@@ -228,27 +241,27 @@ int cmd_explain(const char *spec, const char *what) {
             /* Два разных случая, и путать их нельзя. Нет доменных правил — резолвер и не
              * должен работать, а «не отвечает» звучало бы как поломка. Есть — тогда молчание
              * резолвера и есть поломка, причём для всех клиентов сразу. */
-            if (!has_domains(&gr))
-                printf("%s -> в настройке нет ни одного правила по доменам, поэтому резолвер "
+            if (!has_domains(gr))
+                fprintf(out, "%s -> в настройке нет ни одного правила по доменам, поэтому резолвер "
                        "steer не запущен: имена он не разбирает, спрашивайте адресом\n", what);
             else
-                printf("%s -> резолвер steer не ответил на 127.0.0.1:%d — доменные правила "
+                fprintf(out, "%s -> резолвер steer не ответил на 127.0.0.1:%d — доменные правила "
                        "сейчас не работают ни для кого\n", what, DNS_PORT);
             return 1;
         }
         if (rc == -2) {
-            printf("%s -> резолвер ответил, но адреса не дал: имени нет либо оно не в "
+            fprintf(out, "%s -> резолвер ответил, но адреса не дал: имени нет либо оно не в "
                    "доменных списках, а вышестоящий сервер его не знает\n", what);
             return 0;
         }
         int fake = strncmp(resolved, "198.18.", 7) == 0 || strncmp(resolved, "198.19.", 7) == 0;
-        printf("%s -> %s (%s)\n", what, resolved,
+        fprintf(out, "%s -> %s (%s)\n", what, resolved,
                fake ? "fake-IP, выдан steer — значит имя в доменном списке"
                     : "настоящий адрес — имя ни в одном доменном списке не нашлось");
         addr = resolved;
     }
-    for (size_t i = 0; i < gr.n; i++) {
-        int hit = !gr.g[i].files_n && !gr.g[i].domains;   /* an `any` group */
+    for (size_t i = 0; i < gr->n; i++) {
+        int hit = !gr->g[i].files_n && !gr->g[i].domains;   /* an `any` group */
         /* Domain channels own a set too — it is just filled by the resolver. Asking
          * only the prefix channels made explain answer "no channel matches" for
          * every fake IP, i.e. exactly the addresses a user is most likely to ask
@@ -259,41 +272,46 @@ int cmd_explain(const char *spec, const char *what) {
              * channel matches" meaning "not listed" and meaning "explain never
              * looked". */
             if (getenv("STEER_EXPLAIN_TRACE"))
-                fprintf(stderr, "checking %.63s\n", gr.g[i].name);
-            snprintf(setname, sizeof(setname), "%.63s", gr.g[i].name);
+                fprintf(stderr, "checking %.63s\n", gr->g[i].name);
+            snprintf(setname, sizeof(setname), "%.63s", gr->g[i].name);
             snprintf(elem, sizeof(elem), "{ %s }", addr);
             hit = set_lookup(setname, elem, addr);
             /* Старая раскладка: у доменной группы вторая половина набора, с префиксами. */
-            if (!hit && legacy_may_have_static(&gr.g[i])) {
-                nft_static_set_name(setname, sizeof(setname), gr.g[i].name);
+            if (!hit && legacy_may_have_static(&gr->g[i])) {
+                nft_static_set_name(setname, sizeof(setname), gr->g[i].name);
                 hit = set_lookup(setname, elem, addr);
             }
         }
         if (!hit) continue;
-        struct output *o = out_by_name(&cfg, gr.g[i].out);
-        if (!o) die("group %s points at a missing output", gr.g[i].name);
-        printf("%s -> %s \"%s\" -> output \"%s\"", addr,
-               explain_set_phrase(addr, gr.g[i].files_n > 0, gr.g[i].domains),
-               gr.g[i].name, o->name);
+        const struct output *o = out_by_name(cfg, gr->g[i].out);
+        /* Не бывает: build_groups сверил каждый канал с выходами. Но исполняет это и демон, и
+         * die() здесь завершил бы его целиком — поэтому отказ возвращается. */
+        if (!o) {
+            fprintf(stderr, "steer: group %s points at a missing output\n", gr->g[i].name);
+            return 2;
+        }
+        fprintf(out, "%s -> %s \"%s\" -> output \"%s\"", addr,
+               explain_set_phrase(addr, gr->g[i].files_n > 0, gr->g[i].domains),
+               gr->g[i].name, o->name);
         if (out_has_device(o))
-            printf(" -> dev %s (mark 0x%08x, table %d)\n", o->device, o->mark, o->table);
+            fprintf(out, " -> dev %s (mark 0x%08x, table %d)\n", o->device, o->mark, o->table);
         else
-            printf(" -> direct\n");
+            fprintf(out, " -> direct\n");
         /* Канал бывает СУЖЕН по протоколу и портам, а спрошен был адрес. Адрес в наборе
          * лежит — но «идёт туда» верно не для всего его трафика, и промолчать значило бы
          * ответить правдой наполовину: человек, выясняющий, почему TCP к 104.16.0.1 идёт
          * напрямую, получил бы подтверждение, что канал его забирает. Отдельной строкой,
          * чтобы первая осталась той же, что была, — её читают и глазами, и разбором. */
-        if (!l4match_empty(gr.g[i].l4)) {
+        if (!l4match_empty(gr->g[i].l4)) {
             /* С запасом на предел MAX_PORTS: шестнадцать диапазонов вида «50000-65535» с
              * разделителями — это 217 байт, и обрезанное пояснение было бы хуже полного. */
             char d[256];
-            l4_describe(gr.g[i].l4, d, sizeof(d));
-            printf("      канал сужен: только %s — остальной трафик к этому адресу "
+            l4_describe(gr->g[i].l4, d, sizeof(d));
+            fprintf(out, "      канал сужен: только %s — остальной трафик к этому адресу "
                    "идёт мимо канала\n", d);
         }
         return 0;
     }
-    printf("%s -> no channel matches -> direct (steer does not touch it)\n", addr);
+    fprintf(out, "%s -> no channel matches -> direct (steer does not touch it)\n", addr);
     return 0;
 }
