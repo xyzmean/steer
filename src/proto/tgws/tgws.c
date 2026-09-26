@@ -75,6 +75,7 @@
 #include "tls13.h"
 #include "reality.h"
 #include "spec.h"
+#include "evline.h"
 
 #define LOG_I "steer[info] tgws: "
 #define LOG_W "steer[warn] tgws: "
@@ -2316,6 +2317,8 @@ static void health_report(int dc, int media, const char *sni, long secs,
     int cool = !strcmp(d, TG_WS_DOMAIN) ? TG_COOLDOWN_S : ALT_COOLDOWN_S;
     fprintf(stderr, LOG_W "ДЦ%d%s: через %s данные не приходят — путь отставлен на %d с\n",
             dc, media ? "m" : "", d, cool);
+    evline_emit("health", "dc", EVLINE_INT, (long)dc, "media", EVLINE_INT, (long)media,
+                 "domain", EVLINE_STR, d, "cool", EVLINE_INT, (long)cool, (const char *)NULL);
     char kb[160];
     dom_cool(cool_key(kb, sizeof(kb), dc, d), now + cool);
     if (dc != 203) warm_drop_domain(d);
@@ -2882,6 +2885,7 @@ bad:
 /* ---- служба ------------------------------------------------------------------------- */
 
 int cmd_tgws(const char *spec, const char *name) {
+    evline_open();
     if (!name || !*name) { fprintf(stderr, LOG_W "нужно имя выхода\n"); return 2; }
     /* Правило 5, docs/architecture.md, раздел 2: err_die здесь довершает то, что раньше делал
      * die() изнутри load_spec/registry_assign.
@@ -2911,7 +2915,11 @@ int cmd_tgws(const char *spec, const char *name) {
     int port = out_tgws_port(o);
 
     int srv = socket(AF_INET, SOCK_STREAM, 0);
-    if (srv < 0) { perror("socket"); return 1; }
+    if (srv < 0) {
+        perror("socket");
+        evline_emit("down", "why", EVLINE_STR, "сокет не завёлся", (const char *)NULL);
+        return 1;
+    }
     int one = 1;
     setsockopt(srv, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
     struct sockaddr_in a;
@@ -2921,10 +2929,17 @@ int cmd_tgws(const char *spec, const char *name) {
     a.sin_port = htons((uint16_t)port);
     if (bind(srv, (struct sockaddr *)&a, sizeof(a)) != 0) {
         fprintf(stderr, LOG_W "порт %d занят (%s)\n", port, strerror(errno));
+        evline_emit("down", "why", EVLINE_STR, "порт занят", (const char *)NULL);
         close(srv);
         return 1;
     }
-    if (listen(srv, 32) != 0) { perror("listen"); close(srv); return 1; }
+    if (listen(srv, 32) != 0) {
+        perror("listen");
+        evline_emit("down", "why", EVLINE_STR, "listen отказал", (const char *)NULL);
+        close(srv);
+        return 1;
+    }
+    evline_emit("up", (const char *)NULL);
 
     {
         /* Что именно поднялось: домен по умолчанию, сколько дата-центров идёт своим доменом
@@ -3017,6 +3032,7 @@ int cmd_tgws(const char *spec, const char *name) {
         }
         pthread_attr_destroy(&at);
     }
+    evline_emit("down", "why", EVLINE_STR, "accept отказал", (const char *)NULL);
     close(srv);
     return 0;
 }

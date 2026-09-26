@@ -45,6 +45,7 @@
 #include "rtx.h"
 #include "tunnel.h"
 #include "spec.h"
+#include "evline.h"
 #include "jsonw.h"
 #include "run.h"
 
@@ -3095,6 +3096,7 @@ int cmd_vless_probe(const char *spec_path, const char *out_name, int node, int t
 }
 
 int cmd_vless(const char *spec_path, const char *out_name) {
+    evline_open();
     struct output *o = NULL;
     size_t cnt = 0;
     struct vless_sub_stats st;
@@ -3107,6 +3109,8 @@ int cmd_vless(const char *spec_path, const char *out_name) {
          * смотрите журнал движка», то есть отправляла человека искать то, что уже известно
          * здесь (I-100). total=0 отличает «узлов в подписке нет» от «ни один не ответил». */
         probe_report(out_name, PROBE_FAILED, 0, 0);
+        evline_emit("down", "why", EVLINE_STR, "в подписке нет пригодных узлов",
+                     (const char *)NULL);
         fprintf(stderr, LOG_W2 "в подписке нет пригодных узлов "
                         "(пропущено %zu, чужих протоколов %zu)\n", st.skipped, st.foreign);
         /* Причины — в журнал тоже, а не только в ubus: подъём выхода идёт из procd, и
@@ -3137,6 +3141,9 @@ int cmd_vless(const char *spec_path, const char *out_name) {
          * с роутера; в запись теперь едет и номер, который он написал, и настоящее число
          * пригодных — по ним приговор читается без journal. */
         probe_report(out_name, PROBE_NO_SUCH_NODE, o->vless.nodes_n ? o->vless.nodes[0] : -1, (int)cnt);
+        evline_emit("nonode",
+                     "node", EVLINE_INT, (long)(o->vless.nodes_n ? o->vless.nodes[0] : -1),
+                     "total", EVLINE_INT, (long)cnt, (const char *)NULL);
         fprintf(stderr, LOG_W2 "выбранных узлов нет в подписке (пригодных всего %zu) — "
                         "проверьте nodes\n", cnt);
         return 1;
@@ -3170,6 +3177,8 @@ int cmd_vless(const char *spec_path, const char *out_name) {
         for (size_t i = 0; i < sel_n; i++) {
             char why[256];
             probe_report(out_name, PROBE_RUNNING, (int)i + 1, (int)sel_n);
+            evline_emit("node", "n", EVLINE_INT, (long)(i + 1), "total", EVLINE_INT, (long)sel_n,
+                        (const char *)NULL);
             if (vless_probe(&nodes[sel[i]], 8, why, sizeof(why)) == 0) {
                 fprintf(stderr, LOG_I2 "выбран %s (%s)\n", nodes[sel[i]].name, why);
                 chosen = sel[i];
@@ -3180,6 +3189,8 @@ int cmd_vless(const char *spec_path, const char *out_name) {
     }
     if (chosen < 0) {
         probe_report(out_name, PROBE_FAILED, 0, (int)sel_n);
+        evline_emit("down", "why", EVLINE_STR, "ни один узел подписки не отвечает",
+                     (const char *)NULL);
         fprintf(stderr, LOG_W2 "ни один узел подписки не отвечает\n");
         return 1;
     }
@@ -3187,6 +3198,7 @@ int cmd_vless(const char *spec_path, const char *out_name) {
      * устройство. Запись снимается здесь, а не в tunnel_run: снять её обязан тот, кто её
      * поставил, иначе на каждом пути выхода из tunnel_run про неё придётся помнить. */
     probe_clear(out_name);
+    evline_emit("up", (const char *)NULL);
 
     /* Реестр — чтобы узнать таблицу выхода: из неё берётся адрес устройства. Вызов
      * идемпотентен и с apply не спорит: тот же файл, те же номера. Правило 5,
