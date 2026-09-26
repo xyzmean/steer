@@ -647,6 +647,12 @@ static ssize_t fnv_write(void *c, const char *buf, size_t n) {
     for (size_t i = 0; i < n; i++) { *h ^= (unsigned char)buf[i]; *h *= 1099511628211ULL; }
     return (ssize_t)n;
 }
+#ifdef __BIONIC__
+/* Писатель для funopen (BSD): длина — int, а не size_t. */
+static int fnv_write_bsd(void *c, const char *buf, int n) {
+    return (int)fnv_write(c, buf, (size_t)n);
+}
+#endif
 
 /* Подпись маршрутизации выхода — то, что apply ставит в ip rule и таблицу выхода и что
  * настраивает у выхода kind=awg: вид, метка, таблица, режим отказа, пул устройств (не выбранное
@@ -709,8 +715,15 @@ int cmd_apply_plan(int argc, char **argv) {
     apply_prepare(a.spec, &cfg, &gr, 1, a.nftc, 1);
     awg_check_all(&cfg);
     unsigned long long h = 14695981039346656037ULL;
+    /* Поток-отпечаток: fopencookie есть в glibc и musl, но в bionic его нет вовсе (даже с
+     * _GNU_SOURCE) — там его BSD-двойник funopen с писателем на int. Текст набора правил не
+     * собирается в буфер целиком нарочно: на больших списках это мегабайты. */
+#ifdef __BIONIC__
+    FILE *f = funopen(&h, NULL, fnv_write_bsd, NULL, NULL);
+#else
     cookie_io_functions_t io = { .write = fnv_write };
     FILE *f = fopencookie(&h, "w", io);
+#endif
     if (!f) die("cannot open a stream for the ruleset fingerprint", NULL);
     static char buf[65536];
     setvbuf(f, buf, _IOFBF, sizeof(buf));
