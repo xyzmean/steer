@@ -351,12 +351,14 @@ static int start_dnsd(struct supd *s, struct helper *h) {
     }
     for (size_t i = 0; s->dnsd_flags[i]; i++) av[n++] = s->dnsd_flags[i];
     av[n] = NULL;
+    char a0[PATH_MAX + 8];
+    av[0] = helper_argv0(s->self, a0, sizeof(a0));
     pid_t pid = fork();
     if (pid < 0) { close(p[0]); close(p[1]); return -1; }
     if (pid == 0) {
         loop_child_reset();
         child_fd3(p[0]);
-        execv(av[0], (char *const *)av);
+        execv(s->self, (char *const *)av);
         _exit(127);
     }
     close(p[0]);
@@ -381,6 +383,9 @@ static int start_one(struct helper *h, void *arg) {
         const char *av[12];
         char prog[PATH_MAX + 32];
         helper_argv(h, s->exe, s->self, s->seam, s->d->spec_path, prog, sizeof(prog), av);
+        const char *path = av[0];
+        char a0[PATH_MAX + 8];
+        av[0] = helper_argv0(path, a0, sizeof(a0));
         pid_t pid = fork();
         if (pid < 0) { close(p[0]); close(p[1]); return -1; }
         if (pid == 0) {
@@ -388,7 +393,7 @@ static int start_one(struct helper *h, void *arg) {
             child_fd3(p[1]);
             putenv("STEER_EVENT_FD=3");
             if (h->env[0]) putenv(h->env);
-            execv(av[0], (char *const *)av);
+            execv(path, (char *const *)av);
             _exit(127);
         }
         close(p[1]);

@@ -205,7 +205,26 @@ static int cmd_xsteer_hub(const char *conf) {
 
 int aggregate_main(int argc, char **argv);
 
+/* Роль steer-tools (docs/architecture.md, раздел 2, «Процессы»): ссылка на steerd, и под этим
+ * именем движок отвечает только на инструменты — то, что не трогает ни правил, ни демона и
+ * нужно человеку и управляющему слою отдельно от движка. Отличается argv[0], а не сборкой: файл
+ * один, и расходиться инструментам с движком негде. */
+static const char *const TOOLS[] = {
+    "fit", "srs-read", "obfs-server", "sub-fetch", "sub-quota", "sub-hwid", "dev-id",
+    "tls-probe", "tgws-probe", "vless-nodes", "xsteer-key", "xsteer-link", "xsteer-check",
+    "xsteer-hub", "dnsd-table", NULL,
+};
 
+static int tools_role(const char *argv0) {
+    const char *b = strrchr(argv0, '/');
+    return !strcmp(b ? b + 1 : argv0, "steer-tools");
+}
+
+static int is_tool(const char *cmd) {
+    for (size_t i = 0; TOOLS[i]; i++)
+        if (!strcmp(TOOLS[i], cmd)) return 1;
+    return 0;
+}
 
 int main(int argc, char **argv) {
     /* Платформа (src/platform/platform.h) — до всего остального: от неё зависят пути по
@@ -234,6 +253,15 @@ int main(int argc, char **argv) {
         return 2;
     }
     const char *cmd = argv[1];
+    if (tools_role(argv[0]) && !is_tool(cmd) && strcmp(cmd, "help") && strcmp(cmd, "--help") &&
+        strcmp(cmd, "-h") && strcmp(cmd, "version") && strcmp(cmd, "--version") &&
+        strcmp(cmd, "-V")) {
+        fprintf(stderr, "steer-tools: %s — не инструмент, а команда движка: steer %s\n"
+                        "       инструменты:", cmd, cmd);
+        for (size_t i = 0; TOOLS[i]; i++) fprintf(stderr, " %s", TOOLS[i]);
+        fputc('\n', stderr);
+        return 2;
+    }
 
     /* Справка и версия — до поиска команды: это не команды движка, а вопросы к нему.
      * Обе формы, и слово, и флаг: `steer --help` человек набирает не задумываясь, а
@@ -310,6 +338,13 @@ int main(int argc, char **argv) {
     const char *spec = a.spec, *arg = a.npos ? a.pos[0] : NULL;
 
     if (!strcmp(cmd, "apply")) return cmd_apply(spec, a.dry_run);
+    /* Эти две исполняет демон, а посылает клиент steer (src/client/main.c). Сюда они доходят,
+     * только если движок позвали напрямую или клиент не нашёл демона своей спеки. */
+    if (!strcmp(cmd, "reload") || !strcmp(cmd, "subscribe")) {
+        fprintf(stderr, "steer: команду %s исполняет демон движка (steerd daemon), а посылает "
+                        "ему клиент steer\n", cmd);
+        return 2;
+    }
     if (!strcmp(cmd, "status")) return cmd_status(spec, a.fast);
     if (!strcmp(cmd, "diag")) return cmd_diag(spec);
     if (!strcmp(cmd, "down")) return cmd_down();

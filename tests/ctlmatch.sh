@@ -243,11 +243,16 @@ wait_for '[ "$(ctl version | j code)" = 0 ]' 3
 check "после ухода четырёх сервер снова отвечает" "0" "$(ctl version | j code)"
 
 # ---- 4. кого пускать --------------------------------------------------------------------
+# Чужой uid зовёт движок напрямую, а не клиентом steer: клиент отдаёт `ctl` движку execv'ом по
+# полному пути, а каталог стенда может лежать под /root (0700) — чужому uid путь не пройти, хотя
+# сам setpriv запускает первую программу ещё с правами root. На роутере оба бинарника в /usr/sbin.
+ENGINE="$(dirname "$BIN")/steerd"
+[ -x "$ENGINE" ] || ENGINE="$BIN"
 if [ $ROOT = 1 ] && command -v setpriv >/dev/null 2>&1; then
-    r="$(setpriv --reuid 65534 --regid 65534 --clear-groups "$BIN" ctl --socket "$tmp/s.sock" status)"
+    r="$(setpriv --reuid 65534 --regid 65534 --clear-groups "$ENGINE" ctl --socket "$tmp/s.sock" status)"
     check "uid 65534 — denied" "denied" "$(printf '%s' "$r" | j error)"
     check "  и отказ записан в журнал сервера" "1" "$(grep -c 'steer\[warn\] ctl: отказ: uid 65534' "$tmp/serve.err")"
-    r="$(setpriv --reuid 65533 --regid 65533 --clear-groups "$BIN" ctl --socket "$tmp/s.sock" version)"
+    r="$(setpriv --reuid 65533 --regid 65533 --clear-groups "$ENGINE" ctl --socket "$tmp/s.sock" version)"
     check "uid из --allow-uid — пускается" "0" "$(printf '%s' "$r" | j code)"
 else
     echo "ctlmatch: не root или нет setpriv — проверки uid пропущены"

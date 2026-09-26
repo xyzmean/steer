@@ -67,6 +67,10 @@ fi
 . ./build/sources.sh
 BASE_SRC="$(profile_src base)" || exit 2
 BASE_INC="$(for d in $(profile_var INC_DIRS); do printf -- '-I%s ' "$d"; done)"
+# Клиент сокета `steer` — второй бинарник пакета (docs/architecture.md, раздел 4а, «Бинарники»):
+# движок — steerd, а под именем steer его зовут rpcd splify2, init-скрипт и человек. Клиент один
+# на оба пакета (в нём нет ни видов, ни протоколов), собирается один раз на архитектуру.
+CLIENT_SRC="$(profile_var CLIENT_SRC)" || exit 2
 
 ISAS="
 mipsel_24kc:mipsel-linux-musl:mips32r2+soft_float
@@ -240,15 +244,29 @@ for spec in $ISAS; do
     if docker run --rm -v "$PWD:/src" -w /src "$IMAGE" \
             cc -target "$target" -mcpu="$mcpu" -static -Os -Wall -Wextra \
                -DSTEER_VERSION="\"$VERSION\"" -DSTEER_REV="\"$REV\"" \
-               -o "build/steer-$arch" $BASE_INC $BASE_SRC \
+               -o "build/steerd-$arch" $BASE_INC $BASE_SRC \
                2>"build/$arch.err"; then
-        echo "$(stat -c %s "build/steer-$arch") bytes"
+        echo "$(stat -c %s "build/steerd-$arch") bytes"
     else
         # Старый бинарник обязан исчезнуть: иначе упаковка молча положит в пакет
         # сборку от прошлого раза, и ошибка компиляции превратится в «версия
         # обновилась, а поведение прежнее» — самый дорогой вид тихого сбоя.
-        rm -f "build/steer-$arch"
+        rm -f "build/steerd-$arch"
         echo "FAILED — $(grep -m1 error "build/$arch.err" || head -1 "build/$arch.err")"
+        continue
+    fi
+
+    # Клиент. Без него пакета нет: /usr/sbin/steer зовут все, кто был до демона, — пакет с одним
+    # steerd выглядел бы установленным, а splify2 получал бы «команда не найдена».
+    printf '  %-26s ' "$arch (клиент steer)"
+    if docker run --rm -v "$PWD:/src" -w /src "$IMAGE" \
+            cc -target "$target" -mcpu="$mcpu" -static -Os -Wall -Wextra \
+               -o "build/steer-client-$arch" $BASE_INC $CLIENT_SRC \
+               2>"build/$arch-client.err"; then
+        echo "$(stat -c %s "build/steer-client-$arch") bytes"
+    else
+        rm -f "build/steer-client-$arch"
+        echo "FAILED — $(grep -m1 error "build/$arch-client.err" || head -1 "build/$arch-client.err")"
         continue
     fi
 
@@ -301,7 +319,11 @@ for spec in $ISAS; do
     rm -rf "$root"
     mkdir -p "$root/usr/sbin" "$root/etc/init.d" "$root/etc/steer/lists" \
              "$root/lib/upgrade/keep.d" "$root/etc/hotplug.d/iface"
-    cp "build/steer-$arch" "$root/usr/sbin/steer"
+    # Три имени (docs/architecture.md, раздел 4а): steerd — движок целиком, steer — клиент сокета,
+    # steer-tools — ссылка на steerd, под этим именем движок отвечает только на инструменты.
+    cp "build/steerd-$arch" "$root/usr/sbin/steerd"
+    cp "build/steer-client-$arch" "$root/usr/sbin/steer"
+    ln -sf steerd "$root/usr/sbin/steer-tools"
     # Обёртка обработчика обхода DPI: её запускает procd для каждого выхода kind=zapret, и
     # читает она файл стратегии при КАЖДОМ запуске (см. её шапку). Едет в оба корня — как
     # init-скрипт: расширенный пакет ставится вместо базового, и без своей копии замена
@@ -319,8 +341,8 @@ for spec in $ISAS; do
     # Файл кладётся В ПОЛЕЗНУЮ НАГРУЗКУ, а не в скрипт установки: он обязан исчезнуть вместе
     # с пакетом и принадлежать ему, как init-скрипт.
     cp files/lib/upgrade/keep.d/steer "$root/lib/upgrade/keep.d/steer"
-    chmod 0755 "$root/usr/sbin/steer" "$root/usr/sbin/steer-nfqws" "$root/etc/init.d/steer" \
-               "$root/etc/hotplug.d/iface/95-steer"
+    chmod 0755 "$root/usr/sbin/steerd" "$root/usr/sbin/steer" "$root/usr/sbin/steer-nfqws" \
+               "$root/etc/init.d/steer" "$root/etc/hotplug.d/iface/95-steer"
     chmod 0644 "$root/lib/upgrade/keep.d/steer"
 
     # OUTSIDE the package root: anything inside it ships as a FILE, so a
@@ -333,7 +355,7 @@ for spec in $ISAS; do
 #!/bin/sh
 [ -n "${IPKG_INSTROOT}" ] && exit 0
 /etc/init.d/steer enable 2>/dev/null
-[ -f /etc/steer/spec.json ] && /etc/init.d/steer restart 2>/dev/null
+/etc/init.d/steer restart 2>/dev/null
 exit 0
 EOF
     cat > build/scripts/pre-deinstall <<'EOF'
@@ -354,7 +376,9 @@ EOF
         rm -rf "$eroot"
         mkdir -p "$eroot/usr/sbin" "$eroot/etc/init.d" "$eroot/etc/steer/lists" \
                  "$eroot/lib/upgrade/keep.d" "$eroot/etc/hotplug.d/iface"
-        cp "build/steer-ext-$arch" "$eroot/usr/sbin/steer"
+        cp "build/steer-ext-$arch" "$eroot/usr/sbin/steerd"
+        cp "build/steer-client-$arch" "$eroot/usr/sbin/steer"
+        ln -sf steerd "$eroot/usr/sbin/steer-tools"
         cp files/usr/sbin/steer-nfqws "$eroot/usr/sbin/steer-nfqws"
         cp files/etc/init.d/steer "$eroot/etc/init.d/steer"
         cp files/etc/hotplug.d/iface/95-steer "$eroot/etc/hotplug.d/iface/95-steer"
@@ -363,11 +387,11 @@ EOF
         # объявление настроек — то есть возвращала бы I-037 на ровно том пакете, который
         # ставит большинство.
         cp files/lib/upgrade/keep.d/steer "$eroot/lib/upgrade/keep.d/steer"
-        chmod 0755 "$eroot/usr/sbin/steer" "$eroot/usr/sbin/steer-nfqws" \
+        chmod 0755 "$eroot/usr/sbin/steerd" "$eroot/usr/sbin/steer" "$eroot/usr/sbin/steer-nfqws" \
                    "$eroot/etc/init.d/steer" "$eroot/etc/hotplug.d/iface/95-steer"
         chmod 0644 "$eroot/lib/upgrade/keep.d/steer"
         # Зависимости считаются по СОБРАННОМУ файлу — см. pkg_deps выше.
-        edeps="$(pkg_deps "$eroot/usr/sbin/steer" ext)"
+        edeps="$(pkg_deps "$eroot/usr/sbin/steerd" ext)"
         docker run --rm -v "$PWD":/w -w /w alpine:latest sh -c \
             "apk add --no-cache apk-tools >/dev/null 2>&1; apk mkpkg \
                --info name:steer-extended --info version:$VERSION-r1 \
@@ -389,7 +413,7 @@ Conflicts: steer'
             "steer + клиент VLESS/Reality (как dnsmasq-full)" "$EXT_FIELDS"
     fi
 
-    deps="$(pkg_deps "$root/usr/sbin/steer" base)"
+    deps="$(pkg_deps "$root/usr/sbin/steerd" base)"
     docker run --rm -v "$PWD":/w -w /w alpine:latest sh -c \
         "apk add --no-cache apk-tools >/dev/null 2>&1; apk mkpkg \
            --info name:steer --info version:$VERSION-r1 \
@@ -420,7 +444,9 @@ done
 # бы предлагать людям то, чего не существует.
 echo "серверная половина:"
 for arch in x86_64 aarch64_generic; do
-    bin="build/steer-$arch"
+    # Движок, а не клиент: на VPS нет ни демона, ни сокета — obfs-server подкомандой самого
+    # движка. Имя внутри архива прежнее (steer): его зовут server/install.sh и человек.
+    bin="build/steerd-$arch"
     if [ ! -f "$bin" ]; then
         printf '  %-26s пропуск (движок не собрался)\n' "$arch"
         continue

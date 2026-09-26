@@ -106,6 +106,13 @@ void helper_started(struct helper *h, pid_t pid);
 void helper_argv(const struct helper *h, const char *exe, const char *self, int seam,
                  const char *spec, char *progbuf, size_t pbn, const char **av);
 
+/* argv[0] ребёнка, которого запускают файлом exe: «<каталог>/steer», если exe — steerd, иначе сам
+ * exe. Процесс помощника в списке процессов выглядит так же, как до раздельных бинарников
+ * («/usr/sbin/steer vless out»): по этой строке его ищут pgrep -f 'steer dnsd' в diag,
+ * 'steer obfs <выход>' у вида interface и скрипты splify2. Запускается при этом steerd —
+ * /proc/<pid>/exe указывает на него, и ctl_find демона сверяет именно exe. */
+const char *helper_argv0(const char *exe, char *buf, size_t n);
+
 /* Погасить всех: ordered=0 — SIGTERM всем сразу (supervise); 1 — по одному в обратном порядке
  * подъёма, дожидаясь выхода каждого (демон). Кто не вышел за свой срок — SIGKILL. Ждёт сам
  * (waitpid), цикл событий к этому моменту уже не крутится. */

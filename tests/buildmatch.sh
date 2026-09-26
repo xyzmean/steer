@@ -100,9 +100,17 @@ check "Makefile: сборки движка берут ядро из манифе
 
 # Android.bp: Soong чужих файлов не читает, поэтому список там остаётся — но сверяется с
 # профилем android, чтобы новый файл не собрался везде, кроме прошивки телефона.
+# Модулей три: движок (steer_defaults + steerd) и клиент steer — его список (CLIENT_SRC) сверяется
+# отдельно, по блоку модуля.
 bp="$(grep -oE '"src/[a-z0-9_/]+\.c"' Android.bp | tr -d '"' | sort -u | tr '\n' ' ')"
-check "Android.bp перечисляет ровно профиль android" \
-    "$(profile_src android | words | sort -u | tr '\n' ' ')" "$bp"
+check "Android.bp перечисляет ровно профиль android и клиент" \
+    "$( { profile_src android; echo; profile_var CLIENT_SRC; } | words | sort -u | tr '\n' ' ')" "$bp"
+bp_client="$(awk '/^cc_binary \{/ { blk = "" } { blk = blk $0 "\n" } /^\}/ { if (blk ~ /name: "steer",/) print blk }' Android.bp |
+             grep -oE '"src/[a-z0-9_/]+\.c"' | tr -d '"' | sort -u | tr '\n' ' ')"
+check "Android.bp: клиент steer собирается ровно из CLIENT_SRC" \
+    "$(profile_var CLIENT_SRC | words | sort -u | tr '\n' ' ')" "$bp_client"
+check "Android.bp: движок ставится как steerd со ссылкой steer-tools" "1 1" \
+    "$(grep -c 'stem: "steerd"' Android.bp) $(grep -c 'symlinks: \["steer-tools"\]' Android.bp)"
 
 # ---- переменная, которую никто не читает -----------------------------------
 # Присвоенная и ни разу не использованная переменная в сборочном скрипте — это список,
@@ -136,10 +144,11 @@ for f in src/daemon/main.c src/daemon/failover.c src/lib/sindex.c src/lib/nftnl.
     n=$(grep -c 'fprintf(stderr, "steer: ' "$f" 2>/dev/null); [ -n "$n" ] || n=0
     [ "$n" -gt 0 ] && bare="$bare$f:$n "
 done
-# main.c: восемь законных строк — четыре отказа «этого нет в этой сборке» (VLESS, клиент
+# main.c: девять законных строк — четыре отказа «этого нет в этой сборке» (VLESS, клиент
 # xsteer, хаб xsteer, служебные команды xsteer), «флаги идут после команды», неизвестное
-# слово у tgws-probe (I-316) и два отказа флага --platform (без значения, нет такой
-# платформы) — последние четыре суть разбор аргументов. Все они
+# слово у tgws-probe (I-316), два отказа флага --platform (без значения, нет такой
+# платформы) — эти четыре суть разбор аргументов — и отказ reload/subscribe движком (их
+# исполняет демон, а посылает клиент steer). Все они
 # заканчиваются кодом 2 и до журнала не доходят, о чём сказано в контракте §5. Больше ни в
 # одном файле голых быть не должно.
 #
@@ -151,7 +160,7 @@ done
 # (src/model/srs.c, srsplan.c) в stderr не пишет вовсе — он возвращает отказ и текст снятого.
 # Две строки srsread.c печатаются при УДАВШЕМСЯ разборе — снятые правила и пропущенные подсети
 # IPv6, — и у них уровень есть; проверка ниже сторожит именно это различие.
-check "голых «steer: » ровно столько, сколько отказов вызывающему" "src/daemon/main.c:8 src/tools/srsread.c:10 " "$bare"
+check "голых «steer: » ровно столько, сколько отказов вызывающему" "src/daemon/main.c:9 src/tools/srsread.c:10 " "$bare"
 # Строки, которые печатаются при успехе, обязаны иметь уровень: разбор удался, значит это
 # журнал во время работы, а не отказ вызывающему.
 check "предупреждения srs-read при удавшемся разборе идут с уровнем" "2" \
@@ -700,7 +709,8 @@ done
 check "в src нет условной компиляции по STEER_ANDROID вне src/platform (правило 2)" "" "$platbad"
 # Сборки задают платформу умолчанием, а не старым ключом, который больше никто не читает (и на
 # который src/platform/platform.c отвечает #error).
-check "Android.bp: умолчание платформы — телефон" "1" \
+# Два места: общие флаги движка (steer_defaults) и клиент — пути по умолчанию у него те же.
+check "Android.bp: умолчание платформы — телефон" "2" \
     "$(grep -c '"-DSTEER_DEFAULT_PLATFORM=android"' Android.bp)"
 check "Android.bp и Makefile не передают снятый ключ -DSTEER_ANDROID" "0" \
     "$(grep -hvE '^[[:space:]]*(#|//)' Android.bp Makefile build/sources.mk | grep -cE -- '-DSTEER_ANDROID\>'; true)"

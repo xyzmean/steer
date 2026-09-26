@@ -109,12 +109,15 @@ static int sup_start(struct helper *h, void *arg) {
     const char *av[12];
     char prog[600];
     helper_argv(h, r->exe, r->self, r->seam, r->spec, prog, sizeof(prog), av);
+    const char *path = av[0];
+    char a0[600];
+    av[0] = helper_argv0(path, a0, sizeof(a0));
     pid_t pid = fork();
     if (pid < 0) return -1;
     if (pid == 0) {
         sigprocmask(SIG_UNBLOCK, r->blocked, NULL);
         if (h->env[0]) putenv(h->env);
-        execv(av[0], (char *const *)av);
+        execv(path, (char *const *)av);
         _exit(127);
     }
     helper_started(h, pid);

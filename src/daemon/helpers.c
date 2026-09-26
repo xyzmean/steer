@@ -266,6 +266,14 @@ void helper_argv(const struct helper *h, const char *exe, const char *self, int 
     av[n] = NULL;
 }
 
+const char *helper_argv0(const char *exe, char *buf, size_t n) {
+    const char *sl = strrchr(exe, '/');
+    const char *base = sl ? sl + 1 : exe;
+    if (strcmp(base, "steerd") != 0) return exe;
+    snprintf(buf, n, "%.*ssteer", (int)(base - exe), exe);
+    return buf;
+}
+
 /* Дождаться выхода pid до срока (монотонные мс). 1 — вышел (пожат). */
 static int wait_until(pid_t pid, long deadline) {
     for (;;) {

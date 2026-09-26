@@ -4,6 +4,8 @@
 # на диске, то есть у одного человека.
 build/steer
 build/steer-*
+build/steerd
+build/steerd-*
 build/libmbed-*.a
 build/*.err
 build/pkg/
