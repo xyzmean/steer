@@ -70,6 +70,9 @@
  *   демона, пока не кончится предыдущая. Раньше это делал flock на ctl.lock между процессами-
  *   обработчиками; теперь обработчик один, и очередь — его собственная.
  *
+ *   С --watch в том же цикле живёт сторож выходов (watchd.c): таймер периода, события netlink и
+ *   проход в ребёнке-копии демона. Пока идёт изменяющая команда, проход откладывается.
+ *
  * КОГО ПУСКАТЬ. Первый замок — SELinux: connectto к steerd разрешён splify2_app, и кроме него
  * к сокету может прийти разве что root (su на userdebug) и init. Второй замок — здесь, по
  * SO_PEERCRED и SO_PEERSEC: uid 0 (root) и 1000 (system) — да; процесс в домене splify2_app
@@ -137,6 +140,8 @@
 #include "daemon.h"
 #include "loop.h"
 #include "state.h"
+#include "fostate.h"
+#include "watchd.h"
 #include "ctl.h"
 
 /* Путь сокета по умолчанию — путь платформы (ctl_sock, src/platform/platform.h). */
@@ -199,6 +204,8 @@ struct ctl_conf {
     const char *allow_domain;    /* NULL или "" — по домену не пускать */
     uid_t allow_uid[CTL_ALLOW_UIDS];
     int allow_uid_n;
+    int watch;                   /* --watch: демон — сторож выходов (watchd.c) */
+    int watch_period;            /* --watch-period, секунд */
     char exe[PATH_MAX];
 };
 
@@ -504,6 +511,7 @@ struct ctl_srv {
     int active, subs;
     struct conn *lock_owner, *lockq;
     int hup_pending;
+    struct watchd *watch;     /* сторож выходов; NULL — без --watch */
 };
 
 static void mem_version(struct conn *c, struct cbuf *r);
@@ -970,7 +978,9 @@ static void mem_status(struct conn *c, struct cbuf *r) {
         code = mem_no_spec(d);
     } else {
         memcpy(d->view, d->sp, sizeof(*d->view));
-        outputs_adopt_active(d->view);
+        /* Выбор устройств — из памяти сторожа, если сторож — сам демон (--watch); иначе из
+         * файла, который пишет `failover --loop`. */
+        outputs_adopt_active_st(d->view, d->outs ? d->outs : &fo_store_files);
         /* Дамп ruleset для fw_check — один на процесс подкоманды; у демона процесс один на
          * всё время, и дамп берётся заново на каждый ответ. */
         fwcheck_reset_cache();
@@ -1072,6 +1082,7 @@ static void srv_spec_changed(struct ctl_srv *s, const char *by, int enabled) {
         snprintf(f, sizeof(f), ",\"by\":\"%s\",\"spec\":\"%s\",\"enabled\":%s", by, s->d.fp,
                  enabled ? "true" : "false");
         steerd_emit(&s->d, "applied", f);
+        watchd_spec_changed(s->watch);
         return;
     }
     fprintf(stderr, LOG_W "спека не прочитана (%s): %s\n", by, s->d.err);
@@ -1985,11 +1996,17 @@ static void srv_accept(struct loop *l, int fd, uint32_t ev, void *arg) {
     }
 }
 
+/* Идёт изменяющая команда — сторож откладывает проход (watchd.h). */
+static int srv_busy(void *arg) {
+    return ((struct ctl_srv *)arg)->lock_owner != NULL;
+}
+
 static void srv_term(struct loop *l, int signo, void *arg) {
     (void)signo;
     struct ctl_srv *s = arg;
     struct stat sb;
     if (s->ino && stat(s->cf.sock, &sb) == 0 && sb.st_ino == s->ino) unlink(s->cf.sock);
+    watchd_stop(s->watch);
     loop_stop(l, 0);
 }
 
@@ -2020,7 +2037,10 @@ void ctl_usage_flags(FILE *out) {
           "                      устройства (по умолчанию splify2_app на платформе Android;\n"
           "                      пустое значение — не пускать по домену)\n"
           "  --lists-dir КАТАЛОГ daemon: куда put-file кладёт файлы списков\n"
-          "                      (по умолчанию %s)\n",
+          "                      (по умолчанию %s)\n"
+          "  --watch             daemon: сторожить выходы самому (вместо failover --loop;\n"
+          "                      оба сразу не запускать)\n"
+          "  --watch-period СЕК  daemon: период прохода сторожа в тишине (по умолчанию 60)\n",
           p->ctl_sock, p->spec_path, p->state_dir, p->lists_dir);
 }
 
@@ -2095,6 +2115,16 @@ int ctl_serve_main(int argc, char **argv) {
             }
             continue;
         }
+        if (!strcmp(f, "--watch")) { cf->watch = 1; continue; }
+        if (!strcmp(f, "--watch-period")) {
+            if (!v) ctl_bad_flag("daemon", "у флага нет значения", f);
+            i++;
+            char *e = NULL;
+            long p = strtol(v, &e, 10);
+            if (!*v || *e || p < 1 || p > 86400) ctl_bad_flag("daemon", "--watch-period: нужно число 1..86400", v);
+            cf->watch_period = (int)p;
+            continue;
+        }
         ctl_bad_flag("daemon", "неизвестный флаг", f);
     }
     ssize_t el = readlink("/proc/self/exe", cf->exe, sizeof(cf->exe) - 1);
@@ -2129,7 +2159,13 @@ int ctl_serve_main(int argc, char **argv) {
     loop_signal(S.l, SIGTERM, srv_term, &S);
     loop_signal(S.l, SIGINT, srv_term, &S);
     loop_signal(S.l, SIGHUP, srv_hup, &S);
-    fprintf(stderr, LOG_I "слушаю %s\n", cf->sock);
+    if (cf->watch) {
+        struct watchd_conf wc = { cf->watch_period ? cf->watch_period : 60, ctl_enabled,
+                                  srv_busy, &S };
+        S.watch = watchd_start(&S.d, &wc);
+        if (!S.watch) { fprintf(stderr, LOG_W "сторож: нет памяти\n"); return 1; }
+    }
+    fprintf(stderr, LOG_I "слушаю %s%s\n", cf->sock, cf->watch ? ", сторожу выходы" : "");
     return loop_run(S.l);
 }
 

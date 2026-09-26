@@ -201,6 +201,7 @@ int awg_revive(const struct spec *sp, const struct output *o, const char *dev);
 void awg_hs_memory(int on);
 void awg_hs_send(int fd);
 void awg_hs_recv(int fd);
+void awg_hs_recv_buf(const char *msg, size_t n);
 /* Поле "awg" у выхода в `steer status`: начинается с запятой. */
 void awg_status_json(FILE *out, const struct output *o);
 

@@ -57,6 +57,13 @@ int cmd_down(void);
 int cmd_supervise(const char *spec);
 int cmd_explain(const char *spec, const char *what);
 int failover_loop(const char *spec, int verbose, int period);
+/* События сети для сторожа (watch.c): сокет netlink на RTMGRP_LINK и адреса IPv4/IPv6
+ * (-1 — не открылся) и дочитать накопленное (1 — было хоть одно событие). Ими же пользуется
+ * сторож демона (watchd.c). WATCH_SETTLE_S — сколько ждать после события до внеочередного
+ * прохода: смена сети приходит пачкой, см. failover_loop. */
+int watch_nl_open(void);
+int watch_nl_drain(int fd);
+#define WATCH_SETTLE_S 5
 
 int cmd_failover(const char *spec, int verbose);   /* failover.c */
 void probe_rule_cleanup(void);   /* failover.c */

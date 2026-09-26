@@ -48,7 +48,7 @@
  *
  * ПО СОБЫТИЯМ, А НЕ ТОЛЬКО ПО ПЕРИОДУ: смена интерфейса или адреса (сеть сменилась, TUN выхода
  * поднялся или упал) — внеочередной проход через пять секунд после события, см.
- * failover_events_open. Период остаётся для того, чего событием не увидеть: туннель поднят,
+ * watch_nl_open. Период остаётся для того, чего событием не увидеть: туннель поднят,
  * а трафик через него не идёт.
  *
  * init гасит сервис сигналом всей группе процессов, поэтому дочерний проход получает свой
@@ -60,7 +60,7 @@
  * — подписка на них будила бы его собственными действиями по кругу. А то, ради чего события и
  * нужны, видно именно здесь: сменилась сеть (у Wi-Fi или сотовой появился или пропал адрес),
  * поднялся TUN выхода, который создал помощник, упал интерфейс туннеля. */
-static int failover_events_open(void) {
+int watch_nl_open(void) {
     int fd = socket(AF_NETLINK, SOCK_RAW | SOCK_CLOEXEC | SOCK_NONBLOCK, NETLINK_ROUTE);
     if (fd < 0) return -1;
     struct sockaddr_nl a;
@@ -72,7 +72,7 @@ static int failover_events_open(void) {
 }
 
 /* Дочитать всё, что накопилось. 1 — было хоть одно событие. */
-static int failover_events_drain(int fd) {
+int watch_nl_drain(int fd) {
     char buf[8192];
     int any = 0;
     ssize_t r;
@@ -82,7 +82,7 @@ static int failover_events_drain(int fd) {
 }
 
 int failover_loop(const char *spec, int verbose, int period) {
-    int ev = failover_events_open();
+    int ev = watch_nl_open();
     for (;;) {
         /* ПАМЯТЬ МЕЖДУ ПРОХОДАМИ — у родителя, а не в файлах каталога состояния: на телефоне это
          * /data, флеш, и запись на каждом проходе (раз в минуту и по каждому событию сети) шла бы
@@ -127,7 +127,7 @@ int failover_loop(const char *spec, int verbose, int period) {
          * события за время прохода — его же следы: реагировать на них значило бы будить себя
          * по кругу. На телефоне сторож интерфейсы не трогает (только ждёт), и событие за время
          * прохода — настоящее: например, TUN, который как раз поднял помощник выхода. */
-        if (plat()->netifd && ev >= 0) failover_events_drain(ev);
+        if (plat()->netifd && ev >= 0) watch_nl_drain(ev);
 
         /* Ждать период ИЛИ событие. poll на монотонном времени: во сне устройства ожидание
          * стоит и не будит его. Событие — не повод бежать сразу: смена сети приходит пачкой
@@ -141,10 +141,10 @@ int failover_loop(const char *spec, int verbose, int period) {
             struct pollfd p = { ev, POLLIN, 0 };
             int r = ev >= 0 ? poll(&p, 1, (int)(left > 0x7fffffff ? 0x7fffffff : left))
                             : poll(NULL, 0, (int)(left > 0x7fffffff ? 0x7fffffff : left));
-            if (r > 0 && failover_events_drain(ev)) {
-                struct timespec q = { 5, 0 };
+            if (r > 0 && watch_nl_drain(ev)) {
+                struct timespec q = { WATCH_SETTLE_S, 0 };
                 while (nanosleep(&q, &q) != 0 && errno == EINTR) {}
-                failover_events_drain(ev);
+                watch_nl_drain(ev);
                 if (verbose)
                     fprintf(stderr, "steer[info] failover: сеть изменилась — проверяю выходы\n");
                 break;
