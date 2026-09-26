@@ -16,6 +16,17 @@
 #  7. reload через клиент: сменился сервер обфускации — перезапущен только тот помощник.
 #  8. SIGTERM демону: помощников и резолвера не остаётся; `steer down` (движком) снимает всё.
 #  9. Без демона reload отвечает отказом с кодом 3; steer-tools отвечает только на инструменты.
+# 10. Порядок при старте: первый проход сторожа — после стартового apply, и строк «разъехалась» при
+#     штатном старте нет — ни при первом, ни при перезапуске после `steer down` (выбор устройств
+#     остался в active, правил в ядре нет — проход до apply назвал бы это расхождением).
+# 11. Страж правил: `ip rule del` нашего правила и `ip rule flush` (как netd при перезапуске) —
+#     через ≤ 3 с правила снова на месте, подписчику repaired с перечнем выходов, на пачку — одна
+#     починка; собственные apply (выход убран — его правило снято) и `steer down` repaired не
+#     порождают.
+# 12. Выключенный движок (шов STEER_CTL_ENABLED_FILE вместо свойства телефона): демон с --watch
+#     --supervise за 20 с тишины переключается не больше одного раза (ни таймера сторожа, ни
+#     снимка status, ни стража правил); reload после включения — проход сторожа сразу, дальше не
+#     чаще периода; выключили и reload — снова тишина и ни одной пробы.
 #
 # Нужны root, unshare, nsenter, nft, ip и python3; без них сетевая часть пропускается.
 set -u
@@ -219,6 +230,14 @@ check "демон при старте применил спеку сам (--appl
 check "  набор правил в ядре" "0" "$("$real_nft" list table inet steer >/dev/null 2>&1; echo $?)"
 check "  демон — это steerd (клиент отдал ему себя execv'ом)" "steerd" \
     "$(basename "$(readlink "/proc/$D/exe" 2>/dev/null)")"
+# Строка номер N журнала, где впервые встретилось слово (0 — нет).
+line_of() { grep -n "$1" "$2" | head -n 1 | cut -d: -f1 | grep . || echo 0; }
+order_ok() {
+    a=$(line_of 'спека применена при старте' "$1") w=$(line_of 'watch: первый проход' "$1")
+    [ "$a" -gt 0 ] && [ "$w" -gt "$a" ] && echo ok || echo "apply:$a pass:$w"
+}
+wait_for 'grep -q "watch: первый проход" "$tmp/d.err"' 5
+check "старт: первый проход сторожа — после стартового apply" "ok" "$(order_ok "$tmp/d.err")"
 
 "$BIN" subscribe $S > "$tmp/sub.out" 2>&1 &
 SUB=$!
@@ -283,6 +302,66 @@ check "reload со сменой сервера обфускации: код 0" "
 wait_for '[ "$(runs o)" = 2 ]' 5
 check "  помощник o перезапущен" "2" "$(runs o)"
 
+# ---- страж правил ----
+# Проход сторожа после reload (через 5 с) — пусть кончится: он и сам возвращает недостающее
+# правило, и стенд тогда не отличил бы починку стража от его прохода.
+sleep 6
+# Наши правила: метка с маской движка. ours — сколько их; rule_of ВЫХОД — «метка/маска» его правила
+# (таблица в выводе ip может быть и именем из rt_tables.d хоста — метка из реестра надёжнее).
+ours() { ip rule show | grep -c 'fwmark .*/'; }
+rule_of() { m=$(awk -v o="$1" '$1 == o { print $2 }' "$tmp/st/registry"); ip rule show | grep -o "fwmark 0x$m/[^ ]*" | head -n 1 | cut -d' ' -f2; }
+reps() { grep -c '"ev":"repaired"' "$tmp/sub.out"; }
+tvpn=$(awk '$1 == "vpn" { print $3 }' "$tmp/st/registry")
+n0=$(ours)
+check "страж правил: у выходов vpn и o по правилу" "2" "$n0"
+ip rule del fwmark "$(rule_of vpn)" table "$tvpn"
+check "  ip rule del — правила vpn нет" "1" "$(ours)"
+t0=$(date +%s%N)
+wait_for '[ "$(ours)" = "$n0" ]' 5
+ms=$(( ($(date +%s%N) - t0) / 1000000 ))
+check "  через ≤ 3 с правило на месте" "yes" "$([ "$(ours)" = "$n0" ] && [ $ms -le 3000 ] && echo yes || echo "no:$ms ms, $(ours)")"
+wait_for '[ "$(reps)" = 1 ]' 3
+check "  подписчику repaired с перечнем" '{"v":1,"ev":"repaired","outputs":["vpn"],"masq":false}' \
+    "$(grep '"ev":"repaired"' "$tmp/sub.out")"
+check "  в журнале демона — строка о починке" "1" "$(grep -c 'сняты снаружи — возвращены: vpn' "$tmp/d.err")"
+# Как netd при (пере)запуске: все правила, кроме приоритета 0. Свои (main, default) netd ставит
+# сам — здесь их возвращает стенд.
+ip rule flush
+ip rule add priority 32766 table main; ip rule add priority 32767 table default
+check "  ip rule flush — наших правил нет" "0" "$(ours)"
+t0=$(date +%s%N)
+wait_for '[ "$(ours)" = "$n0" ]' 5
+ms=$(( ($(date +%s%N) - t0) / 1000000 ))
+check "  через ≤ 3 с оба на месте" "yes" "$([ "$(ours)" = "$n0" ] && [ $ms -le 3000 ] && echo yes || echo "no:$ms ms, $(ours)")"
+wait_for '[ "$(reps)" = 2 ]' 3
+sleep 2
+check "  на пачку — одна починка, с обоими выходами" '{"v":1,"ev":"repaired","outputs":["vpn","o"],"masq":false}' \
+    "$(grep '"ev":"repaired"' "$tmp/sub.out" | tail -n +2)"
+check "  таблица vpn не перепривязана (устройство то же)" "sw2" "$(dev)"
+# Свой apply: выход o убран — его правило и таблицу снимает сверка (--drop). Не починка.
+cp "$tmp/spec.json" "$tmp/spec-o.json"
+python3 - "$tmp/spec.json" <<'PY'
+import json, sys
+d = json.load(open(sys.argv[1]))
+del d["outputs"]["o"]
+d["channels"] = [c for c in d["channels"] if c["out"] != "o"]
+json.dump(d, open(sys.argv[1], "w"))
+PY
+out="$(STEER_ENGINE=/bin/false "$BIN" apply $S 2>&1)"; rc=$?
+check "свой apply (выход o убран): код 0, правило o снято" "0 1" "$rc $(ours)"
+sleep 3
+check "  repaired не пришло" "2" "$(reps)"
+cp "$tmp/spec-o.json" "$tmp/spec.json"
+STEER_ENGINE=/bin/false "$BIN" apply $S >/dev/null 2>&1
+check "  выход o вернули apply — правило снова стоит" "2" "$(ours)"
+sleep 6   # проход сторожа после apply (выходы изменились) — до steer down, а не посреди него
+
+# steer down движком при живом демоне (так снимает правила init): таблиц и правил нет — не починка.
+"$BIN" down --state-dir "$tmp/st" >/dev/null 2>&1
+check "steer down при живом демоне: наших правил нет" "0" "$(ours)"
+sleep 3
+check "  repaired не пришло, правила не вернулись" "2 0" "$(reps) $(ours)"
+
 # SIGTERM: демон гасит помощников и резолвер; правила остаются до steer down.
 kill $SUB 2>/dev/null; wait $SUB 2>/dev/null; SUB=""
 kill "$D"
@@ -301,12 +380,80 @@ check "без демона status — движком, тот же формат" 
 check "steer down: таблиц движка нет" "1" "$("$real_nft" list table inet steer >/dev/null 2>&1; echo $?)"
 check "  правил выходов нет" "0" "$(ip rule show | grep -c 'fwmark')"
 
+# Перезапуск после steer down: выбор устройств остался в active, правил в ядре нет. Первый проход
+# — после стартового apply, и «разъехалась» он не говорит.
+check "старт: при первом запуске строк «разъехалась» нет" "0" "$(grep -c 'разъехал' "$tmp/d.err")"
+check "  в active остался выбор прежнего демона" "1" "$(grep -c '^vpn sw' "$tmp/st/active")"
+STEER_SUPERVISE_EXE="$tmp/helper" unshare -m sh -c "mount -t sysfs sysfs /sys && exec \"$BIN\" \
+    daemon --watch --supervise --apply --socket \"$tmp/steer.sock\" $S \
+    --dnsd-flag --listen-port --dnsd-flag $LPORT --dnsd-flag --upstream-port --dnsd-flag $UPORT" \
+    >"$tmp/d2.out" 2>"$tmp/d2.err" &
+D=$!
+wait_for 'grep -q "watch: первый проход" "$tmp/d2.err"' 10
+sleep 1
+check "перезапуск: первый проход — после стартового apply" "ok" "$(order_ok "$tmp/d2.err")"
+check "  строк «разъехалась» нет" "0" "$(grep -c 'разъехал' "$tmp/d2.err")"
+kill "$D"; wait $D 2>/dev/null; D=""
+"$BIN" down --state-dir "$tmp/st" >/dev/null 2>&1
+
 # steer-tools: ссылка на steerd, роль по argv[0].
 ln -s "$(dirname "$BIN")/steerd" "$tmp/steer-tools"
 "$tmp/steer-tools" status $S >/dev/null 2>&1
 check "steer-tools: команда движка — отказ" "2" "$?"
 check "steer-tools fit — инструмент работает" "10.0.0.0/23" \
     "$(printf '10.0.0.0/24\n10.0.1.0/24\n' | "$tmp/steer-tools" fit 2>/dev/null)"
+
+# ---- выключенный движок: ноль пробуждений ----
+# Свой выход на sw1 и своё состояние; выключатель — файл (шов стенда вместо свойства телефона).
+mkdir -p "$tmp/st3"
+printf '{"schema":2,"outputs":{"vpn":{"kind":"interface","device":"sw1","on_fail":"drop"}},'\
+'"channels":[{"name":"p","match":{"prefixes_files":["%s"]},"out":"vpn"}]}\n' "$tmp/p1.lst" > "$tmp/spec3.json"
+ip link set sw1 up
+S3="--spec $tmp/spec3.json --state-dir $tmp/st3"
+echo 0 > "$tmp/enabled"
+csw() { awk '/^voluntary_ctxt_switches/{print $2}' "/proc/$D/status"; }
+echos() { R awk '/^Icmp:/ { if (!h) { for (i = 1; i <= NF; i++) if ($i == "InEchos") c = i; h = 1 } else print $c }' /proc/net/snmp; }
+c3() { "$BIN" ctl --socket "$tmp/s3.sock" "$@"; }
+STEER_CTL_ENABLED_FILE="$tmp/enabled" unshare -m sh -c "mount -t sysfs sysfs /sys && exec \"$BIN\" \
+    daemon --watch --watch-period 3 --supervise --apply --socket \"$tmp/s3.sock\" $S3 \
+    --dnsd-flag --listen-port --dnsd-flag $LPORT --dnsd-flag --upstream-port --dnsd-flag $UPORT" \
+    >"$tmp/d3.out" 2>"$tmp/d3.err" &
+D=$!
+wait_for '[ -S "$tmp/s3.sock" ]' 5
+sleep 1
+cs0=$(csw); e0=$(echos)
+sleep 20
+cs1=$(csw); e1=$(echos)
+check "выключенный движок: за 20 с тишины демон переключается не больше раза" "ok" \
+    "$([ $((cs1 - cs0)) -le 1 ] && echo ok || echo "$((cs1 - cs0))")"
+check "  проб нет, проходов нет, правил нет" "0 0 0" \
+    "$((e1 - e0)) $(grep -c 'watch: первый проход' "$tmp/d3.err") $(ip rule show | grep -c fwmark)"
+check "  детей у демона нет (резолвер не поднят)" "" "$(cat "/proc/$D/task/$D/children" 2>/dev/null | tr -d ' ')"
+echo 1 > "$tmp/enabled"
+r="$(c3 reload)"
+check "включили и reload: код 0, движок включён" "0 True" \
+    "$(printf '%s' "$r" | j code) $(printf '%s' "$r" | j enabled)"
+wait_for 'grep -q "^vpn sw1 0$" "$tmp/st3/active" 2>/dev/null' 5
+check "  проход сторожа сразу после reload" "1" "$(grep -c 'watch: первый проход' "$tmp/d3.err")"
+sleep 1
+e0=$(echos)
+sleep 10
+e1=$(echos)
+n=$((e1 - e0))
+check "  дальше проходы не чаще периода (эхо-проб за 10 с при периоде 3)" "ok" \
+    "$([ "$n" -ge 2 ] && [ "$n" -le 4 ] && echo ok || echo "n=$n")"
+echo 0 > "$tmp/enabled"
+"$BIN" down --state-dir "$tmp/st3" >/dev/null 2>&1
+r="$(c3 reload)"
+check "выключили и reload: движок выключен" "False" "$(printf '%s' "$r" | j enabled)"
+sleep 1
+cs0=$(csw); e0=$(echos)
+sleep 10
+cs1=$(csw); e1=$(echos)
+check "  снова тишина: переключений не больше одного, проб нет" "ok 0" \
+    "$([ $((cs1 - cs0)) -le 1 ] && echo ok || echo "$((cs1 - cs0))") $((e1 - e0))"
+check "  выключение не порождает починку правил" "0" "$(grep -c 'сняты снаружи' "$tmp/d3.err")"
+kill "$D"; wait $D 2>/dev/null; D=""
 
 echo "daemonmatch: $pass passed, $fail failed"
 [ "$fail" = 0 ]

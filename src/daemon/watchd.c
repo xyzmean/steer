@@ -41,6 +41,25 @@
  * В тишине демон просыпается только таймером периода (timerfd на CLOCK_MONOTONIC: во сне
  * устройства он стоит и не будит его) — не чаще, чем `--loop`.
  *
+ * ВЫКЛЮЧЕННЫЙ ДВИЖОК — НОЛЬ ПРОБУЖДЕНИЙ (требование батареи телефона). Демон работает и при
+ * выключенном движке — он же управляющий сокет, — но сторожить тогда нечего: правила снял init, а
+ * трогать маршрутизацию нельзя. Раньше таймер периода тикал и так — просыпался, видел «выключен»
+ * и заводился снова: раз в минуту ради ответа «нет». Теперь выключенный сторож не держит ни
+ * таймера, ни сокета событий сети (событие сети будило бы его ради того же «нет»), и демон спит
+ * в epoll_wait без срока до запроса по сокету. Положение выключателя сторожу говорит сервер
+ * сокета (watchd_enable) — после apply, reload и SIGHUP, то есть тогда, когда init включает или
+ * выключает движок; выключатель, сменившийся без reload, сторож замечает на ближайшем своём
+ * таймере и засыпает сам. Без спеки — то же: проходить нечем, и первый проход зовёт прочитанная
+ * спека.
+ *
+ * ПЕРВЫЙ ПРОХОД — ПОСЛЕ СТАРТОВОГО APPLY. С --apply демон при старте ставит спеку в ядро сам, и
+ * проход раньше этого видел бы ядро без правил (их снял `steerd down` при остановке сервиса):
+ * «маршрутизация разъехалась (правила fwmark нет)» у каждого выхода, выбор которого остался в
+ * `active`, и «туннель молчит» у тех, чьи помощники ещё не подняты. Поэтому сторож заводится
+ * придержанным (hold) и первый проход делает watchd_release — по концу стартового apply,
+ * удачного или нет. Раньше тот же порядок держала только проверка «идёт изменяющая команда» в
+ * таймере — случайно, а не по устройству.
+ *
  * ПАМЯТЬ ВЫХОДОВ — в демоне: `active`, `latency`, `restart-*` (fostate.h) и замеры awg
  * (awg_hs_memory, как у `--loop`). status демона берёт выбор устройств отсюда. `active` при
  * этом ещё и отражается в файл — только при изменении, как и раньше: до шага 6 status, diag и
@@ -223,6 +242,9 @@ struct watchd {
     int settling;                 /* tm стоит на успокоении, а не на периоде */
     int pending;                  /* после идущего прохода нужен ещё один */
     int eventful;                 /* проход идёт по событию сети или смене спеки */
+    int on;                       /* движок включён: без этого ни таймера, ни сокета событий */
+    int hold;                     /* первый проход ждёт конца стартового apply (watchd_release) */
+    unsigned long passes;         /* проходов с начала — первый отмечается в журнале */
     struct fo_run *run;           /* идущий проход; NULL — нет */
     struct spec *sp;              /* копия спеки для прохода */
     struct wev ev[WATCHD_EV_MAX];
@@ -234,8 +256,15 @@ struct watchd {
 
 static void watchd_pass_start(struct watchd *w);
 
+/* Сторож спит: движок выключен или первый проход ждёт стартового apply. Ни один таймер тогда
+ * не заводится — ни успокоение, ни период (см. шапку, «ВЫКЛЮЧЕННЫЙ ДВИЖОК»). */
+static int watchd_dormant(const struct watchd *w) {
+    return !w->on || w->hold;
+}
+
 static void watchd_settle(struct watchd *w) {
     w->eventful = 1;
+    if (watchd_dormant(w)) return;
     if (w->settling) return;      /* пачка уже ждёт своего прохода — срок не отодвигаем */
     w->settling = 1;
     loop_timer_set(w->tm, WATCH_SETTLE_S * 1000L);
@@ -243,6 +272,7 @@ static void watchd_settle(struct watchd *w) {
 
 static void watchd_period(struct watchd *w) {
     w->settling = 0;
+    if (watchd_dormant(w)) { loop_timer_stop(w->tm); return; }
     loop_timer_set(w->tm, w->cf.period_s * 1000L);
 }
 
@@ -251,7 +281,11 @@ static void watchd_timer(struct loop *l, struct loop_timer *t, void *arg) {
     struct watchd *w = arg;
     w->settling = 0;
     if (w->run) return;           /* не бывает: таймер снят на время прохода */
-    if (!w->d->have || (w->cf.enabled && !w->cf.enabled())) { watchd_period(w); return; }
+    /* Спеки нет — проходить нечем, и тикать впустую незачем: прочитанная спека (apply, reload,
+     * SIGHUP) сама позовёт проход через watchd_spec_changed. Выключатель сменился без
+     * reload — сторож засыпает сам, а не проверяет его раз в период. */
+    if (!w->d->have) return;
+    if (w->cf.enabled && !w->cf.enabled()) { watchd_enable(w, 0); return; }
     if (w->cf.busy && w->cf.busy(w->cf.busy_arg)) { watchd_settle(w); return; }
     if (w->nl >= 0) watch_nl_drain(w->nl);   /* пачка, ради которой ждали, — в этот проход */
     watchd_pass_start(w);
@@ -261,6 +295,7 @@ static void watchd_nl(struct loop *l, int fd, uint32_t ev, void *arg) {
     (void)l; (void)ev;
     struct watchd *w = arg;
     if (!watch_nl_drain(fd)) return;
+    if (watchd_dormant(w)) return;
     /* Во время прохода: на роутере — следы его же ifdown/ifup (выбрасываются после прохода),
      * на телефоне — настоящее событие, и после прохода нужен ещё один. */
     if (w->run) {
@@ -271,7 +306,7 @@ static void watchd_nl(struct loop *l, int fd, uint32_t ev, void *arg) {
 }
 
 void watchd_spec_changed(struct watchd *w) {
-    if (!w) return;
+    if (!w || watchd_dormant(w)) return;
     if (w->run) w->pending = 1;
     else watchd_settle(w);
 }
@@ -368,6 +403,7 @@ static void watchd_pass_start(struct watchd *w) {
      * status и masquerade (они смотрят на спеку так, как её прочитал бы свежий процесс). */
     memcpy(w->sp, w->d->sp, sizeof(*w->sp));
     w->ev_n = 0;
+    if (!w->passes++) fprintf(stderr, "steer[info] watch: первый проход\n");
     loop_timer_stop(w->tm);
     w->run = fo_pass_start(w->l, w->sp, &w->mem.base, 0, watchd_ev, w, watchd_pass_done, w);
     if (!w->run) {
@@ -382,7 +418,26 @@ static void watchd_pass_start(struct watchd *w) {
 
 /* ---- заведение и уход ------------------------------------------------------------------ */
 
-struct watchd *watchd_start(struct steerd *d, const struct watchd_conf *c) {
+/* Сокет событий сети: открыт, только пока движок включён. */
+static void watchd_nl_up(struct watchd *w) {
+    if (w->nl >= 0) return;
+    w->nl = watch_nl_open();
+    if (w->nl >= 0 && loop_fd_add(w->l, w->nl, EPOLLIN, watchd_nl, w) != 0) {
+        close(w->nl);
+        w->nl = -1;
+    }
+    if (w->nl < 0)
+        fprintf(stderr, LOG_WW "события сети недоступны — проход только по периоду\n");
+}
+
+static void watchd_nl_down(struct watchd *w) {
+    if (w->nl < 0) return;
+    loop_fd_del(w->l, w->nl);
+    close(w->nl);
+    w->nl = -1;
+}
+
+struct watchd *watchd_start(struct steerd *d, const struct watchd_conf *c, int on, int hold) {
     struct watchd *w = calloc(1, sizeof(*w));
     if (!w) return NULL;
     w->d = d;
@@ -415,18 +470,45 @@ struct watchd *watchd_start(struct steerd *d, const struct watchd_conf *c) {
     /* Правило пробы, оставшееся от сторожа, убитого SIGKILL (прежний круг, прежний демон), —
      * один раз при старте: свои правила проход снимает сам (и при отмене). */
     cleanup_probe_rule();
-    w->nl = watch_nl_open();
-    if (w->nl >= 0 && loop_fd_add(w->l, w->nl, EPOLLIN, watchd_nl, w) != 0) {
-        close(w->nl);
-        w->nl = -1;
-    }
-    if (w->nl < 0)
-        fprintf(stderr, LOG_WW "события сети недоступны — проход только по периоду\n");
+    w->nl = -1;
     d->outs = &w->mem.base;
     d->watch = w;
     w->eventful = 1;              /* первый проход — как по событию: masquerade проверить */
-    loop_timer_set(w->tm, 0);
+    w->hold = hold;
+    if (on) watchd_enable(w, 1);
     return w;
+}
+
+void watchd_enable(struct watchd *w, int on) {
+    if (!w || w->on == !!on) return;
+    w->on = !!on;
+    if (on) {
+        watchd_nl_up(w);
+        w->eventful = 1;
+        w->settling = 0;
+        if (!w->hold) loop_timer_set(w->tm, 0);
+        return;
+    }
+    /* Выключили: маршрутизацию трогать больше нельзя — идущий проход прерывается с уборкой
+     * правила пробы, его события не уходят (решения прерванного прохода не записаны). */
+    if (w->run) {
+        fo_pass_abort(w->run);
+        w->run = NULL;
+        w->ev_n = 0;
+    }
+    loop_timer_stop(w->kill_tm);
+    loop_timer_stop(w->tm);
+    w->settling = w->pending = 0;
+    watchd_nl_down(w);
+}
+
+void watchd_release(struct watchd *w) {
+    if (!w || !w->hold) return;
+    w->hold = 0;
+    if (!w->on || w->run) return;
+    w->eventful = 1;
+    w->settling = 0;
+    loop_timer_set(w->tm, 0);
 }
 
 void watchd_stop(struct watchd *w) {

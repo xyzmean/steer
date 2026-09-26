@@ -88,6 +88,7 @@ cc_defaults {
         "src/daemon/state.c",
         "src/daemon/watchd.c",
         "src/daemon/recon.c",
+        "src/daemon/rulewd.c",
         "src/lib/rtnl.c",
         "src/daemon/foprobe.c",
         "src/daemon/gaiw.c",
