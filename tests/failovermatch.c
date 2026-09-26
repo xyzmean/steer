@@ -11,10 +11,17 @@
  * здесь она и стоит.
  *
  * Как это проверяется без роутера. run_quiet подменён и записывает команды вместо их
- * запуска, а `ip rule show` и `ip route show table N` читаются через popen — он подменён
- * на чтение из памяти (тот же приём, что в tests/fwmatch.c). Выход берётся kind=xsteer:
- * его проба здоровья — наличие устройства (см. device_healthy_for), поэтому стенду не
- * нужны ни сеть, ни root, а устройством служит lo. */
+ * запуска, а состояние ядра — `ip rule show` и `ip route show table N`, которые сторож читает
+ * сообщениями rtnetlink, — отдаёт шов g_ip_show из памяти, дословными дампами `ip`. Выход
+ * берётся kind=xsteer: его проба здоровья — наличие устройства (см. hp_start), поэтому стенду
+ * не нужны ни сеть, ни root, а устройством служит lo.
+ *
+ * Проход — автомат на цикле событий (failover.c, «ПРОХОД — КОНЕЧНЫЙ АВТОМАТ»), и стенд гоняет
+ * ровно его: cmd_failover, revive и device_healthy_for заводят свой цикл и крутят автомат до
+ * конца. Всё, чего автомат ждёт вовне, подменено швами failover_int.h: проба ICMP
+ * (g_icmp_probe — пишет в журнал команд то, что сделала бы настоящая: правило пробы и эхо),
+ * внешние команды оживления (g_cmd_hook — тот же run_quiet-журнал, что и у действий над
+ * ядром), шаг ожидания подъёма (g_revive_step — считается и не ждётся). */
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -93,24 +100,28 @@ static int cmd_count(const char *line) {
 static const char *g_rules = "";
 static const char *g_routes = "";
 
-/* failover.c линкуется отдельным объектом (docs/architecture.md, раздел 4), поэтому подмену
- * popen/pclose/sleep нельзя сделать макросом — макрос виден только внутри своей единицы
- * трансляции. Вместо него — три функции с именами и подписями из <stdio.h>/<unistd.h>:
- * сильные символы в объекте стенда перекрывают слабые из libc при компоновке (тот же приём,
- * которым тесты подменяют библиотечные функции без LD_PRELOAD), и вызовы из failover.o
- * приходят сюда, а не в ядро. */
-FILE *popen(const char *cmd, const char *mode) {
-    (void)mode;
-    const char *text = strstr(cmd, "rule") ? g_rules : g_routes;
-    return fmemopen((void *)text, strlen(text), "r");
+/* Состояние ядра — из памяти: правила (table < 0) и таблица выхода. */
+static int fake_ip_show(int table, char *out, size_t n) {
+    snprintf(out, n, "%s", table < 0 ? g_rules : g_routes);
+    return 0;
 }
-int pclose(FILE *f) { return fclose(f); }
 
-/* Ожидание подъёма подменено пустышкой. revive ждёт десятью секундными шагами, и настоящий
- * sleep стоил бы десять секунд на каждую проверку этой ветки, не добавляя к ней ничего:
- * устройства в стенде по ходу прохода не появляются и не исчезают. */
+/* Проба ICMP целиком — то, что сделала бы настоящая: правило пробы (таблица 299) и эхо через
+ * устройство. Ответ всегда «дошло» — мёртвым устройство делает его отсутствие (lo есть всегда,
+ * nodev — нет), а не проба. */
+static int fake_icmp_probe(const char *dev) {
+    if (g_cmd_n + 2 <= (int)(sizeof(g_cmd) / sizeof(*g_cmd))) {
+        snprintf(g_cmd[g_cmd_n++], sizeof(g_cmd[0]), "probe-rule from %s table 299", dev);
+        snprintf(g_cmd[g_cmd_n++], sizeof(g_cmd[0]), "icmp-probe -I %s 1.1.1.1", dev);
+    }
+    return 1;
+}
+
+/* Ожидание подъёма: revive ждёт десятью шагами по секунде, и настоящий шаг стоил бы десять
+ * секунд на каждую проверку этой ветки, не добавляя к ней ничего: устройства в стенде по ходу
+ * прохода не появляются и не исчезают. Шаг считается и длится ноль. */
 static int g_slept;
-unsigned sleep(unsigned n) { (void)n; g_slept++; return 0; }
+static long fake_step(void) { g_slept++; return 0; }
 
 #include "../src/model/spec.h"
 #include "daemon.h"
@@ -424,6 +435,10 @@ int main(void) {
     snprintf(g_dir, sizeof(g_dir), "/tmp/failovermatch-XXXXXX");
     if (!mkdtemp(g_dir)) { perror("mkdtemp"); return 1; }
     steer_set_state_dir(g_dir);
+    g_ip_show = fake_ip_show;
+    g_icmp_probe = fake_icmp_probe;
+    g_cmd_hook = run_quiet;
+    g_revive_step = fake_step;
 
     /* Test sig_cleanup/cleanup_probe_rule indirectly by checking rule_deleted */
     cleanup_probe_rule();
@@ -778,7 +793,7 @@ int main(void) {
     out_set_pool("lo");
     state_write("active", "hub lo\n");
     tick(RULES_WITH, "default dev lo scope link\n");
-    check("устройство туннеля в пуле не проверяется пингом", cmd_seen("ping"), 0);
+    check("устройство туннеля в пуле не проверяется пингом", cmd_seen("icmp-probe"), 0);
     check("устройство туннеля в пуле не заводит правило пробы", cmd_seen("table 299"), 0);
     check("пул привязан к устройству владельца",
           cmd_seen("ip route replace default dev lo table 301"), 1);
@@ -1063,7 +1078,8 @@ int main(void) {
          * стоит здесь затем, чтобы правка не отменила обычный путь заодно. */
         g_cmd_n = 0;
         device_healthy_for(&g_spec, &o, "lo");
-        check("без файла состояния — обычная проба пингом", cmd_seen("ping"), 1);
+        check("без файла состояния — обычная проба пингом", cmd_seen("icmp-probe -I lo"), 1);
+        check("  с правилом пробы", cmd_seen("probe-rule from lo table 299"), 1);
 
         /* Файл свежий и говорит «поднят». Пинговать наружу нельзя: у хаба полной звезды
          * маршрута в интернет может не быть вовсе, и пинг объявил бы мёртвым работающий
@@ -1072,7 +1088,7 @@ int main(void) {
                     "{\"schema\":1,\"out\":\"lo\",\"up\":true,\"handshake_age\":3}\n");
         g_cmd_n = 0;
         check("файл говорит «поднят» — устройство живо", device_healthy_for(&g_spec, &o, "lo"), 1);
-        check("файл говорит «поднят» — наружу не пингуем", cmd_seen("ping"), 0);
+        check("файл говорит «поднят» — наружу не пингуем", cmd_seen("icmp-probe"), 0);
 
         /* Файл свежий и говорит «не поднят» — приговор его, а не пинга: клиент знает про
          * рукопожатие с хабом то, чего пинг не знает. */
@@ -1080,7 +1096,7 @@ int main(void) {
                     "{\"schema\":1,\"out\":\"lo\",\"up\":false,\"handshake_age\":-1}\n");
         g_cmd_n = 0;
         check("файл говорит «не поднят» — устройство мертво", device_healthy_for(&g_spec, &o, "lo"), 0);
-        check("файл говорит «не поднят» — наружу тоже не пингуем", cmd_seen("ping"), 0);
+        check("файл говорит «не поднят» — наружу тоже не пингуем", cmd_seen("icmp-probe"), 0);
 
         /* Файл устарел: писавшего процесса нет. Врать в сторону «сломано» здесь дороже
          * всего — при on_fail=drop это blackhole, — поэтому приговор отдаётся наличию

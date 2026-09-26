@@ -190,18 +190,19 @@ void awg_down_all(void);
 /* Здоровье устройства по свежести рукопожатия, без проб. 1 — живо или сказать нечего. */
 int awg_healthy(const struct output *o, const char *dev);
 /* Починка молчащего туннеля: заново разрешить Endpoint и перенастроить (создать, если
- * устройства нет). Возврат — как у awg_healthy после починки. */
-int awg_revive(const struct spec *sp, const struct output *o, const char *dev);
+ * устройства нет). names — имена Endpoint, уже разрешённые сторожем (awg_revive_names); NULL —
+ * разрешить самим, синхронно. Возврат — как у awg_healthy после починки. */
+struct kind_name;
+int awg_revive(const struct spec *sp, const struct output *o, const char *dev,
+               const struct kind_name *names, size_t n);
+size_t awg_revive_names(const struct spec *sp, const struct output *o, struct kind_name *dst,
+                        size_t max);
 /* ПАМЯТЬ СТОРОЖА: замеры счётчиков между проходами (см. «здоровье» в awg.c) — в памяти, а не в
- * файле <state>/awg-<устройство>.hs. Зовёт `failover --loop` (steer.c): on=1 — проход берёт и
- * кладёт замеры в память процесса; дочерний проход получает её копией при fork, а свои новые
- * замеры отдаёт родителю через трубу — awg_hs_send в дочернем, awg_hs_recv в родителе (свою
- * память он заменяет, только если сообщение пришло целиком). Без круга (один проход, круг
- * shell на роутере) — как прежде, файлом. */
+ * файле <state>/awg-<устройство>.hs. Зовут долгоживущие сторожа — `failover --loop` (watch.c) и
+ * демон с --watch (watchd.c): on=1 — проход берёт и кладёт замеры в память процесса (проход
+ * идёт в этом же процессе, на его цикле событий). Без круга (один проход, круг shell на
+ * роутере) — как прежде, файлом. */
 void awg_hs_memory(int on);
-void awg_hs_send(int fd);
-void awg_hs_recv(int fd);
-void awg_hs_recv_buf(const char *msg, size_t n);
 /* Поле "awg" у выхода в `steer status`: начинается с запятой. */
 void awg_status_json(FILE *out, const struct output *o);
 

@@ -11,6 +11,7 @@
  * компоновщику. */
 
 #include <stdint.h>
+#include <stddef.h>
 #include "spec.h"
 
 /* ---- сверка фактической маршрутизации (route_facts_of) ---------------------------- */
@@ -70,8 +71,22 @@ int device_healthy_for(const struct spec *sp, const struct output *o, const char
  * failover.c. */
 extern int (*g_health_probe)(const struct spec *, const struct output *, const char *);
 extern int (*g_latency_probe)(const struct spec *, const struct output *, const char *);
-/* Порог гистерезиса читает переменную окружения один раз и кэширует ответ (процесс в бою
- * короткоживущий) — стенду нужно менять её между проходами в одном процессе. */
+/* Порог гистерезиса читает переменную окружения один раз и кэширует ответ — стенду нужно
+ * менять её между проходами в одном процессе. */
 void failover_hyst_reset_for_test(void);
+
+/* Швы автомата прохода (failover.c, «ПРОХОД — КОНЕЧНЫЙ АВТОМАТ»). В бою все NULL; стенд
+ * failovermatch ставит их, потому что ни ядра, ни сети, ни прав ему не дают:
+ *   g_ip_show     — состояние ядра: table < 0 — правила (`ip -4 rule show`), иначе маршруты
+ *                   таблицы (`ip -4 route show table N`), в out дословным текстом `ip`;
+ *   g_icmp_probe  — проба ICMP устройства целиком (с правилом пробы): 1 — ответило;
+ *   g_cmd_hook    — внешняя команда оживления (ifdown, ifup, ubus): «выполняется» сразу, код —
+ *                   как у run_quiet;
+ *   g_revive_step — длительность шага ожидания подъёма, мс (в бою — секунда): стенд считает
+ *                   шаги и не ждёт их. */
+extern int (*g_ip_show)(int table, char *out, size_t n);
+extern int (*g_icmp_probe)(const char *dev);
+extern int (*g_cmd_hook)(const char *const argv[]);
+extern long (*g_revive_step)(void);
 
 #endif

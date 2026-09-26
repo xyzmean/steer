@@ -269,10 +269,15 @@ $(BUILD)/irmatch-android: tests/irmatch.c tests/unit.h $(COMPILE_SRC) $(MODEL_KI
 	@mkdir -p $(BUILD)
 	$(CC) $(CFLAGS) -DSTEER_DEFAULT_PLATFORM=android -o $@ tests/irmatch.c $(COMPILE_SRC_NO_IR) $(MODEL_KINDS)
 
-$(BUILD)/failovermatch: tests/failovermatch.c src/daemon/failover.c src/daemon/daemon.h \
-                        src/daemon/failover_int.h src/daemon/fostate.h src/model/spec.h src/lib/err.c $(FAILOVERMATCH_KINDS)
+# Проход сторожа — автомат на цикле событий: с ним компонуются цикл (loop.c), ожидания
+# (foprobe.c), рабочий поток имён (gaiw.c) и rtnetlink (rtnl.c). Всё, что из них полезло бы в
+# ядро или в сеть, стенд подменяет швами failover_int.h.
+FAILOVERMATCH_SRC := src/daemon/failover.c src/daemon/loop.c src/daemon/foprobe.c src/daemon/gaiw.c src/lib/rtnl.c
+$(BUILD)/failovermatch: tests/failovermatch.c $(FAILOVERMATCH_SRC) src/daemon/daemon.h \
+                        src/daemon/failover_int.h src/daemon/fostate.h src/daemon/foprobe.h src/daemon/gaiw.h \
+                        src/daemon/loop.h src/lib/rtnl.h src/model/spec.h src/lib/err.c $(FAILOVERMATCH_KINDS)
 	@mkdir -p $(BUILD)
-	$(CC) $(CFLAGS) -o $@ tests/failovermatch.c src/daemon/failover.c src/lib/err.c $(FAILOVERMATCH_KINDS) $(PLATFORM_SRC)
+	$(CC) $(CFLAGS) -o $@ tests/failovermatch.c $(FAILOVERMATCH_SRC) src/lib/err.c $(FAILOVERMATCH_KINDS) $(PLATFORM_SRC) -lpthread
 
 # Зависимость выхода от чужого firewall: fw_check судит о конфигурации по тексту дампа
 # nft, и проверить эвристику можно только примерами. Стенд включает исходник движка и
