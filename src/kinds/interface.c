@@ -143,7 +143,7 @@ static void iface_diag(kind_diag_fn *diag, const struct spec *sp, const struct o
 }
 
 /* Помощник — обфускатор (`steer obfs <выход>`). В подпись — сервер и локальный адрес: ровно то,
- * что он читает при старте (см. sup_sig в supervise.c). */
+ * что он читает при старте (см. helper_sig в daemon/helpers.c). */
 static int iface_helper(const struct spec *sp, const struct output *o, struct kind_helper *h) {
     (void)sp;
     const struct out_obfs *ob = &o->iface.obfs;

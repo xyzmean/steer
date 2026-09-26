@@ -12,6 +12,7 @@
  * человек видит рабочую конфигурацию, в которой трафик пропадает. */
 #include <stdio.h>
 #include <string.h>
+#include <unistd.h>
 
 #include "spec.h"
 
@@ -49,10 +50,14 @@ static void vless_status(FILE *out, const struct spec *sp, const struct output *
     fprintf(out, "]");
 }
 
-/* Помощник — клиент туннеля. В подпись — файл подписки и выбор узлов (sup_sig в supervise.c). */
+/* Помощник — клиент туннеля. В подпись — файл подписки и выбор узлов (helper_sig, daemon/helpers.c). */
 static int vless_helper(const struct spec *sp, const struct output *o, struct kind_helper *h) {
     (void)sp;
     snprintf(h->cmd, sizeof(h->cmd), "vless");
+    /* Счётчики туннеля — по файлу-выключателю, как у init.d/steer (procd_set_param env). */
+    char st[256];
+    if (access(plat_etc_path(st, sizeof(st), "stats"), F_OK) == 0)
+        snprintf(h->env, sizeof(h->env), "STEER_TUN_STATS=1");
     kind_sig_mix(&h->sig, o->vless.sub_file, strlen(o->vless.sub_file));
     for (size_t i = 0; i < o->vless.nodes_n; i++)
         kind_sig_mix(&h->sig, &o->vless.nodes[i], sizeof(o->vless.nodes[i]));

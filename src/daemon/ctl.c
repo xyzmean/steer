@@ -73,6 +73,14 @@
  *   С --watch в том же цикле живёт сторож выходов (watchd.c): таймер периода, события netlink и
  *   проход в ребёнке-копии демона. Пока идёт изменяющая команда, проход откладывается.
  *
+ *   С --supervise там же живут дети демона (supd.c): помощники выходов с трубами событий и
+ *   резолвер на таблице. reload и apply тогда не ищут резолвер и супервизор по /proc и не шлют
+ *   им сигналов: демон сам сверяет помощников и пишет резолверу новую таблицу, перечитав спеку.
+ *
+ *   SIGTERM гасит всех детей демона: помощников и резолвер (supd_stop), проход сторожа и детей
+ *   команд, которые ещё идут (их группы процессов — SIGTERM, по сроку SIGKILL), — демон не
+ *   оставляет после себя процессов без присмотра.
+ *
  * КОГО ПУСКАТЬ. Первый замок — SELinux: connectto к steerd разрешён splify2_app, и кроме него
  * к сокету может прийти разве что root (su на userdebug) и init. Второй замок — здесь, по
  * SO_PEERCRED и SO_PEERSEC: uid 0 (root) и 1000 (system) — да; процесс в домене splify2_app
@@ -142,6 +150,7 @@
 #include "state.h"
 #include "fostate.h"
 #include "watchd.h"
+#include "helpers.h"
 #include "ctl.h"
 
 /* Путь сокета по умолчанию — путь платформы (ctl_sock, src/platform/platform.h). */
@@ -206,6 +215,9 @@ struct ctl_conf {
     int allow_uid_n;
     int watch;                   /* --watch: демон — сторож выходов (watchd.c) */
     int watch_period;            /* --watch-period, секунд */
+    int supervise;               /* --supervise: помощники и резолвер — дети демона (supd.c) */
+    const char *dnsd_flags[9];   /* --dnsd-flag: лишние флаги резолверу-ребёнку, NULL в конце */
+    int dnsd_flag_n;
     char exe[PATH_MAX];
 };
 
@@ -1083,6 +1095,7 @@ static void srv_spec_changed(struct ctl_srv *s, const char *by, int enabled) {
                  enabled ? "true" : "false");
         steerd_emit(&s->d, "applied", f);
         watchd_spec_changed(s->watch);
+        supd_spec_changed(s->d.sup);
         return;
     }
     fprintf(stderr, LOG_W "спека не прочитана (%s): %s\n", by, s->d.err);
@@ -1351,6 +1364,15 @@ static void reload_sig(struct conn *c, int code) {
 
 static void reload_begin(struct conn *c) {
     struct ctl_srv *s = c->srv;
+    /* --supervise: резолвер и помощники — дети демона, и искать их по /proc незачем (а сигнал
+     * резолверу на таблице был бы ошибкой: dnsd.sig он не пишет, и сверка подписей всегда
+     * давала бы TERM). Новую таблицу и сверку помощников делает supd_spec_changed, когда демон
+     * перечитает спеку (after_reload → srv_spec_changed). */
+    if (s->d.sup) {
+        cb_str(&c->resp, ",\"reload\":{\"dnsd\":\"table\",\"outputs\":\"daemon\"}");
+        c->after_reload(c);
+        return;
+    }
     c->dn_n = ctl_find(s->cf.exe, "dnsd", c->dn, 8);
     if (c->dn_n <= 0) { reload_finish(c, "none"); return; }
     char *av[8];
@@ -2001,12 +2023,48 @@ static int srv_busy(void *arg) {
     return ((struct ctl_srv *)arg)->lock_owner != NULL;
 }
 
+/* Дети команд, которые ещё идут (apply, diag, vless-probe…): их группам процессов — SIGTERM,
+ * через две секунды — SIGKILL. Раньше демон выходил, оставляя их доживать сиротами: `apply`
+ * посреди nft или vless-probe на три минуты перебора. Ждёт сам — цикл уже не крутится. */
+static void srv_jobs_stop(struct ctl_srv *s) {
+    int any = 0;
+    for (struct conn *c = s->conns; c; c = c->next)
+        if (c->job.running) { kill(-c->job.pid, SIGTERM); any = 1; }
+    long dl = loop_now_ms() + 2000;
+    while (any) {
+        any = 0;
+        for (struct conn *c = s->conns; c; c = c->next) {
+            struct job *j = &c->job;
+            if (!j->running || j->reaped) continue;
+            pid_t w = waitpid(j->pid, NULL, WNOHANG);
+            if (w == j->pid || (w < 0 && errno == ECHILD)) { j->reaped = 1; continue; }
+            if (loop_now_ms() < dl) { any = 1; continue; }
+            kill(-j->pid, SIGKILL);
+            kill(j->pid, SIGKILL);
+            while (waitpid(j->pid, NULL, 0) < 0 && errno == EINTR) {}
+            j->reaped = 1;
+        }
+        if (any) {
+            struct timespec ts = { 0, 50000000L };
+            nanosleep(&ts, NULL);
+        }
+    }
+    /* Внуки, пережившие лидера группы (nft, запущенный командой), — туда же. */
+    for (struct conn *c = s->conns; c; c = c->next)
+        if (c->job.running) kill(-c->job.pid, SIGKILL);
+}
+
 static void srv_term(struct loop *l, int signo, void *arg) {
     (void)signo;
     struct ctl_srv *s = arg;
     struct stat sb;
     if (s->ino && stat(s->cf.sock, &sb) == 0 && sb.st_ino == s->ino) unlink(s->cf.sock);
     watchd_stop(s->watch);
+    /* Детям команд — SIGTERM сразу: гаснут, пока демон по одному гасит помощников. */
+    for (struct conn *c = s->conns; c; c = c->next)
+        if (c->job.running) kill(-c->job.pid, SIGTERM);
+    supd_stop(s->d.sup);
+    srv_jobs_stop(s);
     loop_stop(l, 0);
 }
 
@@ -2040,7 +2098,10 @@ void ctl_usage_flags(FILE *out) {
           "                      (по умолчанию %s)\n"
           "  --watch             daemon: сторожить выходы самому (вместо failover --loop;\n"
           "                      оба сразу не запускать)\n"
-          "  --watch-period СЕК  daemon: период прохода сторожа в тишине (по умолчанию 60)\n",
+          "  --watch-period СЕК  daemon: период прохода сторожа в тишине (по умолчанию 60)\n"
+          "  --supervise         daemon: держать помощников выходов и резолвер самому (вместо\n"
+          "                      procd или steer supervise; оба сразу не запускать)\n"
+          "  --dnsd-flag ФЛАГ    daemon: передать резолверу ещё и этот флаг (до восьми раз)\n",
           p->ctl_sock, p->spec_path, p->state_dir, p->lists_dir);
 }
 
@@ -2116,6 +2177,14 @@ int ctl_serve_main(int argc, char **argv) {
             continue;
         }
         if (!strcmp(f, "--watch")) { cf->watch = 1; continue; }
+        if (!strcmp(f, "--supervise")) { cf->supervise = 1; continue; }
+        if (!strcmp(f, "--dnsd-flag")) {
+            if (!v) ctl_bad_flag("daemon", "у флага нет значения", f);
+            i++;
+            if (cf->dnsd_flag_n >= 8) ctl_bad_flag("daemon", "--dnsd-flag больше восьми раз", NULL);
+            cf->dnsd_flags[cf->dnsd_flag_n++] = v;
+            continue;
+        }
         if (!strcmp(f, "--watch-period")) {
             if (!v) ctl_bad_flag("daemon", "у флага нет значения", f);
             i++;
@@ -2165,7 +2234,12 @@ int ctl_serve_main(int argc, char **argv) {
         S.watch = watchd_start(&S.d, &wc);
         if (!S.watch) { fprintf(stderr, LOG_W "сторож: нет памяти\n"); return 1; }
     }
-    fprintf(stderr, LOG_I "слушаю %s%s\n", cf->sock, cf->watch ? ", сторожу выходы" : "");
+    if (cf->supervise) {
+        struct supd_conf sc = { ctl_enabled, cf->dnsd_flags };
+        if (!supd_start(&S.d, &sc)) { fprintf(stderr, LOG_W "супервизор: нет памяти\n"); return 1; }
+    }
+    fprintf(stderr, LOG_I "слушаю %s%s%s\n", cf->sock, cf->watch ? ", сторожу выходы" : "",
+            cf->supervise ? ", держу помощников" : "");
     return loop_run(S.l);
 }
 

@@ -448,6 +448,31 @@ static void zapret_emit(struct nft_rs *rs, const struct spec *sp, const struct o
     ir_comment(r, "steer:zapret-reply:%s", o->name);
 }
 
+/* Помощник — обработчик очереди, отдельная программа steer-nfqws (не подкоманда движка): тот же
+ * запуск, что у init.d/steer по строкам zapret-instances, — `steer-nfqws <очередь> <файл ключей>`,
+ * и то же условие: файла стратегии нет — поднимать нечем, и об этом одна строка при подсчёте
+ * состава, а не отказ по кругу (см. zapret_instances выше). Номер очереди выводится из метки,
+ * поэтому супервизору нужен реестр (marks). В подпись — очередь и путь файла ключей: их
+ * обработчик берёт аргументами при старте. Содержимое файла подписью не ловится (новая
+ * стратегия — reload_zapret у init.d), как и содержимое подписки у vless. */
+static int zapret_helper(const struct spec *sp, const struct output *o, struct kind_helper *h) {
+    (void)sp;
+    h->marks = 1;
+    if (access(o->zp.opts, R_OK) != 0) {
+        fprintf(stderr, "steer[warn] zapret %s: файла стратегии %s нет — "
+                        "поднимать нечем, выберите стратегию\n", o->name, o->zp.opts);
+        return -1;
+    }
+    int q = out_zapret_queue(o);
+    snprintf(h->cmd, sizeof(h->cmd), "nfqws");
+    snprintf(h->prog, sizeof(h->prog), "steer-nfqws");
+    snprintf(h->arg[0], sizeof(h->arg[0]), "%d", q);
+    snprintf(h->arg[1], sizeof(h->arg[1]), "%s", o->zp.opts);
+    kind_sig_mix(&h->sig, &q, sizeof(q));
+    kind_sig_mix(&h->sig, o->zp.opts, strlen(o->zp.opts));
+    return 0;
+}
+
 const struct kind_ops kind_zapret = {
     .name = "zapret",
     .caps = KC_MARK | KC_CTMARK | KC_SKIP_ZAPRET | KC_IPV6,
@@ -457,4 +482,5 @@ const struct kind_ops kind_zapret = {
     .emit = zapret_emit,
     .status = zapret_status,
     .diag = zapret_diag,
+    .helper = zapret_helper,
 };

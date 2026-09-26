@@ -54,7 +54,7 @@ static int tgws_check(const struct spec *sp, const struct output *o, struct err 
 }
 
 #ifdef STEER_EXTENDED
-/* Помощник — мост. В подпись — домен точек (sup_sig в supervise.c). */
+/* Помощник — мост. В подпись — домен точек (helper_sig в daemon/helpers.c). */
 static int tgws_helper(const struct spec *sp, const struct output *o, struct kind_helper *h) {
     (void)sp;
     snprintf(h->cmd, sizeof(h->cmd), "tgws");
