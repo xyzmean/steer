@@ -27,6 +27,7 @@
 struct loop;
 struct steerd_sub;
 struct fo_store;
+struct supd;
 
 /* Доставить подписчику готовую строку события (с '\n'). Подписчик вправе отписаться прямо
  * из этого вызова (steerd_sub_del самого себя) — рассылка к этому готова. */
@@ -63,6 +64,10 @@ struct steerd {
      * последнего оживления (fostate.h). Заводит её сторож демона (watchd.c, `--watch`); без него
      * NULL, и status берёт выбор устройств из файла `active`, который пишет `failover --loop`. */
     struct fo_store *outs;
+
+    /* Дети демона — помощники выходов и резолвер (helpers.h, supd.c, `--supervise`); без него
+     * NULL, и помощников держат прежние супервизоры (procd, `steer supervise`). */
+    struct supd *sup;
 };
 
 /* Выделить спеку и группы (они большие — в куче, не на стеке). 0 — готово. */

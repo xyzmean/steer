@@ -79,8 +79,8 @@ static int xsteer_latency(const struct spec *sp, const struct output *o, const c
     return -1;
 }
 
-/* Помощник — клиент звезды. В подпись — файл конфигурации и режим потока (sup_sig в
- * supervise.c). */
+/* Помощник — клиент звезды. В подпись — файл конфигурации и режим потока (helper_sig в
+ * daemon/helpers.c). */
 static int xsteer_helper(const struct spec *sp, const struct output *o, struct kind_helper *h) {
     (void)sp;
     snprintf(h->cmd, sizeof(h->cmd), "xsteer");

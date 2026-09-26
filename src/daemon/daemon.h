@@ -55,6 +55,8 @@ int cmd_status(const char *spec, int fast);
 int cmd_diag(const char *spec);
 int cmd_down(void);
 int cmd_supervise(const char *spec);
+/* Поднимать ли резолвер (ответ needs-dnsd; supd.c) — им же решает супервизор демона (supd.c). */
+int dnsd_wanted(void);
 int cmd_explain(const char *spec, const char *what);
 int failover_loop(const char *spec, int verbose, int period);
 /* События сети для сторожа (watch.c): сокет netlink на RTMGRP_LINK и адреса IPv4/IPv6

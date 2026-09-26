@@ -398,15 +398,7 @@ int main(int argc, char **argv) {
         if (load_spec(spec, &cfg, &e) < 0) err_die(&e);
         if (registry_assign(&cfg, &e) < 0) err_die(&e);
         if (build_groups(&cfg, &gr, &e) < 0) err_die(&e);
-        /* В мини-сборке — «поднимать нечего», и это тот же ответ, что даёт генератор
-         * правил: он там перенаправления DNS не ставит. Два ответа обязаны совпадать,
-         * иначе init-скрипт однажды поднимет резолвер без правила или, хуже, правило
-         * останется без резолвера. */
-#ifdef STEER_TGWS
-        return 1;
-#else
-        return 0;
-#endif
+        return dnsd_wanted() ? 0 : 1;
     }
     if (!strcmp(cmd, "tgws")) return cmd_tgws(spec, arg);
     if (!strcmp(cmd, "tls-probe")) {

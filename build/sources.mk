@@ -79,7 +79,7 @@ KINDS_EXT_SRC  := src/kinds/vless.c src/kinds/xsteer.c
 # такой же, как был в steer.c (lib/run.c раньше всех — на него ссылаются и compile, и daemon).
 CORE_SRC := src/lib/run.c src/lib/jsonw.c src/lib/evline.c src/compile/groups.c src/compile/generate.c src/compile/ir.c src/compile/print.c src/compile/legacy.c src/daemon/fwcheck.c \
             src/daemon/apply.c src/daemon/status.c src/daemon/nftquery.c src/daemon/diag.c \
-            src/daemon/explain.c src/daemon/supervise.c src/daemon/watch.c src/daemon/main.c \
+            src/daemon/explain.c src/daemon/helpers.c src/daemon/supervise.c src/daemon/supd.c src/daemon/watch.c src/daemon/main.c \
             $(MODEL_SRC) $(DNSD_SRC) src/daemon/failover.c src/tools/aggregate.c src/proto/obfs/obfs.c \
             src/cli/cli.c src/tools/srs.c src/tools/puff.c src/tools/hwid.c src/daemon/ctl.c \
             src/daemon/conns.c src/daemon/loop.c src/daemon/state.c src/daemon/watchd.c $(KINDS_BASE_SRC)
