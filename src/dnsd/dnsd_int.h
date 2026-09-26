@@ -217,6 +217,9 @@ extern size_t g_dch_n;
 extern int g_origdst;
 extern int g_ct_fd;
 extern struct tcpc *g_tcp_cur;
+/* g_table_fd / g_table_feed (--table-fd) — объявлены в tabfmt.h вместе со struct tabfmt_feed:
+ * файлу, которому они нужны, нужен и разбор трубы (tabfmt_feed/tabfmt_parse), так что тащить
+ * их сюда неполным типом смысла не было бы. */
 
 /* журнал имён (dlog.c) */
 extern int g_dlog_fd;

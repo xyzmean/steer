@@ -20,6 +20,7 @@
  * "static" снят ради этого стенда, тоже в dnsd_int.h. */
 #include "dnsd_int.h"
 #include "nftnl.h"
+#include "tabfmt.h"
 #include <sys/stat.h>
 
 static int fails;
@@ -405,6 +406,164 @@ int main(void) {
                 unlink(sp);
             }
             unlink(lst);
+        }
+    }
+
+    /* ---- ФОРМАТ ТАБЛИЦЫ (src/dnsd/tabfmt.h): сборка → разбор возвращают тот же g_dch --------
+     *
+     * Контракт демон/резолвер (docs/architecture.md, раздел 4а, шаг 1): демон строит таблицу
+     * из спеки (tabfmt_build — тот же dch_build, что и раньше) и шлёт её текстом резолверу,
+     * который её разбирает (tabfmt_parse) БЕЗ спеки вовсе. Если разбор потеряет поле или
+     * перепутает порядок — резолвер в режиме --table-fd молча раздаст не те наборы, а стенд
+     * этого не покажет никаким другим путём: dch_build здесь не подключается к резолверу
+     * заново, сравнение — единственный способ поймать расхождение форматов. */
+    {
+        char l1[] = "/tmp/dnsmatch-tab-l1.XXXXXX";
+        char l2[] = "/tmp/dnsmatch-tab-l2.XXXXXX";
+        int f1 = mkstemp(l1), f2 = mkstemp(l2);
+        check("формат таблицы: списки созданы", 1, f1 >= 0 && f2 >= 0);
+        if (f1 >= 0 && f2 >= 0) {
+            FILE *w1 = fdopen(f1, "w"), *w2 = fdopen(f2, "w");
+            fputs("web.example\n", w1); fclose(w1);
+            fputs("srv.example\nother.example\n", w2); fclose(w2);
+
+            char sp[] = "/tmp/dnsmatch-tab-spec.XXXXXX";
+            int sf = mkstemp(sp);
+            if (sf >= 0) {
+                FILE *ws = fdopen(sf, "w");
+                fprintf(ws,
+                        "{\"schema\":1,"
+                        "\"outputs\":{\"vpn\":{\"kind\":\"interface\",\"device\":\"lo\"}},"
+                        "\"channels\":["
+                        "{\"name\":\"web\",\"match\":{\"domains_files\":[\"%s\"]},\"out\":\"vpn\"},"
+                        "{\"name\":\"srv\",\"match\":{\"domains_files\":[\"%s\",\"%s\"],"
+                        "\"mode\":\"realip\"},\"out\":\"vpn\"}"
+                        "]}\n", l1, l2, l1);
+                fclose(ws);
+
+                static struct spec cfg;
+                struct err e = {0};
+                if (load_spec(sp, &cfg, &e) < 0) err_die(&e);
+
+                char *text = NULL;
+                size_t textlen = 0;
+                FILE *mem = open_memstream(&text, &textlen);
+                tabfmt_build(&cfg, mem);
+                fclose(mem);
+
+                /* Снимок ровно того, что tabfmt_build напечатала (dch_build уже отработал
+                 * внутри неё), — «дч_build по спеке» из требования стенда. */
+                struct { char set[64], out[32], chan[32]; int realip; size_t rules_n;
+                         char rules_path[MAX_FILES][256]; } snap[MAX_CHANNELS];
+                size_t snap_n = g_dch_n;
+                for (size_t i = 0; i < snap_n; i++) {
+                    /* memcpy целиком, а не snprintf("%s", ...): поля snap зеркалят размер
+                     * g_dch (set[64]/out[32]/chan[32]) один в один, а gcc иначе не может
+                     * доказать границу источника внутри массива структур g_dch[MAX_CHANNELS]
+                     * и завышает её до размера всего массива (-Wformat-truncation). */
+                    memcpy(snap[i].set, g_dch[i].set, sizeof(snap[i].set));
+                    memcpy(snap[i].out, g_dch[i].out, sizeof(snap[i].out));
+                    memcpy(snap[i].chan, g_dch[i].chan, sizeof(snap[i].chan));
+                    snap[i].realip = g_dch[i].realip;
+                    snap[i].rules_n = g_dch[i].rules_n;
+                    for (size_t k = 0; k < g_dch[i].rules_n; k++)
+                        snprintf(snap[i].rules_path[k], sizeof(snap[i].rules_path[k]),
+                                 "%s", g_dch[i].rules_path[k]);
+                }
+                check("формат таблицы: dch_build дал два канала", 2, (int)snap_n);
+
+                /* g_dch сейчас держит указатели ВНУТРЬ cfg (dch_build, table.c: rules_path —
+                 * заимствованные строки спеки, никем не malloc'нутые). tabfmt_parse же исходит
+                 * из того, что прошлым владельцем g_dch была ОНА САМА (--table-fd — единственный
+                 * режим, где она вообще вызывается, docs/architecture.md, раздел 4а), и
+                 * освобождает rules_path free()'ом. В настоящем резолвере это всегда так: сборка
+                 * (dch_build) и разбор (tabfmt_parse) в один процесс никогда не приходят вместе.
+                 * В этом стенде — приходят, ради самого сравнения, поэтому перед разбором g_dch
+                 * обнуляется руками — так же, как обнулён он в свежем процессе резолвера (BSS),
+                 * а не через free() чужих указателей. */
+                memset(g_dch, 0, sizeof(g_dch));
+                g_dch_n = 0;
+
+                check("формат таблицы: разбор принял текст", 0,
+                      tabfmt_parse(text, textlen));
+                check("формат таблицы: то же число каналов после разбора",
+                      (int)snap_n, (int)g_dch_n);
+                for (size_t i = 0; i < snap_n && i < g_dch_n; i++) {
+                    char what[96];
+                    snprintf(what, sizeof(what), "формат таблицы: канал %zu, набор", i);
+                    check(what, 0, strcmp(snap[i].set, g_dch[i].set));
+                    snprintf(what, sizeof(what), "формат таблицы: канал %zu, выход", i);
+                    check(what, 0, strcmp(snap[i].out, g_dch[i].out));
+                    snprintf(what, sizeof(what), "формат таблицы: канал %zu, правило", i);
+                    check(what, 0, strcmp(snap[i].chan, g_dch[i].chan));
+                    snprintf(what, sizeof(what), "формат таблицы: канал %zu, realip", i);
+                    check(what, snap[i].realip, g_dch[i].realip);
+                    snprintf(what, sizeof(what), "формат таблицы: канал %zu, число файлов", i);
+                    check(what, (int)snap[i].rules_n, (int)g_dch[i].rules_n);
+                    for (size_t k = 0; k < snap[i].rules_n && k < g_dch[i].rules_n; k++) {
+                        snprintf(what, sizeof(what), "формат таблицы: канал %zu, файл %zu", i, k);
+                        check(what, 0, strcmp(snap[i].rules_path[k], g_dch[i].rules_path[k]));
+                    }
+                }
+
+                /* Испорченный текст — разбор отказывает, а не берёт что попало. */
+                {
+                    static const char bad1[] = "не число\n";
+                    static const char bad2[] = "2\none|out|0|c\n";
+                    check("формат таблицы: нечисловой счётчик — отказ", -1,
+                          tabfmt_parse(bad1, sizeof(bad1) - 1));
+                    check("формат таблицы: обещали больше строк, чем есть — отказ", -1,
+                          tabfmt_parse(bad2, sizeof(bad2) - 1));
+                }
+
+                /* Пустая таблица — законный ответ («нет ни одного доменного канала», main.c),
+                 * и заодно освобождает то, чем разбор владел (rules_path — strdup, см.
+                 * tabfmt.c), не оставляя g_dch занятым для следующего блока стенда. */
+                check("формат таблицы: пустая таблица разбирается", 0,
+                      tabfmt_parse("0\n", 2));
+                check("формат таблицы: пустая таблица — ноль каналов", 0, (int)g_dch_n);
+
+                /* ЗАДЕЛ ПОД IPv6 (решение владельца, 1.9): поле family — «4», «6» или «46».
+                 * dch_build/tabfmt_build сегодня пишут только «4» (проверено выше — оба канала
+                 * из спеки), но РАЗБОР обязан понимать все три уже сейчас, не дожидаясь, пока
+                 * резолвер научится IPv6 сам (см. tabfmt.h). */
+                {
+                    /* Чистая «6» — резолверу нечем: набора и fake-IP под IPv6 у него нет.
+                     * Канал не должен попасть в g_dch, но разбор — не отказ (это не испорченный
+                     * текст, а законное значение поля, для которого резолвер честно говорит
+                     * «не умею»). */
+                    static const char v6only[] = "1\nsix_set|out1|0|6|six\n";
+                    check("формат таблицы: family=6 — разбор не отказывает", 0,
+                          tabfmt_parse(v6only, sizeof(v6only) - 1));
+                    check("формат таблицы: family=6 — канал не заведён", 0, (int)g_dch_n);
+
+                    /* «46» — v4-часть работает как обычно, участвует v6 или нет — тут не
+                     * проверяется (её попросту ещё нет), только то, что КАНАЛ остаётся. */
+                    static const char dual[] = "1\nboth_set|out1|0|46|both\n";
+                    check("формат таблицы: family=46 — разбор не отказывает", 0,
+                          tabfmt_parse(dual, sizeof(dual) - 1));
+                    check("формат таблицы: family=46 — канал заведён", 1, (int)g_dch_n);
+                    if (g_dch_n == 1) {
+                        check("формат таблицы: family=46 — набор тот, что в строке", 0,
+                              strcmp(g_dch[0].set, "both_set"));
+                    }
+
+                    /* Ни «4», ни «6», ни «46» — испорченный текст, а не неизвестное будущее
+                     * значение: формат обязан отказать, а не молча решить что-нибудь за
+                     * будущего автора протокола. */
+                    static const char badfam[] = "1\nx|out1|0|5|x\n";
+                    check("формат таблицы: family=5 — отказ", -1,
+                          tabfmt_parse(badfam, sizeof(badfam) - 1));
+
+                    /* Пусто на следующий блок стенда, как и выше. */
+                    tabfmt_parse("0\n", 2);
+                }
+
+                free(text);
+                unlink(sp);
+            }
+            unlink(l1);
+            unlink(l2);
         }
     }
 

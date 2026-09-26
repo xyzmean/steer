@@ -20,7 +20,7 @@ BIN="${STEER:-./build/steer}"
 command -v python3 >/dev/null 2>&1 || { echo "dnsproxy: python3 нет — пропускаю"; exit 0; }
 
 tmp="$(mktemp -d)"
-trap 'kill ${DPID:-0} ${UPID:-0} 2>/dev/null; rm -rf "$tmp"' EXIT
+trap 'kill ${DPID:-0} ${UPID:-0} ${DPID2:-0} 2>/dev/null; exec 3>&- 2>/dev/null; rm -rf "$tmp"' EXIT
 
 LPORT=15300
 UPORT=15353
@@ -267,6 +267,136 @@ check "в тишине резолвер не просыпается (добро�
     "ok" "$quiet"
 check "TCP: наверх по TCP ушли ровно вопросы клиентов TCP" "10" \
     "$(cat "$tmp/up.txt.tcp" 2>/dev/null | wc -l | tr -d ' ')"
+
+# ---- --table-fd: таблица каналов из трубы демона, а не из спеки самим резолвером -----------
+# docs/architecture.md, раздел 4а, шаг 1: dnsd принимает таблицу через дескриптор, который
+# демон завёл бы для дочернего резолвера. Здесь его роль играет труба, которую заполняет
+# `steer dnsd-table` (та же сборка, что напечатала бы демону), — резолвер спеку в этом режиме
+# не открывает вовсе.
+#
+# Сигнал «канал совпал или нет» — без единой нитки к nftables (этот стенд намеренно обходится
+# без root и без сети наружу, см. шапку файла): запрос AAAA на СОВПАВШЕЕ имя резолвер гасит в
+# NODATA прямо из вопроса, ни разу не спросив апстрим (dns_query, proxy.c, «Подавление — свойство
+# правила, а не данных из ответа») — ровно поэтому сигнал верен и без единой транзакции ядра.
+# Несовпавшее имя идёт напрямую, и апстрим здесь отвечает настоящей записью AAAA — значит
+# ANCOUNT (число записей в ответе, байты 6-7 заголовка) 0 значит «канал забрал домен», 1 —
+# «домена в таблице нет». Разбор именно этого поля, а не адреса: NODATA не несёт вовсе
+# ресурсной записи, сравнивать в ней нечего.
+cat > "$tmp/upstream-aaaa.py" <<'PY'
+import socket, sys
+s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+s.bind(("127.0.0.1", int(sys.argv[1]))); s.settimeout(20)
+while True:
+    data, addr = s.recvfrom(2048)
+    qend = 12
+    while data[qend]: qend += 1 + data[qend]
+    qend += 5
+    hdr = data[:2] + b'\x81\x80' + data[4:6] + b'\x00\x01\x00\x00\x00\x00'
+    ans = b'\xc0\x0c\x00\x1c\x00\x01\x00\x00\x00\x3c\x00\x10' + b'\x20\x01\x0d\xb8' + b'\x00' * 12
+    s.sendto(hdr + data[12:qend] + ans, addr)
+PY
+cat > "$tmp/qaaaa.py" <<'PY'
+import socket, struct, sys
+port, name = int(sys.argv[1]), sys.argv[2]
+q = struct.pack('>HHHHHH', 0x7a7a, 0x0100, 1, 0, 0, 0)
+for l in name.split('.'): q += bytes([len(l)]) + l.encode()
+q += b'\x00' + struct.pack('>HH', 28, 1)  # qtype 28 = AAAA
+s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM); s.settimeout(3)
+s.sendto(q, ('127.0.0.1', port))
+try:
+    d, _ = s.recvfrom(2048)
+    print(struct.unpack('>H', d[6:8])[0])  # ANCOUNT
+except socket.timeout:
+    print('timeout')
+PY
+
+LPORT2=15301
+UPORT2=15364
+printf 'swap.test\n' > "$tmp/tab.lst"
+# Таблица 1: канал с доменным правилом на swap.test. Таблица 2 — ТА ЖЕ спека, но с ПУСТЫМ
+# списком каналов: не файл правил меняется (это уже умеет HUP, reload_rules — не про него
+# этот стенд), а само число каналов и их состав. Это ровно то, чего построчное перечитывание
+# списков никогда не делает: dch_build решает его один раз при запуске (или — здесь — один раз
+# на таблицу). Совпадение исчезает и появляется вместе с таблицей — прямое доказательство, что
+# резолвер живёт по НОВОЙ таблице целиком, а не донашивает старую с обновлёнными файлами.
+mk_tabspec() {  # "1" — канал с swap.test в списке; "" — каналов нет вовсе
+    f="$tmp/tabspec-$1.json"
+    chans='[]'
+    [ -n "$1" ] && chans="[{\"name\":\"c\",\"match\":{\"domains_files\":[\"$tmp/tab.lst\"]},\"out\":\"vpn\"}]"
+    printf '{"schema":1,"from_default":["127.0.0.0/8"],'\
+'"outputs":{"direct":{"kind":"direct"},"vpn":{"kind":"interface","device":"lo"}},'\
+'"channels":%s}' "$chans" > "$f"
+    printf '%s' "$f"
+}
+tabspec_on="$(mk_tabspec 1)"
+tabspec_off="$(mk_tabspec '')"
+
+mkfifo "$tmp/tabpipe"
+# fd 3 — НАШ конец, открытый и на чтение, и на запись: писать в трубу можно, не дожидаясь
+# читателя, и наш же конец не даёт нам самим поймать EOF раньше времени. Резолверу открывается
+# ОТДЕЛЬНЫЙ, только читающий fd 4 (see ниже, при запуске) — если бы он вместо этого унаследовал
+# fd 3 как есть, его СОБСТВЕННАЯ же копия читала-и-писала бы одну и ту же трубу, и закрытие
+# нашего конца никогда не дало бы ему увидеть EOF: труба остаётся «с открытым писателем» до тех
+# пор, пока хоть кто-то — не важно, мы или он сам, — держит открытым конец на запись.
+exec 3<>"$tmp/tabpipe"
+"$BIN" dnsd-table --spec "$tabspec_on" --state-dir "$tmp/state2" >&3
+
+# `3<&-`: без него апстрим тоже унаследовал бы наш конец трубы и держал бы у себя открытым
+# писатель, которого мы позже закрываем, — резолвер тогда не увидел бы EOF никогда, пока не
+# убит и апстрим (та же причина, что у 3<&- при запуске dnsd ниже).
+python3 "$tmp/upstream-aaaa.py" "$UPORT2" 3<&- & UPID2=$!
+sleep 1
+# `3<&-` закрывает унаследованный fd 3 ИМЕННО для этого процесса (наш собственный fd 3 в
+# шелле не трогается), `4<...` открывает резолверу свежий read-only конец той же трубы — уже
+# не блокируясь: наш fd 3 в этот момент открыт как писатель, поэтому open() на чтение не ждёт.
+"$BIN" dnsd --table-fd 4 --state-dir "$tmp/state2" \
+    --listen-port "$LPORT2" --upstream-port "$UPORT2" \
+    3<&- 4<"$tmp/tabpipe" > "$tmp/log2" 2>&1 & DPID2=$!
+sleep 1
+if ! kill -0 "$DPID2" 2>/dev/null; then
+    echo "FAIL резолвер (--table-fd) не поднялся:"; cat "$tmp/log2"; exit 1
+fi
+
+tab_on_hit="$(python3 "$tmp/qaaaa.py" "$LPORT2" swap.test)"
+tab_on_miss="$(python3 "$tmp/qaaaa.py" "$LPORT2" other.test)"
+
+# Тишина и здесь: труба таблицы в epoll — событие только на настоящей записи, не пустое
+# пробуждение по таймеру. Тот же счётчик, что у первого резолвера (тот же запас в 2 с — отдать
+# последнему тику время снять ожидание только что отвеченного запроса ДО начала окна).
+sleep 2
+cs2_0=$(awk '/^voluntary_ctxt_switches/{print $2}' "/proc/$DPID2/status")
+sleep 3
+cs2_1=$(awk '/^voluntary_ctxt_switches/{print $2}' "/proc/$DPID2/status")
+quiet2=$(( cs2_1 - cs2_0 ))
+[ "$quiet2" -le 1 ] && quiet2=ok
+
+"$BIN" dnsd-table --spec "$tabspec_off" --state-dir "$tmp/state2" >&3
+sleep 1
+tab_off_hit="$(python3 "$tmp/qaaaa.py" "$LPORT2" swap.test)"
+# Тот же $DPID2, тот же PID в OS: не respawn под тем же именем переменной, а kill -0 на РОВНО
+# тот процесс, что подняли выше, — упал бы он и procd (здесь — никто) поднял бы замену, у
+# замены был бы другой PID, а мы всё ещё спрашиваем старый.
+still_up="down"; kill -0 "$DPID2" 2>/dev/null && still_up="up"
+
+# Закрыть трубу — резолвер обязан завершиться сам, без TERM (родитель умер, docs/
+# architecture.md, раздел 4а): ждать его пятью секундами таймаута, дольше make test терпеть
+# зависший процесс не должен.
+exec 3>&-
+closed="still running"
+for _ in 1 2 3 4 5 6 7 8 9 10; do
+    kill -0 "$DPID2" 2>/dev/null || { closed="exited"; break; }
+    sleep 0.5
+done
+kill "$DPID2" 2>/dev/null; wait "$DPID2" 2>/dev/null
+kill "$UPID2" 2>/dev/null; wait "$UPID2" 2>/dev/null
+
+check "table-fd: первая таблица — swap.test совпал (AAAA погашен, ANCOUNT 0)" "0" "$tab_on_hit"
+check "table-fd: первая таблица — чужое имя без канала (ANCOUNT 1)" "1" "$tab_on_miss"
+check "table-fd: в тишине резолвер не просыпается" "ok" "$quiet2"
+check "table-fd: после второй таблицы процесс тот же, не перезапустился" "up" "$still_up"
+check "table-fd: вторая таблица без каналов — swap.test больше не совпадает (ANCOUNT 1)" \
+    "1" "$tab_off_hit"
+check "table-fd: закрытие трубы демоном — резолвер завершается сам" "exited" "$closed"
 
 printf '\n%d проверок пройдено' "$pass"
 if [ "$fail" -gt 0 ]; then printf ', %d ПРОВАЛЕНО\n' "$fail"; exit 1; fi

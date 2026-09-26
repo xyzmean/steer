@@ -60,6 +60,9 @@ void aggregate_usage_flags(FILE *out);
 /* Подпись таблицы доменных каналов: ею init-скрипт решает, хватит ли резолверу SIGHUP или
  * нужен перезапуск с пятисекундной паузой procd. Живёт в dnsd.c — там таблица. */
 int dnsd_sig_print(const char *spec, FILE *out);
+/* Та же таблица, которую демон шлёт резолверу трубой --table-fd (docs/architecture.md, раздел
+ * 4а) — текстом в stdout, для стендов и ручной отладки. src/dnsd/tabfmt.c. */
+void tabfmt_build(const struct spec *sp, FILE *out);
 /* Соединения с меткой движка (дамп ctnetlink) — src/daemon/conns.c, тем же разговором с
  * ctnetlink, что у ctnl.c; журнал имён работающего резолвера отдаёт сам резолвер, dlog.c. */
 int ctnl_conns_print(FILE *out);
@@ -367,6 +370,13 @@ int main(int argc, char **argv) {
      * Отдельной командой, а не полем status: её читает оболочка построчно и сравнивает
      * целиком, а не разбирает. Тот же довод, что у zapret-instances и needs-dnsd. */
     if (!strcmp(cmd, "dnsd-sig")) return dnsd_sig_print(spec, stdout);
+    /* Та же таблица, которую резолвер получил бы трубой --table-fd — текстом в stdout, для
+     * стендов (труба вместо файла спеки) и ручной отладки. Формат — src/dnsd/tabfmt.h. */
+    if (!strcmp(cmd, "dnsd-table")) {
+        if (load_spec(spec, &cfg, &e) < 0) err_die(&e);
+        tabfmt_build(&cfg, stdout);
+        return 0;
+    }
     /* Спеку обе не читают: соединения сопоставляются с выходами по реестру меток (метки
      * ПРИМЕНЁННОЙ спеки — см. ctnl_conns_print), журнал отдаёт сам резолвер. --spec они
      * принимают ради управляющего сокета, который передаёт его каждой подкоманде. */

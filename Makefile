@@ -166,7 +166,7 @@ ext-test:
 # добавить в движок подкоманду ради теста. Резолвер (DNSD_SRC) линкуется отдельными
 # объектами, как и модель (MODEL_SRC) — см. tests/dnsmatch.c.
 $(BUILD)/dnsmatch: tests/dnsmatch.c $(DNSD_SRC) src/lib/sindex.h src/lib/nftnl.h src/lib/ctnl.h \
-                   src/lib/jsonw.c src/dnsd/dnsd_int.h $(MODEL_KINDS) src/model/spec.h
+                   src/lib/jsonw.c src/dnsd/dnsd_int.h src/dnsd/tabfmt.h $(MODEL_KINDS) src/model/spec.h
 	@mkdir -p $(BUILD)
 	$(CC) $(CFLAGS) -o $@ tests/dnsmatch.c $(DNSD_SRC) src/lib/jsonw.c $(MODEL_KINDS)
 

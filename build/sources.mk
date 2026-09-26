@@ -49,8 +49,18 @@ MODEL_SRC := $(PLATFORM_SRC) src/lib/err.c src/lib/jsonr.c src/lib/tmpfile.c src
 # на типах резолвера, а общий разговор с ctnetlink (ct_attr, ctnl_dump…) остался в lib/ctnl.c —
 # им пользуется и origdst.c, и список соединений `steer conns` (src/daemon/conns.c, CORE_SRC
 # ниже), а resolver-типов ctnl.h больше не подключает.
+#
+# DNSD_TABLE_SRC — сборка и разбор таблицы доменных каналов (src/dnsd/tabfmt.h, docs/
+# architecture.md, раздел 4а, шаг 1): table.c (dch_build — то же построение, что и раньше) и
+# tabfmt.c (текст ↔ g_dch). Отдельной переменной, а не прямо в DNSD_SRC, потому что демону 1.8
+# они понадобятся БЕЗ остального резолвера (сети, epoll, fake-IP) — он таблицу только собирает
+# и шлёт в трубу, обслуживать LAN не обслуживает сам. Сегодня это подмножество DNSD_SRC (один
+# бинарник несёт всё сразу); шаг 6 (раздельные бинарники) сможет собрать steerd этим списком, не
+# трогая DNSD_SRC вовсе.
+DNSD_TABLE_SRC := src/dnsd/table.c src/dnsd/tabfmt.c
+
 DNSD_SRC := src/lib/sindex.c src/lib/nftnl.c src/lib/ctnl.c \
-            src/dnsd/rules.c src/dnsd/wire.c src/dnsd/origdst.c src/dnsd/fakeip.c src/dnsd/table.c \
+            src/dnsd/rules.c src/dnsd/wire.c src/dnsd/origdst.c src/dnsd/fakeip.c $(DNSD_TABLE_SRC) \
             src/dnsd/dlog.c src/dnsd/proxy.c src/dnsd/main.c
 
 # Виды выхода (src/kinds, docs/architecture.md, раздел 2, правило 1): вид — это файл, и какие виды
