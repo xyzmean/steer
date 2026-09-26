@@ -1,4 +1,5 @@
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
 #include <unistd.h>
@@ -42,8 +43,55 @@ void probe_clear(const char *out_name) {
     unlink(path);
 }
 
+/* Источник в памяти демона — см. probe.h. Один на процесс: процесс демона один, и спрашивает
+ * его только status, который отвечает в этом же процессе. */
+static int (*g_probe_mem)(const char *, struct probe_status *);
+
+void probe_source(int (*fn)(const char *out_name, struct probe_status *st)) {
+    g_probe_mem = fn;
+}
+
+/* Запись выхода out_name в STEER_PROBE_MEM. 1 — нашлась (*st заполнено). */
+static int probe_env(const char *out_name, struct probe_status *st) {
+    const char *p = getenv("STEER_PROBE_MEM");
+    size_t ol = strlen(out_name);
+    while (p && *p) {
+        while (*p == ' ') p++;
+        const char *e = strchr(p, ' ');
+        size_t len = e ? (size_t)(e - p) : strlen(p);
+        if (len > ol && !strncmp(p, out_name, ol) && p[ol] == ':') {
+            char word[16] = "";
+            int node = 0, total = 0;
+            char rec[96];
+            size_t rl = len - ol - 1;
+            if (rl >= sizeof(rec)) rl = sizeof(rec) - 1;
+            memcpy(rec, p + ol + 1, rl);
+            rec[rl] = '\0';
+            char *c1 = strchr(rec, ':');
+            if (c1) {
+                *c1 = ' ';
+                char *c2 = strchr(c1, ':');
+                if (c2) *c2 = ' ';
+            }
+            if (sscanf(rec, "%15s %d %d", word, &node, &total) != 3) return 0;
+            st->node = node;
+            st->total = total;
+            st->state = !strcmp(word, "probing") ? PROBE_RUNNING
+                      : !strcmp(word, "failed")  ? PROBE_FAILED
+                      : !strcmp(word, "nonode")  ? PROBE_NO_SUCH_NODE : PROBE_NONE;
+            if (st->state == PROBE_NONE) st->node = st->total = 0;
+            return 1;
+        }
+        p = e;
+    }
+    return 0;
+}
+
 struct probe_status probe_read(const char *out_name) {
     struct probe_status out = { PROBE_NONE, 0, 0 };
+    if (g_probe_mem && g_probe_mem(out_name, &out) == 0) return out;
+    if (probe_env(out_name, &out)) return out;
+    out = (struct probe_status){ PROBE_NONE, 0, 0 };
     char path[256];
     probe_path(path, sizeof(path), out_name);
     FILE *f = fopen(path, "r");

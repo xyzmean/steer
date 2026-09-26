@@ -216,6 +216,11 @@ static struct xs_secrets g_sc;
  * через опрос процесса, потому что проверка процесса — это запуск процесса, а status
  * опрашивают раз в пять секунд. */
 static void state_write(struct spoke *s) {
+    /* Ребёнок демона с --supervise (труба событий есть): здоровье демон знает из up/down, и файл
+     * для сторожа не пишется — раз в две секунды на флеш телефона (evline.h). Цена — `steer
+     * xsteer-peers` у такого выхода печатает только конфигурацию, без живого состояния. Клиент,
+     * поднятый netifd или руками, трубы не имеет и пишет файл, как раньше. */
+    if (evline_enabled()) return;
     char tmp[336];
     snprintf(tmp, sizeof(tmp), "%s.tmp", s->state_path);
     FILE *f = fopen(tmp, "w");

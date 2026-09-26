@@ -15,6 +15,15 @@
 # после смены спеки (reload) ведёт себя по новой таблице тем же процессом; SIGTERM демону гасит
 # помощников по одному в обратном порядке подъёма и резолвер — детей после демона не остаётся.
 #
+# Сторож и супервизор вместе (--watch --supervise; root, своё сетевое пространство и свой /sys,
+# демон build/steer-xk — базовая сборка с видами vless и xsteer): здоровье выходов xsteer сторож
+# берёт из событий помощников — помощник пишет down, и выход-пул переключается на следующее
+# устройство (switched у подписчика), пишет up — возвращается, и всё это без файлов probe-* и
+# xsteer-*.json в каталоге состояния; ход перебора узлов vless status берёт из памяти демона;
+# оживление обфускатора — перезапуск помощника демоном (helper-down с причиной, helper-up), ubus
+# не зовётся; смена содержимого файла стратегии zapret и reload перезапускают обработчик только
+# этого выхода.
+#
 # Под root стенд уходит в своё сетевое пространство (unshare -n); без root — петля хоста и
 # высокие порты. Без python3 — пропуск (заглушка апстрима и запросы DNS).
 set -u
@@ -29,8 +38,8 @@ fi
 
 tmp="$(mktemp -d)"
 mkdir -p "$tmp/st"
-D="" SUB="" UP=""
-trap 'kill $D $SUB $UP 2>/dev/null; rm -rf "$tmp"' EXIT
+D="" SUB="" UP="" WD=""
+trap 'kill $D $SUB $UP $WD 2>/dev/null; rm -rf "$tmp"' EXIT
 pass=0 fail=0
 check() {
     if [ "$2" = "$3" ]; then pass=$((pass + 1)); else
@@ -226,6 +235,143 @@ check "  помощники — по одному, в обратном поря�
 check "  журнал демона — с уровнем" "0" \
     "$(grep -v '^steer\[\(warn\|info\)\]' "$tmp/d.err" | grep -v '^steer dnsd: ' | grep -c .)"
 D=""
+
+# ---- сторож и супервизор вместе (--watch --supervise) --------------------------------------
+# Выход-пул vpn из устройств xa и xb — устройств выходов kind=xsteer, чьи помощники (заглушки) пишут
+# up или down по файлу down.<выход>. Устройства — dummy: их наличие сторож видит в своём /sys, а
+# живость решает событие помощника. vl — выход vless, чей помощник застрял на переборе узлов (node
+# 2 из 5). zq и zr — выходы zapret со своими файлами стратегии. wo — interface с обфускатором;
+# у его устройства нет адреса, проба ICMP его не находит, и сторож его оживляет. ubus, ifdown и
+# ifup — заглушки в PATH демона: ubus записывает вызов, ifdown/ifup отказывают.
+XK="${STEER_XK:-$(dirname "$BIN")/steer-xk}"
+if [ "${SUPD_INNER:-}" = 1 ] && [ -x "$XK" ] && command -v unshare >/dev/null 2>&1 &&
+   unshare -m sh -c 'mount -t sysfs sysfs /sys' 2>/dev/null &&
+   ip link add xa type dummy 2>/dev/null && ip link add xb type dummy 2>/dev/null &&
+   ip link add wo type dummy 2>/dev/null; then
+    for dv in xa xb wo; do ip link set "$dv" addrgenmode none 2>/dev/null; ip link set "$dv" up; done
+    W="$tmp/w"
+    mkdir -p "$W/st" "$W/bin"
+    printf '#!/bin/sh\necho "ubus $*" >> "%s/ubus.log"\nexit 0\n' "$W" > "$W/bin/ubus"
+    printf '#!/bin/sh\nexit 1\n' > "$W/bin/ifdown"
+    printf '#!/bin/sh\nexit 1\n' > "$W/bin/ifup"
+    chmod +x "$W/bin/ubus" "$W/bin/ifdown" "$W/bin/ifup"
+    cat > "$W/helper" <<H
+#!/bin/sh
+echo "\$1 \$2 \$\$" >> "$W/log"
+[ -n "\${STEER_EVENT_FD:-}" ] && eval "exec 9>&\$STEER_EVENT_FD"
+trap 'echo "stop \$1 \$2 \$\$" >> "$W/log"; exit 0' TERM
+case "\$1" in
+nfqws) while :; do sleep 0.1; done ;;
+vless) printf '{"ev":"node","n":2,"total":5}\n' >&9; while :; do sleep 0.1; done ;;
+esac
+last=""
+while :; do
+    cur=up; [ -e "$W/down.\$2" ] && cur=down
+    if [ "\$cur" != "\$last" ]; then
+        if [ "\$cur" = up ]; then printf '{"ev":"up"}\n' >&9
+        else printf '{"ev":"down","why":"стенд: отказ"}\n' >&9; fi
+        last=\$cur
+    fi
+    sleep 0.1
+done
+H
+    chmod +x "$W/helper"
+    printf 'strategy-1\n' > "$W/zq.opts"
+    printf 'strategy-r\n' > "$W/zr.opts"
+    : > "$W/sub.txt"
+    # wspec [wo] — с «wo» ещё и выход с обфускатором.
+    wspec() {
+        wo=""
+        [ -n "${1:-}" ] && wo=',"wo":{"kind":"interface","device":"wo","obfs":{"mode":"wg-over-tcp","server":"10.99.0.3:4443","listen":"127.0.0.1:5111"}}'
+        cat > "$W/spec.json" <<EOF
+{"schema":2,"from_default":["127.0.0.0/8"],"outputs":{
+ "xa":{"kind":"xsteer","conf":"/etc/xa.conf","on_fail":"direct"},
+ "xb":{"kind":"xsteer","conf":"/etc/xb.conf","on_fail":"direct"},
+ "vpn":{"kind":"interface","devices":["xa","xb"],"on_fail":"drop"},
+ "zq":{"kind":"zapret","opts_file":"$W/zq.opts"},
+ "zr":{"kind":"zapret","opts_file":"$W/zr.opts"},
+ "vl":{"kind":"vless","sub_file":"$W/sub.txt","on_fail":"direct"}$wo},
+ "channels":[]}
+EOF
+    }
+    wruns() { grep -c "^$1 $2 " "$W/log" 2>/dev/null; }
+    wctl() { "$XK" ctl --socket "$W/s.sock" "$@"; }
+    wst() { wctl status | python3 -c 'import json,sys; d=json.loads(json.load(sys.stdin)["stdout"]); print(json.dumps(eval("d"+sys.argv[1]), separators=(",", ":")))' "$1" 2>/dev/null; }
+    nofiles() { ls "$W/st" | grep '^probe-\|^xsteer-' | tr '\n' ' '; }
+    wspec
+    WD=""
+    # STEER_FAILOVER_HYST=0 — возврат на ожившее предпочтительное устройство без выдержки в три
+    # прохода: стенд смотрит на то, откуда сторож берёт здоровье, а не на гистерезис.
+    unshare -m sh -c "mount -t sysfs sysfs /sys && PATH=\"$W/bin:\$PATH\" STEER_FAILOVER_HYST=0 \
+        STEER_SUPERVISE_EXE=\"$W/helper\" exec \"$XK\" daemon --watch --supervise \
+        --socket \"$W/s.sock\" --spec \"$W/spec.json\" --state-dir \"$W/st\" \
+        --dnsd-flag --listen-port --dnsd-flag 15411 --dnsd-flag --upstream-port --dnsd-flag 15475" \
+        >"$W/d.out" 2>"$W/d.err" &
+    WD=$!
+    wait_for '[ -S "$W/s.sock" ]' 5
+    wctl subscribe > "$W/sub.out" 2>&1 &
+    SUB=$!
+    wait_for 'grep -q "\"cmd\":\"subscribe\"" "$W/sub.out" 2>/dev/null' 5
+    # Первый проход: помощники ещё не сказали up — сторож ждёт их, как ждал бы туннель, и выход-пул
+    # встаёт на первое устройство, когда его помощник поднялся (vl ждётся до конца — перебор).
+    wait_for 'grep -q "\"ev\":\"switched\",\"out\":\"vpn\"" "$W/sub.out"' 40
+    check "сторож с супервизором: помощник поднялся — выход-пул на первом устройстве" \
+        '{"v":1,"ev":"switched","out":"vpn","from":null,"to":"xa","why":"start"}' \
+        "$(grep '"ev":"switched","out":"vpn"' "$W/sub.out")"
+    check "  status из памяти — оно же" '"xa"' "$(wst '["outputs"]["vpn"]["device"]')"
+    check "  status: перебор узлов vless — из памяти демона" \
+        '{"state":"probing","node":2,"total":5}' "$(wst '["outputs"]["vl"]["probe"]')"
+
+    touch "$W/down.xa"
+    wait_for 'grep -q "\"ev\":\"switched\",\"out\":\"vpn\",\"from\":\"xa\"" "$W/sub.out"' 40
+    check "помощник xa пишет down — выход переключён на следующее устройство" \
+        '{"v":1,"ev":"switched","out":"vpn","from":"xa","to":"xb","why":"down"}' \
+        "$(grep '"ev":"switched","out":"vpn","from":"xa"' "$W/sub.out")"
+    check "  status — новое устройство" '"xb"' "$(wst '["outputs"]["vpn"]["device"]')"
+    rm -f "$W/down.xa"
+    wait_for 'grep -q "\"ev\":\"switched\",\"out\":\"vpn\",\"from\":\"xb\"" "$W/sub.out"' 40
+    check "помощник xa пишет up — возврат на него" \
+        '{"v":1,"ev":"switched","out":"vpn","from":"xb","to":"xa","why":"preferred"}' \
+        "$(grep '"ev":"switched","out":"vpn","from":"xb"' "$W/sub.out")"
+    check "  файлов probe-* и xsteer-*.json в каталоге состояния нет" "" "$(nofiles)"
+
+    # Выход с обфускатором: его устройство не отвечает — оживление перезапуском помощника в демоне.
+    wspec wo
+    wctl reload >/dev/null
+    wait_for '[ "$(wruns obfs wo)" = 2 ] && grep -q "\"ev\":\"helper-up\",\"out\":\"wo\"" "$W/sub.out" &&
+              [ "$(grep -c "\"ev\":\"helper-up\",\"out\":\"wo\"" "$W/sub.out")" = 2 ]' 40
+    check "оживление обфускатора: помощник перезапущен демоном" "2" "$(wruns obfs wo)"
+    check "  подписчику — helper-down с причиной" \
+        '{"v":1,"ev":"helper-down","out":"wo","helper":"obfs","why":"перезапуск: выход не отвечает"}' \
+        "$(grep '"ev":"helper-down","out":"wo"' "$W/sub.out")"
+    check "  и helper-up после подъёма" "2" "$(grep -c '"ev":"helper-up","out":"wo"' "$W/sub.out")"
+    check "  в журнале — почему" "1" "$(grep -c 'supervise: obfs wo — выход не отвечает, поднимаю заново' "$W/d.err")"
+    check "  ubus не звался" "" "$(cat "$W/ubus.log" 2>/dev/null)"
+    check "  reload без смены стратегий обработчики zapret не тронул" "1 1" "$(wruns nfqws zq) $(wruns nfqws zr)"
+
+    # Стратегия zapret сменилась — reload перезапускает обработчик только этого выхода.
+    xa0="$(wruns xsteer xa)" vl0="$(wruns vless vl)" wo0="$(wruns obfs wo)"
+    printf 'strategy-2\n' > "$W/zq.opts"
+    wctl reload >/dev/null
+    wait_for '[ "$(wruns nfqws zq)" = 2 ]' 10
+    sleep 0.5
+    check "стратегия zq сменилась, reload — перезапущен обработчик zq" "2" "$(wruns nfqws zq)"
+    check "  zr и остальные помощники не тронуты" "1 $xa0 $vl0 $wo0" \
+        "$(wruns nfqws zr) $(wruns xsteer xa) $(wruns vless vl) $(wruns obfs wo)"
+    check "  новый обработчик — с тем же файлом" "1" \
+        "$(grep -c "supervise: nfqws zq — параметры выхода изменились" "$W/d.err")"
+    check "  файлов probe-* и xsteer-*.json по-прежнему нет" "" "$(nofiles)"
+    check "  журнал демона — с уровнем" "0" \
+        "$(grep -v '^steer\[\(warn\|info\)\]' "$W/d.err" | grep -v '^steer dnsd: ' | grep -c .)"
+
+    kill $SUB 2>/dev/null; wait $SUB 2>/dev/null; SUB=""
+    kill -TERM $WD 2>/dev/null
+    wait_for '! kill -0 $WD 2>/dev/null' 15
+    WD=""
+    ip link del xa; ip link del xb; ip link del wo
+else
+    echo "supdmatch: нет root, своего сетевого пространства, своего /sys или $XK — сторож с супервизором пропущен"
+fi
 
 printf '\nsupdmatch: %s passed, %s failed\n' "$pass" "$fail"
 [ "$fail" -eq 0 ]

@@ -39,6 +39,11 @@ static void evline_ensure_open(void) {
     if (g_fd == -2) evline_open();
 }
 
+int evline_enabled(void) {
+    evline_ensure_open();
+    return g_fd >= 0;
+}
+
 /* С запасом ниже PIPE_BUF (POSIX гарантирует его минимум 512, на Linux 4096): событие с
  * контрактными двумя-тремя полями сюда влезает многократно, а если когда-нибудь не влезло —
  * лучше потерять его целиком, чем отправить обрезанный и невалидный JSON в трубу. */

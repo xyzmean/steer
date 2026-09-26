@@ -24,6 +24,13 @@
  * Процесс, вышедший молча после up, — тоже helper-down: причина — код выхода. Труба своя у
  * каждого запуска: события прежнего экземпляра не спутать с событиями нового.
  *
+ * СТОРОЖУ (демон ещё и с --watch) это состояние — источник здоровья выходов vless и xsteer
+ * (fostate.h, watchd.c): смена up/down будит его внеочередным проходом (watchd_helper_changed), а
+ * обфускатор выхода interface он оживляет не сигналом procd, а просьбой сюда — supd_restart:
+ * помощник гасится и поднимается сразу, без паузы падения, с причиной «перезапуск: выход не
+ * отвечает» у helper-down. Ход перебора узлов vless отсюда же берут status демона (в процессе,
+ * probe_source) и его дети (переменная STEER_PROBE_MEM) — файлов probe-* клиенты с трубой не пишут.
+ *
  * РЕЗОЛВЕР НА ТАБЛИЦЕ. `steer dnsd --table-fd N`: спеку он не читает — таблицу доменных каналов
  * (src/dnsd/tabfmt.h) демон пишет ему в трубу при запуске и при каждой смене спеки в памяти
  * (apply, reload, SIGHUP), и резолвер заменяет её без перезапуска (и перечитывает файлы списков
@@ -58,6 +65,7 @@
 #include "daemon.h"
 #include "loop.h"
 #include "state.h"
+#include "watchd.h"
 #include "helpers.h"
 
 #define LOG_SW "steer[warn] supervise: "
@@ -86,6 +94,8 @@ struct supd {
 };
 
 static void supd_kick(struct supd *s);
+static const struct supd *g_probe_sup;
+static int probe_mem(const char *out, struct probe_status *ps);
 
 /* ---- события помощников ------------------------------------------------------------------- */
 
@@ -107,6 +117,15 @@ static void emit_state(struct supd *s, const struct helper *h, const char *ev, c
     steerd_emit(s->d, ev, f);
 }
 
+/* Сторожу (--watch) — внеочередной проход, если от этого помощника зависит здоровье выхода:
+ * устройство выхода создаёт наш процесс (vless, xsteer). Обфускатор и мост сторож о здоровье не
+ * спрашивает — будить его их событиями незачем. */
+static void wake_watch(struct supd *s, const struct helper *h) {
+    if (!s->d->watch || !s->d->have) return;
+    const struct output *o = out_by_name(s->d->sp, h->name);
+    if (o && out_engine_managed(o)) watchd_helper_changed(s->d->watch);
+}
+
 static void ev_line(struct supd *s, struct helper *h, const char *line) {
     struct evline e;
     if (evline_parse(line, &e) != 0) return;
@@ -115,16 +134,20 @@ static void ev_line(struct supd *s, struct helper *h, const char *line) {
     if (!strcmp(e.ev, "up")) {
         st->up = 1;
         st->known = 1;
+        st->said_down = 0;
         st->since = (long)time(NULL);
         st->why[0] = '\0';
         emit_state(s, h, "helper-up", NULL);
+        wake_watch(s, h);
     } else if (!strcmp(e.ev, "down")) {
         const char *why = evline_str(&e, "why");
         st->up = 0;
         st->known = 1;
+        st->said_down = 1;
         st->since = (long)time(NULL);
         snprintf(st->why, sizeof(st->why), "%s", why ? why : "");
         emit_state(s, h, "helper-down", st->why);
+        wake_watch(s, h);
     } else if (!strcmp(e.ev, "node")) {
         if (!evline_int(&e, "n", &v) || !evline_int(&e, "total", &t)) return;
         st->node = v;
@@ -323,7 +346,7 @@ static int start_one(struct helper *h, void *arg) {
         if (loop_fd_add(s->l, h->evfd, EPOLLIN, ev_cb, s) != 0) { close(h->evfd); h->evfd = -1; }
         if (h->st.started) h->st.restarts++;
         h->st.running = 1;
-        h->st.up = h->st.known = 0;
+        h->st.up = h->st.known = h->st.said_down = 0;
         h->st.node = h->st.total = h->st.nonode = 0;
         h->st.started = (long)time(NULL);
         helper_started(h, pid);
@@ -361,6 +384,8 @@ static void child_cb(struct loop *l, pid_t pid, int status, void *arg) {
         /* Погашен нами — причина наша, а не код выхода, который это «вышел по SIGTERM». */
         if (h->gone)
             snprintf(h->st.why, sizeof(h->st.why), "выход убран из спеки");
+        else if (h->restart && h->revive)
+            snprintf(h->st.why, sizeof(h->st.why), "перезапуск: выход не отвечает");
         else if (h->restart)
             snprintf(h->st.why, sizeof(h->st.why), "перезапуск: параметры выхода изменились");
         else if (WIFEXITED(status))
@@ -370,6 +395,7 @@ static void child_cb(struct loop *l, pid_t pid, int status, void *arg) {
         if (was_up) {
             h->st.since = (long)time(NULL);
             emit_state(s, h, "helper-down", h->st.why);
+            wake_watch(s, h);
         }
         break;
     }
@@ -428,6 +454,9 @@ struct supd *supd_start(struct steerd *d, const struct supd_conf *c) {
     s->tm = loop_timer_new(s->l, supd_timer, s);
     if (!s->tm) { free(s); return NULL; }
     d->sup = s;
+    /* status демона отвечает в процессе — ход перебора узлов берёт отсюда (probe.h). */
+    g_probe_sup = s;
+    probe_source(probe_mem);
     size_t fn = supd_plan(s);
     memcpy(s->set.h, s->fresh, fn * sizeof(s->fresh[0]));
     s->set.n = fn;
@@ -469,4 +498,75 @@ const struct helper_state *helper_state_of(const struct steerd *d, const char *o
         if (!h->table && !h->gone && !strcmp(h->name, out)) return &h->st;
     }
     return NULL;
+}
+
+int supd_restart(struct supd *s, const char *out, const char *cmd) {
+    if (!s || s->stopping || !out || !cmd) return -1;
+    for (size_t i = 0; i < s->set.n; i++) {
+        struct helper *h = &s->set.h[i];
+        if (h->table || h->gone || strcmp(h->name, out) || strcmp(h->cmd, cmd)) continue;
+        if (h->pid) {
+            /* Уже гасится (новые параметры или прошлая просьба) — поднимется сразу и так. */
+            if (!h->restart) {
+                h->restart = 1;
+                h->revive = 1;
+                kill(h->pid, SIGTERM);
+            }
+        } else {
+            /* Ждёт паузы после падения — сторожу ждать её незачем: подъём сейчас. */
+            h->delay_ms = HELPERS_DELAY_MS;
+            h->next_ms = 0;
+            supd_kick(s);
+        }
+        return 0;
+    }
+    return -1;
+}
+
+/* ---- ход перебора узлов vless из памяти (probe.h) ---------------------------------------- */
+
+/* То же, что записал бы клиент (probe_report в src/tunnel/tunnel.c), — по его событиям:
+ * nonode — номер вне подписки (живёт до следующего запуска, как запись — пока свежа); node без
+ * up и down у живого процесса — перебор идёт; down самого клиента — ни один узел не ответил (total
+ * — из последнего node, 0 — узлов в подписке не было). Остальное — сказать нечего. */
+static enum probe_state probe_of(const struct helper *h, int *node, int *total) {
+    const struct helper_state *st = &h->st;
+    *node = 0;
+    *total = (int)st->total;
+    if (st->nonode) { *node = (int)st->nonode; return PROBE_NO_SUCH_NODE; }
+    if (st->running && !st->known && st->node > 0) { *node = (int)st->node; return PROBE_RUNNING; }
+    if (st->said_down) return PROBE_FAILED;
+    *total = 0;
+    return PROBE_NONE;
+}
+
+static int probe_mem(const char *out, struct probe_status *ps) {
+    const struct supd *s = g_probe_sup;
+    if (!s || !out) return -1;
+    for (size_t i = 0; i < s->set.n; i++) {
+        const struct helper *h = &s->set.h[i];
+        if (h->table || h->gone || strcmp(h->name, out) || strcmp(h->cmd, "vless")) continue;
+        ps->state = probe_of(h, &ps->node, &ps->total);
+        return 0;
+    }
+    return -1;
+}
+
+void supd_probe_env(const struct supd *s, char *buf, size_t n) {
+    if (!n) return;
+    buf[0] = '\0';
+    if (!s) return;
+    size_t w = (size_t)snprintf(buf, n, "STEER_PROBE_MEM=");
+    for (size_t i = 0; i < s->set.n && w < n; i++) {
+        const struct helper *h = &s->set.h[i];
+        if (h->table || h->gone || strcmp(h->cmd, "vless")) continue;
+        int node, total;
+        enum probe_state ps = probe_of(h, &node, &total);
+        const char *word = ps == PROBE_RUNNING ? "probing" : ps == PROBE_FAILED ? "failed"
+                         : ps == PROBE_NO_SUCH_NODE ? "nonode" : "none";
+        int m = snprintf(buf + w, n - w, "%s%s:%s:%d:%d", w > 16 ? " " : "", h->name, word,
+                         node, total);
+        if (m < 0 || (size_t)m >= n - w) { buf[w] = '\0'; break; }
+        w += (size_t)m;
+    }
 }

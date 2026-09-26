@@ -50,6 +50,14 @@
  * то, что увидел бы очередной `steer failover`, — и не перепривязывает выходы на пустом месте
  * (перепривязка снимает соединения выхода).
  *
+ * ЗДОРОВЬЕ ПОМОЩНИКОВ (демон ещё и с --supervise). Помощники — дети демона, и их состояние он
+ * знает по событиям из трубы (helpers.h, helper_state_of). Проход берёт его отсюда — источник
+ * здоровья помощника в памяти (fostate.h), — а не из файлов probe-* и xsteer-*.json, которые
+ * помощники с трубой событий и не пишут; обфускатор выхода interface оживляется перезапуском в
+ * супервизоре демона (supd_restart), а не сигналом экземпляру procd через ubus. Смена состояния
+ * помощника vless или xsteer (up, down, процесс вышел после up) — внеочередной проход через
+ * WATCH_SETTLE_S, как событие сети: упавший туннель не ждёт периода. Без --supervise источник — прежние файлы.
+ *
  * СОБЫТИЯ подписчикам (docs/ctl.md): switched, failed, revived — копятся за проход и уходят
  * после его конца, когда память выходов уже новая (подписчик, спросивший status по событию,
  * видит уже новое).
@@ -74,6 +82,7 @@
 #include "loop.h"
 #include "state.h"
 #include "fostate.h"
+#include "helpers.h"
 #include "watchd.h"
 
 #define LOG_WW "steer[warn] watch: "
@@ -148,6 +157,53 @@ static void mem_put(struct fo_store *st, const char *name, const char *data, siz
 
 static const struct fo_store_ops mem_ops = { mem_open_r, mem_put };
 
+/* ---- здоровье помощников из памяти супервизора (fostate.h) ---------------------------------- */
+
+struct fo_hmem {
+    struct fo_hsrc base;
+    struct steerd *d;
+};
+
+/* Помощник, которого демон не держит (вид без команды в этой сборке, движок выключен), —
+ * прежним путём, по файлам: пишет их тот, кто его поднял. */
+static int hmem_state(struct fo_hsrc *hs, const char *out, struct fo_hstate *h) {
+    const struct helper_state *st = helper_state_of(((struct fo_hmem *)hs)->d, out);
+    if (!st) return fo_hsrc_files.ops->state(&fo_hsrc_files, out, h);
+    h->node = h->total = 0;
+    if (st->nonode) {
+        h->st = FO_HS_NONODE;
+        h->node = (int)st->nonode;
+        h->total = (int)st->total;
+    } else if (!st->running) {
+        h->st = FO_HS_DOWN;
+    } else if (st->up) {
+        h->st = FO_HS_UP;
+    } else if (st->known) {
+        h->st = FO_HS_DOWN;
+    } else if (st->node > 0) {
+        h->st = FO_HS_PROBING;
+        h->node = (int)st->node;
+        h->total = (int)st->total;
+    } else {
+        h->st = FO_HS_STARTING;
+    }
+    return 0;
+}
+
+/* Туннель xsteer, поднятый netifd, — не ребёнок демона: его клиент пишет файл, как и раньше. */
+static int hmem_xsdev(struct fo_hsrc *hs, const char *dev, int *up, int *fresh) {
+    (void)hs;
+    return fo_hsrc_files.ops->xsdev(&fo_hsrc_files, dev, up, fresh);
+}
+
+static int hmem_restart(struct fo_hsrc *hs, const char *out, const char *cmd) {
+    return supd_restart(((struct fo_hmem *)hs)->d->sup, out, cmd);
+}
+
+static const struct fo_hsrc_ops hmem_ops = {
+    hmem_state, hmem_xsdev, hmem_restart, "процесс туннеля поднимет заново демон",
+};
+
 
 /* ---- сторож ---------------------------------------------------------------------------- */
 
@@ -173,6 +229,7 @@ struct watchd {
     int ev_n;
     long masq_at;                 /* когда последний раз возвращали masquerade (телефон) */
     struct fo_mem mem;
+    struct fo_hmem hmem;          /* здоровье помощников — у супервизора демона (--supervise) */
 };
 
 static void watchd_pass_start(struct watchd *w);
@@ -217,6 +274,10 @@ void watchd_spec_changed(struct watchd *w) {
     if (!w) return;
     if (w->run) w->pending = 1;
     else watchd_settle(w);
+}
+
+void watchd_helper_changed(struct watchd *w) {
+    watchd_spec_changed(w);
 }
 
 /* ---- проход ------------------------------------------------------------------------------ */
@@ -314,6 +375,8 @@ static void watchd_pass_start(struct watchd *w) {
         watchd_period(w);
         return;
     }
+    /* Супервизор заводится после сторожа — спрашивается на каждый проход. */
+    if (w->d->sup) fo_pass_helpers(w->run, &w->hmem.base);
     loop_timer_set(w->kill_tm, WATCHD_PASS_MAX_S * 1000L);
 }
 
@@ -327,6 +390,8 @@ struct watchd *watchd_start(struct steerd *d, const struct watchd_conf *c) {
     w->cf = *c;
     if (w->cf.period_s <= 0) w->cf.period_s = 60;
     w->mem.base.ops = &mem_ops;
+    w->hmem.base.ops = &hmem_ops;
+    w->hmem.d = d;
     w->tm = loop_timer_new(w->l, watchd_timer, w);
     w->kill_tm = loop_timer_new(w->l, watchd_kill, w);
     if (!w->tm || !w->kill_tm) {
@@ -358,6 +423,7 @@ struct watchd *watchd_start(struct steerd *d, const struct watchd_conf *c) {
     if (w->nl < 0)
         fprintf(stderr, LOG_WW "события сети недоступны — проход только по периоду\n");
     d->outs = &w->mem.base;
+    d->watch = w;
     w->eventful = 1;              /* первый проход — как по событию: masquerade проверить */
     loop_timer_set(w->tm, 0);
     return w;

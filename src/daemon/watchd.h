@@ -21,6 +21,9 @@ struct watchd_conf {
 struct watchd *watchd_start(struct steerd *d, const struct watchd_conf *c);
 /* Спека в памяти демона сменилась (apply, reload, SIGHUP): внеочередной проход. */
 void watchd_spec_changed(struct watchd *w);
+/* Помощник выхода (--supervise) поднялся или упал: внеочередной проход, как по событию сети.
+ * NULL — сторожа нет, ничего. */
+void watchd_helper_changed(struct watchd *w);
 /* Демон уходит: идущий проход прерывается (правило пробы снимается, команда оживления
  * убивается). */
 void watchd_stop(struct watchd *w);
