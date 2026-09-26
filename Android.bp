@@ -60,6 +60,7 @@ cc_defaults {
         "src/dnsd/origdst.c",
         "src/dnsd/fakeip.c",
         "src/dnsd/table.c",
+        "src/dnsd/tabfmt.c",
         "src/dnsd/dlog.c",
         "src/dnsd/proxy.c",
         "src/dnsd/main.c",

@@ -1,6 +1,7 @@
 #include "dnsd_int.h"
 #include "sindex.h"
 #include "nftnl.h"
+#include "tabfmt.h"
 
 #define MAX_PKT 4096
 
@@ -84,6 +85,12 @@ struct dnsd_in_pktinfo { int ifindex; struct in_addr spec_dst; struct in_addr ad
 int g_origdst;
 int g_ct_fd = -1;
 static int g_listen_port;
+
+/* --table-fd N — объявление и рационале у tabfmt.h. Установлен ДО run_proxy: dnsd_main
+ * разбирает флаги и читает первую таблицу первым (tabfmt_read_first), здесь читается только
+ * для решения, заводить ли трубу в epoll. */
+int g_table_fd = -1;
+struct tabfmt_feed g_table_feed;
 
 /* ЗАЩИТА ОТ ПОДДЕЛАННОГО ОТВЕТА В РЕЖИМЕ origdst. Пока наверху была петля, подделать ответ
  * мог только тот, кто уже на ней. Теперь наверху сервер Wi-Fi или оператора, по UDP, и
@@ -343,6 +350,50 @@ static void reload_rules(void) {
     for (size_t i = 0; i < g_dch_n; i++)
         fprintf(stderr, "steer dnsd: channel %s: %zu rule(s)\n",
                 g_dch[i].set, g_dch[i].rules.n);
+}
+
+/* Труба таблицы (--table-fd) стала читаемой: дочитать её до EAGAIN (неблокирующая, как и
+ * остальные сокеты цикла) и применить каждую полную таблицу, которая в ней собралась — тем же
+ * путём, каким SIGHUP применяет новые файлы правил (reload_rules выше): набор каналов уже
+ * заменён (tabfmt_feed сама зовёт tabfmt_parse), и reload_rules остаётся загрузить содержимое
+ * их файлов и поднять g_rules_gen — благодаря чему ожидания, уже стоящие в g_pending, досчитают
+ * ответ по СТАРОМУ совпадению (см. rules_gen у struct pending, dnsd_int.h), а не будут молча
+ * пересчитаны под таблицу, которой на момент их запроса ещё не было. Ни один считает их
+ * протухшими и не трогает — это не в зоне ответственности замены таблицы вовсе.
+ *
+ * Возвращает 0, если труба сломалась не по контракту (испорченный текст) или демон её закрыл
+ * (EOF) — в обоих случаях резолверу отвечать больше не на что, вызывающий обязан завершиться. */
+static int table_pipe_readable(void) {
+    for (;;) {
+        char chunk[4096];
+        ssize_t r = read(g_table_fd, chunk, sizeof(chunk));
+        if (r < 0) {
+            if (errno == EAGAIN || errno == EWOULDBLOCK) return 1;
+            if (errno == EINTR) continue;
+            fprintf(stderr, "steer[warn] dnsd: труба таблицы: %s\n", strerror(errno));
+            return 0;
+        }
+        if (r == 0) {
+            fprintf(stderr, "steer dnsd: труба таблицы закрыта родителем — выходим\n");
+            return 0;
+        }
+        int rc = tabfmt_feed(&g_table_feed, chunk, (size_t)r);
+        if (rc < 0) {
+            fprintf(stderr, "steer[warn] dnsd: труба таблицы: испорченный текст\n");
+            return 0;
+        }
+        /* rc == 1 может повториться без нового чтения — демон вправе прислать две таблицы
+         * подряд одной записью, а следующая уже целиком лежит в g_table_feed. */
+        while (rc == 1) {
+            fprintf(stderr, "steer dnsd: таблица от демона: %zu доменных канал(ов)\n", g_dch_n);
+            reload_rules();
+            rc = tabfmt_feed(&g_table_feed, NULL, 0);
+        }
+        if (rc < 0) {
+            fprintf(stderr, "steer[warn] dnsd: труба таблицы: испорченный текст\n");
+            return 0;
+        }
+    }
 }
 
 /* Снятие протухших ожиданий. Вызывается из секундного тика цикла событий, а не
@@ -1544,6 +1595,16 @@ int run_proxy(int listen_port, int upstream_port) {
     tcp_listen_open(listen_port);
     /* Сокет журнала имён — см. «журнал имён» выше. */
     dlog_listen();
+    /* --table-fd: первая таблица уже разобрана (dnsd_main, tabfmt_read_first, ДО этой функции)
+     * — здесь труба заводится в epoll только ради СЛЕДУЮЩИХ. Неблокирующая по той же причине,
+     * что и остальные сокеты цикла: готовность epoll не обещает, что read не заблокируется. */
+    if (g_table_fd >= 0) {
+        fcntl(g_table_fd, F_SETFL, O_NONBLOCK);
+        struct epoll_event tev = {0};
+        tev.events = EPOLLIN;
+        tev.data.ptr = &g_table_fd;
+        epoll_ctl(g_epfd, EPOLL_CTL_ADD, g_table_fd, &tev);
+    }
 
     /* Один сокет наверх на весь процесс — см. комментарий у struct pending. Открывается
      * здесь, а не при первом запросе, чтобы отказ был виден сразу, а не превращался в
@@ -1706,6 +1767,8 @@ int run_proxy(int listen_port, int upstream_port) {
                     if (!handle_client_query()) break;
             } else if (events[i].data.ptr == &g_dlog_fd) {
                 dlog_serve();
+            } else if (events[i].data.ptr == &g_table_fd) {
+                if (!table_pipe_readable()) g_running = 0;
             } else if (tcp_event(events[i].data.ptr, events[i].events)) {
                 /* соединение TCP — клиента или наверх; всё сделано внутри */
             } else {
@@ -1723,6 +1786,7 @@ int run_proxy(int listen_port, int upstream_port) {
     dlog_close();
     if (g_nlk_fd >= 0) close(g_nlk_fd);
     if (g_up_fd >= 0) close(g_up_fd);
+    if (g_table_fd >= 0) close(g_table_fd);
     close(g_listen_fd);
     close(g_epfd);
     for (size_t i = 0; i < g_dch_n; i++) ruleset_free(&g_dch[i].rules);

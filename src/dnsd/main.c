@@ -53,6 +53,7 @@
  */
 #include "dnsd_int.h"
 #include "nftnl.h"
+#include "tabfmt.h"
 
 static int cmd_match(const char *path, const char *host) {
     struct ruleset rs = {0};
@@ -172,7 +173,7 @@ static int cmd_fakeip(const char *state_path, const char *domain) {
  * правке. Формат строк — тот же, что у общих флагов. */
 void dnsd_usage_flags(FILE *out) {
     fprintf(out,
-          "  --spec ФАЙЛ              спека каналов (по умолчанию %s)\n"
+          "  --spec ФАЙЛ              спека каналов (по умолчанию %s; без смысла с --table-fd)\n"
           "  --state-dir КАТАЛОГ      каталог состояния (по умолчанию %s)\n",
           plat()->spec_path, plat()->state_dir);
     fputs("  --listen-port ПОРТ       порт, на котором отвечать LAN (по умолчанию 5300)\n"
@@ -180,6 +181,10 @@ void dnsd_usage_flags(FILE *out) {
           "  --upstream-origdst       переспрашивать тот сервер, к которому шёл запрос\n"
           "                           (адрес из conntrack); без записи — 127.0.0.1\n"
           "  --fakeip-state ФАЙЛ      где хранить раздачу поддельных адресов\n"
+          "  --table-fd N             таблицу доменных каналов брать из дескриптора N (труба\n"
+          "                           демона, docs/architecture.md, раздел 4а), а не читать\n"
+          "                           спеку самому; следующая полная таблица в той же трубе\n"
+          "                           заменяет текущую без перезапуска, закрытие трубы — выход\n"
           "\n"
           "Разовые проверки, вместо запуска резолвера:\n"
           "  --selftest               прогнать разбор и сборку пакетов на своих фикстурах\n"
@@ -215,6 +220,8 @@ int dnsd_main(int argc, char **argv) {
             upstream_port = atoi(argv[++i]);
         } else if (strcmp(argv[i], "--upstream-origdst") == 0) {
             g_origdst = 1;
+        } else if (strcmp(argv[i], "--table-fd") == 0 && i + 1 < argc) {
+            g_table_fd = atoi(argv[++i]);
         } else if (strcmp(argv[i], "--fakeip-state") == 0 && i + 1 < argc) {
             g_fakeip_state_path = argv[++i];
         } else if (strcmp(argv[i], "--state-dir") == 0 && i + 1 < argc) {
@@ -229,20 +236,12 @@ int dnsd_main(int argc, char **argv) {
         }
     }
 
-    /* Channels come from the spec, in spec order — the same file and the same
-     * parser the compiler used, so the sets named here are exactly the sets it
-     * generated. */
-    /* Правило 5, docs/architecture.md, раздел 2: err_die здесь довершает то, что раньше делал
-     * die() изнутри load_spec. */
-    static struct spec cfg;
-    struct err e = {0};
-    if (load_spec(spec, &cfg, &e) < 0) err_die(&e);
-    dch_build(&cfg);
     /* Раскладка — та же проба, что у apply, и тем же ответом: наборы и карту резолвер находит
      * по именам, и искать их не в той таблице значило бы наполнять пустоту. Спрашивается у
      * ядра, а не у файла, который оставил apply: резолвер поднимается и раньше первого apply
      * (загрузка), и ответ ядра от порядка запуска не зависит. Имя таблицы — своё у сборки
-     * (nft_table), как у всего остального движка. */
+     * (nft_table), как у всего остального движка. Спеки эта проба не касается вовсе — делается
+     * до ветки ниже и одинаково для обоих источников таблицы каналов. */
     {
         static char sets_tbl[64], map_tbl[64];
         int legacy = nft_compat() & NFTC_LEGACY;
@@ -252,9 +251,36 @@ int dnsd_main(int argc, char **argv) {
         g_nft_map_table = map_tbl;
         g_nft_sets_interval = !legacy;
     }
-    /* Подпись пишется СРАЗУ ПОСЛЕ сборки таблицы и до всего остального: с этой секунды
-     * `reload_dnsd` вправе сравнивать её со свежей и выбирать HUP вместо перезапуска. */
-    dch_sig_write();
+
+    /* --table-fd: демон уже прочитал спеку и построил таблицу каналов сам (docs/architecture.md,
+     * раздел 4а, шаг 1) — резолвер спеку не открывает вовсе, ни сейчас, ни при следующей
+     * замене таблицы (та приходит той же трубой, tabfmt_feed, из цикла epoll в run_proxy).
+     * Первая таблица читается ДО начала обслуживания LAN, блокирующим чтением: обслуживать
+     * запросы без единого канала, ещё не зная, есть ли у резолвера вообще правила, — хуже,
+     * чем подождать несколько миллисекунд первую запись демона. */
+    if (g_table_fd >= 0) {
+        if (tabfmt_read_first(g_table_fd, &g_table_feed) != 0) {
+            fprintf(stderr, "steer dnsd: труба таблицы (--table-fd %d) закрылась или испортилась "
+                            "до первой таблицы — резолверу без демона отвечать не на что\n",
+                    g_table_fd);
+            return 1;
+        }
+    } else {
+        /* Channels come from the spec, in spec order — the same file and the same
+         * parser the compiler used, so the sets named here are exactly the sets it
+         * generated. */
+        /* Правило 5, docs/architecture.md, раздел 2: err_die здесь довершает то, что раньше
+         * делал die() изнутри load_spec. */
+        static struct spec cfg;
+        struct err e = {0};
+        if (load_spec(spec, &cfg, &e) < 0) err_die(&e);
+        dch_build(&cfg);
+        /* Подпись пишется СРАЗУ ПОСЛЕ сборки таблицы и до всего остального: с этой секунды
+         * `reload_dnsd` вправе сравнивать её со свежей и выбирать HUP вместо перезапуска. Только
+         * в этом режиме: с --table-fd решение «HUP или перезапуск» демон принимает сам, зная,
+         * что именно поменялось, — файл подписи ему для этого не нужен. */
+        dch_sig_write();
+    }
     /* НИ ОДНОГО ДОМЕННОГО КАНАЛА — ЭТО НЕ ПРИЧИНА ВЫЙТИ, А ОБЫЧНЫЙ РЕЖИМ РАБОТЫ.
      *
      * Здесь стоял ранний `return 0` со словами «nothing to do», и он делал ровно то, от
@@ -278,9 +304,14 @@ int dnsd_main(int argc, char **argv) {
      *
      * Строка в журнале остаётся: она полезна при разборе («почему домен не уходит в
      * туннель» — потому что доменных каналов нет вовсе), но это уведомление, а не отказ. */
-    if (!g_dch_n)
-        fprintf(stderr, "steer dnsd: no channel in %s matches domains — "
-                        "forwarding only, no domain routing\n", spec);
+    if (!g_dch_n) {
+        if (g_table_fd >= 0)
+            fprintf(stderr, "steer dnsd: таблица от демона без доменных каналов — "
+                            "forwarding only, no domain routing\n");
+        else
+            fprintf(stderr, "steer dnsd: no channel in %s matches domains — "
+                            "forwarding only, no domain routing\n", spec);
+    }
     if (!g_fakeip_state_path) {
         static char st[PATH_MAX];
         int need = snprintf(st, sizeof(st), "%s/fakeip.state", steer_state_dir());
