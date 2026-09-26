@@ -261,6 +261,11 @@ int main(int argc, char **argv) {
         return 2;
     }
 
+    /* Служебные подкоманды демона (apply-сверка, src/daemon/recon.c): их запускает только сам
+     * демон, в справке и таблице команд их нет, и слова у них свои. */
+    if (!strcmp(cmd, "apply-plan")) return cmd_apply_plan(argc - 2, argv + 2);
+    if (!strcmp(cmd, "apply-commit")) return cmd_apply_commit(argc - 2, argv + 2);
+
     const struct cli_cmd *c = cli_lookup(cmd);
     if (!c) cli_unknown(cmd);
     /* Просьба о справке перехватывается ДО разбора, одинаково для всех команд —

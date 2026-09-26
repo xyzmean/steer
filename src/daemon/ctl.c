@@ -59,8 +59,9 @@
  *   stdout, — а stderr на время команды перенаправлен в файл в памяти. Одна правда на двоих,
  *   как и прежде, только без второго процесса.
  *
- *   Через ребёнка: apply, check, diag, vless-probe, vless-nodes, sub-check и reload (его
- *   dnsd-sig) — работа ядра или долгий срок. Ребёнок — fork+exec самого себя с подкомандой, в
+ *   Через ребёнка: apply и reload (план и применение изменившихся частей — apply-сверка,
+ *   recon.c; у reload ещё dnsd-sig), check, diag, vless-probe, vless-nodes, sub-check — работа
+ *   ядра, компиляция или долгий срок. Ребёнок — fork+exec самого себя с подкомандой, в
  *   своей группе процессов; его stdout и stderr — неблокирующие трубы в том же epoll, выход —
  *   через signalfd, срок — таймером цикла. Пока ребёнок работает, демон отвечает остальным:
  *   долгий vless-probe больше не держит status. Сбой в ребёнке (die, зависание на nft) по-
@@ -152,6 +153,7 @@
 #include "fostate.h"
 #include "watchd.h"
 #include "helpers.h"
+#include "recon.h"
 #include "ctl.h"
 
 /* Путь сокета по умолчанию — путь платформы (ctl_sock, src/platform/platform.h). */
@@ -511,6 +513,13 @@ struct conn {
     int dn_n;
     void (*after_reload)(struct conn *c);
     struct steerd_sub sub;
+    /* Apply-сверка (recon.c): план новой спеки, решение, stderr плана, код и stderr reload. */
+    struct recon_plan plan;
+    struct recon_diff diff;
+    struct cbuf perr;
+    int watch;                /* сторожу внеочередной проход */
+    int committed;            /* apply-commit запускался */
+    int rcode;                /* код reload */
 };
 
 struct ctl_srv {
@@ -525,6 +534,7 @@ struct ctl_srv {
     struct conn *lock_owner, *lockq;
     int hup_pending;
     struct watchd *watch;     /* сторож выходов; NULL — без --watch */
+    struct recon_state rec;   /* что демон применил сам (apply-сверка, recon.c) */
 };
 
 static void mem_version(struct conn *c, struct cbuf *r);
@@ -668,7 +678,8 @@ static void conn_ev(struct loop *l, int fd, uint32_t ev, void *arg);
 /* Изменяющая команда кончилась: следующая из очереди — сейчас же. SIGHUP, пришедший, пока
  * шла команда, перечитывает спеку после неё: перечитывание пишет реестр меток, как и
  * dry-run, и вперемешку с чужим apply им нельзя. */
-static void srv_spec_changed(struct ctl_srv *s, const char *by, int enabled);
+static void srv_spec_changed(struct ctl_srv *s, const char *by, int enabled,
+                             const struct recon_diff *d, int watch, struct cbuf *changed);
 
 static void lock_release(struct ctl_srv *s) {
     s->lock_owner = NULL;
@@ -681,7 +692,7 @@ static void lock_release(struct ctl_srv *s) {
     }
     if (s->hup_pending) {
         s->hup_pending = 0;
-        srv_spec_changed(s, "hup", ctl_enabled());
+        srv_spec_changed(s, "hup", ctl_enabled(), NULL, 1, NULL);
     }
 }
 
@@ -1091,24 +1102,54 @@ static int ctl_read_file(const char *path, struct cbuf *b, size_t max) {
     return 1;
 }
 
-/* Спека на диске изменилась (apply, reload, SIGHUP) — перечитать её в память и сказать
- * подписчикам. Удалось — событие applied с отпечатком; нет — spec-error, а в памяти остаётся
- * прежняя спека: демон продолжает отвечать по последней годной. */
-static void srv_spec_changed(struct ctl_srv *s, const char *by, int enabled) {
-    char f[2560];
-    if (steerd_load(&s->d) == 0) {
-        snprintf(f, sizeof(f), ",\"by\":\"%s\",\"spec\":\"%s\",\"enabled\":%s", by, s->d.fp,
-                 enabled ? "true" : "false");
-        steerd_emit(&s->d, "applied", f);
-        watchd_spec_changed(s->watch);
-        supd_spec_changed(s->d.sup);
-        return;
+/* Поле changed ответа и события applied (docs/ctl.md): что тронула сверка. Набор правил и
+ * маршрутизация — по решению apply-сверки (d; NULL — в ядро ничего не шло), помощники и таблица
+ * резолвера — по сверке супервизора. */
+static void changed_json(struct cbuf *b, const struct recon_diff *d, const struct supd_changes *ch) {
+    cb_fmt(b, ",\"changed\":{\"ruleset\":%s,\"routing\":[", d && d->ruleset ? "true" : "false");
+    for (size_t i = 0; d && i < d->route_n; i++) {
+        if (i) cb_str(b, ",");
+        cb_jstr(b, d->route[i]);
     }
-    fprintf(stderr, LOG_W "спека не прочитана (%s): %s\n", by, s->d.err);
-    char m[2304];
-    steerd_json_str(m, sizeof(m), s->d.err);
-    snprintf(f, sizeof(f), ",\"by\":\"%s\",\"message\":%s", by, m);
-    steerd_emit(&s->d, "spec-error", f);
+    cb_str(b, "],\"helpers\":[");
+    for (size_t i = 0; ch && i < ch->helpers_n; i++) {
+        if (i) cb_str(b, ",");
+        cb_jstr(b, ch->helpers[i]);
+    }
+    cb_fmt(b, "],\"dnsd\":%s}", ch && ch->dnsd ? "true" : "false");
+}
+
+/* Спека на диске изменилась (apply, reload, SIGHUP) — перечитать её в память и сказать
+ * подписчикам. Удалось — супервизор сверяет помощников и таблицу резолвера, событие applied с
+ * отпечатком и полем changed; нет — spec-error, а в памяти остаётся прежняя спека: демон
+ * продолжает отвечать по последней годной. watch — сторожу внеочередной проход (изменились
+ * выходы; помощники — тоже повод, их супервизор называет сам). changed (может быть NULL) — куда
+ * дописать поле changed для ответа. */
+static void srv_spec_changed(struct ctl_srv *s, const char *by, int enabled,
+                             const struct recon_diff *d, int watch, struct cbuf *changed) {
+    struct supd_changes ch;
+    memset(&ch, 0, sizeof(ch));
+    struct cbuf cj = {0};
+    if (steerd_load(&s->d) == 0) {
+        supd_spec_changed(s->d.sup, &ch);
+        changed_json(&cj, d, &ch);
+        struct cbuf f = {0};
+        cb_fmt(&f, ",\"by\":\"%s\",\"spec\":\"%s\",\"enabled\":%s", by, s->d.fp,
+               enabled ? "true" : "false");
+        if (cj.p) cb_put(&f, cj.p, cj.n);
+        steerd_emit(&s->d, "applied", f.p ? f.p : "");
+        free(f.p);
+        if (watch || ch.helpers_n) watchd_spec_changed(s->watch);
+    } else {
+        changed_json(&cj, d, NULL);
+        fprintf(stderr, LOG_W "спека не прочитана (%s): %s\n", by, s->d.err);
+        char m[2304], f[2560];
+        steerd_json_str(m, sizeof(m), s->d.err);
+        snprintf(f, sizeof(f), ",\"by\":\"%s\",\"message\":%s", by, m);
+        steerd_emit(&s->d, "spec-error", f);
+    }
+    if (changed && cj.p) cb_put(changed, cj.p, cj.n);
+    free(cj.p);
 }
 
 /* argv проверки кандидата: `apply --dry-run --spec ПУТЬ [--state-dir …]`. */
@@ -1156,15 +1197,86 @@ static void st_check(struct conn *c) {
 }
 
 static void reload_begin(struct conn *c);
-static void apply_done(struct conn *c, int code);
+
+/* ---- apply-сверка: план и применение ----------------------------------------------------------
+ *
+ * Устройство и доводы — в шапке recon.c. Здесь — шаги на цикле демона: ребёнок `apply-plan`
+ * (проверки dry-run и отпечатки частей), решение recon_decide, ребёнок `apply-commit` только с
+ * изменившимися частями — или никакого, если меняться нечему. */
+
+/* Ребёнок-план по спеке path; раскладку набора правил, узнанную у прежнего плана, — готовой. */
+static int plan_start(struct conn *c, const char *path, job_done_fn done) {
+    struct ctl_srv *s = c->srv;
+    char *av[12], nb[16];
+    size_t n = 0;
+    av[n++] = s->cf.exe;
+    av[n++] = "apply-plan";
+    av[n++] = "--spec";
+    av[n++] = (char *)path;
+    if (s->cf.state_dir) { av[n++] = "--state-dir"; av[n++] = (char *)s->cf.state_dir; }
+    if (s->rec.nftc >= 0) {
+        snprintf(nb, sizeof(nb), "%d", s->rec.nftc);
+        av[n++] = "--nftc";
+        av[n++] = nb;
+    }
+    av[n] = NULL;
+    return job_start(c, av, 120, CTL_OUT_MAX, CTL_ERR_MAX, done);
+}
+
+/* План пришёл: разобрать и запомнить его stderr (предупреждения проверки). 0 — годный. */
+static int plan_take(struct conn *c) {
+    struct job *j = &c->job;
+    if (recon_plan_parse(j->out.p ? j->out.p : "", j->out.n, &c->plan) != 0) return -1;
+    free(c->perr.p);
+    c->perr = j->err;
+    memset(&j->err, 0, sizeof(j->err));
+    c->srv->rec.nftc = c->plan.nftc;
+    c->watch = recon_watch_changed(&c->srv->rec, &c->plan);
+    return 0;
+}
+
+/* Решить, что применять, и применить: ребёнок apply-commit или сразу done(c, 0), если в ядро
+ * идти незачем. */
+static void commit_start(struct conn *c, job_done_fn done) {
+    struct ctl_srv *s = c->srv;
+    recon_decide(&s->rec, &c->plan, &c->diff);
+    c->committed = 0;
+    if (!recon_diff_any(&c->diff)) { done(c, 0); return; }
+    char buf[1024], *av[24];
+    recon_commit_argv(&c->diff, s->cf.exe, s->cf.spec, s->cf.state_dir, s->rec.nftc, buf,
+                      sizeof(buf), av);
+    c->committed = 1;
+    if (job_start(c, av, 300, CTL_OUT_MAX, CTL_ERR_MAX, done) != 0) {
+        c->committed = 0;
+        done(c, -1);
+    }
+}
+
+/* stdout и stderr применения для ответа: у apply-commit — его; набор правил он собирал сам (и
+ * предупреждения проверки повторил), иначе впереди — предупреждения плана. Без apply-commit —
+ * строка итога, как у подкоманды. */
+static void commit_output(struct conn *c, struct cbuf *out, struct cbuf *err) {
+    struct job *j = &c->job;
+    memset(out, 0, sizeof(*out));
+    memset(err, 0, sizeof(*err));
+    out->max = CTL_OUT_MAX;
+    err->max = CTL_ERR_MAX;
+    if (c->committed && j->out.p) cb_put(out, j->out.p, j->out.n);
+    if (!c->committed)
+        cb_fmt(out, "steer: applied %zu channel(s), %zu output(s)\n", c->plan.ch_n, c->plan.out_n);
+    if (!(c->committed && c->diff.ruleset) && c->perr.p) cb_put(err, c->perr.p, c->perr.n);
+    if (c->committed && j->err.p) cb_put(err, j->err.p, j->err.n);
+}
 
 static void apply_finish(struct conn *c) {
-    srv_spec_changed(c->srv, "apply", 1);
+    srv_spec_changed(c->srv, "apply", 1, &c->diff, c->watch, &c->resp);
     conn_reply(c);
 }
 
-/* Шаг 2 apply: проверка прошла. */
-static void apply_dry(struct conn *c, int code) {
+static void apply_committed(struct conn *c, int code);
+
+/* Шаг 2 apply: план прошёл (проверки те же, что у dry-run). */
+static void apply_planned(struct conn *c, int code) {
     struct ctl_srv *s = c->srv;
     struct job *j = &c->job;
     struct cbuf none = {0};
@@ -1176,6 +1288,12 @@ static void apply_dry(struct conn *c, int code) {
         resp_bool(&c->resp, "saved", 0);
         resp_bool(&c->resp, "applied", 0);
         if (j->timed_out) resp_error(&c->resp, "timeout", "проверка не уложилась в свой срок и остановлена");
+        conn_reply(c);
+        return;
+    }
+    if (plan_take(c) != 0) {
+        unlink(c->tmp);
+        resp_error(&c->resp, "internal", "план применения не разобран");
         conn_reply(c);
         return;
     }
@@ -1191,31 +1309,33 @@ static void apply_dry(struct conn *c, int code) {
     ctl_fsync_dir(spec);
 
     if (!ctl_enabled()) {
-        resp_run(&c->resp, 0, &none, &j->err);
+        /* Правила снимет и поставит init, когда движок выключат и включат: что будет в ядре
+         * потом, демон не знает. */
+        recon_forget(&s->rec);
+        memset(&c->diff, 0, sizeof(c->diff));
+        resp_run(&c->resp, 0, &none, &c->perr);
         resp_bool(&c->resp, "saved", 1);
         resp_bool(&c->resp, "applied", 0);
         resp_bool(&c->resp, "enabled", 0);
-        srv_spec_changed(s, "apply", 0);
+        srv_spec_changed(s, "apply", 0, &c->diff, c->watch, &c->resp);
         conn_reply(c);
         return;
     }
-    char *av[10];
-    size_t n = 0;
-    av[n++] = s->cf.exe;
-    av[n++] = "apply";
-    av[n++] = "--spec";
-    av[n++] = (char *)spec;
-    if (s->cf.state_dir) { av[n++] = "--state-dir"; av[n++] = (char *)s->cf.state_dir; }
-    av[n] = NULL;
-    if (job_start(c, av, 300, CTL_OUT_MAX, CTL_ERR_MAX, apply_done) != 0) apply_done(c, -1);
+    commit_start(c, apply_committed);
 }
 
-/* Шаг 3 apply: ядро приняло набор — или нет, и тогда прежняя спека возвращается на место. */
-static void apply_done(struct conn *c, int code) {
+/* Шаг 3 apply: ядро приняло изменившиеся части — или нет, и тогда прежняя спека возвращается на
+ * место. */
+static void apply_committed(struct conn *c, int code) {
     struct ctl_srv *s = c->srv;
     struct job *j = &c->job;
     const char *spec = s->cf.spec;
-    if (code != 0 || j->timed_out) {
+    struct cbuf out, err;
+    commit_output(c, &out, &err);
+    if (code != 0 || (c->committed && j->timed_out)) {
+        /* Что успело встать до отказа, не знаем (ядро отвергло набор — ничего, срок вышел посреди
+         * маршрутизации — часть): следующий apply применит всё. */
+        recon_forget(&s->rec);
         int rolled = 0;
         if (c->had_old == 1) {
             char t2[PATH_MAX];
@@ -1227,23 +1347,29 @@ static void apply_done(struct conn *c, int code) {
             rolled = unlink(spec) == 0;
         }
         if (rolled) ctl_fsync_dir(spec);
-        else cb_str(&j->err, LOG_W "прежнюю спеку вернуть не удалось — на диске новая\n");
+        else cb_str(&err, LOG_W "прежнюю спеку вернуть не удалось — на диске новая\n");
         fprintf(stderr, LOG_W "apply отвергнут (код %d)%s\n", code,
                 rolled ? " — прежняя спека возвращена" : "");
-        resp_run(&c->resp, code < 0 ? 127 : code, &j->out, &j->err);
+        resp_run(&c->resp, code < 0 ? 127 : code, &out, &err);
         resp_bool(&c->resp, "saved", !rolled);
         resp_bool(&c->resp, "applied", 0);
         resp_bool(&c->resp, "enabled", 1);
         resp_bool(&c->resp, "rolled_back", rolled);
-        if (j->timed_out) resp_error(&c->resp, "timeout", "применение не уложилось в свой срок и остановлено");
+        if (c->committed && j->timed_out)
+            resp_error(&c->resp, "timeout", "применение не уложилось в свой срок и остановлено");
         /* Вернуть не удалось — на диске новая спека, и память идёт за диском (молча: в ядре
          * она не стоит, события applied нет). */
         if (!rolled) steerd_load(&s->d);
+        free(out.p);
+        free(err.p);
         conn_reply(c);
         return;
     }
-    fprintf(stderr, LOG_I "спека применена\n");
-    resp_run(&c->resp, 0, &j->out, &j->err);
+    recon_applied(&s->rec, &c->plan, &c->diff);
+    fprintf(stderr, LOG_I "спека применена%s\n", c->committed ? "" : " (в ядре менять нечего)");
+    resp_run(&c->resp, 0, &out, &err);
+    free(out.p);
+    free(err.p);
     resp_bool(&c->resp, "saved", 1);
     resp_bool(&c->resp, "applied", 1);
     resp_bool(&c->resp, "enabled", 1);
@@ -1252,34 +1378,34 @@ static void apply_done(struct conn *c, int code) {
 }
 
 /* apply — приложение присылает спеку ЦЕЛИКОМ; демон проверяет её, атомарно кладёт на место и
- * применяет. Порядок и доводы:
+ * применяет то, что в ней изменилось. Порядок и доводы:
  *
  *   1. Очередь изменяющих команд (см. «ИСПОЛНЕНИЕ» в шапке).
- *   2. Кандидат — во временный файл рядом со спекой и `apply --dry-run` по нему. Отказ —
+ *   2. Кандидат — во временный файл рядом со спекой и `apply-plan` по нему: те же проверки, что
+ *      у `apply --dry-run`, и отпечатки частей (набор правил, маршрутизация выходов). Отказ —
  *      временный файл удаляется, spec.json не тронут; в ответе код и stderr проверки,
  *      "saved":false.
  *   3. Прежняя спека читается в память — на случай отката в п. 5 — и кандидат становится
  *      spec.json переименованием: снаружи виден либо прежний файл, либо новый целиком.
  *   4. Движок выключен — на этом всё: "saved":true, "applied":false, "enabled":false.
  *      Правила поставит init, когда движок включат (см. ctl_enabled).
- *   5. `apply` по новой спеке. Отказ (ядро не приняло набор — dry-run ядро не спрашивает) —
- *      прежняя спека возвращается на место, и в ядре, и на диске остаётся то, что было:
- *      иначе init повторял бы отвергнутую спеку на каждой загрузке и перезапуске netd.
+ *   5. Сверка с применённым (recon.c): изменившиеся части — `apply-commit` (набор правил одной
+ *      транзакцией, привязка изменившихся выходов, снятие правил убранных); не изменилось ничего
+ *      — в ядро демон не идёт вовсе. Отказ (ядро не приняло набор — план ядро не спрашивает) —
+ *      прежняя спека возвращается на место, и в ядре, и на диске остаётся то, что было: иначе
+ *      init повторял бы отвергнутую спеку на каждой загрузке и перезапуске netd.
  *      "saved":false, "rolled_back":true.
  *   6. Успех — перечитать спеку резолвером и супервизором (как reload), "reload" в ответе.
  *
- * После п. 4 и п. 6 демон перечитывает спеку в память и шлёт подписчикам applied. Сторожу
- * (failover --loop) сигнал не нужен: каждый его проход — новый процесс, который читает спеку
- * заново. */
+ * После п. 4 и п. 6 демон перечитывает спеку в память и шлёт подписчикам applied; в ответе и в
+ * событии — поле changed. */
 static void st_apply(struct conn *c) {
     if (ctl_write_tmp(c->srv->cf.spec, c->q.body, c->q.body_n, c->tmp, sizeof(c->tmp)) != 0) {
         resp_error(&c->resp, "internal", "не удалось записать временный файл спеки");
         conn_reply(c);
         return;
     }
-    char *av[10];
-    dry_argv(c, c->tmp, av);
-    if (job_start(c, av, 120, 1, CTL_ERR_MAX, apply_dry) != 0) {
+    if (plan_start(c, c->tmp, apply_planned) != 0) {
         unlink(c->tmp);
         resp_error(&c->resp, "internal", "не удалось запустить движок");
         conn_reply(c);
@@ -1396,15 +1522,77 @@ static void reload_begin(struct conn *c) {
 }
 
 static void reload_done(struct conn *c) {
-    srv_spec_changed(c->srv, "reload", ctl_enabled());
+    srv_spec_changed(c->srv, "reload", ctl_enabled(), &c->diff, c->watch, &c->resp);
     conn_reply(c);
 }
 
-static void st_reload(struct conn *c) {
-    cb_str(&c->resp, ",\"code\":0");
-    resp_bool(&c->resp, "enabled", ctl_enabled());
+/* Голова ответа reload: код (не 0 — ядро не приняло набор или план не прошёл, причина в
+ * stderr), выключатель. Дальше — прежние шаги reload. */
+static void reload_head(struct conn *c, int enabled, struct cbuf *err) {
+    cb_fmt(&c->resp, ",\"code\":%d", c->rcode);
+    if (c->rcode != 0) {
+        cb_utf8_trim(err);
+        cb_str(&c->resp, ",\"stderr\":");
+        cb_json(&c->resp, err->p ? err->p : "", err->n);
+    }
+    resp_bool(&c->resp, "enabled", enabled);
     c->after_reload = reload_done;
     reload_begin(c);
+}
+
+static void reload_committed(struct conn *c, int code) {
+    struct cbuf out, err;
+    commit_output(c, &out, &err);
+    if (code != 0 || (c->committed && c->job.timed_out)) {
+        /* Спеки на откат у reload нет: на диске она та же. Ядро отвергло набор — прежний стоит;
+         * что успело встать до срока — не знаем. Остальное reload делает, как прежде. */
+        recon_forget(&c->srv->rec);
+        c->rcode = code < 0 ? 127 : code;
+        memset(&c->diff, 0, sizeof(c->diff));
+        fprintf(stderr, LOG_W "reload: применение не прошло (код %d)\n", code);
+    } else {
+        recon_applied(&c->srv->rec, &c->plan, &c->diff);
+    }
+    free(out.p);
+    reload_head(c, 1, &err);
+    free(err.p);
+}
+
+static void reload_planned(struct conn *c, int code) {
+    struct job *j = &c->job;
+    if (code != 0 || j->timed_out || plan_take(c) != 0) {
+        /* Спека не проходит проверку (или план не разобран): в ядро не идём, остальное — как
+         * прежде (перечитывание само скажет spec-error, если спека не читается). */
+        c->rcode = code > 0 ? code : 127;
+        c->watch = 1;
+        memset(&c->diff, 0, sizeof(c->diff));
+        reload_head(c, 1, &j->err);
+        return;
+    }
+    commit_start(c, reload_committed);
+}
+
+/* reload — то же, что apply, без новой спеки: сверка той, что на диске, с применённой (набор
+ * правил, маршрутизация, помощники, таблица резолвера — только изменившееся), и перечитывание.
+ * Движок выключен — в ядро не идём. */
+static void st_reload(struct conn *c) {
+    c->rcode = 0;
+    if (!ctl_enabled()) {
+        recon_forget(&c->srv->rec);
+        c->watch = 1;
+        memset(&c->diff, 0, sizeof(c->diff));
+        reload_head(c, 0, NULL);
+        return;
+    }
+    if (plan_start(c, c->srv->cf.spec, reload_planned) != 0) {
+        struct cbuf e = {0};
+        cb_str(&e, LOG_W "не удалось запустить движок\n");
+        c->rcode = 127;
+        c->watch = 1;
+        memset(&c->diff, 0, sizeof(c->diff));
+        reload_head(c, 1, &e);
+        free(e.p);
+    }
 }
 
 /* ---- файлы списков: put-file, list-files, rm-file --------------------------------------------
@@ -1926,6 +2114,7 @@ static void conn_free(struct conn *c) {
     free(c->job.err.p);
     free(c->resp.p);
     free(c->old.p);
+    free(c->perr.p);
     free(c->body);
     free(c);
 }
@@ -2080,7 +2269,7 @@ static void srv_hup(struct loop *l, int signo, void *arg) {
     (void)l; (void)signo;
     struct ctl_srv *s = arg;
     if (s->lock_owner) s->hup_pending = 1;
-    else srv_spec_changed(s, "hup", ctl_enabled());
+    else srv_spec_changed(s, "hup", ctl_enabled(), NULL, 1, NULL);
 }
 
 static void ctl_bad_flag(const char *cmd, const char *msg, const char *arg) {
@@ -2219,6 +2408,7 @@ int ctl_serve_main(int argc, char **argv) {
     /* После ctl_listen: живой соседний сервер там уже дал бы отказ стартовать, и временные
      * файлы его обработчиков не тронуты. */
     ctl_lists_sweep(cf->lists_dir);
+    recon_init(&S.rec);
     if (steerd_init(&S.d, S.l, cf->spec, cf->state_dir) != 0) {
         fprintf(stderr, LOG_W "нет памяти под спеку\n");
         return 1;

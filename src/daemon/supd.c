@@ -55,6 +55,7 @@
 #include <signal.h>
 #include <time.h>
 #include <sys/types.h>
+#include <sys/stat.h>
 #include <sys/wait.h>
 #include <sys/epoll.h>
 
@@ -86,6 +87,10 @@ struct supd {
     char self[PATH_MAX];      /* настоящий файл движка: резолвер и помощники-программы */
     int seam;
     int stopping;
+    /* Отпечаток последней отданной резолверу таблицы (текст и файлы списков); tab_ok=0 — не
+     * отдавали. */
+    unsigned long long tab_fp;
+    int tab_ok;
     /* Резолвер: конец записи трубы таблицы и не отданные ещё байты. */
     int dn_fd;
     int dn_out;               /* ждём EPOLLOUT */
@@ -239,15 +244,59 @@ static void tab_out_cb(struct loop *l, int fd, uint32_t events, void *arg) {
     tab_flush(arg);
 }
 
-/* Собрать таблицу по спеке в памяти и поставить в трубу. */
-static void tab_send(struct supd *s) {
-    if (s->dn_fd < 0 || !s->d->have) return;
+/* Отпечаток таблицы: сам текст и то, что резолвер прочтёт по путям из неё (устройство, inode,
+ * размер и время правки каждого файла списка). Резолвер, получив таблицу, перечитывает списки —
+ * поэтому список, обновлённый на месте (put-file кладёт его переименованием: новый inode), тоже
+ * повод отдать таблицу, хотя текст её тот же. Поля строки канала — через «|», пути — с шестого
+ * (src/dnsd/tabfmt.h). */
+static unsigned long long tab_fingerprint(const char *p, size_t n) {
+    unsigned long long h = KIND_SIG_INIT;
+    kind_sig_mix(&h, p, n);
+    const char *end = p + n;
+    const char *ln = memchr(p, '\n', n);
+    for (ln = ln ? ln + 1 : end; ln < end; ) {
+        const char *e = memchr(ln, '\n', (size_t)(end - ln));
+        if (!e) e = end;
+        int field = 0;
+        for (const char *q = ln; q < e; ) {
+            const char *bar = memchr(q, '|', (size_t)(e - q));
+            const char *fe = bar ? bar : e;
+            if (field >= 5 && fe > q) {
+                char path[PATH_MAX];
+                size_t l = (size_t)(fe - q) < sizeof(path) - 1 ? (size_t)(fe - q) : sizeof(path) - 1;
+                memcpy(path, q, l);
+                path[l] = '\0';
+                struct stat sb;
+                long long v[5] = { 0, 0, -1, 0, 0 };
+                if (stat(path, &sb) == 0) {
+                    v[0] = (long long)sb.st_dev;
+                    v[1] = (long long)sb.st_ino;
+                    v[2] = (long long)sb.st_size;
+                    v[3] = (long long)sb.st_mtim.tv_sec;
+                    v[4] = (long long)sb.st_mtim.tv_nsec;
+                }
+                kind_sig_mix(&h, v, sizeof(v));
+            }
+            field++;
+            q = bar ? bar + 1 : e;
+        }
+        ln = e + 1;
+    }
+    return h;
+}
+
+/* Собрать таблицу по спеке в памяти и поставить в трубу. force=0 — только если она (или файлы
+ * списков) изменилась с прошлой отдачи; 1 — всегда (резолвер только что запущен). 1 — отдана. */
+static int tab_send(struct supd *s, int force) {
+    if (s->dn_fd < 0 || !s->d->have) return 0;
     char *p = NULL;
     size_t n = 0;
     FILE *f = open_memstream(&p, &n);
-    if (!f) return;
+    if (!f) return 0;
     tabfmt_build(s->d->sp, f);
-    if (fclose(f) != 0 || !p) { free(p); return; }
+    if (fclose(f) != 0 || !p) { free(p); return 0; }
+    unsigned long long fp = tab_fingerprint(p, n);
+    if (!force && s->tab_ok && fp == s->tab_fp) { free(p); return 0; }
     if (s->qoff) {
         memmove(s->q, s->q + s->qoff, s->qn - s->qoff);
         s->qn -= s->qoff;
@@ -257,20 +306,23 @@ static void tab_send(struct supd *s) {
         fprintf(stderr, LOG_SW "резолвер не забирает таблицу — закрываю трубу\n");
         free(p);
         tab_close(s);
-        return;
+        return 0;
     }
     if (s->qn + n > s->qcap) {
         size_t c = s->qcap ? s->qcap : 65536;
         while (c < s->qn + n) c *= 2;
         char *q = realloc(s->q, c);
-        if (!q) { free(p); return; }
+        if (!q) { free(p); return 0; }
         s->q = q;
         s->qcap = c;
     }
     memcpy(s->q + s->qn, p, n);
     s->qn += n;
     free(p);
+    s->tab_fp = fp;
+    s->tab_ok = 1;
     tab_flush(s);
+    return 1;
 }
 
 /* ---- запуск ------------------------------------------------------------------------------- */
@@ -312,7 +364,7 @@ static int start_dnsd(struct supd *s, struct helper *h) {
     tab_close(s);
     s->dn_fd = p[1];
     helper_started(h, pid);
-    tab_send(s);
+    tab_send(s, 1);
     return 0;
 }
 
@@ -466,12 +518,42 @@ struct supd *supd_start(struct steerd *d, const struct supd_conf *c) {
     return s;
 }
 
-void supd_spec_changed(struct supd *s) {
+/* Кого тронет сверка: помощник новый (или возвращён, пока прежний гас), с новой подписью,
+ * убранный. Считается ДО helpers_merge по тем же признакам, что у неё (команда и выход, подпись),
+ * — сама сверка общая с `steer supervise` и отчёта не ведёт. */
+static void changes_of(const struct supd *s, size_t fn, struct supd_changes *ch) {
+    const struct helper *h = s->set.h;
+    for (size_t k = 0; k < fn; k++) {
+        const struct helper *f = &s->fresh[k];
+        if (f->table) continue;
+        int same = 0;
+        for (size_t i = 0; i < s->set.n; i++)
+            if (!h[i].gone && !strcmp(h[i].cmd, f->cmd) && !strcmp(h[i].name, f->name) &&
+                h[i].sig == f->sig)
+                same = 1;
+        if (!same && ch->helpers_n < HELPERS_MAX)
+            snprintf(ch->helpers[ch->helpers_n++], sizeof(ch->helpers[0]), "%s", f->name);
+    }
+    for (size_t i = 0; i < s->set.n; i++) {
+        if (h[i].table || h[i].gone) continue;
+        int keep = 0;
+        for (size_t k = 0; k < fn; k++)
+            if (!strcmp(h[i].cmd, s->fresh[k].cmd) && !strcmp(h[i].name, s->fresh[k].name))
+                keep = 1;
+        if (!keep && ch->helpers_n < HELPERS_MAX)
+            snprintf(ch->helpers[ch->helpers_n++], sizeof(ch->helpers[0]), "%s", h[i].name);
+    }
+}
+
+void supd_spec_changed(struct supd *s, struct supd_changes *ch) {
+    if (ch) memset(ch, 0, sizeof(*ch));
     if (!s || s->stopping) return;
     size_t fn = supd_plan(s);
+    if (ch) changes_of(s, fn, ch);
     helpers_merge(&s->set, s->fresh, fn);
     helpers_compact(&s->set);
-    tab_send(s);
+    int sent = tab_send(s, 0);
+    if (ch) ch->dnsd = sent;
     supd_kick(s);
 }
 

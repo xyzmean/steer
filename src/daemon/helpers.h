@@ -128,9 +128,17 @@ struct supd_conf {
 
 /* Поднять детей по спеке в памяти демона: помощников и резолвер на таблице. NULL — нет памяти. */
 struct supd *supd_start(struct steerd *d, const struct supd_conf *c);
-/* Спека в памяти сменилась (apply, reload, SIGHUP): сверить помощников, послать резолверу
- * новую таблицу. */
-void supd_spec_changed(struct supd *s);
+/* Что тронула сверка (apply-сверка, docs/ctl.md, поле changed): выходы, чей помощник поднят,
+ * перезапущен ради новых параметров или погашен; написана ли резолверу новая таблица. */
+struct supd_changes {
+    char helpers[HELPERS_MAX][32];
+    size_t helpers_n;
+    int dnsd;
+};
+/* Спека в памяти сменилась (apply, reload, SIGHUP): сверить помощников по подписям, послать
+ * резолверу таблицу — только если изменился её текст или файлы списков, на которые она
+ * ссылается. ch (может быть NULL) — что тронуто. */
+void supd_spec_changed(struct supd *s, struct supd_changes *ch);
 /* Демон уходит: резолверу — закрыть трубу, помощникам — SIGTERM в обратном порядке подъёма,
  * по сроку SIGKILL. Ждёт их выхода. */
 void supd_stop(struct supd *s);
