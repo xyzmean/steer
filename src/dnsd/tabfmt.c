@@ -34,6 +34,7 @@ void tabfmt_build(const struct spec *sp, FILE *out) {
 static void tabfmt_release_current(void) {
     for (size_t i = 0; i < g_dch_n; i++) {
         ruleset_free(&g_dch[i].rules);
+        dch_parts_free(g_dch[i].parts, g_dch[i].parts_n);
         for (size_t k = 0; k < g_dch[i].rules_n; k++)
             free((char *)g_dch[i].rules_path[k]);
     }

@@ -211,6 +211,7 @@ const struct platform_ops plat_android = {
      * (property_get) не прочесть, а тянуть ради заголовка bionic-зависимость незачем: имени
      * системы панели достаточно. Модель ядро отдаёт из дерева устройств. */
     .os_release = NULL,
+    .packages_list = "/data/system/packages.list",
     .os_name = "Android",
     .model_path = "/proc/device-tree/model",
     .model_fallback = "android",

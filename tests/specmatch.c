@@ -254,6 +254,29 @@ int main(void) {
                                   "\"channels\":[{\"name\":\"p\",\"out\":\"wg\",\"match\":{"
                                   "\"proto\":\"udp\",\"ports\":[\"443\"]}}]}")));
 
+        /* Наборы sing-box: ключ srs_files/srs_file — источник списка наравне с prefixes_files,
+         * в схеме 1 тоже (сужение набора не пишется в спеку, его читает компилятор). Разбор
+         * содержимого не открывает — файла может и не быть. */
+        check("srs_file: канал из одного набора разобран (схема 1)", 0,
+              load_from_str(SPEC("\"outputs\":{\"wg\":{\"kind\":\"interface\",\"device\":\"wg0\"}},"
+                                 "\"channels\":[{\"name\":\"s\",\"out\":\"wg\","
+                                 "\"match\":{\"srs_file\":\"/tmp/nope.srs\"}}]}")));
+        check("srs_file: путь в канале", 1, g_spec.ch_n == 1 && g_spec.ch[0].srs_n == 1 &&
+              !strcmp(g_spec.ch[0].srs_files[0], "/tmp/nope.srs"));
+        check("srs_files: массив путей", 0,
+              load_from_str(SPEC("\"outputs\":{\"wg\":{\"kind\":\"interface\",\"device\":\"wg0\"}},"
+                                 "\"channels\":[{\"name\":\"s\",\"out\":\"wg\","
+                                 "\"match\":{\"srs_files\":[\"/tmp/a.srs\",\"/tmp/b.srs\"]}}]}")));
+        check("srs_files: два пути", 2, g_spec.ch_n == 1 ? (long)g_spec.ch[0].srs_n : -1);
+        check("srs_file рядом с srs_files: отказ", 2,
+              load_from_str(SPEC("\"outputs\":{\"wg\":{\"kind\":\"interface\",\"device\":\"wg0\"}},"
+                                 "\"channels\":[{\"name\":\"s\",\"out\":\"wg\",\"match\":{"
+                                 "\"srs_files\":[\"/tmp/a.srs\"],\"srs_file\":\"/tmp/b.srs\"}}]}")));
+        check("any рядом с srs_files — не «весь трафик», allow_all не нужен", 0,
+              load_from_str(SPEC("\"outputs\":{\"wg\":{\"kind\":\"interface\",\"device\":\"wg0\"}},"
+                                 "\"channels\":[{\"name\":\"s\",\"out\":\"wg\",\"match\":{"
+                                 "\"srs_file\":\"/tmp/a.srs\",\"any\":true}}]}")));
+
         /* Негодные записи — громкий отказ. Не педантизм: `nft -f` отвергает набор правил
          * ЦЕЛИКОМ на одном плохом элементе, и тогда на роутере остаются прежние правила, а
          * человек видит, что его выбор не подействовал, без намёка на причину. */

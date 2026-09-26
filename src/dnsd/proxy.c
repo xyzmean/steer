@@ -330,26 +330,33 @@ static void reload_rules(void) {
     g_rules_gen++;
     for (size_t i = 0; i < g_dch_n; i++) {
         struct ruleset fresh;
-        memset(&fresh, 0, sizeof(fresh));
-        int missing = 0;
-        for (size_t k = 0; k < g_dch[i].rules_n; k++)
-            if (load_rules_into(g_dch[i].rules_path[k], &fresh) != 0) {
-                missing++;
-                fprintf(stderr, "steer dnsd: channel %s: %s не читается\n",
-                        g_dch[i].set, g_dch[i].rules_path[k]);
-            }
-        if (missing && g_dch[i].rules.n > 0) {
+        struct dpart *parts;
+        size_t parts_n;
+        int composite;
+        /* Источники канала — списки, наборы .srs и их выбор (dch_rules_load, rules.c). */
+        int missing = dch_rules_load(&g_dch[i], &fresh, &parts, &parts_n, &composite);
+        if (missing)
+            fprintf(stderr, "steer dnsd: channel %s: источников не читается: %d\n",
+                    g_dch[i].set, missing);
+        if (missing && (g_dch[i].rules.n > 0 || g_dch[i].parts_n > 0)) {
             ruleset_free(&fresh);
+            dch_parts_free(parts, parts_n);
             fprintf(stderr, "steer dnsd: channel %s: оставлены прежние правила\n",
                     g_dch[i].set);
             continue;
         }
         ruleset_free(&g_dch[i].rules);
+        dch_parts_free(g_dch[i].parts, g_dch[i].parts_n);
         g_dch[i].rules = fresh;
+        g_dch[i].parts = parts;
+        g_dch[i].parts_n = parts_n;
+        g_dch[i].composite = composite;
     }
-    for (size_t i = 0; i < g_dch_n; i++)
-        fprintf(stderr, "steer dnsd: channel %s: %zu rule(s)\n",
-                g_dch[i].set, g_dch[i].rules.n);
+    for (size_t i = 0; i < g_dch_n; i++) {
+        size_t n = g_dch[i].rules.n;
+        for (size_t k = 0; k < g_dch[i].parts_n; k++) n += g_dch[i].parts[k].rules.n;
+        fprintf(stderr, "steer dnsd: channel %s: %zu rule(s)\n", g_dch[i].set, n);
+    }
 }
 
 /* Труба таблицы (--table-fd) стала читаемой: дочитать её до EAGAIN (неблокирующая, как и
@@ -807,7 +814,7 @@ static int upstream_answer(struct pending *p, uint8_t *buf, ssize_t n) {
             for (size_t c = 0; c < g_dch_n; c++) {
                 if (!(sets & (1ULL << c)) || !g_dch[c].realip) continue;
                 for (int k = 0; k < nips; k++)
-                    nft_add_element(g_dch[c].set, ntohl(ips[k].addr), set_ttl_clamp(ips[k].ttl));
+                    dch_add(c, qname, ntohl(ips[k].addr), set_ttl_clamp(ips[k].ttl));
             }
         if (!quiet)
             reply_client(buf, (size_t)n, &p->client, p->client_len, &p->local, p->have_local);
@@ -1789,6 +1796,11 @@ int run_proxy(int listen_port, int upstream_port) {
     if (g_table_fd >= 0) close(g_table_fd);
     close(g_listen_fd);
     close(g_epfd);
-    for (size_t i = 0; i < g_dch_n; i++) ruleset_free(&g_dch[i].rules);
+    for (size_t i = 0; i < g_dch_n; i++) {
+        ruleset_free(&g_dch[i].rules);
+        dch_parts_free(g_dch[i].parts, g_dch[i].parts_n);
+        g_dch[i].parts = NULL;
+        g_dch[i].parts_n = 0;
+    }
     return 0;
 }

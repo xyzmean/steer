@@ -439,6 +439,86 @@ int nft_add_element(const char *set_name, uint32_t key_host, uint32_t ttl) {
     return (rc == 0 || rc == -EEXIST) ? 0 : -1;
 }
 
+/* ---- составной ключ: адрес . протокол . порты ---------------------------------------------
+ *
+ * Набор канала со смешанным сужением (src/model/srsplan.c) объявлен как `ipv4_addr .
+ * inet_proto . inet_service` с флагом interval — в ядре это pipapo, и элемент у него один:
+ * NFTA_SET_ELEM_KEY с началом и NFTA_SET_ELEM_KEY_END с концом диапазона по всем полям сразу
+ * (не пара «начало + маркер конца», как у интервального набора из одного поля). Поля ключа
+ * выровнены по 4 байта: адрес — 4, протокол — байт и три нуля, порт — два байта big-endian и
+ * два нуля. Снято `nft --debug=netlink add element … { 198.51.100.7 . 17 . 50000-65535 }` на
+ * ядре 6.8: «076433c6 00000011 000050c3 - 076433c6 00000011 0000ffff».
+ *
+ * Срок — на самом элементе, как у обычного. Пересекающийся элемент ядро отвергает (EEXIST),
+ * поэтому вызывающий кладёт ящики, уже разложенные без пересечений (l4_union_boxes). */
+static size_t nftlk_concat_build(uint8_t *buf, size_t cap, uint32_t seq, uint16_t nft_msg_type,
+                                 const char *table, const char *obj_name,
+                                 const uint8_t key[12], const uint8_t key_end[12],
+                                 uint64_t timeout_ms) {
+    const char *fam_str, *tbl_str;
+    nftlk_split_table(table, &fam_str, &tbl_str);
+    struct nlbuf b;
+    nlbuf_init(&b, buf, cap);
+    struct nlmsghdr *nh = (struct nlmsghdr *)b.p;
+    b.p += NLMSG_ALIGN(sizeof(*nh));
+    struct nfgenmsg *nfg = (struct nfgenmsg *)b.p;
+    b.p += NLMSG_ALIGN(sizeof(*nfg));
+    nlbuf_put_str(&b, NFTA_SET_ELEM_LIST_TABLE, tbl_str);
+    nlbuf_put_str(&b, NFTA_SET_ELEM_LIST_SET, obj_name);
+    struct nlattr *elems = nlbuf_begin_nested(&b, NFTA_SET_ELEM_LIST_ELEMENTS);
+    struct nlattr *elem  = nlbuf_begin_nested(&b, NFTA_LIST_ELEM);
+    struct nlattr *k = nlbuf_begin_nested(&b, NFTA_SET_ELEM_KEY);
+    nlbuf_put_data(&b, NFTA_DATA_VALUE, key, 12);
+    nlbuf_end_nested(&b, k);
+    struct nlattr *ke = nlbuf_begin_nested(&b, NFTA_SET_ELEM_KEY_END);
+    nlbuf_put_data(&b, NFTA_DATA_VALUE, key_end, 12);
+    nlbuf_end_nested(&b, ke);
+    if (timeout_ms) nlbuf_put_be64(&b, NFTA_SET_ELEM_TIMEOUT, timeout_ms);
+    nlbuf_end_nested(&b, elem);
+    nlbuf_end_nested(&b, elems);
+    nh->nlmsg_len   = (uint32_t)(b.p - buf);
+    nh->nlmsg_type  = (uint16_t)((NFNL_SUBSYS_NFTABLES << 8) | nft_msg_type);
+    nh->nlmsg_flags = NLM_F_REQUEST | NLM_F_ACK
+                    | (nft_msg_type == NFT_MSG_NEWSETELEM ? NLM_F_CREATE : 0);
+    nh->nlmsg_seq   = seq;
+    nh->nlmsg_pid   = 0;
+    nfg->nfgen_family = nftlk_family(fam_str);
+    nfg->version      = NFNETLINK_V0;
+    nfg->res_id       = 0;
+    return nh->nlmsg_len;
+}
+
+static void concat_key(uint8_t out[12], uint32_t addr_host, uint8_t proto, uint16_t port) {
+    memset(out, 0, 12);
+    uint32_t a = htonl(addr_host);
+    memcpy(out, &a, 4);
+    out[4] = proto;
+    out[8] = (uint8_t)(port >> 8);
+    out[9] = (uint8_t)(port & 0xFF);
+}
+
+int nft_concat_element(int add, const char *set_name, uint32_t addr_host,
+                       const struct nftlk_box *box, uint32_t ttl) {
+    if (g_nlk_fd < 0) return -1;
+    uint8_t key[12], key_end[12], buf[NFTLK_MSG_CAP];
+    concat_key(key, addr_host, box->plo, box->lo);
+    concat_key(key_end, addr_host, box->phi, box->hi);
+    uint64_t timeout_ms = 0;
+    if (add && ttl) timeout_ms = (uint64_t)(ttl > 86400 ? 86400 : ttl) * 1000;
+    uint32_t seq = nftlk_seq_reserve(1);
+    size_t len = nftlk_concat_build(buf, sizeof(buf), seq,
+                                    add ? NFT_MSG_NEWSETELEM : NFT_MSG_DELSETELEM,
+                                    g_nft_table, set_name, key, key_end, timeout_ms);
+    uint8_t *msgs[1] = { buf };
+    int err = 0;
+    if (nftlk_txn(msgs, &len, 1, seq, &err) != 0) return -1;
+    if (err != 0 && dbg())
+        fprintf(stderr, "nftlk: concat element %s %s: error=%d (%s)\n", add ? "add" : "del",
+                set_name, err, strerror(-err));
+    if (add) return (err == 0 || err == -EEXIST) ? 0 : -1;
+    return (err == 0 || err == -ENOENT) ? 0 : -1;
+}
+
 /* Points a fake IP (key) at its real backend (data) in the DNAT map splify-apply
  * installs (`ip daddr 198.18.0.0/15 dnat ip to ip daddr map @<map_name>`). No
  * timeout: the fake IP is a stable, exclusive allocation for this domain, so the

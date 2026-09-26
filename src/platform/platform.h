@@ -65,6 +65,9 @@ struct platform_ops {
     unsigned lan_bridge : 1;          /* раздача через мост Linux (diag про br_netfilter) */
     unsigned warn_iptables_nat : 1;   /* старое ядро: предупреждать о живом nat iptables */
     const char *ctl_allow_domain;     /* SELinux-домен клиента сокета; NULL — проверки нет */
+    /* Таблица «пакет → UID» (package_name из наборов sing-box, src/model/srsplan.c); NULL —
+     * приложений на платформе нет, и правило набора про приложение не выражается. */
+    const char *packages_list;
 
     /* ---- устройство для заголовков подписки (src/tools/hwid.c) --------------------------- */
     const char *os_release;           /* файл версии системы; NULL — только имя os_name */

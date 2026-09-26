@@ -1,4 +1,5 @@
 #include "dnsd_int.h"
+#include "srsplan.h"
 
 struct dchan g_dch[MAX_CHANNELS];
 size_t g_dch_n;
@@ -13,7 +14,7 @@ size_t g_dch_n;
 uint64_t dch_match_mask(const char *host) {
     uint64_t m = 0;
     for (size_t i = 0; i < g_dch_n && i < 64; i++)
-        if (ruleset_match(&g_dch[i].rules, host)) m |= 1ULL << i;
+        if (dch_matches(&g_dch[i], host)) m |= 1ULL << i;
     return m;
 }
 
@@ -115,6 +116,102 @@ static void dch_name(const struct spec *sp, char *dst, size_t n, const struct ch
     group_set_name(sp, dst, n, c->out, "dom", fr, fn, realip, &c->l4);
 }
 
+/* ---- каналы с наборами sing-box -----------------------------------------------------------
+ *
+ * Канал с `srs_files` раскладывается на части (src/model/srsplan.c) — той же функцией, что у
+ * компилятора, поэтому имена наборов и то, какие клаузы в какой набор, совпадают без сговора.
+ * Доменная «единица» — это обычный канал или часть такого канала; имя её набора считается так
+ * же, как его считает build_groups для группы этой части. */
+static struct srs_plan g_plans[MAX_CHANNELS];
+static int g_plan_ok[MAX_CHANNELS];
+
+static void unit_name(const struct spec *sp, const struct channel *c, const struct srs_part *p,
+                      int realip, char *dst, size_t n) {
+    if (!p) { dch_name(sp, dst, n, c, realip); return; }
+    size_t fn = c->from_n ? c->from_n : sp->from_default_n;
+    const char (*fr)[64] = c->from_n ? c->from : sp->from_default;
+    if (p->kind == SP_COMPOSITE)
+        group_set_name_mixed(sp, dst, n, c->out, "dom", fr, fn, realip);
+    else if (p->kind == SP_EXTRA)
+        group_set_name_extra(sp, dst, n, c->out, "dom", fr, fn, realip, p->id);
+    else
+        group_set_name(sp, dst, n, c->out, "dom", fr, fn, realip,
+                       l4match_same(&p->l4, &c->l4) ? &c->l4 : &p->l4);
+}
+
+/* Строки источников, собранные здесь (выбор клауз), живут до следующей сборки таблицы. */
+static char **g_strs;
+static size_t g_strs_n, g_strs_cap;
+
+static const char *keep_str(char *s) {
+    if (!s) return NULL;
+    if (g_strs_n == g_strs_cap) {
+        size_t cap = g_strs_cap ? g_strs_cap * 2 : 16;
+        char **p = realloc(g_strs, cap * sizeof(*p));
+        if (!p) { free(s); return NULL; }
+        g_strs = p;
+        g_strs_cap = cap;
+    }
+    g_strs[g_strs_n++] = s;
+    return s;
+}
+
+static void strs_free(void) {
+    for (size_t i = 0; i < g_strs_n; i++) free(g_strs[i]);
+    g_strs_n = 0;
+}
+
+/* «srs:<клаузы>:<путь>» для клауз имён части. Обычный набор — номера (соседние — диапазоном);
+ * составной — номер и сужение каждой («0=udp/50000-65535»): у элементов набора оно своё. */
+static const char *srs_source(const struct srs_psel *ps, int composite) {
+    size_t cap = 64 + strlen(ps->path), n = 0;
+    char *b = malloc(cap);
+    if (!b) return NULL;
+    n = (size_t)snprintf(b, cap, "srs:");
+    int first = 1;
+    for (size_t i = 0; i < ps->ncl; i++) {
+        if (!(ps->sel[i >> 3] & (1u << (i & 7)))) continue;
+        if (srs_clause(ps->set, i)->kind != SRS_C_DOM) continue;
+        size_t j = i;
+        if (!composite)
+            while (j + 1 < ps->ncl && (ps->sel[(j + 1) >> 3] & (1u << ((j + 1) & 7))) &&
+                   srs_clause(ps->set, j + 1)->kind == SRS_C_DOM)
+                j++;
+        char item[200], l4t[160];
+        if (composite) {
+            l4_to_text(&ps->eff[i], l4t, sizeof(l4t));
+            snprintf(item, sizeof(item), "%s%zu=%s", first ? "" : ",", i, l4t);
+        } else if (j > i) {
+            snprintf(item, sizeof(item), "%s%zu-%zu", first ? "" : ",", i, j);
+        } else {
+            snprintf(item, sizeof(item), "%s%zu", first ? "" : ",", i);
+        }
+        size_t il = strlen(item);
+        if (n + il + strlen(ps->path) + 4 > cap) {
+            cap = (n + il + strlen(ps->path) + 4) * 2;
+            char *nb = realloc(b, cap);
+            if (!nb) { free(b); return NULL; }
+            b = nb;
+        }
+        memcpy(b + n, item, il + 1);
+        n += il;
+        first = 0;
+        i = j;
+    }
+    snprintf(b + n, cap - n, ":%s", ps->path);
+    return keep_str(b);
+}
+
+static const char *cl_source(const struct l4match *l4, const char *path) {
+    char t[160];
+    l4_to_text(l4, t, sizeof(t));
+    size_t n = strlen(t) + strlen(path) + 8;
+    char *b = malloc(n);
+    if (!b) return NULL;
+    snprintf(b, n, "cl:%s:%s", t, path);
+    return keep_str(b);
+}
+
 /* В какой доменный набор компилятор кладёт канал БЕЗ доменных списков. 1 — в набор `set`
  * с режимом `*realip`, 0 — ни в какой: его группа адресная, и доменной части у канала нет.
  *
@@ -131,27 +228,95 @@ static void dch_name(const struct spec *sp, char *dst, size_t n, const struct ch
  * когда совпадает с доменным каналом по выходу, клиентам и сужению — ровно то, что входит в
  * имя набора; режим группы — у первого такого доменного канала в порядке компилятора
  * (сначала правила на устройство, потом остальные). Поэтому имя адресного канала считается
- * с режимом каждого кандидата и сравнивается с именем кандидата: совпало — это его группа. */
-static int dch_join_domain_group(const struct spec *sp, const struct channel *c, char *set,
-                                 size_t n, int *realip) {
+ * с режимом каждого кандидата и сравнивается с именем кандидата: совпало — это его группа.
+ *
+ * Доменный кандидат — обычный канал с domains_files или часть канала с наборами, в которой
+ * есть имена (unit_name). */
+static int dch_join_domain_group(const struct spec *sp, const struct channel *c,
+                                 const struct srs_part *cp, char *set, size_t n, int *realip) {
     for (int pass = 0; pass < 2; pass++)
         for (size_t j = 0; j < sp->ch_n; j++) {
             const struct channel *d = &sp->ch[j];
             if ((pass == 0) != (d->dev_scope != 0)) continue;
-            if (d->disabled || !d->domains_n) continue;
-            char want[64], mine[64];
-            dch_name(sp, want, sizeof(want), d, d->realip);
-            dch_name(sp, mine, sizeof(mine), c, d->realip);
-            if (strcmp(want, mine)) continue;
-            snprintf(set, n, "%s", want);
-            *realip = d->realip;
-            return 1;
+            if (d->disabled) continue;
+            size_t np = d->srs_n ? (g_plan_ok[j] ? g_plans[j].n : 0) : 1;
+            for (size_t k = 0; k < np; k++) {
+                const struct srs_part *dp = d->srs_n ? &g_plans[j].p[k] : NULL;
+                if (dp ? !dp->has_dom : !d->domains_n) continue;
+                char want[64], mine[64];
+                unit_name(sp, d, dp, d->realip, want, sizeof(want));
+                unit_name(sp, c, cp, d->realip, mine, sizeof(mine));
+                if (strcmp(want, mine)) continue;
+                snprintf(set, n, "%s", want);
+                *realip = d->realip;
+                return 1;
+            }
         }
     return 0;
 }
 
+/* Найти или завести канал резолвера под набор set. */
+static struct dchan *dch_slot(const char *set, int realip, const char *out) {
+    size_t k = 0;
+    for (; k < g_dch_n; k++)
+        if (!strcmp(g_dch[k].set, set) && g_dch[k].realip == realip) return &g_dch[k];
+    if (g_dch_n >= MAX_CHANNELS) return NULL;
+    memset(&g_dch[g_dch_n], 0, sizeof(g_dch[g_dch_n]));
+    snprintf(g_dch[g_dch_n].set, sizeof(g_dch[g_dch_n].set), "%s", set);
+    snprintf(g_dch[g_dch_n].out, sizeof(g_dch[g_dch_n].out), "%.31s", out);
+    g_dch[g_dch_n].realip = realip;
+    return &g_dch[g_dch_n++];
+}
+
+static void dch_name_rule(struct dchan *d, const struct channel *c, int dom) {
+    if (!d->chan[0] || (!d->chan_dom && dom)) {
+        snprintf(d->chan, sizeof(d->chan), "%.31s", c->name);
+        d->chan_dom = dom;
+    }
+}
+
+static void dch_src(struct dchan *d, const char *src) {
+    if (src && d->rules_n < MAX_FILES) d->rules_path[d->rules_n++] = src;
+}
+
+/* Канал с наборами: его части с именами — каналы резолвера (или, без имён, но со своими
+ * адресными списками, — часть доменной группы соседа, как у обычного канала). */
+static void dch_add_srs_channel(const struct spec *sp, size_t ci) {
+    const struct channel *c = &sp->ch[ci];
+    if (!g_plan_ok[ci]) return;
+    for (size_t pi = 0; pi < g_plans[ci].n; pi++) {
+        const struct srs_part *p = &g_plans[ci].p[pi];
+        char set[64];
+        int realip = c->realip;
+        if (p->has_dom) unit_name(sp, c, p, realip, set, sizeof(set));
+        else if (!(p->own && c->prefixes_n && p->kind != SP_EXTRA) ||
+                 !dch_join_domain_group(sp, c, p, set, sizeof(set), &realip))
+            continue;
+        struct dchan *d = dch_slot(set, realip, c->out);
+        if (!d) return;
+        dch_name_rule(d, c, p->has_dom);
+        int composite = p->kind == SP_COMPOSITE;
+        if (p->own) {
+            for (size_t f = 0; f < c->domains_n; f++)
+                dch_src(d, composite ? cl_source(&c->l4, c->domains_files[f]) : c->domains_files[f]);
+            for (size_t f = 0; f < c->prefixes_n; f++)
+                dch_src(d, composite ? cl_source(&c->l4, c->prefixes_files[f]) : c->prefixes_files[f]);
+        }
+        for (size_t k = 0; k < p->sel_n; k++)
+            if (p->sel[k].has_dom) dch_src(d, srs_source(&p->sel[k], composite));
+    }
+}
+
 void dch_build(const struct spec *sp) {
     g_dch_n = 0;
+    strs_free();
+    for (size_t i = 0; i < sp->ch_n && i < MAX_CHANNELS; i++) {
+        if (g_plan_ok[i]) srs_plan_free(&g_plans[i]);
+        g_plan_ok[i] = 0;
+        if (!sp->ch[i].srs_n || sp->ch[i].disabled) continue;
+        struct err e = {0};
+        g_plan_ok[i] = srs_plan_channel(sp, &sp->ch[i], -1, &g_plans[i], &e) == 0;
+    }
     /* Same coalescing the compiler does, and it must agree with it exactly: the set
      * names here ARE the sets it generated. Domain channels that share an output, the
      * same clients and the same mode are one set — which is why this groups by
@@ -188,6 +353,7 @@ void dch_build(const struct spec *sp) {
          * ничего не меняется, надо именно удалить» (обратка, два роутера с одинаковым
          * набором правил). Ровно та же строка, что в steer.c, и по той же причине. */
         if (sp->ch[i].disabled) continue;
+        if (sp->ch[i].srs_n) { dch_add_srs_channel(sp, i); continue; }
         if (!sp->ch[i].domains_n && !sp->ch[i].prefixes_n) continue;
         char set[64];
         int realip = sp->ch[i].realip;
@@ -203,7 +369,7 @@ void dch_build(const struct spec *sp) {
          * Канал без доменных списков доменной части не получает, если только компилятор не
          * положил его в доменную группу соседа, — см. dch_join_domain_group. */
         if (sp->ch[i].domains_n) dch_name(sp, set, sizeof(set), &sp->ch[i], realip);
-        else if (!dch_join_domain_group(sp, &sp->ch[i], set, sizeof(set), &realip)) continue;
+        else if (!dch_join_domain_group(sp, &sp->ch[i], NULL, set, sizeof(set), &realip)) continue;
         size_t k = 0;
         for (; k < g_dch_n; k++)
             if (!strcmp(g_dch[k].set, set) && g_dch[k].realip == realip) break;

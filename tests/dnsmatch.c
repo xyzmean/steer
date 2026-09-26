@@ -21,6 +21,7 @@
 #include "dnsd_int.h"
 #include "nftnl.h"
 #include "tabfmt.h"
+#include "srsplan.h"
 #include <sys/stat.h>
 
 static int fails;
@@ -28,6 +29,12 @@ static int fails;
 static void check(const char *what, int want, int got) {
     printf("%-58s %s\n", what, want == got ? "ok" : "ПРОВАЛ");
     if (want != got) fails++;
+}
+
+static void check_str(const char *what, const char *want, const char *got) {
+    int ok = strcmp(want, got) == 0;
+    printf("%-58s %s\n", what, ok ? "ok" : "ПРОВАЛ");
+    if (!ok) { fails++; printf("     хочу: %s\n     есть: %s\n", want, got); }
 }
 
 /* Набор из строк списка — в том же виде, в каком их читает load_rules_into. */
@@ -701,6 +708,89 @@ int main(void) {
         memcpy(q3, q1, sizeof(q3));
         q3[qe - 3] = 28;                        /* QTYPE A -> AAAA */
         check("отпечаток вопроса: тип записи учитывается", 1, question_fp(q3, qe) != f1);
+    }
+
+    /* ---- НАБОРЫ sing-box (.srs) У РЕЗОЛВЕРА ------------------------------------------------
+     *
+     * Путь к `.srs` — источник правил наравне с `.lst`: load_rules_into узнаёт набор по подписи
+     * и берёт его имена; канал с srs_files получает у резолвера выбор клауз (dch_build), а у
+     * составного набора — ещё и сужение каждой клаузы (часть правил со своим l4). Исключения
+     * («x, но не y») — своя часть с правилами-исключениями. Файлы — tests/srs, запуск из корня. */
+    {
+        struct ruleset rs = {0};
+        check("srs: путь к набору читается как список", 0,
+              load_rules_into("tests/srs/discord.srs", &rs));
+        check("srs: имя из набора совпадает", 1, ruleset_match(&rs, "discord.com"));
+        check("srs: поддомен суффикса совпадает", 1, ruleset_match(&rs, "cdn.discordapp.com"));
+        check("srs: чужое имя — нет", 0, ruleset_match(&rs, "notdiscord.com"));
+        ruleset_free(&rs);
+        memset(&rs, 0, sizeof(rs));
+        check("srs: версия 1 (суффикс двумя ключами)", 0,
+              load_rules_into("tests/srs/telegram-v1.srs", &rs));
+        check("srs v1: само имя", 1, ruleset_match(&rs, "telegram.org"));
+        check("srs v1: поддомен", 1, ruleset_match(&rs, "core.telegram.org"));
+        ruleset_free(&rs);
+
+        char sp[] = "/tmp/dnsmatch-srs-spec.XXXXXX";
+        int sf = mkstemp(sp);
+        if (sf >= 0) {
+            FILE *ws = fdopen(sf, "w");
+            fprintf(ws, "{\"schema\":1,"
+                        "\"outputs\":{\"vl\":{\"kind\":\"interface\",\"device\":\"lo\"}},"
+                        "\"channels\":["
+                        "{\"name\":\"n\",\"match\":{\"srs_file\":\"tests/srs/dnsmixed.srs\"},"
+                        "\"out\":\"vl\"}]}\n");
+            fclose(ws);
+            static struct spec cfg;
+            struct err e = {0};
+            if (load_spec(sp, &cfg, &e) < 0) err_die(&e);
+            srs_concat_override = 1;
+            dch_build(&cfg);
+            check("srs: канал резолвера один (составной набор)", 1, (int)g_dch_n);
+            check_str("srs: имя набора — составное", "vl_dom_c0_m", g_dch_n ? g_dch[0].set : "");
+            check_str("srs: источник — клаузы имён с сужением",
+                      "srs:0=udp/50000-65535,1=-,2=-:tests/srs/dnsmixed.srs",
+                      g_dch_n && g_dch[0].rules_n ? g_dch[0].rules_path[0] : "");
+            if (g_dch_n) {
+                struct ruleset m;
+                struct dpart *parts;
+                size_t pn;
+                int comp;
+                check("srs: источники прочитаны", 0, dch_rules_load(&g_dch[0], &m, &parts, &pn, &comp));
+                g_dch[0].rules = m;
+                g_dch[0].parts = parts;
+                g_dch[0].parts_n = pn;
+                g_dch[0].composite = comp;
+                check("srs: набор составной", 1, comp);
+                check("srs: имя с сужением совпадает", 1, dch_matches(&g_dch[0], "a.voice.example"));
+                check("srs: имя без сужения совпадает", 1, dch_matches(&g_dch[0], "plain.example"));
+                check("srs: «и» с исключением — само имя совпадает", 1,
+                      dch_matches(&g_dch[0], "www.excl.example"));
+                check("srs: исключённое имя — нет", 0, dch_matches(&g_dch[0], "no.excl.example"));
+                check("srs: чужое имя — нет", 0, dch_matches(&g_dch[0], "voice.example.com"));
+                int udp = 0, full = 0;
+                for (size_t k = 0; k < pn; k++) {
+                    if (ruleset_match(&parts[k].rules, "a.voice.example") &&
+                        parts[k].l4.proto == CH_PROTO_UDP) udp = 1;
+                    if (ruleset_match(&parts[k].rules, "plain.example") &&
+                        l4match_empty(&parts[k].l4)) full = 1;
+                }
+                check("srs: у имени с сужением часть udp", 1, udp);
+                check("srs: у имени без сужения часть без сужения", 1, full);
+                ruleset_free(&g_dch[0].rules);
+                dch_parts_free(g_dch[0].parts, g_dch[0].parts_n);
+                g_dch[0].parts = NULL;
+                g_dch[0].parts_n = 0;
+            }
+            srs_concat_override = 0;
+            dch_build(&cfg);
+            check("srs без составных наборов: по каналу на сужение", 2, (int)g_dch_n);
+            check_str("… первый — с сужением набора",
+                      "srs:0:tests/srs/dnsmixed.srs", g_dch_n ? g_dch[0].rules_path[0] : "");
+            srs_concat_override = -1;
+            g_dch_n = 0;
+            unlink(sp);
+        }
     }
 
     printf("\n%s\n", fails ? "ЕСТЬ ПРОВАЛЫ" : "все проверки прошли");

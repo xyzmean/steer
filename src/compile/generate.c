@@ -18,6 +18,7 @@
 
 #include "spec.h"
 #include "generate.h"
+#include "srs.h"
 
 /* Короткий строковый буфер для выражений-перечней («ip saddr { a, b }», «th dport { … }»).
  * 4 КБ с запасом: самый длинный перечень — MAX_FROM (32) адресов или устройств по 63 символа,
@@ -303,12 +304,72 @@ static void x_mark(struct nft_rule *r, const struct output *o, unsigned mark) {
 }
 
 /* ---- наборы групп ----------------------------------------------------------------------- */
+
+/* Подсети наборов sing-box группы — источниками элементов (печатник читает их потоком). */
+static void set_add_srs(struct nft_table *t, struct nft_set *s, const struct group *g, int excl) {
+    for (size_t k = 0; k < g->srs_n; k++) {
+        const struct srs_psel *ps = g->srs[k];
+        size_t n = 0;
+        for (size_t c = 0; c < ps->ncl; c++)
+            if (ps->sel[c >> 3] & (1u << (c & 7))) {
+                const struct srs_clause *cl = srs_clause(ps->set, c);
+                if (cl->kind == SRS_C_CIDR) n += excl ? cl->n_xv4 : cl->n_v4;
+            }
+        if (!n) continue;
+        struct ir_srs *src = ir_mem(t->rs, sizeof(*src));
+        if (!src) return;
+        src->set = ps->set;
+        src->sel = ps->sel;
+        src->excl = excl;
+        ir_set_srs(s, ps->path, src);
+    }
+}
+
+/* Элементы составного набора: адресные списки со сужением канала и подсети наборов со своим
+ * сужением у каждой клаузы. Раскладку в непересекающиеся элементы делает печатник. */
+static void set_add_mixed(struct nft_table *t, struct nft_set *s, const struct group *g) {
+    size_t n = (g->addrs ? g->files_n : 0) + (g->srs_addrs ? g->srs_n : 0);
+    if (!n) return;
+    struct ir_mixed_src *v = ir_mem(t->rs, n * sizeof(*v));
+    struct ir_mixed *m = ir_mem(t->rs, sizeof(*m));
+    if (!v || !m) return;
+    size_t k = 0;
+    if (g->addrs)
+        for (size_t f = 0; f < g->files_n; f++) {
+            v[k].path = g->files[f];
+            v[k].l4 = g->files_l4[f];
+            k++;
+        }
+    if (g->srs_addrs)
+        for (size_t f = 0; f < g->srs_n; f++) {
+            v[k].path = g->srs[f]->path;
+            v[k].set = g->srs[f]->set;
+            v[k].sel = g->srs[f]->sel;
+            v[k].eff = g->srs[f]->eff;
+            k++;
+        }
+    m->n = k;
+    m->v = v;
+    ir_set_mixed(s, m);
+}
+
 static void build_group_sets(struct nft_table *t, const struct groups *gr) {
     for (size_t i = 0; i < gr->n; i++) {
         const struct group *g = &gr->g[i];
         /* `any`-группе набор не нужен; опустевшей — нужен, иначе её правило потеряет
          * `ip daddr` и станет безусловным (см. поле `emptied`). */
-        if (!g->files_n && !g->domains && !g->emptied) continue;
+        if (!group_has_set(g)) continue;
+        /* Составной набор: адрес . протокол . порты — у списка канала смешанное сужение, и у
+         * каждого элемента оно своё (src/model/srsplan.c). Флаги те же, что у обычного; без
+         * auto-merge: ядро сливает в составном ключе только точные повторы, а пересечений в нём
+         * нет по построению (раскладку делает печатник). */
+        if (g->composite) {
+            struct nft_set *s = ir_set_add(t, g->name, "ipv4_addr . inet_proto . inet_service");
+            if (!s) return;
+            s->flags = NFT_SET_INTERVAL | (g->domains ? NFT_SET_TIMEOUT : 0);
+            set_add_mixed(t, s, g);
+            continue;
+        }
         struct nft_set *s = ir_set_add(t, g->name, "ipv4_addr");
         if (!s) return;
         /* Доменный набор — timeout из-за резолвера: он кладёт адреса с TTL ответа, и адрес,
@@ -330,7 +391,53 @@ static void build_group_sets(struct nft_table *t, const struct groups *gr) {
          * печатник потоком (ir.h, «Память»). */
         if (g->files_n && g->addrs)
             for (size_t k = 0; k < g->files_n; k++) ir_set_file(s, g->files[k]);
+        if (g->srs_addrs) set_add_srs(t, s, g, 0);
+        /* Исключения-подсети доп. группы («x.com, но не эти адреса»): свой набор рядом, и
+         * правило проверяет его ПЕРЕД поиском в основном (x_dest). */
+        if (g->xcidr) {
+            char xn[80];
+            snprintf(xn, sizeof(xn), "%s_x", g->name);
+            struct nft_set *x = ir_set_add(t, xn, "ipv4_addr");
+            if (!x) return;
+            x->flags = NFT_SET_INTERVAL;
+            x->auto_merge = 1;
+            set_add_srs(t, x, g, 1);
+        }
     }
+}
+
+/* Назначение у правила группы: сужение и поиск в наборе, а у групп каналов с наборами sing-box
+ * ещё и их условия. reverse — встречный путь (там наш клиент — получатель, сервер — источник).
+ * lookup — ставить ли поиск в наборе (у разных цепочек своё условие, см. вызовы).
+ *
+ * Составной набор ищется одним выражением: адрес, протокол и порт сразу (`ip daddr . meta
+ * l4proto . th dport`), и отдельного x_l4 у такого правила нет — сужение лежит в элементах.
+ * У пакета без портов (ICMP, GRE) `th dport` читает два байта его заголовка, а элемент без
+ * сужения покрывает протоколы 0-255 и порты 0-65535, поэтому такой пакет ловится тем же
+ * правилом, что и раньше обычным набором. */
+static void x_dest(struct nft_rule *r, const struct group *g, int reverse, int lookup) {
+    if (g->xsrc_n) {
+        /* Ограничение по клиенту из набора (source_ip_cidr) — второе «ip saddr» рядом с «кому»
+         * канала: два сравнения в одном правиле — это пересечение. */
+        struct sbuf b = { .n = 0 };
+        sb_add(&b, "ip %s { ", reverse ? "daddr" : "saddr");
+        for (size_t i = 0; i < g->xsrc_n; i++) {
+            uint32_t a = g->xsrc[i].net;
+            sb_add(&b, "%s%u.%u.%u.%u/%d", i ? ", " : "", a >> 24, (a >> 16) & 255,
+                   (a >> 8) & 255, a & 255, g->xsrc[i].plen);
+        }
+        sb_add(&b, " }");
+        ir_x(r, "%s", b.s);
+    }
+    if (g->composite) {
+        if (lookup)
+            ir_setref(r, reverse ? "ip saddr . meta l4proto . th sport"
+                                 : "ip daddr . meta l4proto . th dport", g->name);
+        return;
+    }
+    x_l4(r, g->l4, reverse);
+    if (g->xcidr) ir_x(r, "ip %s != @%s_x", reverse ? "saddr" : "daddr", g->name);
+    if (lookup) ir_setref(r, reverse ? "ip saddr" : "ip daddr", g->name);
 }
 
 /* ---- разметка: prerouting_mark ------------------------------------------------------------
@@ -351,8 +458,7 @@ static int build_prerouting_mark(struct nft_table *t, const struct spec *sp,
          * становится два — см. legacy.c, шаг 1). */
         struct nft_rule *r = ir_rule(c);
         x_from(r, sp, g);
-        x_l4(r, g->l4, 0);
-        if (g->files_n || g->domains || g->emptied) ir_setref(r, "ip daddr", g->name);
+        x_dest(r, g, 0, group_has_set(g));
         /* НАШИ биты, а не всё слово: `mark and ~маска or метка`. Перезапись стирала метку
          * mwan3/pbr/sqm молча, а их перезапись — нашу, и тогда помеченный пакет уходил по
          * таблице main, минуя запрет on_fail=drop (I-135). Диапазон объявлен в spec.h и в
@@ -458,8 +564,7 @@ static void build_postrouting_down(struct nft_table *t, const struct spec *sp,
         /* Зеркало сужения: без него счётчик скачанного считал бы и тот трафик, который
          * правило разметки не берёт, — то есть врал бы ровно на ту величину, ради которой
          * порты и заведены. Тот же довод, что у x_to рядом. */
-        x_l4(r, g->l4, 1);
-        if (g->files_n || g->domains) ir_setref(r, "ip saddr", g->name);
+        x_dest(r, g, 1, g->files_n || g->srs_n || g->domains);
         x_counter_carried(r, g->name, 1);
         ir_comment(r, "steer-down:%s", g->name);
     }
@@ -765,8 +870,7 @@ int nft_emit_output_mark(struct nft_rs *rs, const struct spec *sp, const struct 
             ir_x(r, "ip daddr != { 10.0.0.0/8, 127.0.0.0/8, 169.254.0.0/16, 172.16.0.0/12, "
                     "192.168.0.0/16, 224.0.0.0/4, 255.255.255.255 }");
         }
-        x_l4(r, g->l4, 0);
-        if (g->files_n || g->domains || g->emptied) ir_setref(r, "ip daddr", g->name);
+        x_dest(r, g, 0, group_has_set(g));
         x_mark(r, o, o->mark);
         x_counter_carried(r, g->name, 0);
         ir_x(r, "return");
@@ -791,8 +895,7 @@ int nft_emit_output_mark(struct nft_rs *rs, const struct spec *sp, const struct 
         struct nft_rule *r = ir_rule(c);
         ir_x(r, "ct direction reply");
         ir_x(r, "ct mark and 0x%08x == 0x%08x", STEER_MARK_MASK, o->mark);
-        x_l4(r, g->l4, 1);
-        if (g->files_n || g->domains || g->emptied) ir_setref(r, "ip saddr", g->name);
+        x_dest(r, g, 1, group_has_set(g));
         x_counter_carried(r, g->name, 1);
         ir_comment(r, "steer-down:%s", g->name);
     }

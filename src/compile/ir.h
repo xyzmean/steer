@@ -106,11 +106,37 @@ enum nft_elk {
     NFT_EL_VALUE,               /* s — один элемент как есть */
     NFT_EL_ADDR_FILE,           /* s — путь к списку: адресные строки, прочее пропускается */
     NFT_EL_FAKEIP_STATE,        /* s — путь к fakeip.state резолвера: пары «поддельный : настоящий» */
+    NFT_EL_SRS,                 /* s — путь к набору .srs, p — struct ir_srs: его подсети v4 */
+    NFT_EL_MIXED,               /* p — struct ir_mixed: элементы составного набора (адрес . протокол
+                                 * . порты) из списков и наборов со своим сужением у каждого */
+};
+
+/* Источники элементов из наборов sing-box (src/model/srs.h). Дерево держит только указатели:
+ * набор читает печатник, потоком, как адресный список. Сами типы дереву не нужны — объявлены
+ * по имени, чтобы ir.c по-прежнему ничего не знал о модели. */
+struct srs_set;
+struct l4match;
+struct ir_srs {
+    const struct srs_set *set;
+    const unsigned char *sel;   /* бит на клаузу набора; NULL — все */
+    int excl;                   /* 1 — подсети ИСКЛЮЧЕНИЙ клауз, а не назначения */
+};
+struct ir_mixed_src {
+    const char *path;           /* адресный список или набор .srs */
+    const struct l4match *l4;   /* список: сужение, с которым идут все его адреса */
+    const struct srs_set *set;  /* набор: NULL — это адресный список */
+    const unsigned char *sel;
+    const struct l4match *eff;  /* набор: сужение каждой клаузы, по номеру */
+};
+struct ir_mixed {
+    size_t n;
+    const struct ir_mixed_src *v;
 };
 
 struct nft_elsrc {
     enum nft_elk k;
     const char *s;
+    const void *p;
     struct nft_elsrc *next;
 };
 
@@ -162,6 +188,12 @@ struct nft_set *ir_map_add(struct nft_table *t, const char *name, const char *ke
 void ir_set_value(struct nft_set *s, const char *v);
 void ir_set_file(struct nft_set *s, const char *path);
 void ir_set_fakeip_state(struct nft_set *s, const char *path);
+/* Подсети набора .srs (NFT_EL_SRS) и элементы составного набора (NFT_EL_MIXED). Указатели
+ * живут дольше дерева (разбор набора и группы каналов) — дерево их не копирует. */
+void ir_set_srs(struct nft_set *s, const char *path, const struct ir_srs *src);
+void ir_set_mixed(struct nft_set *s, const struct ir_mixed *m);
+/* Память арены дерева — для того, что живёт вместе с ним (источники элементов). */
+void *ir_mem(struct nft_rs *rs, size_t n);
 struct nft_chain *ir_chain_add(struct nft_table *t, const char *name);
 struct nft_chain *ir_base_chain_add(struct nft_table *t, const char *name, const char *type,
                                     const char *hook, const char *prio_name, int prio_off);

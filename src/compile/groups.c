@@ -37,15 +37,39 @@ static int group_add_file(struct group *g, const char *path, struct err *e) {
         const char **p = realloc(g->files, cap * sizeof(*p));
         if (!p) return err_set(e, "out of memory building channel groups", NULL);
         g->files = p;
+        /* Составной набор: сужение каждого файла — параллельно, той же ёмкости. */
+        if (g->composite) {
+            const struct l4match **q = realloc(g->files_l4, cap * sizeof(*q));
+            if (!q) return err_set(e, "out of memory building channel groups", NULL);
+            g->files_l4 = q;
+        }
         g->files_cap = cap;
     }
     g->files[g->files_n++] = path;
     return 0;
 }
 
+static int group_add_srs(struct group *g, const struct srs_psel *ps, struct err *e) {
+    if (g->srs_n == g->srs_cap) {
+        size_t cap = g->srs_cap ? g->srs_cap * 2 : 4;
+        const struct srs_psel **p = realloc(g->srs, cap * sizeof(*p));
+        if (!p) return err_set(e, "out of memory building channel groups", NULL);
+        g->srs = p;
+        g->srs_cap = cap;
+    }
+    g->srs[g->srs_n++] = ps;
+    return 0;
+}
+
 void groups_free(struct groups *gr) {
-    for (size_t i = 0; i < gr->n; i++) free(gr->g[i].files);
+    for (size_t i = 0; i < gr->n; i++) {
+        free(gr->g[i].files);
+        free(gr->g[i].files_l4);
+        free(gr->g[i].srs);
+    }
     gr->n = 0;
+    for (size_t i = 0; i < gr->plans_n; i++) srs_plan_free(&gr->plans[i]);
+    gr->plans_n = 0;
 }
 
 static int same_from(const struct spec *sp, const struct channel *c, const struct group *g) {
@@ -72,6 +96,97 @@ static int same_from(const struct spec *sp, const struct channel *c, const struc
  *
  * Внутри каждой из двух групп порядок спеки сохраняется: два правила на разные устройства
  * или два глобальных по-прежнему читаются сверху вниз, как и раньше. */
+/* Сужения нет — для составной группы: у её элементов оно своё, у правила — никакого. */
+static const struct l4match L4_NONE;
+
+static void member_add(struct group *g, const char *name) {
+    for (size_t i = 0; i < g->members_n; i++) if (g->members[i] == name) return;
+    if (g->members_n < MAX_CHANNELS) g->members[g->members_n++] = name;
+}
+
+/* Канал с наборами sing-box: группы — по его раскладке (src/model/srsplan.c). Части раскладки
+ * ложатся в группы по тем же правилам слияния, что обычные каналы: обычная часть — к группе с
+ * тем же выходом, клиентами, режимом и сужением (в том числе к группе обычного канала);
+ * составная — к составной с тем же выходом и клиентами; доп. часть — своей группой всегда. */
+static int add_srs_channel(const struct spec *sp, struct groups *gr, const struct channel *c,
+                           struct err *e) {
+    if (gr->plans_n >= MAX_CHANNELS) return err_set(e, "too many channels", NULL);
+    struct srs_plan *pl = &gr->plans[gr->plans_n];
+    if (srs_plan_channel(sp, c, -1, pl, e) != 0) return -1;
+    gr->plans_n++;
+    const char (*from)[64] = c->from_n ? c->from : sp->from_default;
+    size_t from_n = c->from_n ? c->from_n : sp->from_default_n;
+    for (size_t pi = 0; pi < pl->n; pi++) {
+        const struct srs_part *p = &pl->p[pi];
+        int domains = p->has_dom;
+        int composite = p->kind == SP_COMPOSITE;
+        /* Сужение части, совпавшее с сужением канала, — указателем на сужение КАНАЛА: имя набора
+         * тогда то же, что у канала с proto/ports (group_set_name нумерует сужения каналов). */
+        const struct l4match *l4 = composite ? &L4_NONE :
+                                   l4match_same(&p->l4, &c->l4) ? &c->l4 : &p->l4;
+        struct group *g = NULL;
+        if (p->kind != SP_EXTRA)
+            for (size_t k = 0; k < gr->n && !g; k++) {
+                struct group *h = &gr->g[k];
+                if (strcmp(h->out, c->out) != 0 || h->all || h->extra) continue;
+                if (h->composite != composite) continue;
+                if (domains && h->domains && h->realip != c->realip) continue;
+                if (!same_from(sp, c, h)) continue;
+                if (!composite && !l4match_same(h->l4, l4)) continue;
+                g = h;
+            }
+        if (!g) {
+            if (gr->n >= MAX_CHANNELS) return err_set(e, "too many channels", NULL);
+            g = &gr->g[gr->n++];
+            memset(g, 0, sizeof(*g));
+            g->out = c->out;
+            g->realip = c->realip;
+            g->from = from;
+            g->from_n = from_n;
+            g->l4 = l4;
+            g->composite = composite;
+            if (p->kind == SP_EXTRA) {
+                g->extra = p->id;
+                g->all = p->all;
+                g->xsrc = p->src;
+                g->xsrc_n = p->src_n;
+                g->xcidr = p->xcidr;
+                /* Приложения набора — «кому» этой группы: тем же видом «uid:N», что у канала на
+                 * телефон, поэтому правило строит тот же local_who. Имя считается по «кому»
+                 * канала: оно и отличает группы, а UID приложений в спеке не записан. */
+                if (p->uid_n) {
+                    g->from = (const char (*)[64])p->uid;
+                    g->from_n = p->uid_n;
+                }
+                group_set_name_extra(sp, g->name, sizeof(g->name), g->out,
+                                     p->all ? "all" : domains ? "dom" : "ip", from, from_n,
+                                     c->realip, p->id);
+            } else if (composite) {
+                group_set_name_mixed(sp, g->name, sizeof(g->name), g->out,
+                                     domains ? "dom" : "ip", from, from_n, c->realip);
+            } else {
+                group_set_name(sp, g->name, sizeof(g->name), g->out, domains ? "dom" : "ip",
+                               from, from_n, c->realip, l4);
+            }
+        }
+        if (domains) {
+            if (!g->domains) g->realip = c->realip;
+            g->domains = 1;
+        }
+        if (p->own) {
+            g->dfiles_n += c->domains_n;
+            for (size_t f = 0; f < c->prefixes_n; f++) {
+                if (group_add_file(g, c->prefixes_files[f], e) != 0) return -1;
+                if (g->composite) g->files_l4[g->files_n - 1] = &c->l4;
+            }
+        }
+        for (size_t k = 0; k < p->sel_n; k++)
+            if (group_add_srs(g, &p->sel[k], e) != 0) return -1;
+        member_add(g, c->name);
+    }
+    return 0;
+}
+
 int build_groups(const struct spec *sp, struct groups *gr, struct err *e) {
     /* Прежние векторы файлов не теряются: повторный разбор в том же значении их отдаёт. */
     groups_free(gr);
@@ -84,6 +199,12 @@ int build_groups(const struct spec *sp, struct groups *gr, struct err *e) {
          * ядре так же, как если бы его не было в спеке. Именно этого от выключателя и ждут:
          * «выключено» обязано значить «не действует», а не «действует тише». */
         if (c->disabled) continue;
+        /* Канал с наборами sing-box — по своей раскладке (у набора бывает своё сужение у каждой
+         * клаузы, свои условия и исключения). Канал без них — ровно как раньше, до байта. */
+        if (c->srs_n) {
+            if (add_srs_channel(sp, gr, c, e) != 0) return -1;
+            continue;
+        }
         int domains = c->domains_n > 0;
         /* Канал, забирающий ВЕСЬ трафик: у него нет набора вовсе. */
         int all = c->any && !c->prefixes_n && !c->domains_n;
@@ -91,6 +212,8 @@ int build_groups(const struct spec *sp, struct groups *gr, struct err *e) {
         for (; k < gr->n; k++) {
             struct group *g = &gr->g[k];
             if (strcmp(g->out, c->out) != 0) continue;
+            /* Составные и доп. группы — только каналов с наборами (add_srs_channel). */
+            if (g->composite || g->extra) continue;
             /* «Весь трафик» и «трафик из списка» — РАЗНЫЕ группы, даже когда выход и
              * клиенты совпадают. Слияние их было молчаливой потерей: правило группы
              * получало имя _ip и начинало проверять набор, то есть канал «весь трафик
@@ -147,9 +270,16 @@ int build_groups(const struct spec *sp, struct groups *gr, struct err *e) {
      * набора нет вовсе. */
     for (size_t i = 0; i < gr->n; i++) {
         struct group *g = &gr->g[i];
-        if (!g->files_n && !g->domains) continue;
-        group_set_name(sp, g->name, sizeof(g->name), g->out, g->domains ? "dom" : "ip",
-                       g->from, g->from_n, g->realip, g->l4);
+        if (!g->files_n && !g->srs_n && !g->domains) continue;
+        /* Доп. группа названа при заведении — её «кому» бывает UID приложений, а имя считается
+         * по «кому» канала; дописываться в неё некому. */
+        if (g->extra) continue;
+        if (g->composite)
+            group_set_name_mixed(sp, g->name, sizeof(g->name), g->out, g->domains ? "dom" : "ip",
+                                 g->from, g->from_n, g->realip);
+        else
+            group_set_name(sp, g->name, sizeof(g->name), g->out, g->domains ? "dom" : "ip",
+                           g->from, g->from_n, g->realip, g->l4);
     }
     /* Страховка, а не проверка входа: имя обязано быть уникальным по построению, и если
      * оно всё-таки повторилось — значит различитель не различил (например, два имени
@@ -277,6 +407,29 @@ static int count_list(const char *path, size_t *total, size_t *bad,
  *   несколько строк плохие — это мусор в файле, предупреждаем и пропускаем их, потому что
  *                            ронять канал из 19 тысяч префиксов из-за одной строки хуже. */
 int check_address_lists(struct groups *gr, struct err *e) {
+    /* Наборы sing-box: что снято при чтении и раскладке — по строке на причину (печатается
+     * здесь, в apply, а не в build_groups: status и explain строят группы на каждый опрос). */
+    for (size_t i = 0; i < gr->plans_n; i++) {
+        const char *w = gr->plans[i].warn;
+        while (*w) {
+            size_t n = strcspn(w, "\n");
+            fprintf(stderr, LOG_W "%.*s\n", (int)n, w);
+            w += n;
+            if (*w == '\n') w++;
+        }
+    }
+    for (size_t i = 0; i < gr->n; i++) {
+        struct group *g = &gr->g[i];
+        g->srs_addrs = 0;
+        for (size_t k = 0; k < g->srs_n; k++) {
+            const struct srs_psel *ps = g->srs[k];
+            for (size_t c = 0; c < ps->ncl; c++)
+                if (ps->sel[c >> 3] & (1u << (c & 7))) {
+                    const struct srs_clause *cl = srs_clause(ps->set, c);
+                    if (cl->kind == SRS_C_CIDR) g->srs_addrs += cl->n_v4;
+                }
+        }
+    }
     for (size_t i = 0; i < gr->n; i++) {
         struct group *g = &gr->g[i];
         /* Непрочитанный файл выбрасывается из группы ЗДЕСЬ, до подсчёта и до генерации:
@@ -292,7 +445,7 @@ int check_address_lists(struct groups *gr, struct err *e) {
             for (size_t m = k + 1; m < g->files_n; m++) g->files[m - 1] = g->files[m];
             g->files_n--;
         }
-        if (!g->files_n && !g->domains && !g->all) {
+        if (!g->files_n && !g->srs_n && !g->domains && !g->all) {
             /* Ни одного читаемого адресного списка, доменов нет. Канал остаётся пустым —
              * почему именно так, сказано у поля `emptied`. */
             g->emptied = 1;

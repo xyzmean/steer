@@ -217,7 +217,9 @@ static void status_emit(const struct spec *sp, const struct groups *gr, FILE *ou
          * значении уже разошлось по установленным версиям splify2. Переопределить его
          * значило бы, что новый движок со старым интерфейсом молча показывает не то. */
         if (dn) fprintf(out, ",\"down_packets\":%lu,\"down_bytes\":%lu", dn_p, dn_b);
-        fprintf(out, ",\"lists\":%zu,\"channels\":[", gr->g[i].files_n + gr->g[i].dfiles_n);
+        /* Набор .srs — один список, сколько бы клауз из него ни попало в группу. */
+        fprintf(out, ",\"lists\":%zu,\"channels\":[",
+                gr->g[i].files_n + gr->g[i].dfiles_n + gr->g[i].srs_n);
         for (size_t m = 0; m < gr->g[i].members_n; m++)
             fprintf(out, "%s\"%s\"", m ? "," : "", gr->g[i].members[m]);
         fprintf(out, "]}");

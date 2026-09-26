@@ -24,6 +24,12 @@ int nftlk_elem_msg(uint16_t nft_msg_type, const char *table,
                     uint64_t timeout_ms);
 uint32_t set_ttl_clamp(uint32_t ttl);
 int nft_add_element(const char *set_name, uint32_t key_host, uint32_t ttl);
+/* Элемент составного набора `ipv4_addr . inet_proto . inet_service` (см. nftnl.c): адрес и
+ * ящик «протоколы × порты». add — положить (ttl в секундах, 0 — навсегда) или убрать. 0 —
+ * в ядре желаемое состояние (EEXIST при добавлении и ENOENT при удалении — тоже). */
+struct nftlk_box { uint8_t plo, phi; uint16_t lo, hi; };
+int nft_concat_element(int add, const char *set_name, uint32_t addr_host,
+                       const struct nftlk_box *box, uint32_t ttl);
 int nft_map_set_element(const char *map_name, uint32_t fake_host,
                          uint32_t real_host, uint32_t known_real);
 

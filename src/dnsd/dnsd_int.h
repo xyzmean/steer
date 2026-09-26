@@ -172,11 +172,27 @@ struct fakeip_table {
 struct tcpc;
 
 /* One entry per channel that matches domains, in SPEC ORDER. */
+/* Часть правил доменного канала со своим сужением или своими исключениями — из наборов
+ * sing-box (src/model/srs.c). Имя совпадает, если совпало с rules и не совпало с excl; адрес
+ * такого имени ложится в составной набор с сужением l4 (у обычного набора сужение у правила). */
+struct dpart {
+    struct ruleset rules;
+    struct ruleset excl;
+    int has_excl;
+    struct l4match l4;
+};
+
 struct dchan {
     char set[64];               /* the nft set the compiler generated for it */
+    /* Источники правил: путь к списку (`.lst` или `.srs` — различается подписью файла) либо
+     * выбор из набора и сужение для составного набора — формы разбирает dch_rules_load
+     * (rules.c): «srs:<клаузы>:<путь>», «cl:<сужение>:<путь>». */
     const char *rules_path[MAX_FILES];
     size_t rules_n;
     struct ruleset rules;
+    struct dpart *parts;        /* правила со своим сужением или исключениями */
+    size_t parts_n;
+    int composite;              /* набор составной: элемент — адрес . протокол . порты */
     int realip;                 /* put the real answers in the set, do not fake */
     /* Правило спеки, от имени которого набор показывается в журнале имён (dns-log), и его
      * выход: человеку нужно имя правила с экрана, а не имя набора nft. Набор бывает общим у
@@ -237,6 +253,18 @@ void ruleset_free(struct ruleset *rs);
 int ruleset_match(const struct ruleset *rs, const char *host);
 int load_rules(const char *path, struct ruleset *rs);
 int load_rules_into(const char *path, struct ruleset *rs);
+/* Правила канала из его источников — рядом с текущими (main, parts): вызывающий подменяет
+ * целиком. Возвращает число непрочитанных источников; *composite — есть ли сужение у
+ * источников (набор канала составной). */
+int dch_rules_load(const struct dchan *d, struct ruleset *main, struct dpart **parts,
+                   size_t *parts_n, int *composite);
+void dch_parts_free(struct dpart *parts, size_t n);
+/* Совпадает ли имя с правилами канала (основными или частями). */
+int dch_matches(const struct dchan *d, const char *host);
+/* Положить адрес имени в набор канала i (или убрать): у составного набора — ящиками по
+ * сужению совпавших частей. ttl — как у nft_add_element. */
+int dch_add(size_t i, const char *domain, uint32_t addr_host, uint32_t ttl);
+void dch_del(size_t i, const char *domain, uint32_t addr_host);
 
 /* wire.c */
 int parse_query(const uint8_t *pkt, size_t len, char *out_qname,
