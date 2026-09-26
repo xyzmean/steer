@@ -82,7 +82,8 @@ CORE_SRC := src/lib/run.c src/lib/jsonw.c src/lib/evline.c src/compile/groups.c 
             src/daemon/explain.c src/daemon/supervise.c src/daemon/watch.c src/daemon/main.c \
             $(MODEL_SRC) $(DNSD_SRC) src/daemon/failover.c src/tools/aggregate.c src/proto/obfs/obfs.c \
             src/cli/cli.c src/tools/srs.c src/tools/puff.c src/tools/hwid.c src/daemon/ctl.c \
-            src/daemon/conns.c src/daemon/loop.c src/daemon/state.c src/daemon/watchd.c $(KINDS_BASE_SRC)
+            src/daemon/conns.c src/daemon/loop.c src/daemon/state.c src/daemon/watchd.c \
+            src/lib/rtnl.c src/daemon/foprobe.c src/daemon/gaiw.c $(KINDS_BASE_SRC)
 
 # Общее для обеих ролей: формат кадра, конфигурация, маршрутизация, рукопожатие, соединение
 # и то, на чём они стоят (TLS-записи, примитивы Reality, TUN). Расходиться на проводе этим

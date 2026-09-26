@@ -1014,13 +1014,33 @@ static void prefix_str(const struct awg_prefix *p, char *dst, size_t n) {
     snprintf(dst, n, "%s/%u", a, p->cidr);
 }
 
+/* Адрес на устройство или с него: RTM_NEWADDR/RTM_DELADDR, то же, что `ip addr add|del A/len
+ * dev X` (IFA_LOCAL и IFA_ADDRESS — один и тот же адрес, как у iproute2 без peer). 0 или errno.
+ * IPv6 — с IFA_F_NODAD: адрес на точке-точке без соседей, и проверка дубликата только задержала
+ * бы его на секунду в состоянии tentative. */
+static int addr_msg(int add, const struct awg_prefix *p, int index) {
+    uint8_t buf[128];
+    struct nlbuf b;
+    struct ifaddrmsg ifa = { .ifa_family = p->family, .ifa_prefixlen = p->cidr,
+                             .ifa_flags = p->family == AF_INET6 ? IFA_F_NODAD : 0,
+                             .ifa_scope = RT_SCOPE_UNIVERSE, .ifa_index = (unsigned)index };
+    struct nlmsghdr *nh = msg_begin(&b, buf, sizeof buf, add ? RTM_NEWADDR : RTM_DELADDR,
+                                    NLM_F_REQUEST | NLM_F_ACK | (add ? NLM_F_CREATE | NLM_F_EXCL : 0),
+                                    ++g_seq, &ifa, sizeof ifa);
+    size_t al = p->family == AF_INET ? 4 : 16;
+    nlbuf_put_data(&b, IFA_LOCAL, p->addr, al);
+    nlbuf_put_data(&b, IFA_ADDRESS, p->addr, al);
+    size_t n = msg_end(&b, nh);
+    return n ? rtnl_simple(buf, n) : EMSGSIZE;
+}
+
 /* Привести адреса устройства к файлу: недостающие добавить, лишние снять. Не «снять всё и
  * поставить заново»: повторный apply с тем же файлом не должен ни на миг оставлять устройство
- * без адреса. Через `ip`, как у kind=interface и у TUN клиентов (bind_device и соседи): одна
- * команда на адрес, раз в apply. IPv6 — с nodad: адрес на точке-точке без соседей, и
- * проверка дубликата только задержала бы его на секунду в состоянии tentative. */
+ * без адреса. Сообщениями rtnetlink, а не запуском `ip`: настройку туннеля делает и починка
+ * сторожа, а сторож в демоне работает без процессов на проход (docs/architecture.md, «4а») —
+ * и сама настройка ядру уже идёт по netlink, так что адрес здесь ничем не особенный. */
 static void addrs_sync(const char *dev, const struct awg_conf *c) {
-    char have[32][64];
+    struct awg_prefix have[32];
     size_t have_n = 0;
     struct ifaddrs *ifa0 = NULL;
     if (getifaddrs(&ifa0) == 0) {
@@ -1036,26 +1056,29 @@ static void addrs_sync(const char *dev, const struct awg_conf *c) {
                 memcpy(p.addr, a6, 16);
             }
             p.cidr = (uint8_t)(i->ifa_netmask ? prefix_of_mask(i->ifa_netmask) : (fam == AF_INET ? 32 : 128));
-            prefix_str(&p, have[have_n++], sizeof have[0]);
+            have[have_n++] = p;
         }
         freeifaddrs(ifa0);
     }
+    int index = 0;
+    if (link_query(dev, NULL, 0, &index) != 0) return;
+    int kept[32] = {0};
     for (size_t k = 0; k < c->addr_n; k++) {
-        char want[64];
-        prefix_str(&c->addr[k], want, sizeof want);
+        const struct awg_prefix *w = &c->addr[k];
         int found = 0;
-        for (size_t h = 0; h < have_n; h++) if (!strcmp(have[h], want)) { found = 1; have[h][0] = '\0'; }
+        for (size_t h = 0; h < have_n; h++)
+            if (!kept[h] && have[h].family == w->family && have[h].cidr == w->cidr &&
+                !memcmp(have[h].addr, w->addr, w->family == AF_INET ? 4 : 16)) { found = 1; kept[h] = 1; }
         if (found) continue;
-        const char *v4[] = { "ip", "addr", "add", want, "dev", dev, NULL };
-        const char *v6[] = { "ip", "-6", "addr", "add", want, "dev", dev, "nodad", NULL };
-        if (run_quiet(c->addr[k].family == AF_INET ? v4 : v6) != 0)
-            fprintf(stderr, LOG_W "%s: адрес %s не встал\n", dev, want);
+        int e = addr_msg(1, w, index);
+        if (e && e != EEXIST) {
+            char want[64];
+            prefix_str(w, want, sizeof want);
+            fprintf(stderr, LOG_W "%s: адрес %s не встал: %s\n", dev, want, strerror(e));
+        }
     }
-    for (size_t h = 0; h < have_n; h++) {
-        if (!have[h][0]) continue;
-        const char *del[] = { "ip", "addr", "del", have[h], "dev", dev, NULL };
-        run_quiet(del);
-    }
+    for (size_t h = 0; h < have_n; h++)
+        if (!kept[h]) addr_msg(0, &have[h], index);
 }
 
 /* ---- разрешение Endpoint --------------------------------------------------------------- */
@@ -1068,12 +1091,39 @@ static void addrs_sync(const char *dev, const struct awg_conf *c) {
  * телефона это обычное дело) getaddrinfo по RFC 6724 отдал бы первым адрес IPv6, и туннель
  * ушёл бы мимо цели — см. awg_via_check. Имя без адреса IPv4 при via не разрешится вовсе, и
  * журнал говорит почему. */
-static int resolve_peers(struct awg_conf *c, const char *dev, int loud, int v4only) {
+/* Ответ сторожа на это имя (kind_name, разрешённые заранее рабочим потоком — см. revive_names
+ * у вида ниже): NULL — сторож его не разрешал, спросить getaddrinfo самим. */
+static const struct kind_name *name_answer(const struct kind_name *names, size_t n,
+                                           const struct awg_peer *pe, int v4only) {
+    for (size_t i = 0; names && i < n; i++)
+        if (names[i].port == pe->ep_port && names[i].v4only == v4only &&
+            !strcmp(names[i].host, pe->ep_host))
+            return &names[i];
+    return NULL;
+}
+
+static int resolve_peers_with(struct awg_conf *c, const char *dev, int loud, int v4only,
+                              const struct kind_name *names, size_t nn) {
     int bad = 0;
     for (size_t i = 0; i < c->peer_n; i++) {
         struct awg_peer *pe = &c->peer[i];
         pe->ep_len = 0;
         if (!pe->has_ep) continue;
+        const struct kind_name *ans = name_answer(names, nn, pe, v4only);
+        if (ans) {
+            if (ans->rc == 0 && ans->addr_len && ans->addr_len <= sizeof pe->ep) {
+                memcpy(&pe->ep, &ans->addr, ans->addr_len);
+                pe->ep_len = ans->addr_len;
+                continue;
+            }
+            if (loud)
+                fprintf(stderr, LOG_W "%s: Endpoint %s не разрешился%s (%s) — пир без адреса, "
+                                "повторю при починке туннеля\n", dev, pe->ep_host,
+                        v4only ? " в IPv4 (туннель через via идёт только по IPv4)" : "",
+                        gai_strerror(ans->rc));
+            bad++;
+            continue;
+        }
         struct addrinfo hints = { .ai_family = v4only ? AF_INET : AF_UNSPEC,
                                   .ai_socktype = SOCK_DGRAM, .ai_protocol = IPPROTO_UDP };
         struct addrinfo *res = NULL;
@@ -1096,6 +1146,12 @@ static int resolve_peers(struct awg_conf *c, const char *dev, int loud, int v4on
         freeaddrinfo(res);
     }
     return bad;
+}
+
+/* Без ответов сторожа — сами, синхронно. Зовёт стенд awgmatch (движку хватает
+ * resolve_peers_with), поэтому inline: неиспользованная в сборке движка, она не шумит. */
+static inline int resolve_peers(struct awg_conf *c, const char *dev, int loud, int v4only) {
+    return resolve_peers_with(c, dev, loud, v4only, NULL, 0);
 }
 
 /* ---- реестр устройств и подпись параметров ------------------------------------------- */
@@ -1183,14 +1239,11 @@ static int is_our_kind(const char *k) {
  * каждому событию сети: это постоянные записи во флеш круглые сутки, против требования
  * владельца о батарее и сне (на роутере state — tmpfs, там это ничего не стоило).
  *
- * На телефоне сторож — `failover --loop`: один долгоживущий родитель и проход в дочернем
- * процессе (fork; почему так — у failover_loop в steer.c). Память родителя дочерний видит
- * копией, так что прошлые замеры он получает даром; новые отдаёт родителю через трубу одной
- * короткой записью (строк не больше, чем устройств). Проход, умерший на полпути (die() в
- * разборе спеки, SIGKILL), ничего не отдаёт — и родитель держит прежние замеры, а не пустые:
- * пустые означали бы «прошлого замера нет», и приговор отложился бы ещё на проход. Замеров в
- * файл круг не пишет вовсе; файл остаётся для одиночного прохода (круг procd на роутере), где
- * памяти между проходами нет. Сна это не касается: во сне проходов нет вовсе. */
+ * На телефоне сторож — `failover --loop` (или демон с --watch): один долгоживущий процесс, и
+ * проход идёт в нём же, автоматом на его цикле событий (failover.c). Прошлые замеры проход
+ * берёт из памяти процесса и туда же кладёт новые. Замеров в файл круг не пишет вовсе; файл
+ * остаётся для одиночного прохода (круг procd на роутере), где памяти между проходами нет. Сна
+ * это не касается: во сне проходов нет вовсе. */
 struct hs_sample {
     char dev[IFNAMSIZ];
     unsigned long long tx, rx;
@@ -1238,66 +1291,6 @@ static void hs_put(const char *dev, const struct hs_sample *s) {
     fclose(f);
 }
 
-/* Сообщение в трубу: строка на замер и «end» в конце — по нему родитель узнаёт, что прочёл всё.
- * Одной записью: при нескольких десятках строк это меньше PIPE_BUF, и родитель не увидит
- * половину. */
-void awg_hs_send(int fd) {
-    char buf[REG_MAX * 96 + 8];
-    size_t n = 0;
-    for (size_t i = 0; i < g_hs_n; i++) {
-        int w = snprintf(buf + n, sizeof buf - n, "%s %llu %llu %ld %d\n", g_hs[i].dev,
-                         g_hs[i].tx, g_hs[i].rx, g_hs[i].t, g_hs[i].v);
-        if (w < 0 || (size_t)w >= sizeof buf - n) return;
-        n += (size_t)w;
-    }
-    if (n + 4 >= sizeof buf) return;
-    memcpy(buf + n, "end\n", 4);
-    n += 4;
-    for (size_t off = 0; off < n; ) {
-        ssize_t w = write(fd, buf + off, n - off);
-        if (w < 0 && errno == EINTR) continue;
-        if (w <= 0) return;
-        off += (size_t)w;
-    }
-}
-
-void awg_hs_recv(int fd) {
-    char buf[REG_MAX * 96 + 8];
-    size_t n = 0;
-    for (;;) {
-        if (n >= sizeof buf - 1) break;
-        ssize_t r = read(fd, buf + n, sizeof buf - 1 - n);
-        if (r < 0 && errno == EINTR) continue;
-        if (r <= 0) break;
-        n += (size_t)r;
-    }
-    awg_hs_recv_buf(buf, n);
-}
-
-/* То же по уже прочитанному сообщению: демон читает трубу прохода сам, в своём цикле событий
- * (src/daemon/watchd.c), и замеры приходят ему хвостом общего сообщения. */
-void awg_hs_recv_buf(const char *msg, size_t n) {
-    char buf[REG_MAX * 96 + 8];
-    if (n >= sizeof buf) return;
-    memcpy(buf, msg, n);
-    buf[n] = '\0';
-    if (n < 4 || strcmp(buf + n - 4, "end\n") != 0) return;   /* проход не договорил */
-    struct hs_sample got[REG_MAX];
-    size_t k = 0;
-    for (char *save = NULL, *ln = strtok_r(buf, "\n", &save); ln; ln = strtok_r(NULL, "\n", &save)) {
-        if (!strcmp(ln, "end") || k >= REG_MAX) break;
-        struct hs_sample s;
-        memset(&s, 0, sizeof s);
-        char dev[64];
-        if (sscanf(ln, "%63s %llu %llu %ld %d", dev, &s.tx, &s.rx, &s.t, &s.v) != 5) continue;
-        if (strlen(dev) >= IFNAMSIZ) continue;
-        snprintf(s.dev, sizeof s.dev, "%s", dev);
-        got[k++] = s;
-    }
-    memcpy(g_hs, got, k * sizeof got[0]);
-    g_hs_n = k;
-}
-
 static void dev_state_drop(const char *dev) {
     char p[512];
     sig_path(dev, p, sizeof p);
@@ -1310,7 +1303,8 @@ static void dev_state_drop(const char *dev) {
 
 /* Поднять и настроить устройство выхода. loud — apply (предупреждения о файле печатаются);
  * сторож зовёт тихо, чтобы раз в пять минут не повторять одно и то же. 0 — готово. */
-static int awg_configure(const struct spec *sp, const struct output *o, int loud) {
+static int awg_configure(const struct spec *sp, const struct output *o, int loud,
+                         const struct kind_name *names, size_t nn) {
     static struct awg_conf c;         /* ~20 КБ — не на стек телефона */
     struct awg_secrets s;
     char err[256];
@@ -1428,7 +1422,7 @@ static int awg_configure(const struct spec *sp, const struct output *o, int loud
         if (link_query(dev, NULL, 0, &index) != 0) goto out;
     }
 
-    resolve_peers(&c, dev, loud, via != NULL);
+    resolve_peers_with(&c, dev, loud, via != NULL, names, nn);
 
     /* Пиры, которых в файле нет, снимаются флагом REPLACE_PEERS. Ставится он ТОЛЬКО когда
      * состав пиров действительно разошёлся: флаг снимает всех и ставит заново, то есть рвёт
@@ -1499,7 +1493,7 @@ int awg_apply_all(const struct spec *sp) {
             bad++;
             continue;
         }
-        if (awg_configure(sp, o, 1) != 0) bad++;
+        if (awg_configure(sp, o, 1, NULL, 0) != 0) bad++;
         /* В реестр — даже при отказе: устройство могло быть создано до отказа настройки, и
          * снять его потом должен кто-то. */
         if (keep_n < REG_MAX) snprintf(keep[keep_n++], IFNAMSIZ, "%s", o->device);
@@ -1646,7 +1640,8 @@ int awg_healthy(const struct output *o, const char *dev) {
     return verdict;
 }
 
-int awg_revive(const struct spec *sp, const struct output *o, const char *dev) {
+int awg_revive(const struct spec *sp, const struct output *o, const char *dev,
+               const struct kind_name *names, size_t n) {
     /* Устройства нет — это не «молчит», а «ещё не поднято»: так бывает при каждом включении
      * движка на телефоне, где сторож стартует раньше, чем выход успел создать устройство, и
      * после ручного `ip link del`. Предупреждение о молчащем пире в этом случае — ложная
@@ -1656,8 +1651,37 @@ int awg_revive(const struct spec *sp, const struct output *o, const char *dev) {
         fprintf(stderr, LOG_I "%s: устройства нет — поднимаю\n", dev);
     else
         fprintf(stderr, LOG_W "%s: туннель молчит — заново разрешаю Endpoint и перенастраиваю\n", dev);
-    if (awg_configure(sp, o, 0) != 0) return 0;
+    if (awg_configure(sp, o, 0, names, n) != 0) return 0;
     return awg_healthy(o, dev);
+}
+
+/* Имена Endpoint, которые починка разрешит, — чтобы сторож разрешил их заранее, не останавливая
+ * цикл демона (kind_name в kinds/kind.h, рабочий поток — src/daemon/gaiw.c). Литерал адреса —
+ * тоже имя: getaddrinfo ответит на него сразу, и отдельная ветка ради него не нужна. */
+size_t awg_revive_names(const struct spec *sp, const struct output *o, struct kind_name *dst,
+                        size_t max) {
+    (void)sp;
+    static struct awg_conf c;
+    struct awg_secrets s;
+    char err[256];
+    if (awg_conf_load(o->awg.conf, &c, &s, err, sizeof err) != 0) {
+        awg_secrets_wipe(&s);
+        awg_conf_free(&c);
+        return 0;
+    }
+    int v4only = awg_out_via(o) != NULL;
+    size_t n = 0;
+    for (size_t i = 0; i < c.peer_n && n < max; i++) {
+        if (!c.peer[i].has_ep) continue;
+        memset(&dst[n], 0, sizeof dst[n]);
+        snprintf(dst[n].host, sizeof dst[n].host, "%s", c.peer[i].ep_host);
+        dst[n].port = c.peer[i].ep_port;
+        dst[n].v4only = v4only;
+        n++;
+    }
+    awg_secrets_wipe(&s);
+    awg_conf_free(&c);
+    return n;
 }
 
 /* ---- status ------------------------------------------------------------------------------ */
@@ -1774,5 +1798,6 @@ const struct kind_ops kind_awg = {
     /* Чинится не ожиданием: процесса, который поднял бы туннель заново, нет — устройство живёт в
      * ядре. Лечится то же, что у netifd лечит ifdown/ifup: см. awg_revive выше. */
     .revive = awg_revive,
+    .revive_names = awg_revive_names,
     .status = awg_status,
 };

@@ -9,7 +9,7 @@
 #include <sys/wait.h>
 #include <linux/netlink.h>
 #include <linux/rtnetlink.h>
-#include <poll.h>
+#include <sys/epoll.h>
 #include <signal.h>
 #include <fcntl.h>
 #include <sys/socket.h>
@@ -26,6 +26,8 @@
 #include "srs.h"
 #include "ctl.h"
 #include "daemon.h"
+#include "loop.h"
+#include "fostate.h"
 
 
 /* Сторож по кругу: `steer failover --loop СЕК`.
@@ -35,24 +37,27 @@
  * /system/bin/sh значило бы выдать домену steerd право исполнять shell — то есть любую
  * команду, которую удастся подсунуть в спеку. Поэтому круг здесь, в движке.
  *
- * КАЖДЫЙ ПРОХОД — ОТДЕЛЬНЫЙ ПРОЦЕСС (fork). cmd_failover писан под «один проход и выход»:
- * спека грузится в глобальные массивы один раз, и повторный load_spec в том же процессе
- * склеил бы выходы двух чтений. Дочерний процесс получает чистую память и выходит через
- * exit, так что его atexit (снятие probe-rule) срабатывает, как и при запуске из shell; die()
- * в нём — это конец одного прохода, а не сторожа: следующий проход перечитает спеку, и
- * исправленная спека подхватится без перезапуска сервиса — ровно как в круге procd.
+ * ПРОХОД — ТОТ ЖЕ АВТОМАТ, ЧТО У ДЕМОНА И `steer failover` (failover.c, «ПРОХОД — КОНЕЧНЫЙ
+ * АВТОМАТ»), на своём цикле событий (loop.h), в этом же процессе, без fork. Раньше каждый проход
+ * был отдельным процессом: cmd_failover писался под «один проход и выход» и грузил спеку в
+ * глобальные массивы. Спека давно значение (правило 6), автомат ждёт на цикле, а не синхронно, и
+ * копия процесса на проход ушла — вместе с трубой, по которой ребёнок отдавал замеры awg: они
+ * теперь просто живут в памяти этого процесса (awg_hs_memory). Спека по-прежнему читается
+ * заново на каждом проходе: исправленная спека подхватывается без перезапуска сервиса — ровно
+ * как в круге procd, — а негодная означает только, что этот проход не состоится (строка отказа
+ * та же, что напечатал бы `steer failover`).
  *
- * СОН НА CLOCK_MONOTONIC — требование батареи. Этот таймер во сне устройства стоит и не
- * будит его (будят только *_ALARM и удерживаемый wakelock, которых здесь нет): пока телефон
- * спит, сторож молчит, а проснувшись, досыпает остаток периода.
+ * СОН НА CLOCK_MONOTONIC — требование батареи. Таймер цикла (timerfd на CLOCK_MONOTONIC) во сне
+ * устройства стоит и не будит его (будят только *_ALARM и удерживаемый wakelock, которых здесь
+ * нет): пока телефон спит, сторож молчит, а проснувшись, досыпает остаток периода.
  *
  * ПО СОБЫТИЯМ, А НЕ ТОЛЬКО ПО ПЕРИОДУ: смена интерфейса или адреса (сеть сменилась, TUN выхода
  * поднялся или упал) — внеочередной проход через пять секунд после события, см.
  * watch_nl_open. Период остаётся для того, чего событием не увидеть: туннель поднят,
- * а трафик через него не идёт.
+ * а трафик через него не идёт. Следующий проход — через период после конца предыдущего.
  *
- * init гасит сервис сигналом всей группе процессов, поэтому дочерний проход получает свой
- * SIGTERM и убирает за собой так же, как от kill на роутере. */
+ * SIGTERM и SIGINT приходят через цикл: идущий проход прерывается с уборкой правила пробы, и
+ * процесс уходит по сигналу, как уходил раньше. */
 /* Сокет событий ядра для сторожа: смена состояния интерфейса и его адресов. -1 — не
  * открылся, и сторож живёт одним периодом, как раньше.
  *
@@ -81,79 +86,147 @@ int watch_nl_drain(int fd) {
     return any;
 }
 
-int failover_loop(const char *spec, int verbose, int period) {
-    int ev = watch_nl_open();
-    for (;;) {
-        /* ПАМЯТЬ МЕЖДУ ПРОХОДАМИ — у родителя, а не в файлах каталога состояния: на телефоне это
-         * /data, флеш, и запись на каждом проходе (раз в минуту и по каждому событию сети) шла бы
-         * круглые сутки. Замеры счётчиков туннелей awg дочерний проход получает копией памяти при
-         * fork, а свои новые отдаёт по трубе (awg_hs_send / awg_hs_recv, src/kinds/awg.c). Остальное, что
-         * проход пишет, — выбор устройств (active), реестр меток, подпись awg — пишется только
-         * при изменении. Нет трубы — этот проход работает по-старому, файлом: без памяти
-         * приговор «туннель молчит» не вынести вовсе. O_CLOEXEC — чтобы команды, которые проход
-         * запускает (ip, nft), не держали конец записи и родитель не ждал их, читая трубу. */
-        int pfd[2];
-        int piped = pipe2(pfd, O_CLOEXEC) == 0;
-        awg_hs_memory(piped);
-        pid_t pid = fork();
-        if (pid == 0) {
-            if (piped) close(pfd[0]);
-            int rc = cmd_failover(spec, verbose);
-            /* masquerade правилом iptables (телефон): netd при перезапуске перестраивает
-             * iptables, и наши правила пропадают — вернуть их (iptables_masq_ensure в apply.c).
-             * Свой экземпляр спеки (правило 6): та, что cmd_failover уже разобрал, живёт в
-             * его собственном static struct spec и наружу не смотрит. Дочерний процесс за
-             * миг до этого прошёл этим же load_spec внутри cmd_failover — если спека была
-             * годной там, второй разбор здесь не откажет; не откажет — просто не подметём
-             * masquerade в этом проходе, тем же кругом починится в следующем. */
-            if (plat()->iptables_masq) {
-                static struct spec cfg;
-                struct err e2 = {0};
-                if (load_spec(spec, &cfg, &e2) == 0) iptables_masq_ensure(&cfg);
-            }
-            if (piped) awg_hs_send(pfd[1]);
-            exit(rc);
-        }
-        if (piped) close(pfd[1]);
-        if (pid > 0) {
-            /* Сначала дочитать трубу (до конца файла — проход вышел), потом ждать: сообщение
-             * короче буфера трубы, так что проход не встанет на записи, но порядок и так верный. */
-            if (piped) awg_hs_recv(pfd[0]);
-            while (waitpid(pid, NULL, 0) < 0 && errno == EINTR) {}
-        } else
-            fprintf(stderr, "steer[warn] failover: fork: %s\n", strerror(errno));
-        if (piped) close(pfd[0]);
-        /* На роутере (plat()->netifd) проход сам делает ifdown/ifup мёртвому интерфейсу, и
-         * события за время прохода — его же следы: реагировать на них значило бы будить себя
-         * по кругу. На телефоне сторож интерфейсы не трогает (только ждёт), и событие за время
-         * прохода — настоящее: например, TUN, который как раз поднял помощник выхода. */
-        if (plat()->netifd && ev >= 0) watch_nl_drain(ev);
+/* Возвращать ли masquerade (телефон, iptables_masq_ensure) после этого прохода. iptables -C —
+ * процесс на устройство, а сторож работает без процессов на проход; правило же пропадает только
+ * при перезапуске netd, который перестраивает iptables. Поэтому — после проходов по событию
+ * сети или смене спеки (force) и не реже раза в WATCH_MASQ_S. */
+int watch_masq_due(long *last, int force) {
+    struct timespec t;
+    clock_gettime(CLOCK_MONOTONIC, &t);
+    long now = (long)t.tv_sec;
+    if (!force && *last && now - *last < WATCH_MASQ_S) return 0;
+    *last = now ? now : 1;
+    return 1;
+}
 
-        /* Ждать период ИЛИ событие. poll на монотонном времени: во сне устройства ожидание
-         * стоит и не будит его. Событие — не повод бежать сразу: смена сети приходит пачкой
-         * (адрес ушёл, интерфейс лёг, поднялся, адрес пришёл), и проход на середине увидел бы
-         * полусобранную сеть. Пять секунд — и чтобы она закончилась, и чтобы мигающий
-         * интерфейс не гонял проходы подряд. */
-        long left = (long)period * 1000;
-        struct timespec t0;
-        clock_gettime(CLOCK_MONOTONIC, &t0);
-        for (;;) {
-            struct pollfd p = { ev, POLLIN, 0 };
-            int r = ev >= 0 ? poll(&p, 1, (int)(left > 0x7fffffff ? 0x7fffffff : left))
-                            : poll(NULL, 0, (int)(left > 0x7fffffff ? 0x7fffffff : left));
-            if (r > 0 && watch_nl_drain(ev)) {
-                struct timespec q = { WATCH_SETTLE_S, 0 };
-                while (nanosleep(&q, &q) != 0 && errno == EINTR) {}
-                watch_nl_drain(ev);
-                if (verbose)
-                    fprintf(stderr, "steer[info] failover: сеть изменилась — проверяю выходы\n");
-                break;
-            }
-            struct timespec t1;
-            clock_gettime(CLOCK_MONOTONIC, &t1);
-            long spent = (t1.tv_sec - t0.tv_sec) * 1000L + (t1.tv_nsec - t0.tv_nsec) / 1000000L;
-            if (spent >= (long)period * 1000) break;
-            left = (long)period * 1000 - spent;
-        }
+struct floop {
+    struct loop *l;
+    const char *spec;
+    int verbose, period;
+    int nl;
+    struct loop_timer *tm;
+    int settling, pending, eventful;
+    struct fo_run *run;
+    long masq_at;
+};
+
+/* Спека прохода — static: она большая, а проход один за раз. */
+static struct spec g_loop_spec;
+
+static void fl_period(struct floop *f) {
+    f->settling = 0;
+    loop_timer_set(f->tm, (long)f->period * 1000L);
+}
+
+/* Событие не повод бежать сразу: смена сети приходит пачкой (адрес ушёл, интерфейс лёг,
+ * поднялся, адрес пришёл), и проход на середине увидел бы полусобранную сеть. Пять секунд — и
+ * чтобы она закончилась, и чтобы мигающий интерфейс не гонял проходы подряд. */
+static void fl_settle(struct floop *f) {
+    f->eventful = 1;
+    if (f->settling) return;
+    f->settling = 1;
+    loop_timer_set(f->tm, WATCH_SETTLE_S * 1000L);
+}
+
+static void fl_done(void *arg, int res) {
+    (void)res;
+    struct floop *f = arg;
+    f->run = NULL;
+    /* masquerade правилом iptables (телефон): netd при перезапуске перестраивает iptables, и
+     * наши правила пропадают — вернуть их (iptables_masq_ensure в apply.c). Смотрит он на
+     * кандидатов выхода (devices), а не на выбранное проходом устройство. */
+    if (plat()->iptables_masq && watch_masq_due(&f->masq_at, f->eventful))
+        iptables_masq_ensure(&g_loop_spec);
+    f->eventful = 0;
+    /* На роутере (plat()->netifd) проход сам делает ifdown/ifup мёртвому интерфейсу, и
+     * события за время прохода — его же следы: реагировать на них значило бы будить себя
+     * по кругу. На телефоне сторож интерфейсы не трогает (только ждёт), и событие за время
+     * прохода — настоящее: например, TUN, который как раз поднял помощник выхода. */
+    if (plat()->netifd && f->nl >= 0) watch_nl_drain(f->nl);
+    if (f->pending) {
+        f->pending = 0;
+        fl_settle(f);
+    } else {
+        fl_period(f);
     }
+}
+
+static void fl_pass(struct floop *f) {
+    memset(&g_loop_spec, 0, sizeof(g_loop_spec));
+    struct err e = {0};
+    if (load_spec(f->spec, &g_loop_spec, &e) < 0 || registry_assign(&g_loop_spec, &e) < 0) {
+        /* Тот же текст, что у err_die в `steer failover`, — но конец прохода, а не круга. */
+        fprintf(stderr, "steer: %s\n", e.msg);
+        fl_period(f);
+        return;
+    }
+    f->run = fo_pass_start(f->l, &g_loop_spec, &fo_store_files, f->verbose, NULL, NULL,
+                           fl_done, f);
+    if (!f->run) fl_period(f);
+}
+
+static void fl_timer(struct loop *l, struct loop_timer *t, void *arg) {
+    (void)l; (void)t;
+    struct floop *f = arg;
+    f->settling = 0;
+    if (f->run) return;
+    if (f->nl >= 0 && watch_nl_drain(f->nl)) f->eventful = 1;
+    if (f->eventful && f->verbose)
+        fprintf(stderr, "steer[info] failover: сеть изменилась — проверяю выходы\n");
+    fl_pass(f);
+}
+
+static void fl_nl(struct loop *l, int fd, uint32_t ev, void *arg) {
+    (void)l; (void)ev;
+    struct floop *f = arg;
+    if (!watch_nl_drain(fd)) return;
+    if (f->run) {
+        if (!plat()->netifd) f->pending = 1;
+        return;
+    }
+    fl_settle(f);
+}
+
+static void fl_sig(struct loop *l, int sig, void *arg) {
+    (void)l;
+    struct floop *f = arg;
+    if (f->run) fo_pass_abort(f->run);
+    f->run = NULL;
+    cleanup_probe_rule();
+    /* Уйти по сигналу, как уходил круг до цикла: кто его ждёт (procd, init), видит то же. */
+    signal(sig, SIG_DFL);
+    sigset_t s;
+    sigemptyset(&s);
+    sigaddset(&s, sig);
+    sigprocmask(SIG_UNBLOCK, &s, NULL);
+    raise(sig);
+    _exit(128 + sig);
+}
+
+int failover_loop(const char *spec, int verbose, int period) {
+    failover_pass_guard();
+    awg_hs_memory(1);
+    struct loop *l = loop_new();
+    if (!l) {
+        fprintf(stderr, "steer[warn] failover: цикл событий не завёлся: %s\n", strerror(errno));
+        return 1;
+    }
+    static struct floop f;
+    memset(&f, 0, sizeof(f));
+    f.l = l;
+    f.spec = spec;
+    f.verbose = verbose;
+    f.period = period > 0 ? period : 60;
+    f.tm = loop_timer_new(l, fl_timer, &f);
+    if (!f.tm) { loop_free(l); return 1; }
+    f.nl = watch_nl_open();
+    if (f.nl >= 0 && loop_fd_add(l, f.nl, EPOLLIN, fl_nl, &f) != 0) {
+        close(f.nl);
+        f.nl = -1;
+    }
+    loop_signal(l, SIGTERM, fl_sig, &f);
+    loop_signal(l, SIGINT, fl_sig, &f);
+    f.eventful = 1;               /* первый проход — как по событию: masquerade проверить */
+    loop_timer_set(f.tm, 0);
+    return loop_run(l);
 }

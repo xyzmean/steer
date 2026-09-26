@@ -40,9 +40,11 @@
 #     проход при старте; устройство упало (ip link set down) — внеочередной проход по событию
 #     netlink, подписчику switched с причиной, status из памяти и таблица выхода — на новом
 #     устройстве, выбор отражён в файл active прежним форматом, замеры и отметки оживлений на
-#     диск не пишутся; status во время долгой пробы (ping спит 3 с) отвечает сразу; оживление —
-#     revived; живых нет — failed с on_fail и запрет в таблице; в тишине демон не просыпается;
-#     после перезапуска выход не перепривязан; проходы по периоду — не чаще периода.
+#     диск не пишутся; status во время долгой пробы (адресат молчит, проба ждёт 3 с) отвечает
+#     сразу — проход идёт в цикле демона, без ребёнка; оживление — revived; живых нет — failed с
+#     on_fail и запрет в таблице; в тишине демон не просыпается; после перезапуска выход не
+#     перепривязан; проходы по периоду — не чаще периода, и ни один проход по исправной спеке не
+#     запускает процессов (счёт PID в своём пространстве PID демона).
 #
 # Без root пункты 4 и 8 пропускаются, без python3 — весь стенд (им шлются сырые запросы).
 set -u
@@ -61,7 +63,7 @@ tmp="$(mktemp -d)"
 chmod 0711 "$tmp"
 mkdir -p "$tmp/state" "$tmp/bin"
 SRV="" SUP="" DNSD="" SUB1=""
-trap 'kill $SRV $SUP $DNSD $SUB1 ${WD:-} ${WSUB:-} 2>/dev/null; rm -rf "$tmp"' EXIT
+trap 'kill $SRV $SUP $DNSD $SUB1 ${WD:-} ${WSUB:-} ${RPID:-} 2>/dev/null; rm -rf "$tmp"' EXIT
 pass=0 fail=0
 check() {
     if [ "$2" = "$3" ]; then pass=$((pass + 1)); else
@@ -631,45 +633,76 @@ check "SIGTERM: сервер убрал за собой сокет" "no" "$([ -e
 SRV=""
 
 # ---- 10. сторож в демоне (--watch) ------------------------------------------------------
-# Выход vpn с пулом из двух устройств-пустышек (dummy) в сетевом пространстве стенда. Демон
-# живёт в своём пространстве имён монтирования со своим /sys — иначе /sys/class/net
-# показывал бы устройства хоста, а не пространства стенда (сторож судит о наличии устройства
-# по operstate). ping подменён: пишет журнал вызовов, по файлу ping.slow спит три секунды (долгая
-# проба), ответ всегда «жив» — мёртвым устройство делает `ip link set … down`. ifdown/ifup
-# подменены отказом: оживление интерфейса netifd здесь — ожидание подъёма.
-if [ "${CTLMATCH_INNER:-}" = 1 ] && ip link add sw1 type dummy 2>/dev/null &&
-   ip link add sw2 type dummy 2>/dev/null &&
-   unshare -m sh -c 'mount -t sysfs sysfs /sys' 2>/dev/null; then
-    cat > "$tmp/bin/ping" <<EOF
-#!/bin/sh
-echo "\$(date +%s.%N) \$*" >> "$tmp/ping.log"
-if [ -e "$tmp/ping.slow" ]; then touch "$tmp/ping.started"; sleep 3; touch "$tmp/ping.done"; fi
-exit 0
-EOF
+# Выход vpn с пулом из двух устройств — концов пар veth, вторые концы которых лежат в соседнем
+# сетевом пространстве-ответчике: там на lo адреса 1.1.1.1 и 8.8.8.8 (цели пробы сторожа), и
+# эхо ICMP через sw1 или sw2 ему по-настоящему отвечают. Проба — из самого демона (сырой сокет,
+# привязанный к устройству, с правилом пробы), ping не подменяется и не нужен; мёртвым
+# устройство делает `ip link set … down`, молчащим адресатом — снятый у ответчика адрес. Демон
+# живёт в своём пространстве имён монтирования со своим /sys — иначе /sys/class/net показывал бы
+# устройства хоста, а не пространства стенда (сторож судит о наличии устройства по operstate).
+# ifdown/ifup подменены отказом: оживление интерфейса netifd здесь — ожидание подъёма.
+RPID=""
+if [ "${CTLMATCH_INNER:-}" = 1 ] && command -v nsenter >/dev/null 2>&1 &&
+   unshare -m sh -c 'mount -t sysfs sysfs /sys' 2>/dev/null && { unshare -n sleep 600 & RPID=$!; } &&
+   sleep 0.3 && ip link add sw1 type veth peer name sw1p 2>/dev/null &&
+   ip link add sw2 type veth peer name sw2p 2>/dev/null &&
+   ip link set sw1p netns "$RPID" && ip link set sw2p netns "$RPID"; then
+    R() { nsenter -t "$RPID" -n "$@"; }
+    R ip link set lo up
+    R ip addr add 1.1.1.1/32 dev lo; R ip addr add 8.8.8.8/32 dev lo
+    R ip link set sw1p up; R ip link set sw2p up
+    R ip addr add 10.9.1.2/24 dev sw1p; R ip addr add 10.9.2.2/24 dev sw2p
     printf '#!/bin/sh\nexit 1\n' > "$tmp/bin/ifdown"
     printf '#!/bin/sh\nexit 1\n' > "$tmp/bin/ifup"
-    chmod +x "$tmp/bin/ping" "$tmp/bin/ifdown" "$tmp/bin/ifup"
+    chmod +x "$tmp/bin/ifdown" "$tmp/bin/ifup"
+    # Без адресов IPv6 link-local: у veth их проверка дубликата (DAD) кончается через секунду-
+    # другую после подъёма, и это событие адреса будило бы сторожа внеочередным проходом там,
+    # где стенд считает проходы по периоду.
+    ip link set sw1 addrgenmode none 2>/dev/null; ip link set sw2 addrgenmode none 2>/dev/null
     ip link set sw1 up; ip link set sw2 up
     ip addr add 10.9.1.1/24 dev sw1; ip addr add 10.9.2.1/24 dev sw2
     mkdir -p "$tmp/wstate"
     printf '{"schema":1,"outputs":{"vpn":{"kind":"interface","devices":["sw1","sw2"],"on_fail":"drop"}},'\
 '"channels":[{"name":"p","match":{"prefixes_files":["%s"]},"out":"vpn"}]}\n' "$tmp/p1.lst" > "$tmp/w.json"
-    WD="" WSUB=""
-    wserve() {   # wserve ПЕРИОД — поднять демона-сторожа заново
-        [ -n "$WD" ] && { kill "$WD" 2>/dev/null; wait "$WD" 2>/dev/null; }
-        unshare -m sh -c "mount -t sysfs sysfs /sys && exec \"$BIN\" daemon --watch \
+    WD="" WU="" WSUB=""
+    # wserve ПЕРИОД [pid] — поднять демона-сторожа заново. С «pid» — ещё и в своём пространстве
+    # PID: там номера процессов идут подряд, и по ним видно, запускал ли демон кого-нибудь.
+    # Демон там — первый процесс пространства; WD — его номер снаружи, WU — unshare над ним.
+    wserve() {
+        wstop
+        pidns=""; [ "${2:-}" = pid ] && pidns="-p -f"
+        unshare -m $pidns sh -c "mount -t sysfs sysfs /sys && exec \"$BIN\" daemon --watch \
             --watch-period $1 --socket \"$tmp/w.sock\" --spec \"$tmp/w.json\" \
             --state-dir \"$tmp/wstate\"" >>"$tmp/w.out" 2>>"$tmp/w.err" &
-        WD=$!
+        WU=$! WD=$!
         wait_for '[ -S "$tmp/w.sock" ]' 5
+        if [ -n "$pidns" ]; then
+            WD="$(cat "/proc/$WU/task/$WU/children" 2>/dev/null | tr -d ' ')"
+            [ -n "$WD" ] || WD="$(pgrep -P "$WU" | head -n 1)"
+        fi
+    }
+    wstop() {
+        [ -n "$WD" ] && kill "$WD" 2>/dev/null
+        [ -n "$WU" ] && wait "$WU" 2>/dev/null
+        rm -f "$tmp/w.sock"
+        WD="" WU=""
     }
     wctl() { "$BIN" ctl --socket "$tmp/w.sock" "$@"; }
     wdev() { wctl status | j stdout | j outputs.vpn.device; }
     wtbl() { ip -4 route show table "$(awk '$1 == "vpn" { print $3 }' "$tmp/wstate/registry")" | grep '^default\|^blackhole default' | grep -v 'metric 65535'; }
+    # Сколько эхо-запросов ответчик получил (Icmp InEchos его пространства) — по ним видны пробы.
+    echos() { R awk '/^Icmp:/ { if (!h) { for (i = 1; i <= NF; i++) if ($i == "InEchos") c = i; h = 1 } else print $c }' /proc/net/snmp; }
+    # Сырых сокетов ICMP в пространстве стенда — открыты только пробой демона, пока она ждёт.
+    rawsocks() { awk 'NR > 1' /proc/net/raw | grep -c .; }
+    # Номер следующего процесса в пространстве PID демона (сам вызов — один процесс там).
+    nspid() { nsenter -t "$WD" -p sh -c 'echo $$'; }
     wserve 60
     wait_for 'grep -q "^vpn sw1 0$" "$tmp/wstate/active" 2>/dev/null' 5
     check "сторож: первый проход при старте — выход на первом устройстве пула" "sw1" "$(wdev)"
     check "  таблица выхода привязана к нему" "default dev sw1 scope link" "$(wtbl | sed 's/ *$//')"
+    check "  проба — эхо ICMP через устройство, ответчик его получил" "1" \
+        "$([ "$(echos)" -ge 1 ] && echo 1 || echo 0)"
+    check "  правило пробы после пробы снято" "0" "$(ip -4 rule show | grep -c 'lookup 299')"
     "$BIN" ctl --socket "$tmp/w.sock" subscribe > "$tmp/wsub.out" 2>&1 &
     WSUB=$!
     wait_for 'grep -q "\"cmd\":\"subscribe\"" "$tmp/wsub.out" 2>/dev/null' 5
@@ -687,16 +720,19 @@ EOF
     check "  замеры и отметки оживлений на диск не пишутся" "" \
         "$(ls "$tmp/wstate" | grep '^latency\|^restart-')"
 
-    # Долгая проба: ping спит три секунды, а демон отвечает сразу.
-    touch "$tmp/ping.slow"
+    # Долгая проба: первая цель молчит (адрес у ответчика снят — эхо ждёт свои три секунды),
+    # а демон отвечает сразу: проба ждёт в его цикле, а не в ребёнке.
+    R ip addr del 1.1.1.1/32 dev lo
     ip link add sw3 type dummy
-    wait_for '[ -e "$tmp/ping.started" ]' 12
+    wait_for '[ "$(rawsocks)" -gt 0 ]' 12
     t0=$(date +%s%N); r="$(wctl status)"; t1=$(date +%s%N)
     ms=$(( (t1 - t0) / 1000000 ))
     check "сторож: status во время пробы отвечает сразу (код 0, быстрее секунды, проба ещё идёт)" \
-        "0 yes no" "$(printf '%s' "$r" | j code) $([ $ms -lt 1000 ] && echo yes || echo "no:$ms") $([ -e "$tmp/ping.done" ] && echo yes || echo no)"
-    wait_for '[ -e "$tmp/ping.done" ]' 8
-    rm -f "$tmp/ping.slow"
+        "0 yes yes" "$(printf '%s' "$r" | j code) $([ $ms -lt 1000 ] && echo yes || echo "no:$ms") $([ "$(rawsocks)" -gt 0 ] && echo yes || echo no)"
+    check "  у демона нет детей, пока проба ждёт" "" "$(cat "/proc/$WD/task/$WD/children" 2>/dev/null | tr -d ' ')"
+    wait_for '[ "$(rawsocks)" = 0 ]' 10
+    check "  промолчала первая цель — ответила вторая, выход на месте" "sw2" "$(wdev)"
+    R ip addr add 1.1.1.1/32 dev lo
     ip link del sw3
     sleep 0.5
 
@@ -734,30 +770,38 @@ EOF
     kill $WSUB 2>/dev/null; wait $WSUB 2>/dev/null; WSUB=""
 
     # Перезапуск демона: выбор берётся из файла active, и выход не перепривязывается заново
-    # (перепривязка снимает соединения выхода). Период 2 — проходы не чаще периода.
+    # (перепривязка снимает соединения выхода). Период 2 — проходы не чаще периода. Демон — в
+    # своём пространстве PID: за несколько проходов по исправной спеке он не запускает ни одного
+    # процесса (номер следующего процесса там растёт только на наши собственные вызовы nspid).
     ip link set sw1 up; ip link set sw2 up
-    sleep 0.3
+    # Смена operstate приходит от linkwatch с задержкой до секунды — пусть придёт прежнему демону,
+    # а не новому: иначе его первый период съело бы внеочередное успокоение.
+    sleep 2
     printf 'vpn sw1 0\n' > "$tmp/wstate/active"
     ip route replace default dev sw1 table "$(awk '$1 == "vpn" { print $3 }' "$tmp/wstate/registry")"
     outs=$(wc -l < "$tmp/w.out")
-    : > "$tmp/ping.log"
-    wserve 2
-    sleep 7
+    e0=$(echos)
+    wserve 2 pid
+    sleep 1
+    p0=$(nspid)
+    sleep 6
+    p1=$(nspid)
+    e1=$(echos)
     check "сторож: после перезапуска демона выход не перепривязан" "0" \
         "$(tail -n +$((outs + 1)) "$tmp/w.out" | grep -c 'выход vpn')"
-    check "  проходы — по периоду, не чаще (за 7 с при периоде 2)" "ok" \
-        "$(python3 -c '
-import sys
-t = [float(l.split()[0]) for l in open(sys.argv[1]) if "-I sw1" in l]
-gaps = [b - a for a, b in zip(t, t[1:])]
-print("ok" if 3 <= len(t) <= 5 and all(g >= 1.9 for g in gaps) else "n=%d gaps=%s" % (len(t), gaps))
-' "$tmp/ping.log")"
+    n=$((e1 - e0))
+    check "  проходы — по периоду, не чаще (эхо-проб за 7 с при периоде 2)" "ok" \
+        "$([ "$n" -ge 3 ] && [ "$n" -le 5 ] && echo ok || echo "n=$n")"
+    check "  процессов на проход нет (новых PID в пространстве демона за 6 с, кроме своих)" "0" \
+        "$(( p1 - p0 - 1 ))"
     check "  журнал сторожа — с уровнем" "0" \
         "$(grep -v '^steer\[\(warn\|info\)\]' "$tmp/w.err" | grep -c .)"
-    kill "$WD" 2>/dev/null; wait "$WD" 2>/dev/null; WD=""
+    wstop
     ip link del sw1; ip link del sw2
+    kill "$RPID" 2>/dev/null; wait "$RPID" 2>/dev/null
 else
-    echo "ctlmatch: нет root, сетевого пространства или своего /sys — сторож в демоне пропущен"
+    [ -n "$RPID" ] && kill "$RPID" 2>/dev/null
+    echo "ctlmatch: нет root, сетевого пространства, nsenter или своего /sys — сторож в демоне пропущен"
 fi
 
 printf '\nctlmatch: %s passed, %s failed\n' "$pass" "$fail"

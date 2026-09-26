@@ -17,6 +17,8 @@
 #define STEER_KIND_H
 #include <stdio.h>
 #include <stddef.h>
+#include <stdint.h>
+#include <sys/socket.h>
 
 struct output;
 struct spec;
@@ -78,6 +80,21 @@ struct kind_helper {
     unsigned long long sig;
 };
 
+/* Имя, которое починка вида разрешила бы getaddrinfo (Endpoint у awg). Разрешение имени
+ * блокирует — DNS может отвечать секунды или не отвечать вовсе, — а сторож в демоне работает на
+ * цикле событий и ждать синхронно не вправе. Поэтому вид НАЗЫВАЕТ имена заранее (revive_names),
+ * сторож разрешает их рабочим потоком (src/daemon/gaiw.c) и отдаёт ответы в revive. Верхняя
+ * половина — вопрос вида, нижняя — ответ сторожа. */
+struct kind_name {
+    char host[256];
+    uint16_t port;
+    int v4only;                     /* только IPv4 (туннель через via — см. awg_via_check) */
+    int rc;                         /* 0 — разрешилось; иначе код getaddrinfo */
+    struct sockaddr_storage addr;
+    socklen_t addr_len;
+};
+#define KIND_NAMES_MAX 8
+
 /* Куда вид отдаёт свои проверки diag: id, приговор (ok/note/warn/fail), что смотрели, что делать. */
 typedef void kind_diag_fn(const char *id, const char *verdict, const char *what, const char *why);
 
@@ -131,8 +148,15 @@ struct kind_ops {
     /* Мера здоровья устройства, владелец которого — выход этого вида. NULL — общая проба
      * (ICMP или TCP по KC_TCP_PROBE). 1 — живо, 0 — нет. */
     int (*health)(const struct spec *sp, const struct output *o, const char *dev);
-    /* Починка молчащего устройства. NULL — общий путь (ждать свой процесс, ifdown/ifup). */
-    int (*revive)(const struct spec *sp, const struct output *o, const char *dev);
+    /* Починка молчащего устройства. NULL — общий путь (ждать свой процесс, ifdown/ifup).
+     * names — ответы на revive_names (n штук); NULL — вид разрешает имена сам, синхронно (так
+     * зовут стенды). Сама починка обязана не ждать: всё, что в ней было ожиданием, — это
+     * разрешение имён, и оно вынесено в revive_names. */
+    int (*revive)(const struct spec *sp, const struct output *o, const char *dev,
+                  const struct kind_name *names, size_t n);
+    /* Имена, которые revive разрешит (не больше max, в dst). NULL или 0 — имён нет. */
+    size_t (*revive_names)(const struct spec *sp, const struct output *o, struct kind_name *dst,
+                           size_t max);
     /* Замер задержки. NULL — общий замер соединением TCP; мс или -1. */
     int (*latency)(const struct spec *sp, const struct output *o, const char *dev);
 

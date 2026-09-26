@@ -64,6 +64,9 @@ int failover_loop(const char *spec, int verbose, int period);
 int watch_nl_open(void);
 int watch_nl_drain(int fd);
 #define WATCH_SETTLE_S 5
+/* masquerade на телефоне сторож возвращает не на каждом проходе (watch.c, watch_masq_due). */
+#define WATCH_MASQ_S 600
+int watch_masq_due(long *last, int force);
 
 int cmd_failover(const char *spec, int verbose);   /* failover.c */
 void probe_rule_cleanup(void);   /* failover.c */

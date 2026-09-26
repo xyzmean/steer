@@ -38,10 +38,17 @@
 #include <ifaddrs.h>
 #include <signal.h>
 #include <sys/stat.h>
+#include <sys/epoll.h>
 #include <ctype.h>
+#include <linux/netlink.h>
+#include <linux/rtnetlink.h>
 #include "spec.h"
 #include "awg.h"
 #include "run.h"
+#include "rtnl.h"
+#include "loop.h"
+#include "foprobe.h"
+#include "gaiw.h"
 #include "failover_int.h"
 #include "fostate.h"
 
@@ -63,8 +70,9 @@
  * этом туннеле, и тогда здоровый путь выглядел бы мёртвым. */
 static const char *PROBE_TARGETS[] = { "1.1.1.1", "8.8.8.8", NULL };
 
-/* Чтение вывода команды — определено ниже, у сверки состояния; нужно и привязке таблицы. */
-static void ip_show(const char *cmd, char *out, size_t n);
+/* Чтение правил и таблицы — определено ниже, у сверки состояния; нужно и привязке таблицы. */
+static void rules_show(char *out, size_t n);
+static void routes_show(int table, char *out, size_t n);
 
 /* Адрес источника устройства: без него правило пробы не к чему привязать, а само
  * отсутствие адреса уже означает, что устройство не готово нести трафик. */
@@ -98,100 +106,47 @@ static int device_present(const char *dev) {
     return up;
 }
 
-/* Доступен ли внешний адрес ПО TCP через данное устройство.
+/* ПРОБА TCP — доступен ли внешний адрес ПО TCP через данное устройство.
  *
- * Зачем отдельная проверка, а не device_healthy: VLESS-туннель пропускает ТОЛЬКО TCP
- * (клиент завершает TCP у себя и соединяется с сервером обычным сокетом — ICMP сквозь
- * него не идёт принципиально). device_healthy пингует ICMP, и для выхода kind=vless
- * отвечал «мёртв» на полностью рабочем туннеле: на живом роутере это выглядело как
- * вечное «vl: не отвечает — перезапускаю интерфейс» в журнале и гоняло ifdown/ifup
- * по устройству, которым netifd вовсе не управляет.
+ * Зачем отдельная проверка, а не ICMP: VLESS-туннель пропускает ТОЛЬКО TCP (клиент завершает
+ * TCP у себя и соединяется с сервером обычным сокетом — ICMP сквозь него не идёт
+ * принципиально). Проба ICMP отвечала «мёртв» на полностью рабочем туннеле kind=vless: на
+ * живом роутере это выглядело как вечное «vl: не отвечает — перезапускаю интерфейс» в журнале
+ * и гоняло ifdown/ifup по устройству, которым netifd вовсе не управляет.
  *
- * SO_BINDTODEVICE привязывает сокет именно к этому устройству, не полагаясь на метки и
- * таблицы маршрутизации: проба обязана идти тем путём, который мы проверяем. Неблокирующий
- * connect с poll — чтобы на чёрной дыре не стоять дольше таймаута. */
-/* ЧЕТВЁРТЫЙ АРГУМЕНТ — задержка в миллисекундах, необязателен (NULL — не мерить).
+ * SO_BINDTODEVICE привязывает сокет именно к этому устройству, не полагаясь на метки и таблицы
+ * маршрутизации: проба обязана идти тем путём, который мы проверяем. Соединение неблокирующее и
+ * ждётся циклом событий со сроком (foprobe_tcp в foprobe.c) — на чёрной дыре проба стоит не
+ * дольше срока и не держит при этом ни цикл демона, ни процесс.
  *
- * Мера берётся ЗДЕСЬ, а не рядом с вызовом: интересует время до установления соединения, а
- * не время работы функции. На неудачном кандидате разница между ними — целый таймаут.
+ * Задержка меряется там же, от начала соединения до установления: интересует время до
+ * установления соединения, а не время работы функции (на неудачном кандидате разница между
+ * ними — целый срок). CLOCK_MONOTONIC, а не время суток: подводка часов ntpd на только что
+ * поднявшемся роутере — обычное дело, и замер по стенным часам дал бы отрицательную задержку.
  *
- * CLOCK_MONOTONIC, а не время суток: подводка часов ntpd на только что поднявшемся роутере —
- * обычное дело, и замер по стенным часам дал бы отрицательную задержку. */
-static int tcp_reachable(const char *dev, const char *host, int port, int timeout_s,
-                         int *out_ms) {
-    if (out_ms) *out_ms = -1;
-    struct timespec t0;
-    clock_gettime(CLOCK_MONOTONIC, &t0);
-    struct in_addr a;
-    if (inet_aton(host, &a) == 0) return 0;
-    int fd = socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
-    if (fd < 0) return 0;
-    if (setsockopt(fd, SOL_SOCKET, SO_BINDTODEVICE, dev, strlen(dev) + 1) != 0) {
-        close(fd);
-        return 0;
-    }
-    struct sockaddr_in sa = { .sin_family = AF_INET, .sin_port = htons((uint16_t)port),
-                              .sin_addr = a };
-    int ok = 0;
-    int rc = connect(fd, (struct sockaddr *)&sa, sizeof(sa));
-    if (rc == 0) ok = 1;                          /* соединилось мгновенно — обычно сосед по L2 */
-    else if (errno == EINPROGRESS) {
-        struct pollfd pw = { .fd = fd, .events = POLLOUT, .revents = 0 };
-        if (poll(&pw, 1, timeout_s * 1000) > 0) {
-            int err = 0; socklen_t el = sizeof(err);
-            if (getsockopt(fd, SOL_SOCKET, SO_ERROR, &err, &el) == 0 && err == 0)
-                ok = 1;
-        }
-    }
-    close(fd);
-    if (ok && out_ms) {
-        struct timespec t1;
-        clock_gettime(CLOCK_MONOTONIC, &t1);
-        long ms = (t1.tv_sec - t0.tv_sec) * 1000 + (t1.tv_nsec - t0.tv_nsec) / 1000000;
-        if (ms < 0) ms = 0;
-        if (ms > 1000000) ms = 1000000;
-        *out_ms = (int)ms;
-    }
-    return ok;
-}
-
-/* Живо ли устройство на самом деле. operstate у туннеля почти всегда "unknown" и
- * остаётся таким, когда пир давно молчит, — поэтому решает пакет, дошедший до
- * настоящего адреса, а не то, что о себе сообщает интерфейс. */
-static int device_healthy(const char *dev) {
-    if (!device_present(dev)) return 0;
-    char src[64];
-    if (!device_src(dev, src, sizeof(src))) return 0;
-
-    char tbl[16], prio[16];
-    snprintf(tbl, sizeof(tbl), "%d", PROBE_TABLE);
-    snprintf(prio, sizeof(prio), "%d", PROBE_PRIO);
-
-    const char *del[] = { "ip", "-4", "rule", "del", "from", src, "table", tbl,
-                          "priority", prio, NULL };
-    run_quiet(del);
-    const char *rt[] = { "ip", "-4", "route", "replace", "default", "dev", dev,
-                         "table", tbl, NULL };
-    run_quiet(rt);
-    const char *add[] = { "ip", "-4", "rule", "add", "from", src, "table", tbl,
-                          "priority", prio, NULL };
-    run_quiet(add);
-
-    int ok = 0;
-    for (int i = 0; PROBE_TARGETS[i] && !ok; i++) {
-        const char *p[] = { "ping", "-c", "1", "-W", "3", "-I", dev, "-q",
-                            PROBE_TARGETS[i], NULL };
-        ok = run_quiet(p) == 0;
-    }
-
-    /* Убрать за собой обязательно: оставленное правило пробы пережило бы этот
-     * процесс и молча увело бы трафик источника в таблицу, которую никто больше
-     * не наполняет. */
-    run_quiet(del);
-    const char *flush[] = { "ip", "-4", "route", "flush", "table", tbl, NULL };
-    run_quiet(flush);
-    return ok;
-}
+ * ПРОБА ICMP — живо ли устройство на самом деле. operstate у туннеля почти всегда "unknown" и
+ * остаётся таким, когда пир давно молчит, — поэтому решает пакет, дошедший до настоящего
+ * адреса, а не то, что о себе сообщает интерфейс. Нет адреса IPv4 у устройства — оно не готово
+ * нести трафик, и проба отвечает «нет» сразу.
+ *
+ * Эхо-запрос шлёт сам процесс (foprobe_icmp: сырой сокет, ping-сокет, внешний ping — последним
+ * откатом), с сокета, привязанного к устройству (SO_BINDTODEVICE) и к его адресу. И при этом
+ * на время пробы по-прежнему ставится правило `from <адрес устройства> lookup 299` с
+ * `default dev <устройство>` в таблице 299 — теперь сообщениями rtnetlink, без запуска `ip`.
+ * SO_BINDTODEVICE его НЕ заменяет полностью, и вот почему. Привязка к устройству решает только
+ * путь ТУДА: поиск маршрута с заданным устройством пропускает маршруты через другие устройства,
+ * а не найдя ничего, считает адресата «за этим устройством». Путь ОБРАТНО она не решает: ответ
+ * приходит с устройства туннеля от 1.1.1.1, и при строгой проверке обратного пути (rp_filter=1)
+ * ядро спрашивает, ведёт ли маршрут к 1.1.1.1 с нашего адреса туда же, откуда пришёл пакет. По
+ * таблице main он ведёт в WAN — ответ выбрасывается, и живой запасной туннель выглядел бы
+ * мёртвым. Правило по адресу источника отвечает на этот вопрос «да, через устройство пробы», и
+ * отвечает только для адреса самого устройства: живой путь им не задет. Так проверка НЕ трогает
+ * живой путь — чтобы проверить запасной туннель, не нужно на него переключаться.
+ *
+ * Убрать правило обязательно: оставленное, оно пережило бы пробу и молча увело бы трафик
+ * источника в таблицу, которую никто больше не наполняет. Снимается оно в конце пробы, при
+ * отмене прохода (демон уходит) и — от прохода, убитого SIGKILL, — при старте сторожа
+ * (cleanup_probe_rule). */
 
 /* УСТРОЙСТВО XSTEER, ПОДНЯТОЕ NETIFD: как его узнать и что о нём известно.
  *
@@ -279,25 +234,7 @@ int (*g_latency_probe)(const struct spec *, const struct output *, const char *)
  *
  * Вид, которому такой замер не годится, отвечает сам (kind_ops.latency): xsteer не меряется
  * НИКОГДА — см. kinds/xsteer.c. */
-static int device_latency(const struct spec *sp, const struct output *o, const char *dev) {
-    if (g_latency_probe) return g_latency_probe(sp, o, dev);
-    if (!device_present(dev)) return -1;
-    o = out_for_device(sp, o, dev);
-    const struct kind_ops *k = kind_of(o);
-    if (k->latency) return k->latency(sp, o, dev);
-    /* И туннель xsteer, поднятый netifd, — по тому же доводу, что у вида xsteer: мерить его
-     * нечем, а число из пробы наружу означало бы не задержку туннеля, а наличие интернета у
-     * хаба. */
-    if (xs_state_read(dev, NULL, NULL)) return -1;
-    int best = -1;
-    for (int i = 0; PROBE_TARGETS[i]; i++) {
-        int ms = -1;
-        if (tcp_reachable(dev, PROBE_TARGETS[i], TCP_PROBE_PORT, TCP_PROBE_TIMEOUT, &ms) &&
-            ms >= 0 && (best < 0 || ms < best))
-            best = ms;
-    }
-    return best;
-}
+/* Сама проба — hp_start (замер) ниже, в автомате прохода. */
 
 /* Владелец устройства. Объяснение — у объявления в spec.h; там же сказано, почему функция
  * объявлена рядом со спекой, а живёт здесь (тот же случай, что bind_device). */
@@ -317,52 +254,23 @@ const struct output *out_for_device(const struct spec *sp, const struct output *
     return owner ? owner : o;
 }
 
-int device_healthy_for(const struct spec *sp, const struct output *o, const char *dev);
 /* Проба здоровья вызывается через указатель, а не напрямую, ровно ради одного: стенд
  * гистерезиса задаёт здоровье устройств по тику, не создавая интерфейсов в /sys и не открывая
- * сокетов. В бою указатель НИКОГДА не меняется и всегда ссылается на device_healthy_for —
- * ветка предсказуемая, той же природы, что швы путей для стендов в остальном коде.
- * Объявление (extern) — в failover_int.h: его присваивает tests/failovermatch.c. */
+ * сокетов. В бою указатель НИКОГДА не меняется и равен NULL — тогда спрашивается устройство
+ * (hp_start ниже); ветка предсказуемая, той же природы, что швы путей для стендов в остальном
+ * коде. Объявление (extern) — в failover_int.h: его присваивает tests/failovermatch.c.
+ *
+ * Мера здоровья принадлежит УСТРОЙСТВУ, а не виду выхода, который его назвал: у устройства с
+ * владельцем спрашиваем так, как спросил бы владелец (out_for_device). Своя мера у вида
+ * владельца (kind_ops.health): xsteer — наличие устройства (пинг наружу через хаб полной звезды
+ * теряется на исправном туннеле, kinds/xsteer.c), awg — свежесть рукопожатия и счётчики пира в
+ * ядре (kinds/awg.c). Туннель xsteer, поднятый netifd, судится своим файлом состояния (см.
+ * xs_state_read выше): спека про него знает только имя устройства, а про рукопожатие с хабом
+ * знает его собственный клиент. Устаревший файл (писавшего процесса нет) возвращает нас к
+ * наличию устройства: врать в сторону «сломано» здесь дороже всего — при on_fail=drop это
+ * blackhole работающему выходу. Туннель, который завершает TCP у себя (vless), — пробой TCP;
+ * остальное — пробой ICMP. */
 int (*g_health_probe)(const struct spec *, const struct output *, const char *);
-static int health_of(const struct spec *sp, const struct output *o, const char *dev) {
-    return g_health_probe ? g_health_probe(sp, o, dev) : device_healthy_for(sp, o, dev);
-}
-
-int device_healthy_for(const struct spec *sp, const struct output *o, const char *dev) {
-    if (!device_present(dev)) return 0;
-    /* Мера здоровья принадлежит УСТРОЙСТВУ, а не виду выхода, который его назвал: у
-     * устройства с владельцем спрашиваем так, как спросил бы владелец. Для выхода,
-     * владеющего своим устройством сам, это тот же ответ, что и раньше. */
-    o = out_for_device(sp, o, dev);
-    /* Своя мера у вида владельца (kind_ops.health): xsteer — наличие устройства (пинг наружу
-     * через хаб полной звезды теряется на исправном туннеле, kinds/xsteer.c), awg — свежесть
-     * рукопожатия и счётчики пира в ядре (kinds/awg.c). */
-    const struct kind_ops *k = kind_of(o);
-    if (k->health) return k->health(sp, o, dev);
-    /* Туннель xsteer, поднятый netifd (см. xs_state_read выше). Спека про него знает только
-     * имя устройства, а про рукопожатие с хабом знает его собственный клиент — и пишет это в
-     * свой файл. Приговор отдаётся файлу целиком: пинг наружу здесь запрещён ровно по той же
-     * причине, что и у выхода kind=xsteer.
-     *
-     * Устаревший файл (писавшего процесса нет) возвращает нас к наличию устройства — оно
-     * проверено выше и сюда мы попали только потому, что устройство есть. Врать в сторону
-     * «сломано» здесь дороже всего: при on_fail=drop это blackhole работающему выходу. А
-     * умерший клиент устройства за собой не оставляет — netifd сносит его следом, и это
-     * видно в журнале роутера строкой «Network device 'xs-xs0' link is down». */
-    {
-        int up = 0, fresh = 0;
-        if (xs_state_read(dev, &up, &fresh)) return fresh ? up : 1;
-    }
-    /* Туннель, который завершает TCP у себя (vless): ICMP через него не проходит вовсе,
-     * проверяем TCP-рукопожатием — см. TCP_PROBE_PORT выше. */
-    if (out_has_cap(o, KC_TCP_PROBE)) {
-        for (int i = 0; PROBE_TARGETS[i]; i++)
-            if (tcp_reachable(dev, PROBE_TARGETS[i], TCP_PROBE_PORT, TCP_PROBE_TIMEOUT, NULL))
-                return 1;
-        return 0;
-    }
-    return device_healthy(dev);
-}
 
 /* Работает ли обход (zapret_running) и жив ли обработчик очереди (nfqws_on_queue) — вопросы к
  * процессам nfqws, они в kinds/zapret.c. */
@@ -560,7 +468,7 @@ void rule_ensure(unsigned mark, int table) {
     /* Статический и с запасом — по той же причине, что в route_facts_read: это ВСЕ правила
      * коробки, и обрезанный дамп значил бы «нашего нет» и лишнюю копию. */
     static char rules[16384];
-    ip_show("ip -4 rule show 2>/dev/null", rules, sizeof(rules));
+    rules_show(rules, sizeof(rules));
     struct rule_copies c = rule_copies_of(rules, mark, table);
     /* Прочитать не вышло (нет ip, отказал popen) — добавляем, ничего не снимая: лишняя копия
      * того же правила ничего не меняет в маршрутизации, а снятие вслепую могло бы оставить
@@ -632,10 +540,9 @@ static int rt_line_parse(const char *line, struct rt_line *r) {
  * окно, от которого эта функция избавляет. */
 static void table_prune(int table, const char *dev, int backstop) {
     static char routes[8192];
-    char cmd[64], t[16];
-    snprintf(cmd, sizeof(cmd), "ip -4 route show table %d 2>/dev/null", table);
+    char t[16];
     snprintf(t, sizeof(t), "%d", table);
-    ip_show(cmd, routes, sizeof(routes));
+    routes_show(table, routes, sizeof(routes));
     int kept = 0;
     for (const char *ln = routes; ln && *ln; ) {
         const char *end = strchr(ln, '\n');
@@ -1048,15 +955,26 @@ static const char *facts_why(const struct route_facts *f, const char *dev) {
     return "состояние не разобрано";
 }
 
-/* Прочитать вывод команды. popen, а не run_quiet: тому вывод нужен выброшенным, а нам —
- * прочитанным. Подменяется стендом ровно так же, как в tests/fwmatch.c. */
-static void ip_show(const char *cmd, char *out, size_t n) {
+/* Прочитать состояние ядра: правила (`ip -4 rule show`) и таблицу (`ip -4 route show table N`)
+ * — сообщениями rtnetlink, напечатанными в той же форме (src/lib/rtnl.h: почему текстом и в
+ * чём отличие от iproute2). Раньше это был popen `ip`: два процесса на выход на каждом проходе,
+ * а сторож в демоне работает без процессов на проход. Не прочиталось — пустой текст, то есть
+ * «состояние не известно», и сверка ничего не трогает (см. route_facts.known).
+ *
+ * Шов g_ip_show — для стенда failovermatch: ему ядро не дают, и он отвечает дословными дампами
+ * `ip` с живого роутера (table < 0 — правила). В бою NULL. */
+int (*g_ip_show)(int table, char *out, size_t n);
+
+static void rules_show(char *out, size_t n) {
     out[0] = '\0';
-    FILE *p = popen(cmd, "r");
-    if (!p) return;
-    size_t got = fread(out, 1, n - 1, p);
-    out[got] = '\0';
-    pclose(p);
+    if (g_ip_show) { g_ip_show(-1, out, n); return; }
+    rtnl_rules_text(out, n);
+}
+
+static void routes_show(int table, char *out, size_t n) {
+    out[0] = '\0';
+    if (g_ip_show) { g_ip_show(table, out, n); return; }
+    rtnl_routes_text(table, out, n);
 }
 
 static struct route_facts route_facts_read(const struct output *o) {
@@ -1064,12 +982,11 @@ static struct route_facts route_facts_read(const struct output *o) {
      * только наши: рядом живут mwan3, fw4 и чужие туннели, у которых правил бывают
      * десятки. Обрезанный дамп означал бы «нашего правила нет» и пересоздание живой
      * привязки каждую минуту — то есть короткий провал помеченного трафика на ровном
-     * месте. Статические, потому что процесс короткоживущий и делить с этим стек незачем. */
+     * месте. Статические: буферы большие, а проход однопоточный (в демоне — на цикле событий,
+     * по одному шагу за раз), и делить с ними стек незачем. */
     static char rules[16384], routes[8192];
-    char cmd[64];
-    ip_show("ip -4 rule show 2>/dev/null", rules, sizeof(rules));
-    snprintf(cmd, sizeof(cmd), "ip -4 route show table %d 2>/dev/null", o->table);
-    ip_show(cmd, routes, sizeof(routes));
+    rules_show(rules, sizeof(rules));
+    routes_show(o->table, routes, sizeof(routes));
     return route_facts_of(rules, routes, o->mark, o->table);
 }
 
@@ -1107,7 +1024,7 @@ struct fo_store fo_store_files = { &files_ops };
  * минуту, трафик прыгал на него и через минуту падал обратно — и так по кругу, каждый прыжок
  * это до минуты мёртвого трафика. УХОД с мёртвого устройства при этом мгновенен и гистерезисом
  * не задерживается: держать трафик на упавшем туннеле нельзя. 0 — прежнее поведение (без
- * задержки). Читается один раз: процесс короткоживущий. */
+ * задержки). Читается один раз: окружение процесса за его жизнь не меняется. */
 static int g_hyst_cache = -2;
 static int failover_hyst(void) {
     if (g_hyst_cache == -2) {
@@ -1117,7 +1034,7 @@ static int failover_hyst(void) {
     }
     return g_hyst_cache;
 }
-/* Стенду нужно менять порог между проходами; в бою процесс короткоживущий и это не зовётся.
+/* Стенду нужно менять порог между проходами одного процесса; в бою это не зовётся.
  * Объявление — в failover_int.h. */
 void failover_hyst_reset_for_test(void) { g_hyst_cache = -2; }
 
@@ -1316,139 +1233,6 @@ static int restart_allowed(struct fo_store *st, const char *dev) {
     return 1;
 }
 
-static int revive_st(struct fo_store *st, const struct spec *sp, const struct output *o,
-                     const char *dev, int verbose);
-int revive(const struct spec *sp, const struct output *o, const char *dev, int verbose) {
-    return revive_st(&fo_store_files, sp, o, dev, verbose);
-}
-
-static int revive_st(struct fo_store *st, const struct spec *sp, const struct output *o,
-                     const char *dev, int verbose) {
-    if (!restart_allowed(st, dev)) {
-        if (verbose)
-            fprintf(stderr, LOG_I "%s: перезапуск был недавно, пропускаю\n", dev);
-        return 0;
-    }
-
-    /* Устройство xsteer, поднятое netifd: клиент наш, а интерфейс — его, и зовётся интерфейс
-     * НЕ так, как устройство (xs0 против xs-xs0). `ifdown xs-xs0` netifd отвечает «Interface
-     * not found», то есть сторож писал бы в журнал отказ вместо починки. Чинить здесь нечего
-     * и не нам: упавшего клиента поднимает заново netifd, как любой обработчик протокола, и
-     * дело сторожа то же, что и с нашими собственными процессами, — сказать и подождать. */
-    if (xs_state_read(dev, NULL, NULL)) {
-        fprintf(stderr, LOG_W "%s: не отвечает — клиента туннеля поднимет заново служба "
-                        "сети; жду\n", dev);
-        for (int i = 0; i < 10; i++) {
-            sleep(1);
-            if (device_healthy_for(sp, o, dev)) return 1;
-        }
-        return 0;
-    }
-
-    /* Устройство vless и xsteer создаёт НАШ процесс, а не netifd. ifdown/ifup здесь
-     * бесполезны — netifd про это устройство не знает («Interface vl not found») — и на
-     * живом роутере это выглядело как вечный холостой цикл перезапусков в журнале.
-     * Падение процесса ловит procd (init-скрипт ставит respawn), и подъём заново выбирает
-     * рабочий узел (vless) или заново здоровается с хабом (xsteer) сам. У сторожа здесь
-     * одна задача: сообщить, что туннель молчит, и подождать — кому именно ждать, тот
-     * поднимется сам.
-     *
-     * Вопрос задаётся УСТРОЙСТВУ, а не выходу, который его назвал, по той же причине, что и
-     * проба здоровья (см. device_owner): в пуле разнородных туннелей устройство vless
-     * названо выходом kind=interface, и решение по виду НАЗВАВШЕГО дало бы здесь ifdown/ifup
-     * по устройству, которым netifd не управляет, — «Interface … not found» раз в минуту и
-     * ничего больше. */
-    /* Вид, который чинит своё устройство сам (kind_ops.revive), — у ВЛАДЕЛЬЦА устройства. Туннель
-     * kind=awg чинится не ожиданием: процесса, который поднял бы его заново, нет — устройство
-     * живёт в ядре. Лечится то же, что у netifd лечит ifdown/ifup: имя Endpoint разрешается
-     * заново (переезд сервера по DNS), настройка ложится заново, а пропавшее устройство
-     * создаётся. Частоту уже ограничил restart_allowed выше. */
-    {
-        const struct output *ow = out_for_device(sp, o, dev);
-        const struct kind_ops *k = kind_of(ow);
-        if (k->revive) return k->revive(sp, ow, dev);
-    }
-    if (out_engine_managed(o) || device_owner(sp, dev)) {
-        /* СНАЧАЛА спрашиваем, не известна ли уже причина, по которой ждать бессмысленно.
-         *
-         * Снято с живого роутера: у выхода с `node: 31` при двадцати девяти узлах в подписке
-         * сторож писал «должен подняться заново через procd; жду» раз в пять минут — часами.
-         * Ждать там нечего: номер вне подписки, procd поднимает клиента, тот выходит с тем же
-         * отказом, и так до правки числа человеком. Строка «жду» обещает работу, которой не
-         * будет, и этим она хуже молчания: по ней человек ждёт вместе со сторожем.
-         *
-         * Причину знает сам клиент и уже записал её (probe_report), поэтому здесь её не
-         * выводят заново, а читают. Спрашивается у ВЛАДЕЛЬЦА устройства — по той же причине,
-         * что и проба здоровья: в пуле разнородных туннелей запись пишет клиент под своим
-         * именем, а не выход, который его назвал. */
-        const struct output *pr_own = device_owner(sp, dev);
-        struct probe_status pr = probe_read(pr_own ? pr_own->name : o->name);
-        if (pr.state == PROBE_NO_SUCH_NODE) {
-            fprintf(stderr, LOG_W "%s: выбран узел %d, а пригодных в подписке %d — сам не "
-                            "поднимется, поправьте номер узла\n", dev, pr.node, pr.total);
-            return 0;
-        }
-        fprintf(stderr, LOG_W "%s: не отвечает — процесс туннеля должен подняться "
-                        "заново через procd; жду\n", dev);
-        for (int i = 0; i < 10; i++) {
-            sleep(1);
-            if (device_healthy_for(sp, o, dev)) return 1;
-        }
-        return 0;
-    }
-
-    /* Без netifd (телефон: ни ifdown/ifup, ни procd с ubus) интерфейс туннеля поднимает тот,
-     * кто его завёл, — приложение VPN или наш же процесс, и перезапускать его отсюда нечем.
-     * Дело сторожа то же, что у выходов, чьё устройство заводит движок: сказать и подождать,
-     * не оживёт ли. */
-    if (!plat()->netifd) {
-        fprintf(stderr, LOG_W "%s: не отвечает — жду, не поднимется ли\n", dev);
-        for (int i = 0; i < 10; i++) {
-            sleep(1);
-            if (device_healthy_for(sp, o, dev)) return 1;
-        }
-        return 0;
-    }
-    fprintf(stderr, LOG_W "%s: не отвечает — перезапускаю интерфейс\n", dev);
-    /* Сначала помощник выхода (обфускатор), потом интерфейс, и порядок здесь — не вкусовщина.
-     *
-     * У выхода с obfs датаграммы WireGuard идут не в сеть, а в свой процесс, и если
-     * молчит он, то поднимать заново интерфейс бессмысленно: рукопожатие уйдёт в тот же
-     * тупик. Обфускатор умеет чинить себя сам (тишина при активной отправке — признак
-     * мёртвого пути), но узнаёт об этом только по факту отправки, а пока туннель лежит,
-     * отправлять нечего. Отсюда явный сигнал: procd поднимет процесс заново, и уже
-     * после этого ifdown/ifup даст WireGuard свежую попытку.
-     *
-     * Через ubus, а не kill: экземпляром владеет procd, и он же обязан поднять замену
-     * (экземпляр зовётся «<помощник>_<выход>», как его заводит init-скрипт). Отказ
-     * игнорируем. Помощника спрашиваем у вида: сюда доходит только устройство netifd, то есть
-     * interface, а у него помощник — ровно обфускатор, когда obfs настроен. */
-    struct kind_helper hp = { .sig = KIND_SIG_INIT };
-    const struct kind_ops *hk = kind_of(o);
-    if (hk->helper && hk->helper(sp, o, &hp) == 0) {
-        /* С запасом: имя выхода до 24 символов плюс обрамление JSON — иначе
-         * -Wformat-truncation справедливо ругается, а сборка здесь обязана быть без
-         * предупреждений (I-007). */
-        char inst[112];
-        snprintf(inst, sizeof(inst), "{\"name\":\"steer\",\"instance\":\"%.7s_%.24s\","
-                                     "\"signal\":15}", hp.cmd, o->name);
-        const char *sig[] = { "ubus", "call", "service", "signal", inst, NULL };
-        run_quiet(sig);
-        sleep(1);
-    }
-    const char *down[] = { "ifdown", dev, NULL };
-    const char *up[] = { "ifup", dev, NULL };
-    run_quiet(down);
-    run_quiet(up);
-    /* Рукопожатию нужно время: проверить сразу — значит объявить мёртвым то, что
-     * ещё поднимается. Ждём короткими шагами, чтобы не держать проход дольше нужного. */
-    for (int i = 0; i < 10; i++) {
-        sleep(1);
-        if (device_healthy_for(sp, o, dev)) return 1;
-    }
-    return 0;
-}
-
 void cleanup_probe_rule(void) {
     char prio[16];
     snprintf(prio, sizeof(prio), "%d", PROBE_PRIO);
@@ -1477,26 +1261,11 @@ void failover_pass_guard(void) {
     signal(SIGINT, sig_cleanup);
     signal(SIGTERM, sig_cleanup);
     /* Снять probe-rule, оставшийся от ПРЕЖНЕГО прохода, прежде чем ставить свой.
-     * atexit и обработчики выше закрывают обычное завершение, но не SIGKILL и не
+     * Обработчики выше и отмена прохода закрывают обычное завершение, но не SIGKILL и не
      * OOM-killer (I-022): после жёсткого убийства правило жило в ядре до ручной
-     * чистки. Уборка в начале прохода восстанавливает состояние независимо от
+     * чистки. Уборка при старте сторожа восстанавливает состояние независимо от
      * того, как умер предыдущий процесс, и идемпотентна — нет правила, нет дела. */
     cleanup_probe_rule();
-}
-
-int cmd_failover(const char *spec, int verbose) {
-    /* Спека — значение, а не глобалы (правило 6): свой экземпляр у точки входа. */
-    static struct spec cfg;
-    atexit(cleanup_probe_rule);
-    failover_pass_guard();
-
-    /* Правило 5, docs/architecture.md, раздел 2: err_die здесь довершает то, что раньше делал
-     * die() изнутри load_spec/registry_assign — «конец одного прохода», как и сказано в шапке
-     * watch.c, только теперь через явную проверку возврата, а не exit() из глубины разбора. */
-    struct err e = {0};
-    if (load_spec(spec, &cfg, &e) < 0) err_die(&e);
-    if (registry_assign(&cfg, &e) < 0) err_die(&e);
-    return failover_pass(&cfg, &fo_store_files, verbose, NULL, NULL);
 }
 
 static const char *on_fail_name(enum on_fail of) {
@@ -1511,258 +1280,1114 @@ static void fo_emit(fo_event_fn ev, void *arg, enum fo_ev_kind kind, const struc
     ev(arg, &e);
 }
 
-/* Проход сторожа. sp — спека вызывающего (`steer failover` читает её сам, демон отдаёт копию
- * своей), st — память между проходами, ev — получатель событий (fostate.h). */
-int failover_pass(struct spec *sp, struct fo_store *st, int verbose, fo_event_fn ev, void *arg) {
-    int changed = 0;
-    int streak_new[MAX_OUTPUTS] = {0};
-    /* ПОРЯДОК ОБХОДА — ПО ЗАВИСИМОСТЯМ `via`, а не по спеке.
-     *
-     * Выход, чей туннель идёт через другой выход (см. «вложенные выходы» в spec.h), жив только
-     * пока жива его цель: соединение внутреннего туннеля с сервером едет в устройство цели. Ответ
-     * «цель жива» сторож и так получает в этом же проходе — нужно лишь спросить цель ПЕРВОЙ.
-     * Поэтому сначала выходы без via, затем те, чья цель без via, и так до MAX_VIA_DEPTH: спека
-     * круги и цепочки длиннее не пропускает (via_check в spec.c), так что каждый выход получает
-     * место ровно один раз. Порядок внутри одного слоя — прежний, спековый: у спек без via обход
-     * тот же, что был, до последнего прохода.
-     *
-     * Ни проб, ни таймеров ради этого не заводится — требование батареи на телефоне: зависимость
-     * читается из уже известного ответа, а пробы внутреннего выхода при лежащей цели и вовсе не
-     * делаются (см. via_down ниже). */
-    size_t ord[MAX_OUTPUTS];
-    size_t ord_n = 0;
-    for (int depth = 0; depth <= MAX_VIA_DEPTH; depth++)
-        for (size_t i = 0; i < sp->out_n; i++)
-            if (out_via_depth(sp, &sp->out[i]) == depth) ord[ord_n++] = i;
-    /* Кто в ЭТОМ проходе нашёл живое устройство. */
-    int alive[MAX_OUTPUTS] = {0};
-    for (size_t oi = 0; oi < ord_n; oi++) {
-        size_t i = ord[oi];
-        struct output *o = &sp->out[i];
-        if (!out_has_device(o)) continue;
+/* ==== ПРОХОД — КОНЕЧНЫЙ АВТОМАТ НА ЦИКЛЕ СОБЫТИЙ ===========================================
+ *
+ * Решение владельца: сторож в демоне работает без fork на проход (docs/architecture.md, «4а»).
+ * Всё, чего проход ждёт, — пробы устройств, внешние команды оживления, подъём устройства,
+ * разрешение имени Endpoint, — он ждёт не синхронно, а шагом автомата: начал ожидание,
+ * вернул управление циклу, а по готовности дескриптора, срабатыванию таймера или выходу
+ * ребёнка продолжил с того места, где остановился. Цикл при этом свободен: демон отвечает на
+ * status и apply посреди пробы, которая ждёт свои три секунды.
+ *
+ * ЛОГИКА ОДНА. Автомат — это прежний проход, разложенный по шагам, а не второй проход рядом с
+ * ним: порядок обхода по via, «первый живой по предпочтению», гистерезис возврата, выбор по
+ * замеру с допуском, оживление по порядку, сверка маршрутизации и on_fail — те же решения в том
+ * же порядке, с теми же пробами (и тем же их числом: проба, которой прежний код не делал из-за
+ * короткого замыкания условия, не делается и здесь). Состояния ниже названы по местам прежнего
+ * кода, где он ждал. Им же пользуются все, кто проход зовёт:
+ *   - демон с --watch (watchd.c) — на своём цикле, fo_pass_start;
+ *   - `steer failover --loop` (watch.c) — на своём цикле, тоже fo_pass_start: fork на проход
+ *     ушёл и оттуда;
+ *   - `steer failover` — failover_pass: заводит цикл, крутит его до конца прохода и выходит.
+ *
+ * Что по-прежнему синхронно: действия над ядром в конце шага выхода — привязка таблицы
+ * (`ip route replace`, `ip rule`), снятие соединений, отметка в наборе nft. Это доли
+ * миллисекунды у ядра и случаются только при перемене (привязка, отказ, починка разъехавшегося
+ * состояния), а не на каждом проходе; откладывать их значило бы откладывать решения прохода
+ * до его конца. Сверка же, которая идёт на каждом проходе, читает ядро сообщениями rtnetlink
+ * без процессов (rules_show, routes_show выше). Итог: проход по исправной спеке не запускает
+ * ни одного процесса; процесс появляется только на ДЕЙСТВИЕ — ifdown/ifup, сигнал помощнику
+ * через ubus, перепривязку, — или на пробу там, где проба ICMP из процесса запрещена (foprobe.h).
+ *
+ * ОЖИДАНИЕ ПОДЪЁМА при оживлении — десять шагов по секунде, как и было, но шаг — это таймер
+ * цикла, а не sleep; и событие netlink о самом устройстве (появилось, поднялось, получило
+ * адрес) проверяет его сразу, не дожидаясь конца шага. Такая внеочередная проверка шагом не
+ * считается — предел ожидания прежний, — и за шаг она одна: пачка событий от одного ifup не
+ * превращается в пачку проб. */
 
-        /* Цель via лежит — внутренний выход нерабочий, что бы ни говорила его собственная проба.
-         * Проба тут и соврать может: устройство vless или xsteer остаётся на месте, пока жив
-         * процесс, а до сервера его соединение через мёртвую цель не доедет. И пробовать, и
-         * оживлять его бесполезно — поэтому ни того, ни другого, сразу ветка отказа с ЕГО
-         * on_fail: каналы внутреннего выхода получают то, что человек для них выбрал. */
-        const struct output *via = out_via(sp, o);
-        int via_down = via && !alive[via - sp->out];
+#define ICMP_PROBE_TIMEOUT_MS 3000                     /* как у прежнего `ping -W 3` */
+#define TCP_PROBE_TIMEOUT_MS  (TCP_PROBE_TIMEOUT * 1000)
+#define REVIVE_WAIT_STEPS 10
+#define REVIVE_STEP_MS 1000
+/* Предел внешней команды оживления (ifdown, ifup, ubus): не ответила — SIGKILL её группе.
+ * Раньше предел был один на весь проход (десять минут у ребёнка демона); теперь зависнуть
+ * может только команда, а не проход. */
+#define CMD_MAX_MS 60000
 
-        char was[32];
-        active_get_st(st, o->name, was, sizeof(was));
-        /* Где в списке предпочтения стоит несущее трафик сейчас. -1 — записи нет или её
-         * устройство больше не кандидат: тогда гистерезису не за что держаться, берём
-         * лучшее здоровое сразу. */
-        int cur = -1;
-        for (size_t k = 0; k < o->devices_n; k++)
-            if (!strcmp(o->devices[k], was)) { cur = (int)k; break; }
+/* Швы для стенда failovermatch (объявления — в failover_int.h). В бою все NULL. */
+int (*g_icmp_probe)(const char *dev);
+int (*g_cmd_hook)(const char *const argv[]);
+long (*g_revive_step)(void);
 
-        /* Первое здоровое по предпочтению. Пробуем по порядку и ОСТАНАВЛИВАЕМСЯ на нём —
-         * пробить пробой каждое устройство значило бы платить таймаут за каждый мёртвый
-         * запас на каждом тике. Здоровье устройств 0..first_h тем самым известно. */
-        int first_h = -1;
-        for (size_t k = 0; k < o->devices_n && !via_down; k++) {
-            if (health_of(sp, o, o->devices[k])) { first_h = (int)k; break; }
-            if (verbose)
-                fprintf(stderr, LOG_W "%s: %s не отвечает\n", o->name, o->devices[k]);
-        }
+enum fo_state {
+    S_START, S_OUT, S_SCAN, S_SCAN_R, S_LAT, S_LAT_M, S_LAT_M_R, S_LAT_C, S_LAT_CUR_R,
+    S_LAT_PICK, S_LAT_PICK_R, S_HYST, S_HYST_R, S_REV0, S_REV, S_REV_R, S_FIN, S_END,
+    S_PROBE_ONLY, S_PROBE_ONLY_R, S_REVIVE_ONLY, S_REVIVE_ONLY_R,
+    RV_START, RV_UBUS_R, RV_PAUSE, RV_DOWN, RV_DOWN_R, RV_UP_R, RV_WAIT_INIT, RV_WAIT_ARM,
+    RV_WAITING, RV_WAIT_PROBE, RV_WAIT_R, RV_EV_PROBE, RV_EV_R, RV_KIND, RV_KIND_GO,
+};
 
-        const char *chosen = NULL;
-        int streak = active_streak_get(st, o->name);
-        int new_streak = 0;
-        /* Для события switched: чем выбор объяснить. Устройства 0..first_h пробой уже
-         * спрошены, поэтому «текущее мертво» при cur < first_h известно без новой пробы. */
-        int by_latency = 0;
-        int cur_dead = cur >= 0 && first_h >= 0 && cur < first_h;
+/* Вид пробы: здоровье через шов стенда (в проходе), здоровье устройства без шва (ожидание
+ * подъёма при оживлении — так было и раньше: там спрашивалось само устройство), замер. */
+enum { HP_HEALTH, HP_HEALTH_REAL, HP_LATENCY };
 
-        /* ---- ВЫБОР ПО ЗАМЕРУ, если выход этого просит --------------------------------
-         *
-         * Работает НЕ на каждом тике, и это главное в устройстве. Выше сторож нарочно
-         * останавливается на первом здоровом: пробить пробой каждого мёртвого запаса стоит
-         * таймаут, и на восьми кандидатах это двадцать секунд на тик. Замер же требует
-         * опросить ВСЕХ — иначе сравнивать не с чем. Поэтому у него свой, длинный интервал
-         * (умолчание 180 с против тика в 60), а между замерами выход ведёт себя как прежде,
-         * то есть по порядку предпочтения.
-         *
-         * Допуск (умолчание 50 мс) — гистерезис в единицах самого замера. Без него сторож
-         * менял бы устройство на каждом дрожании в пару миллисекунд, а смена устройства
-         * здесь это смена выходного адреса и обрыв соединений через прежнее.
-         *
-         * Оба числа взяты у sing-box (interval 3m, tolerance 50), где эта задача решена
-         * давно и проверена на несравнимо большем числе установок, чем наша.
-         *
-         * Порядок предпочтения человека НЕ отменяется, а становится решающим при равенстве:
-         * кандидат, чей замер не хуже лучшего на допуск, считается равным, и из таких
-         * берётся самый предпочтительный. Иначе включение режима означало бы «мой список
-         * больше ничего не значит». */
-        if (o->prefer_latency && first_h >= 0 && o->devices_n > 1) {
-            int tol = o->lat_tolerance_ms > 0 ? o->lat_tolerance_ms : LAT_TOLERANCE_MS;
-            long iv  = o->lat_interval_s  > 0 ? o->lat_interval_s  : LAT_INTERVAL_S;
-            int ms[MAX_DEVICES];
-            int have = 0, stale = 0;
-            for (size_t k = 0; k < o->devices_n; k++) {
-                long age = 0;
-                ms[k] = -1;
-                if (lat_get(st, o->name, o->devices[k], &ms[k], &age)) {
-                    if (age > iv || age < 0) stale = 1;
-                } else stale = 1;
-            }
-            if (stale) {
-                /* Меряем ВСЕХ, включая тех, что ниже first_h: смысл режима ровно в том,
-                 * чтобы узнать про них. */
-                for (size_t k = 0; k < o->devices_n; k++)
-                    ms[k] = device_latency(sp, o, o->devices[k]);
-                lat_put(st, o->name, o->devices, ms, o->devices_n);
-            }
-            for (size_t k = 0; k < o->devices_n; k++) if (ms[k] >= 0) have++;
-            if (have > 0) {
-                int best = -1;
-                for (size_t k = 0; k < o->devices_n; k++)
-                    if (ms[k] >= 0 && (best < 0 || ms[k] < best)) best = ms[k];
-                int pick = -1;
-                for (size_t k = 0; k < o->devices_n; k++)
-                    if (ms[k] >= 0 && ms[k] - best <= tol) { pick = (int)k; break; }
-                if (pick >= 0) {
-                    /* Уходить с ЖИВОГО текущего только если выигрыш больше допуска. Мёртвое
-                     * текущее уступает сразу: здоровье старше замера. */
-                    if (cur >= 0 && cur != pick && ms[cur] >= 0 &&
-                        health_of(sp, o, o->devices[cur]) && ms[cur] - ms[pick] <= tol)
-                        pick = cur;
-                    if (!health_of(sp, o, o->devices[pick])) pick = -1;
-                }
-                if (pick >= 0) {
-                    chosen = o->devices[pick];
-                    by_latency = 1;
-                    if (verbose)
-                        fprintf(stderr, LOG_I "%s: по замеру выбран %s (%d мс, лучший %d, "
-                                        "допуск %d)\n",
-                                o->name, o->devices[pick], ms[pick], best, tol);
-                }
-            } else if (verbose) {
-                /* Ни один замер не удался — режим молча становится прежним. Сказать надо:
-                 * иначе человек думает, что выбор идёт по задержке, а он идёт по списку.
-                 * Так бывает у выхода kind=xsteer, который не меряется никогда. */
-                fprintf(stderr, LOG_W "%s: задержку измерить не удалось ни у одного "
-                                "устройства — выбираю по порядку\n", o->name);
-            }
-        }
+struct fo_run {
+    struct loop *l;
+    struct spec *sp;
+    struct fo_store *st;
+    int verbose;
+    fo_event_fn ev;
+    void *ev_arg;
+    fo_done_fn done;
+    void *done_arg;
+    struct loop_timer *kick;          /* первый шаг — оборотом цикла, а не изнутри fo_pass_start */
+    enum fo_state s;
+    int res;                          /* итог последнего ожидания */
 
-        if (!chosen && first_h >= 0) {
-            if (cur > first_h) {
-                /* Трафик сейчас на менее предпочтительном устройстве, а более
-                 * предпочтительное ожило. Уходить с текущего, если оно ещё живо, спешить
-                 * нельзя — это и есть мелькание. Держим его, пока верхнее не подтвердит
-                 * здоровье STEER_FAILOVER_HYST тиков подряд. Мёртвое текущее — сразу вниз. */
-                int hyst = failover_hyst();
-                if (health_of(sp, o, o->devices[cur])) {
-                    int s = streak + 1;
-                    if (hyst > 0 && s < hyst) { chosen = o->devices[cur]; new_streak = s; }
-                    else chosen = o->devices[first_h];
-                } else {
-                    chosen = o->devices[first_h];
-                    cur_dead = 1;
-                }
-            } else {
-                /* first_h == cur (несём лучшее доступное) либо cur < first_h (текущее
-                 * мертво — first_h это уход вниз): в обоих случаях берём first_h без
-                 * задержки, счётчик сбрасываем. */
-                chosen = o->devices[first_h];
-            }
-        }
+    /* ---- проход (прежние локальные переменные failover_pass) ---- */
+    int changed;
+    int streak_new[MAX_OUTPUTS];
+    int alive[MAX_OUTPUTS];           /* кто в ЭТОМ проходе нашёл живое устройство */
+    size_t ord[MAX_OUTPUTS], ord_n, oi;
+    size_t i;
+    struct output *o;
+    const struct output *via;
+    int via_down;
+    char was[32];
+    int cur, first_h;
+    size_t k;
+    const char *chosen;
+    int streak, new_streak, by_latency, cur_dead;
+    int tol;
+    long iv;
+    int ms[MAX_DEVICES];
+    int best, pick;
 
-        /* Ни одно не ответило — вот теперь можно тратить время на оживление. Порядок
-         * тот же, поэтому основной туннель получает попытку первым. */
-        if (!chosen && !via_down) {
-            if (cur >= 0) cur_dead = 1;   /* ни одно не ответило — и текущее тоже */
-            for (size_t k = 0; k < o->devices_n; k++)
-                if (revive_st(st, sp, o, o->devices[k], verbose)) {
-                    chosen = o->devices[k];
-                    fo_emit(ev, arg, FO_EV_REVIVED, o, NULL, chosen, NULL);
-                    break;
-                }
-        }
-        streak_new[i] = new_streak;
-        alive[i] = chosen != NULL;
-        /* Причину назвать надо: иначе «живых устройств нет» стоит у выхода, чьё устройство на
-         * месте и чья проба, спроси её, ответила бы «да». Строка — на переходе в отказ (как и
-         * объявление apply_failed) или при -v, а не на каждом проходе. */
-        if (via_down && (verbose || strcmp(was, "-") != 0))
-            fprintf(stderr, LOG_W "выход %s: идёт через %s, а тот не работает — выход "
-                            "считается нерабочим\n", o->name, via->name);
+    /* ---- идущая проба ---- */
+    struct {
+        int kind;
+        char dev[32];
+        int ti, best, rule;
+        char src[64];
+        struct foprobe *p;
+    } hp;
 
-        if (chosen) {
-            snprintf(o->device, sizeof(o->device), "%s", chosen);
-            if (strcmp(was, chosen) != 0) {
-                bind_device(o, chosen);
-                printf("steer: выход %s -> %s%s\n", o->name, chosen,
-                       was[0] && strcmp(was, "-") ? " (переключение)" : "");
-                changed = 1;
-                const char *why = !was[0] ? "start" : !strcmp(was, "-") ? "recovered"
-                                : cur < 0 ? "spec" : by_latency ? "latency"
-                                : cur_dead ? "down" : "preferred";
-                fo_emit(ev, arg, FO_EV_SWITCHED, o,
-                        was[0] && strcmp(was, "-") ? was : NULL, chosen, why);
-            } else {
-                /* Имя устройства то же — и это НЕ значит, что маршрутизация цела.
-                 * Спрашиваем ядро, а не свою память: см. «сверка фактического
-                 * состояния» выше, там же почему пинг при этом идёт. */
-                struct route_facts f = route_facts_read(o);
-                if (!f.known) {
-                    /* Состояние прочитать не удалось. Оставляем как есть: переписать живую
-                     * привязку по незнанию хуже, чем не заметить поломку — та лечится
-                     * следующим проходом, а провал трафика уже случится. Строка на проход
-                     * при -v: молча гадать тоже нельзя. */
-                    if (verbose)
-                        fprintf(stderr, LOG_W "%s: состояние маршрутизации не прочитать "
-                                        "(нет ip?) — ничего не меняю\n", o->name);
-                } else if (!routing_live_ok(&f, chosen)) {
-                    fprintf(stderr, LOG_W "выход %s: %s отвечает, но маршрутизация "
-                                    "разъехалась (%s) — возвращаю маршрут\n",
-                            o->name, chosen, facts_why(&f, chosen));
-                    bind_device(o, chosen);
-                    changed = 1;
-                } else {
-                    /* Маршрутизация цела, но у выхода с drop пропал запасной запрет (его снял
-                     * кто-то снаружи, или таблицу ставил движок до этой версии). Возвращается
-                     * одной командой, без перепривязки: соединения рвать не из-за чего. */
-                    if (o->on_fail == FAIL_DROP && !f.backstop) backstop_set(o->table);
-                    if (verbose) fprintf(stderr, LOG_I "%s: %s работает\n", o->name, chosen);
-                }
-            }
-        } else {
-            o->device[0] = '\0';
-            /* Тоже по факту, а не по записи в active. Запись «-» говорит лишь о том, что
-             * об отказе уже сообщали, а не о том, что заявленный on_fail всё ещё стоит в
-             * ядре: клиент туннеля мог с тех пор подняться и привязать таблицу к
-             * устройству, которое не отвечает, — тогда трафик уходит в мёртвый туннель
-             * вместо остановки, обещанной on_fail=drop. */
-            if (strcmp(was, "-") != 0) {
-                apply_failed(o, 1);         /* отказ только что случился — объявляем */
-                changed = 1;
-                fo_emit(ev, arg, FO_EV_FAILED, o, was[0] ? was : NULL, NULL,
-                        via_down ? "via" : "down");
-            } else {
-                struct route_facts f = route_facts_read(o);
-                if (!f.known) {
-                    /* То же, что в живой ветке: по незнанию не трогаем. Здесь цена ошибки
-                     * даже выше — apply_failed при on_fail=drop останавливает трафик, и
-                     * сделать это «на всякий случай» значило бы уронить работающий выход. */
-                    if (verbose)
-                        fprintf(stderr, LOG_W "%s: состояние маршрутизации не прочитать "
-                                        "(нет ip?) — ничего не меняю\n", o->name);
-                } else if (!routing_failed_ok(&f, o->on_fail)) {
-                    fprintf(stderr, LOG_W "выход %s: живых устройств по-прежнему нет, а "
-                                    "маршрутизация разъехалась (%s) — возвращаю "
-                                    "on_fail=%s\n",
-                            o->name, failed_why(&f, o->on_fail), on_fail_name(o->on_fail));
-                    apply_failed(o, 0);
-                    changed = 1;
-                }
+    /* ---- идущее оживление ---- */
+    struct {
+        enum fo_state ret;
+        const struct output *o;
+        const struct output *ow;
+        char dev[32];
+        int i, extra, timer_fired;
+        struct loop_timer *tm;
+        int nl;
+        struct fospawn *sp;
+        struct gaiw *gw;
+        struct kind_name names[KIND_NAMES_MAX];
+        size_t nn;
+    } rv;
+};
+
+static void fo_step(struct fo_run *r);
+
+/* ---- проба --------------------------------------------------------------------------------- */
+
+/* Правило пробы — см. шапку «ПРОБА ICMP» выше, почему оно остаётся при SO_BINDTODEVICE. */
+static void probe_rule_set(struct fo_run *r) {
+    struct in_addr src;
+    if (inet_aton(r->hp.src, &src) == 0) return;
+    rtnl_rule_from(0, src, PROBE_TABLE, PROBE_PRIO);
+    unsigned idx = if_nametoindex(r->hp.dev);
+    if (idx) rtnl_route_default_dev(PROBE_TABLE, (int)idx);
+    rtnl_rule_from(1, src, PROBE_TABLE, PROBE_PRIO);
+    r->hp.rule = 1;
+}
+
+static void probe_rule_clear(struct fo_run *r) {
+    if (!r->hp.rule) return;
+    struct in_addr src;
+    if (inet_aton(r->hp.src, &src) != 0) rtnl_rule_from(0, src, PROBE_TABLE, PROBE_PRIO);
+    rtnl_table_flush(PROBE_TABLE);
+    r->hp.rule = 0;
+}
+
+/* Итог TCP-цели: 1 — решено (здоровье нашло живую цель). Замер спрашивает все цели и берёт
+ * ЛУЧШУЮ, а не первую ответившую: цели в разных сетях, и «первая ответила за 300 мс» на
+ * канале, где вторая отвечает за 20, — это не задержка канала. */
+static int hp_tcp_take(struct fo_run *r, int ok, int ms) {
+    if (r->hp.kind == HP_LATENCY) {
+        if (ok && ms >= 0 && (r->hp.best < 0 || ms < r->hp.best)) r->hp.best = ms;
+        return 0;
+    }
+    if (ok) { r->res = 1; return 1; }
+    return 0;
+}
+
+static void hp_tcp_cb(void *arg, int ok, int ms);
+
+/* 1 — проба идёт; 0 — кончилась, итог в r->res. */
+static int hp_tcp_next(struct fo_run *r) {
+    for (; PROBE_TARGETS[r->hp.ti]; r->hp.ti++) {
+        int ok = 0, ms = -1;
+        r->hp.p = foprobe_tcp(r->l, r->hp.dev, PROBE_TARGETS[r->hp.ti], TCP_PROBE_PORT,
+                              TCP_PROBE_TIMEOUT_MS, hp_tcp_cb, r, &ok, &ms);
+        if (r->hp.p) return 1;
+        if (hp_tcp_take(r, ok, ms)) return 0;
+    }
+    r->res = r->hp.kind == HP_LATENCY ? r->hp.best : 0;
+    return 0;
+}
+
+static void hp_tcp_cb(void *arg, int ok, int ms) {
+    struct fo_run *r = arg;
+    r->hp.p = NULL;
+    if (!hp_tcp_take(r, ok, ms)) {
+        r->hp.ti++;
+        if (hp_tcp_next(r)) return;
+    }
+    fo_step(r);
+}
+
+static void hp_icmp_cb(void *arg, int ok, int ms);
+
+static int hp_icmp_next(struct fo_run *r) {
+    for (; PROBE_TARGETS[r->hp.ti]; r->hp.ti++) {
+        int ok = 0;
+        r->hp.p = foprobe_icmp(r->l, r->hp.dev, r->hp.src, PROBE_TARGETS[r->hp.ti],
+                               ICMP_PROBE_TIMEOUT_MS, hp_icmp_cb, r, &ok);
+        if (r->hp.p) return 1;
+        if (ok) break;
+    }
+    r->res = PROBE_TARGETS[r->hp.ti] != NULL;
+    probe_rule_clear(r);
+    return 0;
+}
+
+static void hp_icmp_cb(void *arg, int ok, int ms) {
+    (void)ms;
+    struct fo_run *r = arg;
+    r->hp.p = NULL;
+    if (ok) {
+        r->res = 1;
+        probe_rule_clear(r);
+    } else {
+        r->hp.ti++;
+        if (hp_icmp_next(r)) return;
+    }
+    fo_step(r);
+}
+
+/* Спросить устройство dev выхода o. Состояние, в котором продолжить, вызывающий ставит ДО
+ * вызова. 1 — проба идёт (вызывающий возвращает управление циклу, продолжение — из обратного
+ * вызова); 0 — ответ уже есть, в r->res (здоровье 1/0, замер — мс или -1). */
+static int hp_start(struct fo_run *r, int kind, const struct output *o, const char *dev) {
+    const struct spec *sp = r->sp;
+    r->hp.kind = kind;
+    snprintf(r->hp.dev, sizeof(r->hp.dev), "%s", dev);
+    r->hp.ti = 0;
+    r->hp.best = -1;
+    if (kind == HP_HEALTH && g_health_probe) { r->res = g_health_probe(sp, o, dev); return 0; }
+    if (kind == HP_LATENCY) {
+        if (g_latency_probe) { r->res = g_latency_probe(sp, o, dev); return 0; }
+        r->res = -1;
+        if (!device_present(dev)) return 0;
+        o = out_for_device(sp, o, dev);
+        const struct kind_ops *k = kind_of(o);
+        if (k->latency) { r->res = k->latency(sp, o, dev); return 0; }
+        /* И туннель xsteer, поднятый netifd, — по тому же доводу, что у вида xsteer: мерить его
+         * нечем, а число из пробы наружу означало бы не задержку туннеля, а наличие интернета у
+         * хаба. */
+        if (xs_state_read(dev, NULL, NULL)) return 0;
+        return hp_tcp_next(r);
+    }
+    r->res = 0;
+    if (!device_present(dev)) return 0;
+    o = out_for_device(sp, o, dev);
+    const struct kind_ops *k = kind_of(o);
+    if (k->health) { r->res = k->health(sp, o, dev); return 0; }
+    {
+        int up = 0, fresh = 0;
+        if (xs_state_read(dev, &up, &fresh)) { r->res = fresh ? up : 1; return 0; }
+    }
+    if (out_has_cap(o, KC_TCP_PROBE)) return hp_tcp_next(r);
+    if (g_icmp_probe) { r->res = g_icmp_probe(dev); return 0; }
+    if (!device_src(dev, r->hp.src, sizeof(r->hp.src))) return 0;
+    probe_rule_set(r);
+    return hp_icmp_next(r);
+}
+
+/* ---- внешняя команда оживления --------------------------------------------------------------- */
+
+static void cmd_cb(void *arg, int rc) {
+    struct fo_run *r = arg;
+    r->rv.sp = NULL;
+    r->res = rc;
+    fo_step(r);
+}
+
+/* 1 — команда идёт; 0 — кончилась (итог в r->res). Шов g_cmd_hook — стенду: команда
+ * «выполняется» его журналом и кончается сразу. */
+static int cmd_start(struct fo_run *r, const char *const argv[]) {
+    if (g_cmd_hook) { r->res = g_cmd_hook(argv); return 0; }
+    int rc = -1;
+    r->rv.sp = fospawn_start(r->l, argv, CMD_MAX_MS, cmd_cb, r, &rc);
+    if (r->rv.sp) return 1;
+    r->res = rc;
+    return 0;
+}
+
+/* ---- оживление: таймер шага и события netlink --------------------------------------------- */
+
+static void rv_arm(struct fo_run *r) {
+    long ms = g_revive_step ? g_revive_step() : REVIVE_STEP_MS;
+    loop_timer_set(r->rv.tm, ms);
+}
+
+static void rv_timer(struct loop *l, struct loop_timer *t, void *arg) {
+    (void)l; (void)t;
+    struct fo_run *r = arg;
+    switch (r->s) {
+    case RV_PAUSE:                    /* пауза после сигнала помощнику */
+        r->s = RV_DOWN;
+        fo_step(r);
+        return;
+    case RV_WAITING:                  /* шаг ожидания кончился — проба */
+        r->rv.i++;
+        r->s = RV_WAIT_PROBE;
+        fo_step(r);
+        return;
+    case RV_EV_R:                     /* шаг кончился посреди внеочередной пробы */
+        r->rv.timer_fired = 1;
+        return;
+    default:
+        return;
+    }
+}
+
+static void rv_nl_close(struct fo_run *r) {
+    if (r->rv.nl < 0) return;
+    loop_fd_del(r->l, r->rv.nl);
+    close(r->rv.nl);
+    r->rv.nl = -1;
+}
+
+/* Событие о самом устройстве оживления (по номеру: у только что созданного он уже есть на
+ * момент события) — внеочередная проба, одна за шаг. */
+static void rv_nl(struct loop *l, int fd, uint32_t ev, void *arg) {
+    (void)l; (void)ev;
+    struct fo_run *r = arg;
+    unsigned idx = if_nametoindex(r->rv.dev);
+    int mine = 0;
+    char buf[8192];
+    ssize_t n;
+    while ((n = recv(fd, buf, sizeof(buf), 0)) > 0 || (n < 0 && errno == ENOBUFS)) {
+        if (n < 0) { mine = 1; continue; }   /* события потеряны — могли быть и наши */
+        int left = (int)n;
+        for (struct nlmsghdr *h = (struct nlmsghdr *)buf; NLMSG_OK(h, (unsigned)left);
+             h = NLMSG_NEXT(h, left)) {
+            if (h->nlmsg_type == RTM_NEWLINK &&
+                h->nlmsg_len >= NLMSG_LENGTH(sizeof(struct ifinfomsg))) {
+                const struct ifinfomsg *ifi = NLMSG_DATA(h);
+                if (idx && (unsigned)ifi->ifi_index == idx) mine = 1;
+            } else if (h->nlmsg_type == RTM_NEWADDR &&
+                       h->nlmsg_len >= NLMSG_LENGTH(sizeof(struct ifaddrmsg))) {
+                const struct ifaddrmsg *ifa = NLMSG_DATA(h);
+                if (idx && ifa->ifa_index == idx) mine = 1;
             }
         }
     }
-    active_save(st, sp, streak_new);
-    if (!changed && verbose) fprintf(stderr, LOG_I "изменений нет\n");
+    if (mine && r->s == RV_WAITING && !r->rv.extra) {
+        r->rv.extra = 1;
+        r->s = RV_EV_PROBE;
+        fo_step(r);
+    }
+}
+
+static void rv_nl_open(struct fo_run *r) {
+    int fd = socket(AF_NETLINK, SOCK_RAW | SOCK_CLOEXEC | SOCK_NONBLOCK, NETLINK_ROUTE);
+    if (fd < 0) return;
+    struct sockaddr_nl a;
+    memset(&a, 0, sizeof(a));
+    a.nl_family = AF_NETLINK;
+    a.nl_groups = RTMGRP_LINK | RTMGRP_IPV4_IFADDR;
+    if (bind(fd, (struct sockaddr *)&a, sizeof(a)) != 0 ||
+        loop_fd_add(r->l, fd, EPOLLIN, rv_nl, r) != 0) {
+        close(fd);
+        return;
+    }
+    r->rv.nl = fd;
+}
+
+/* Начать оживление устройства dev выхода o; итог (1 — ожило) — в r->res в состоянии ret. */
+static void rv_begin(struct fo_run *r, const struct output *o, const char *dev, enum fo_state ret) {
+    r->rv.ret = ret;
+    r->rv.o = o;
+    r->rv.ow = NULL;
+    if (dev != r->rv.dev) snprintf(r->rv.dev, sizeof(r->rv.dev), "%s", dev);
+    r->rv.i = r->rv.extra = r->rv.timer_fired = 0;
+    r->rv.nn = 0;
+    r->s = RV_START;
+}
+
+static void rv_done(struct fo_run *r, int res) {
+    rv_nl_close(r);
+    loop_timer_stop(r->rv.tm);
+    r->res = res;
+    r->s = r->rv.ret;
+}
+
+static void rv_gai_cb(void *arg, const struct kind_name *names, size_t n) {
+    struct fo_run *r = arg;
+    r->rv.gw = NULL;
+    if (n > KIND_NAMES_MAX) n = KIND_NAMES_MAX;
+    memcpy(r->rv.names, names, n * sizeof(names[0]));
+    r->rv.nn = n;
+    fo_step(r);
+}
+
+/* ---- заведение и уход ----------------------------------------------------------------------- */
+
+static void run_kick(struct loop *l, struct loop_timer *t, void *arg) {
+    (void)l; (void)t;
+    fo_step(arg);
+}
+
+static struct fo_run *run_new(struct loop *l, struct spec *sp, struct fo_store *st, int verbose,
+                              fo_event_fn ev, void *ev_arg, fo_done_fn done, void *done_arg) {
+    struct fo_run *r = calloc(1, sizeof(*r));
+    if (!r) return NULL;
+    r->l = l;
+    r->sp = sp;
+    r->st = st;
+    r->verbose = verbose;
+    r->ev = ev;
+    r->ev_arg = ev_arg;
+    r->done = done;
+    r->done_arg = done_arg;
+    r->rv.nl = -1;
+    r->kick = loop_timer_new(l, run_kick, r);
+    r->rv.tm = loop_timer_new(l, rv_timer, r);
+    if (!r->kick || !r->rv.tm) {
+        loop_timer_free(r->kick);
+        loop_timer_free(r->rv.tm);
+        free(r);
+        return NULL;
+    }
+    return r;
+}
+
+static void run_free(struct fo_run *r) {
+    if (r->hp.p) foprobe_cancel(r->hp.p);
+    probe_rule_clear(r);
+    if (r->rv.sp) fospawn_cancel(r->rv.sp);
+    if (r->rv.gw) gaiw_cancel(r->rv.gw);
+    rv_nl_close(r);
+    loop_timer_free(r->rv.tm);
+    loop_timer_free(r->kick);
+    free(r);
+}
+
+static void run_end(struct fo_run *r, int res) {
+    fo_done_fn done = r->done;
+    void *arg = r->done_arg;
+    run_free(r);
+    if (done) done(arg, res);
+}
+
+struct fo_run *fo_pass_start(struct loop *l, struct spec *sp, struct fo_store *st, int verbose,
+                             fo_event_fn ev, void *ev_arg, fo_done_fn done, void *done_arg) {
+    struct fo_run *r = run_new(l, sp, st, verbose, ev, ev_arg, done, done_arg);
+    if (!r) return NULL;
+    r->s = S_START;
+    loop_timer_set(r->kick, 0);
+    return r;
+}
+
+void fo_pass_abort(struct fo_run *r) {
+    if (r) run_free(r);
+}
+
+/* ---- шаг выхода: действия после решения (прежний хвост тела цикла failover_pass) ----------- */
+
+static void out_finish(struct fo_run *r) {
+    struct output *o = r->o;
+    const char *chosen = r->chosen;
+    const char *was = r->was;
+    r->streak_new[r->i] = r->new_streak;
+    r->alive[r->i] = chosen != NULL;
+    /* Причину назвать надо: иначе «живых устройств нет» стоит у выхода, чьё устройство на
+     * месте и чья проба, спроси её, ответила бы «да». Строка — на переходе в отказ (как и
+     * объявление apply_failed) или при -v, а не на каждом проходе. */
+    if (r->via_down && (r->verbose || strcmp(was, "-") != 0))
+        fprintf(stderr, LOG_W "выход %s: идёт через %s, а тот не работает — выход "
+                        "считается нерабочим\n", o->name, r->via->name);
+
+    if (chosen) {
+        snprintf(o->device, sizeof(o->device), "%s", chosen);
+        if (strcmp(was, chosen) != 0) {
+            bind_device(o, chosen);
+            printf("steer: выход %s -> %s%s\n", o->name, chosen,
+                   was[0] && strcmp(was, "-") ? " (переключение)" : "");
+            r->changed = 1;
+            const char *why = !was[0] ? "start" : !strcmp(was, "-") ? "recovered"
+                            : r->cur < 0 ? "spec" : r->by_latency ? "latency"
+                            : r->cur_dead ? "down" : "preferred";
+            fo_emit(r->ev, r->ev_arg, FO_EV_SWITCHED, o,
+                    was[0] && strcmp(was, "-") ? was : NULL, chosen, why);
+        } else {
+            /* Имя устройства то же — и это НЕ значит, что маршрутизация цела.
+             * Спрашиваем ядро, а не свою память: см. «сверка фактического
+             * состояния» выше, там же почему пинг при этом идёт. */
+            struct route_facts f = route_facts_read(o);
+            if (!f.known) {
+                /* Состояние прочитать не удалось. Оставляем как есть: переписать живую
+                 * привязку по незнанию хуже, чем не заметить поломку — та лечится
+                 * следующим проходом, а провал трафика уже случится. Строка на проход
+                 * при -v: молча гадать тоже нельзя. */
+                if (r->verbose)
+                    fprintf(stderr, LOG_W "%s: состояние маршрутизации не прочитать "
+                                    "— ничего не меняю\n", o->name);
+            } else if (!routing_live_ok(&f, chosen)) {
+                fprintf(stderr, LOG_W "выход %s: %s отвечает, но маршрутизация "
+                                "разъехалась (%s) — возвращаю маршрут\n",
+                        o->name, chosen, facts_why(&f, chosen));
+                bind_device(o, chosen);
+                r->changed = 1;
+            } else {
+                /* Маршрутизация цела, но у выхода с drop пропал запасной запрет (его снял
+                 * кто-то снаружи, или таблицу ставил движок до этой версии). Возвращается
+                 * одной командой, без перепривязки: соединения рвать не из-за чего. */
+                if (o->on_fail == FAIL_DROP && !f.backstop) backstop_set(o->table);
+                if (r->verbose) fprintf(stderr, LOG_I "%s: %s работает\n", o->name, chosen);
+            }
+        }
+    } else {
+        o->device[0] = '\0';
+        /* Тоже по факту, а не по записи в active. Запись «-» говорит лишь о том, что
+         * об отказе уже сообщали, а не о том, что заявленный on_fail всё ещё стоит в
+         * ядре: клиент туннеля мог с тех пор подняться и привязать таблицу к
+         * устройству, которое не отвечает, — тогда трафик уходит в мёртвый туннель
+         * вместо остановки, обещанной on_fail=drop. */
+        if (strcmp(was, "-") != 0) {
+            apply_failed(o, 1);         /* отказ только что случился — объявляем */
+            r->changed = 1;
+            fo_emit(r->ev, r->ev_arg, FO_EV_FAILED, o, was[0] ? was : NULL, NULL,
+                    r->via_down ? "via" : "down");
+        } else {
+            struct route_facts f = route_facts_read(o);
+            if (!f.known) {
+                /* То же, что в живой ветке: по незнанию не трогаем. Здесь цена ошибки
+                 * даже выше — apply_failed при on_fail=drop останавливает трафик, и
+                 * сделать это «на всякий случай» значило бы уронить работающий выход. */
+                if (r->verbose)
+                    fprintf(stderr, LOG_W "%s: состояние маршрутизации не прочитать "
+                                    "— ничего не меняю\n", o->name);
+            } else if (!routing_failed_ok(&f, o->on_fail)) {
+                fprintf(stderr, LOG_W "выход %s: живых устройств по-прежнему нет, а "
+                                "маршрутизация разъехалась (%s) — возвращаю "
+                                "on_fail=%s\n",
+                        o->name, failed_why(&f, o->on_fail), on_fail_name(o->on_fail));
+                apply_failed(o, 0);
+                r->changed = 1;
+            }
+        }
+    }
+}
+
+/* ---- автомат ------------------------------------------------------------------------------ */
+
+/* Крутить автомат, пока шаги отвечают сразу; вернуться, как только начато ожидание (его
+ * обратный вызов позовёт fo_step снова) или проход кончился (run_end освободил r). */
+static void fo_step(struct fo_run *r) {
+    struct spec *sp = r->sp;
+    for (;;) {
+        struct output *o = r->o;
+        switch (r->s) {
+
+        /* ---- проход ---- */
+        case S_START:
+            /* ПОРЯДОК ОБХОДА — ПО ЗАВИСИМОСТЯМ `via`, а не по спеке.
+             *
+             * Выход, чей туннель идёт через другой выход (см. «вложенные выходы» в spec.h),
+             * жив только пока жива его цель: соединение внутреннего туннеля с сервером едет в
+             * устройство цели. Ответ «цель жива» сторож и так получает в этом же проходе —
+             * нужно лишь спросить цель ПЕРВОЙ. Поэтому сначала выходы без via, затем те, чья
+             * цель без via, и так до MAX_VIA_DEPTH: спека круги и цепочки длиннее не
+             * пропускает (via_check в spec.c), так что каждый выход получает место ровно один
+             * раз. Порядок внутри одного слоя — прежний, спековый: у спек без via обход тот
+             * же, что был, до последнего прохода.
+             *
+             * Ни проб, ни таймеров ради этого не заводится — требование батареи на телефоне:
+             * зависимость читается из уже известного ответа, а пробы внутреннего выхода при
+             * лежащей цели и вовсе не делаются (см. via_down ниже). */
+            r->ord_n = 0;
+            for (int depth = 0; depth <= MAX_VIA_DEPTH; depth++)
+                for (size_t i = 0; i < sp->out_n; i++)
+                    if (out_via_depth(sp, &sp->out[i]) == depth) r->ord[r->ord_n++] = i;
+            r->oi = 0;
+            r->s = S_OUT;
+            continue;
+
+        case S_OUT:
+            if (r->oi >= r->ord_n) { r->s = S_END; continue; }
+            r->i = r->ord[r->oi];
+            r->o = o = &sp->out[r->i];
+            if (!out_has_device(o)) { r->oi++; continue; }
+            /* Цель via лежит — внутренний выход нерабочий, что бы ни говорила его собственная
+             * проба. Проба тут и соврать может: устройство vless или xsteer остаётся на месте,
+             * пока жив процесс, а до сервера его соединение через мёртвую цель не доедет. И
+             * пробовать, и оживлять его бесполезно — поэтому ни того, ни другого, сразу ветка
+             * отказа с ЕГО on_fail: каналы внутреннего выхода получают то, что человек для
+             * них выбрал. */
+            r->via = out_via(sp, o);
+            r->via_down = r->via && !r->alive[r->via - sp->out];
+            active_get_st(r->st, o->name, r->was, sizeof(r->was));
+            /* Где в списке предпочтения стоит несущее трафик сейчас. -1 — записи нет или её
+             * устройство больше не кандидат: тогда гистерезису не за что держаться, берём
+             * лучшее здоровое сразу. */
+            r->cur = -1;
+            for (size_t k = 0; k < o->devices_n; k++)
+                if (!strcmp(o->devices[k], r->was)) { r->cur = (int)k; break; }
+            r->first_h = -1;
+            r->k = 0;
+            r->s = S_SCAN;
+            continue;
+
+        case S_SCAN:
+            /* Первое здоровое по предпочтению. Пробуем по порядку и ОСТАНАВЛИВАЕМСЯ на нём —
+             * пробить пробой каждое устройство значило бы платить таймаут за каждый мёртвый
+             * запас на каждом тике. Здоровье устройств 0..first_h тем самым известно. */
+            if (r->k >= o->devices_n || r->via_down) { r->s = S_LAT; continue; }
+            r->s = S_SCAN_R;
+            if (hp_start(r, HP_HEALTH, o, o->devices[r->k])) return;
+            continue;
+
+        case S_SCAN_R:
+            if (r->res) { r->first_h = (int)r->k; r->s = S_LAT; continue; }
+            if (r->verbose)
+                fprintf(stderr, LOG_W "%s: %s не отвечает\n", o->name, o->devices[r->k]);
+            r->k++;
+            r->s = S_SCAN;
+            continue;
+
+        case S_LAT:
+            r->chosen = NULL;
+            r->streak = active_streak_get(r->st, o->name);
+            r->new_streak = 0;
+            /* Для события switched: чем выбор объяснить. Устройства 0..first_h пробой уже
+             * спрошены, поэтому «текущее мертво» при cur < first_h известно без новой пробы. */
+            r->by_latency = 0;
+            r->cur_dead = r->cur >= 0 && r->first_h >= 0 && r->cur < r->first_h;
+            /* ---- ВЫБОР ПО ЗАМЕРУ, если выход этого просит ----------------------------
+             *
+             * Работает НЕ на каждом тике, и это главное в устройстве. Выше сторож нарочно
+             * останавливается на первом здоровом: пробить пробой каждого мёртвого запаса
+             * стоит таймаут, и на восьми кандидатах это двадцать секунд на тик. Замер же
+             * требует опросить ВСЕХ — иначе сравнивать не с чем. Поэтому у него свой, длинный
+             * интервал (умолчание 180 с против тика в 60), а между замерами выход ведёт себя
+             * как прежде, то есть по порядку предпочтения.
+             *
+             * Допуск (умолчание 50 мс) — гистерезис в единицах самого замера. Без него сторож
+             * менял бы устройство на каждом дрожании в пару миллисекунд, а смена устройства
+             * здесь это смена выходного адреса и обрыв соединений через прежнее.
+             *
+             * Оба числа взяты у sing-box (interval 3m, tolerance 50), где эта задача решена
+             * давно и проверена на несравнимо большем числе установок, чем наша.
+             *
+             * Порядок предпочтения человека НЕ отменяется, а становится решающим при
+             * равенстве: кандидат, чей замер не хуже лучшего на допуск, считается равным, и
+             * из таких берётся самый предпочтительный. Иначе включение режима означало бы
+             * «мой список больше ничего не значит». */
+            if (o->prefer_latency && r->first_h >= 0 && o->devices_n > 1) {
+                r->tol = o->lat_tolerance_ms > 0 ? o->lat_tolerance_ms : LAT_TOLERANCE_MS;
+                r->iv  = o->lat_interval_s  > 0 ? o->lat_interval_s  : LAT_INTERVAL_S;
+                int stale = 0;
+                for (size_t k = 0; k < o->devices_n; k++) {
+                    long age = 0;
+                    r->ms[k] = -1;
+                    if (lat_get(r->st, o->name, o->devices[k], &r->ms[k], &age)) {
+                        if (age > r->iv || age < 0) stale = 1;
+                    } else stale = 1;
+                }
+                /* Меряем ВСЕХ, включая тех, что ниже first_h: смысл режима ровно в том, чтобы
+                 * узнать про них. */
+                r->k = 0;
+                r->s = stale ? S_LAT_M : S_LAT_C;
+                continue;
+            }
+            r->s = S_HYST;
+            continue;
+
+        case S_LAT_M:
+            if (r->k >= o->devices_n) {
+                lat_put(r->st, o->name, o->devices, r->ms, o->devices_n);
+                r->s = S_LAT_C;
+                continue;
+            }
+            r->s = S_LAT_M_R;
+            if (hp_start(r, HP_LATENCY, o, o->devices[r->k])) return;
+            continue;
+
+        case S_LAT_M_R:
+            r->ms[r->k] = r->res;
+            r->k++;
+            r->s = S_LAT_M;
+            continue;
+
+        case S_LAT_C: {
+            int have = 0;
+            for (size_t k = 0; k < o->devices_n; k++) if (r->ms[k] >= 0) have++;
+            if (have == 0) {
+                /* Ни один замер не удался — режим молча становится прежним. Сказать надо:
+                 * иначе человек думает, что выбор идёт по задержке, а он идёт по списку.
+                 * Так бывает у выхода kind=xsteer, который не меряется никогда. */
+                if (r->verbose)
+                    fprintf(stderr, LOG_W "%s: задержку измерить не удалось ни у одного "
+                                    "устройства — выбираю по порядку\n", o->name);
+                r->s = S_HYST;
+                continue;
+            }
+            int best = -1;
+            for (size_t k = 0; k < o->devices_n; k++)
+                if (r->ms[k] >= 0 && (best < 0 || r->ms[k] < best)) best = r->ms[k];
+            int pick = -1;
+            for (size_t k = 0; k < o->devices_n; k++)
+                if (r->ms[k] >= 0 && r->ms[k] - best <= r->tol) { pick = (int)k; break; }
+            r->best = best;
+            r->pick = pick;
+            if (pick < 0) { r->s = S_HYST; continue; }
+            /* Уходить с ЖИВОГО текущего только если выигрыш больше допуска. Мёртвое текущее
+             * уступает сразу: здоровье старше замера. */
+            if (r->cur >= 0 && r->cur != pick && r->ms[r->cur] >= 0) {
+                r->s = S_LAT_CUR_R;
+                if (hp_start(r, HP_HEALTH, o, o->devices[r->cur])) return;
+                continue;
+            }
+            r->s = S_LAT_PICK;
+            continue;
+        }
+
+        case S_LAT_CUR_R:
+            if (r->res && r->ms[r->cur] - r->ms[r->pick] <= r->tol) r->pick = r->cur;
+            r->s = S_LAT_PICK;
+            continue;
+
+        case S_LAT_PICK:
+            r->s = S_LAT_PICK_R;
+            if (hp_start(r, HP_HEALTH, o, o->devices[r->pick])) return;
+            continue;
+
+        case S_LAT_PICK_R:
+            if (r->res) {
+                r->chosen = o->devices[r->pick];
+                r->by_latency = 1;
+                if (r->verbose)
+                    fprintf(stderr, LOG_I "%s: по замеру выбран %s (%d мс, лучший %d, "
+                                    "допуск %d)\n",
+                            o->name, o->devices[r->pick], r->ms[r->pick], r->best, r->tol);
+            }
+            r->s = S_HYST;
+            continue;
+
+        case S_HYST:
+            if (!r->chosen && r->first_h >= 0) {
+                if (r->cur > r->first_h) {
+                    /* Трафик сейчас на менее предпочтительном устройстве, а более
+                     * предпочтительное ожило. Уходить с текущего, если оно ещё живо, спешить
+                     * нельзя — это и есть мелькание. Держим его, пока верхнее не подтвердит
+                     * здоровье STEER_FAILOVER_HYST тиков подряд. Мёртвое текущее — сразу вниз. */
+                    r->s = S_HYST_R;
+                    if (hp_start(r, HP_HEALTH, o, o->devices[r->cur])) return;
+                    continue;
+                }
+                /* first_h == cur (несём лучшее доступное) либо cur < first_h (текущее мертво —
+                 * first_h это уход вниз): в обоих случаях берём first_h без задержки, счётчик
+                 * сбрасываем. */
+                r->chosen = o->devices[r->first_h];
+            }
+            r->s = S_REV0;
+            continue;
+
+        case S_HYST_R: {
+            int hyst = failover_hyst();
+            if (r->res) {
+                int s = r->streak + 1;
+                if (hyst > 0 && s < hyst) { r->chosen = o->devices[r->cur]; r->new_streak = s; }
+                else r->chosen = o->devices[r->first_h];
+            } else {
+                r->chosen = o->devices[r->first_h];
+                r->cur_dead = 1;
+            }
+            r->s = S_REV0;
+            continue;
+        }
+
+        case S_REV0:
+            /* Ни одно не ответило — вот теперь можно тратить время на оживление. Порядок
+             * тот же, поэтому основной туннель получает попытку первым. */
+            if (!r->chosen && !r->via_down) {
+                if (r->cur >= 0) r->cur_dead = 1;   /* ни одно не ответило — и текущее тоже */
+                r->k = 0;
+                r->s = S_REV;
+                continue;
+            }
+            r->s = S_FIN;
+            continue;
+
+        case S_REV:
+            if (r->k >= o->devices_n) { r->s = S_FIN; continue; }
+            rv_begin(r, o, o->devices[r->k], S_REV_R);
+            continue;
+
+        case S_REV_R:
+            if (r->res) {
+                r->chosen = o->devices[r->k];
+                fo_emit(r->ev, r->ev_arg, FO_EV_REVIVED, o, NULL, r->chosen, NULL);
+                r->s = S_FIN;
+                continue;
+            }
+            r->k++;
+            r->s = S_REV;
+            continue;
+
+        case S_FIN:
+            out_finish(r);
+            r->oi++;
+            r->s = S_OUT;
+            continue;
+
+        case S_END:
+            active_save(r->st, sp, r->streak_new);
+            if (!r->changed && r->verbose) fprintf(stderr, LOG_I "изменений нет\n");
+            /* Строки о переключении — в stdout: у долгоживущего процесса он буферизован, а
+             * читают его журнал сервиса и стенды — сразу после прохода. */
+            fflush(stdout);
+            run_end(r, 0);
+            return;
+
+        /* ---- одна проба или одно оживление (синхронные обёртки для стенда) ---- */
+        case S_PROBE_ONLY:
+            r->s = S_PROBE_ONLY_R;
+            if (hp_start(r, HP_HEALTH_REAL, r->rv.o, r->rv.dev)) return;
+            continue;
+        case S_PROBE_ONLY_R:
+            run_end(r, r->res);
+            return;
+        case S_REVIVE_ONLY:
+            rv_begin(r, r->rv.o, r->rv.dev, S_REVIVE_ONLY_R);
+            continue;
+        case S_REVIVE_ONLY_R:
+            run_end(r, r->res);
+            return;
+
+        /* ---- оживление устройства r->rv.dev выхода r->rv.o ---- */
+        case RV_START: {
+            const struct output *ro = r->rv.o;
+            const char *dev = r->rv.dev;
+            if (!restart_allowed(r->st, dev)) {
+                if (r->verbose)
+                    fprintf(stderr, LOG_I "%s: перезапуск был недавно, пропускаю\n", dev);
+                rv_done(r, 0);
+                continue;
+            }
+            /* Устройство xsteer, поднятое netifd: клиент наш, а интерфейс — его, и зовётся
+             * интерфейс НЕ так, как устройство (xs0 против xs-xs0). `ifdown xs-xs0` netifd
+             * отвечает «Interface not found», то есть сторож писал бы в журнал отказ вместо
+             * починки. Чинить здесь нечего и не нам: упавшего клиента поднимает заново netifd,
+             * как любой обработчик протокола, и дело сторожа то же, что и с нашими собственными
+             * процессами, — сказать и подождать. */
+            if (xs_state_read(dev, NULL, NULL)) {
+                fprintf(stderr, LOG_W "%s: не отвечает — клиента туннеля поднимет заново "
+                                "служба сети; жду\n", dev);
+                r->s = RV_WAIT_INIT;
+                continue;
+            }
+            /* Устройство vless и xsteer создаёт НАШ процесс, а не netifd. ifdown/ifup здесь
+             * бесполезны — netifd про это устройство не знает («Interface vl not found») — и
+             * на живом роутере это выглядело как вечный холостой цикл перезапусков в журнале.
+             * Падение процесса ловит procd (init-скрипт ставит respawn), и подъём заново
+             * выбирает рабочий узел (vless) или заново здоровается с хабом (xsteer) сам. У
+             * сторожа здесь одна задача: сообщить, что туннель молчит, и подождать — кому
+             * именно ждать, тот поднимется сам.
+             *
+             * Вопрос задаётся УСТРОЙСТВУ, а не выходу, который его назвал, по той же причине,
+             * что и проба здоровья (см. device_owner): в пуле разнородных туннелей устройство
+             * vless названо выходом kind=interface, и решение по виду НАЗВАВШЕГО дало бы здесь
+             * ifdown/ifup по устройству, которым netifd не управляет, — «Interface … not
+             * found» раз в минуту и ничего больше.
+             *
+             * Вид, который чинит своё устройство сам (kind_ops.revive), — у ВЛАДЕЛЬЦА
+             * устройства. Туннель kind=awg чинится не ожиданием: процесса, который поднял бы
+             * его заново, нет — устройство живёт в ядре. Лечится то же, что у netifd лечит
+             * ifdown/ifup: имя Endpoint разрешается заново (переезд сервера по DNS), настройка
+             * ложится заново, а пропавшее устройство создаётся. Частоту уже ограничил
+             * restart_allowed выше. */
+            const struct output *ow = out_for_device(sp, ro, dev);
+            if (kind_of(ow)->revive) {
+                r->rv.ow = ow;
+                r->s = RV_KIND;
+                continue;
+            }
+            if (out_engine_managed(ro) || device_owner(sp, dev)) {
+                /* СНАЧАЛА спрашиваем, не известна ли уже причина, по которой ждать
+                 * бессмысленно.
+                 *
+                 * Снято с живого роутера: у выхода с `node: 31` при двадцати девяти узлах в
+                 * подписке сторож писал «должен подняться заново через procd; жду» раз в пять
+                 * минут — часами. Ждать там нечего: номер вне подписки, procd поднимает
+                 * клиента, тот выходит с тем же отказом, и так до правки числа человеком.
+                 * Строка «жду» обещает работу, которой не будет, и этим она хуже молчания: по
+                 * ней человек ждёт вместе со сторожем.
+                 *
+                 * Причину знает сам клиент и уже записал её (probe_report), поэтому здесь её
+                 * не выводят заново, а читают. Спрашивается у ВЛАДЕЛЬЦА устройства — по той же
+                 * причине, что и проба здоровья: в пуле разнородных туннелей запись пишет
+                 * клиент под своим именем, а не выход, который его назвал. */
+                const struct output *pr_own = device_owner(sp, dev);
+                struct probe_status pr = probe_read(pr_own ? pr_own->name : ro->name);
+                if (pr.state == PROBE_NO_SUCH_NODE) {
+                    fprintf(stderr, LOG_W "%s: выбран узел %d, а пригодных в подписке %d — сам "
+                                    "не поднимется, поправьте номер узла\n", dev, pr.node,
+                            pr.total);
+                    rv_done(r, 0);
+                    continue;
+                }
+                fprintf(stderr, LOG_W "%s: не отвечает — процесс туннеля должен подняться "
+                                "заново через procd; жду\n", dev);
+                r->s = RV_WAIT_INIT;
+                continue;
+            }
+            /* Без netifd (телефон: ни ifdown/ifup, ни procd с ubus) интерфейс туннеля поднимает
+             * тот, кто его завёл, — приложение VPN или наш же процесс, и перезапускать его
+             * отсюда нечем. Дело сторожа то же, что у выходов, чьё устройство заводит движок:
+             * сказать и подождать, не оживёт ли. */
+            if (!plat()->netifd) {
+                fprintf(stderr, LOG_W "%s: не отвечает — жду, не поднимется ли\n", dev);
+                r->s = RV_WAIT_INIT;
+                continue;
+            }
+            fprintf(stderr, LOG_W "%s: не отвечает — перезапускаю интерфейс\n", dev);
+            /* Сначала помощник выхода (обфускатор), потом интерфейс, и порядок здесь — не
+             * вкусовщина.
+             *
+             * У выхода с obfs датаграммы WireGuard идут не в сеть, а в свой процесс, и если
+             * молчит он, то поднимать заново интерфейс бессмысленно: рукопожатие уйдёт в тот
+             * же тупик. Обфускатор умеет чинить себя сам (тишина при активной отправке —
+             * признак мёртвого пути), но узнаёт об этом только по факту отправки, а пока
+             * туннель лежит, отправлять нечего. Отсюда явный сигнал: procd поднимет процесс
+             * заново, и уже после этого ifdown/ifup даст WireGuard свежую попытку.
+             *
+             * Через ubus, а не kill: экземпляром владеет procd, и он же обязан поднять замену
+             * (экземпляр зовётся «<помощник>_<выход>», как его заводит init-скрипт). Отказ
+             * игнорируем. Помощника спрашиваем у вида: сюда доходит только устройство netifd,
+             * то есть interface, а у него помощник — ровно обфускатор, когда obfs настроен. */
+            struct kind_helper hp = { .sig = KIND_SIG_INIT };
+            const struct kind_ops *hk = kind_of(ro);
+            if (hk->helper && hk->helper(sp, ro, &hp) == 0) {
+                /* С запасом: имя выхода до 24 символов плюс обрамление JSON — иначе
+                 * -Wformat-truncation справедливо ругается, а сборка здесь обязана быть без
+                 * предупреждений (I-007). */
+                char inst[112];
+                snprintf(inst, sizeof(inst), "{\"name\":\"steer\",\"instance\":\"%.7s_%.24s\","
+                                             "\"signal\":15}", hp.cmd, ro->name);
+                const char *sig[] = { "ubus", "call", "service", "signal", inst, NULL };
+                r->s = RV_UBUS_R;
+                if (cmd_start(r, sig)) return;
+                continue;
+            }
+            r->s = RV_DOWN;
+            continue;
+        }
+
+        case RV_UBUS_R:
+            /* Секунда процессу помощника на подъём — таймером, а не sleep. */
+            r->s = RV_PAUSE;
+            rv_arm(r);
+            return;
+
+        case RV_PAUSE:
+            return;                   /* ждём таймер (rv_timer) */
+
+        case RV_DOWN: {
+            const char *down[] = { "ifdown", r->rv.dev, NULL };
+            r->s = RV_DOWN_R;
+            if (cmd_start(r, down)) return;
+            continue;
+        }
+
+        case RV_DOWN_R: {
+            const char *up[] = { "ifup", r->rv.dev, NULL };
+            r->s = RV_UP_R;
+            if (cmd_start(r, up)) return;
+            continue;
+        }
+
+        case RV_UP_R:
+            /* Рукопожатию нужно время: проверить сразу — значит объявить мёртвым то, что ещё
+             * поднимается. Ждём короткими шагами, чтобы не держать проход дольше нужного. */
+            r->s = RV_WAIT_INIT;
+            continue;
+
+        case RV_WAIT_INIT:
+            r->rv.i = 0;
+            rv_nl_open(r);
+            r->s = RV_WAIT_ARM;
+            continue;
+
+        case RV_WAIT_ARM:
+            if (r->rv.i >= REVIVE_WAIT_STEPS) { rv_done(r, 0); continue; }
+            r->rv.extra = 0;
+            r->rv.timer_fired = 0;
+            r->s = RV_WAITING;
+            rv_arm(r);
+            return;
+
+        case RV_WAITING:
+            return;                   /* ждём таймер шага или событие об устройстве */
+
+        case RV_WAIT_PROBE:
+            r->s = RV_WAIT_R;
+            if (hp_start(r, HP_HEALTH_REAL, r->rv.o, r->rv.dev)) return;
+            continue;
+
+        case RV_WAIT_R:
+            if (r->res) { rv_done(r, 1); continue; }
+            r->s = RV_WAIT_ARM;
+            continue;
+
+        case RV_EV_PROBE:
+            r->s = RV_EV_R;
+            if (hp_start(r, HP_HEALTH_REAL, r->rv.o, r->rv.dev)) return;
+            continue;
+
+        case RV_EV_R:
+            if (r->res) { rv_done(r, 1); continue; }
+            if (r->rv.timer_fired) {
+                r->rv.timer_fired = 0;
+                r->rv.i++;
+                r->s = RV_WAIT_PROBE;
+                continue;
+            }
+            r->s = RV_WAITING;        /* таймер шага по-прежнему заведён */
+            return;
+
+        case RV_KIND: {
+            /* Имена, которые починка вида разрешила бы getaddrinfo, — рабочим потоком
+             * (gaiw.h), чтобы DNS не остановил цикл. */
+            const struct kind_ops *k = kind_of(r->rv.ow);
+            r->rv.nn = k->revive_names ? k->revive_names(sp, r->rv.ow, r->rv.names,
+                                                         KIND_NAMES_MAX) : 0;
+            r->s = RV_KIND_GO;
+            if (r->rv.nn) {
+                r->rv.gw = gaiw_start(r->l, r->rv.names, r->rv.nn, rv_gai_cb, r);
+                if (r->rv.gw) return;
+            }
+            continue;
+        }
+
+        case RV_KIND_GO: {
+            const struct kind_ops *k = kind_of(r->rv.ow);
+            int ok = k->revive(sp, r->rv.ow, r->rv.dev, k->revive_names ? r->rv.names : NULL,
+                               r->rv.nn);
+            rv_done(r, ok);
+            continue;
+        }
+        }
+        return;
+    }
+}
+
+/* ---- синхронно: свой цикл, прогон до конца ------------------------------------------------ */
+
+struct fo_sync {
+    struct loop *l;
+    struct fo_run *r;
+    int res;
+};
+
+static void sync_done(void *arg, int res) {
+    struct fo_sync *s = arg;
+    s->res = res;
+    s->r = NULL;
+    loop_stop(s->l, 0);
+}
+
+/* SIGTERM/SIGINT посреди прохода `steer failover`: снять правило пробы и выйти — то же, что
+ * делал обработчик sig_cleanup, пока сигналы не шли через цикл. */
+static void sync_sig(struct loop *l, int sig, void *arg) {
+    (void)l;
+    struct fo_sync *s = arg;
+    if (s->r) fo_pass_abort(s->r);
+    cleanup_probe_rule();
+    _exit(128 + sig);
+}
+
+static int run_sync(enum fo_state first, struct spec *sp, struct fo_store *st, int verbose,
+                    fo_event_fn ev, void *ev_arg, const struct output *o, const char *dev,
+                    int fail) {
+    /* loop_new блокирует сигналы цикла в процессе — вернуть маску, как была: вне прохода
+     * `steer failover` живёт с обработчиками failover_pass_guard. */
+    sigset_t old;
+    sigprocmask(SIG_SETMASK, NULL, &old);
+    struct loop *l = loop_new();
+    if (!l) {
+        fprintf(stderr, LOG_W "цикл событий не завёлся: %s\n", strerror(errno));
+        sigprocmask(SIG_SETMASK, &old, NULL);
+        return fail;
+    }
+    struct fo_sync s = { l, NULL, fail };
+    loop_signal(l, SIGTERM, sync_sig, &s);
+    loop_signal(l, SIGINT, sync_sig, &s);
+    struct fo_run *r = run_new(l, sp, st, verbose, ev, ev_arg, sync_done, &s);
+    if (r) {
+        s.r = r;
+        r->s = first;
+        r->rv.o = o;
+        if (dev) snprintf(r->rv.dev, sizeof(r->rv.dev), "%s", dev);
+        loop_timer_set(r->kick, 0);
+        loop_run(l);
+        if (s.r) fo_pass_abort(s.r);
+    }
+    loop_free(l);
+    sigprocmask(SIG_SETMASK, &old, NULL);
+    return s.res;
+}
+
+int failover_pass(struct spec *sp, struct fo_store *st, int verbose, fo_event_fn ev, void *arg) {
+    run_sync(S_START, sp, st, verbose, ev, arg, NULL, NULL, 0);
     return 0;
+}
+
+int device_healthy_for(const struct spec *sp, const struct output *o, const char *dev) {
+    return run_sync(S_PROBE_ONLY, (struct spec *)sp, &fo_store_files, 0, NULL, NULL, o, dev, 0);
+}
+
+int revive(const struct spec *sp, const struct output *o, const char *dev, int verbose) {
+    return run_sync(S_REVIVE_ONLY, (struct spec *)sp, &fo_store_files, verbose, NULL, NULL, o,
+                    dev, 0);
+}
+
+int cmd_failover(const char *spec, int verbose) {
+    /* Спека — значение, а не глобалы (правило 6): свой экземпляр у точки входа. */
+    static struct spec cfg;
+    atexit(cleanup_probe_rule);
+    failover_pass_guard();
+
+    /* Правило 5, docs/architecture.md, раздел 2: err_die здесь довершает то, что раньше делал
+     * die() изнутри load_spec/registry_assign — «конец одного прохода», только через явную
+     * проверку возврата, а не exit() из глубины разбора. */
+    struct err e = {0};
+    if (load_spec(spec, &cfg, &e) < 0) err_die(&e);
+    if (registry_assign(&cfg, &e) < 0) err_die(&e);
+    return failover_pass(&cfg, &fo_store_files, verbose, NULL, NULL);
 }

@@ -1,40 +1,35 @@
 /* Сторож выходов в демоне: `steer daemon --watch` вместо `steer failover --loop`.
  *
  * Шаг 3 устройства 1.8 (docs/architecture.md, «4а»): таймер и события netlink в цикле демона,
- * память выходов — в памяти демона. Проход тот же, что у `steer failover`, — failover_pass
- * (failover.c), а не его копия; отличается только то, где лежит память между проходами
- * (fostate.h), кто зовёт проход и куда уходят его новости.
+ * память выходов — в памяти демона. Проход тот же, что у `steer failover`, — автомат прохода
+ * failover.c (fo_pass_start), а не его копия; отличается только то, где лежит память между
+ * проходами (fostate.h), кто зовёт проход и куда уходят его новости.
  *
  * ВКЛЮЧАЕТСЯ ФЛАГОМ. До шага 6 procd и init по-прежнему держат `steer failover --loop`, а демон
  * на телефоне поднят всегда. Два сторожа сразу дрались бы за одни и те же таблицы выходов и
  * оживляли бы одни и те же устройства дважды, поэтому демон сторожит только с `--watch`, а
  * сервис, который его так запускает, обязан снять старый круг.
  *
- * ПРОХОД — В ОТДЕЛЬНОМ ПРОЦЕССЕ (fork без exec), ответ — по трубе. Выбирали из трёх:
+ * ПРОХОД — В ЦИКЛЕ ДЕМОНА, БЕЗ FORK. Решение владельца: без процесса на проход. Проход —
+ * конечный автомат на цикле демона: пробы (TCP connect, эхо ICMP из сырого или ping-сокета),
+ * ожидание подъёма устройства (таймер шага и события netlink), внешние команды оживления
+ * (ifdown/ifup, ubus — ребёнок на ДЕЙСТВИЕ, выход через loop_child), разрешение имени Endpoint
+ * у awg (рабочий поток) — всё это ждётся шагами автомата, а не синхронно. Цикл демона во время
+ * прохода свободен: status, subscribe, apply отвечают, пока проба ждёт ответа (стенд ctlmatch
+ * меряет это пробой, которая ждёт три секунды), и проход по исправной спеке не запускает ни
+ * одного процесса (тот же стенд считает процессы в своём пространстве PID). Устройство
+ * автомата и что в нём по-прежнему синхронно — в failover.c, «ПРОХОД — КОНЕЧНЫЙ АВТОМАТ».
  *
- *   1) неблокирующие пробы в цикле демона — TCP connect в epoll, ICMP через SOCK_DGRAM/
- *      IPPROTO_ICMP. Пробы — не единственное, что в проходе ждёт. Порядок проб зависит от их
- *      ответов (первое здоровое останавливает перебор, гистерезис спрашивает текущее, замер —
- *      всех, выход с via спрашивается после цели), а оживление — это ifdown/ifup, сигнал
- *      помощнику через ubus и до десяти секунд ожидания подъёма, у awg — перенастройка через
- *      netlink ядра. Сделать всё это неблокирующим значило бы переписать проход автоматом
- *      состояний рядом с прежним, то есть завести вторую логику, которая разойдётся с первой
- *      молча, — а `steer failover` до шага 6 обязан жить;
- *   2) пробы ребёнком (ping через loop_child) при решениях в демоне — то же дробление прохода
- *      на шаги, только ожидание переезжает в ребёнка;
- *   3) проход целиком в ребёнке — выбран. Ребёнок — копия демона: спека, группы и память
- *      выходов у него уже есть (копией при fork, без чтения файлов), и он исполняет тот же
- *      failover_pass, который исполняет `steer failover`. Назад по трубе он отдаёт новую память
- *      выходов, события прохода и замеры awg; демон принимает их целиком или никак (проход,
- *      умерший на полпути, не оставляет полупамяти). Действия над ядром (ip rule/route,
- *      conntrack) делает тот же ребёнок — посреди прохода, как и раньше, иначе решения прохода
- *      пришлось бы откладывать до его конца.
+ * Раньше (6c0cecf) проход шёл в ребёнке — копии демона без exec, с ответом по трубе: пробы и
+ * оживление ждали синхронно, а неблокирующий проход был бы второй логикой рядом с
+ * `steer failover`. Теперь автомат у них общий — `steer failover` крутит его на своём цикле до
+ * конца прохода, — и копия с трубой ушли.
  *
- *   Цикл демона во время прохода свободен: status, subscribe, apply отвечают, пока ребёнок ждёт
- *   ping или подъёма туннеля (стенд ctlmatch меряет это пробой, которая спит три секунды). Цена
- *   — fork раз в период: копия при записи, без exec и без разбора спеки, доли миллисекунды раз
- *   в минуту. Прежний довод fork у `failover --loop` (глобальные массивы спеки) здесь ни при
- *   чём: память между проходами живёт у демона, ребёнок её только читает и возвращает.
+ * Спека прохода — своя копия спеки демона (проход пишет в неё выбранные устройства, а apply
+ * посреди прохода может заменить спеку демона); память — прямо память демона: проход кладёт
+ * `active` в конце, и status посреди прохода видит прежний выбор целиком, а не половину.
+ * Предел прохода остаётся (WATCHD_PASS_MAX_S): каждое ожидание автомата имеет свой срок, но
+ * проход, который его всё же превысит, прерывается — с уборкой правила пробы и команды.
  *
  * РАСПИСАНИЕ — как у `failover --loop` (watch.c): первый проход при старте, следующий — через
  * период после конца предыдущего; событие сети (RTMGRP_LINK, адреса IPv4/IPv6) — внеочередной
@@ -55,19 +50,21 @@
  * то, что увидел бы очередной `steer failover`, — и не перепривязывает выходы на пустом месте
  * (перепривязка снимает соединения выхода).
  *
- * СОБЫТИЯ подписчикам (docs/ctl.md): switched, failed, revived — строками из прохода, после того
- * как демон принял его память (подписчик, спросивший status по событию, видит уже новое). */
+ * СОБЫТИЯ подписчикам (docs/ctl.md): switched, failed, revived — копятся за проход и уходят
+ * после его конца, когда память выходов уже новая (подписчик, спросивший status по событию,
+ * видит уже новое).
+ *
+ * MASQUERADE НА ТЕЛЕФОНЕ (plat()->iptables_masq): netd при перезапуске перестраивает iptables, и
+ * правило masquerade пропадает — сторож его возвращает (iptables_masq_ensure в apply.c). Это
+ * `iptables -C` на устройство, то есть процессы, и потому не на каждом проходе: после прохода
+ * по событию сети или смене спеки и не реже раза в WATCH_MASQ_S (watch_masq_due в watch.c). */
 #define _GNU_SOURCE
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <errno.h>
 #include <unistd.h>
-#include <fcntl.h>
-#include <signal.h>
-#include <dirent.h>
 #include <sys/types.h>
-#include <sys/wait.h>
 #include <sys/epoll.h>
 
 #include "platform.h"
@@ -81,12 +78,13 @@
 
 #define LOG_WW "steer[warn] watch: "
 
-/* Проход дольше этого — зависание (nft, ip, помощник, не отвечающий ubus): ребёнка убиваем, и
- * следующий проход начнётся с уборки правила пробы (failover_pass_guard). С запасом: восемь
- * выходов по восемь мёртвых устройств с оживлением и замером — это минуты, а не десять. */
+/* Проход дольше этого — зависание: каждое ожидание автомата имеет свой срок (пробы — секунды,
+ * команда оживления — минута), так что сюда проход может прийти только очень длинным списком
+ * мёртвых устройств. Прерывается с уборкой (fo_pass_abort). С запасом: восемь выходов по восемь
+ * мёртвых устройств с оживлением и замером — это минуты, а не десять. */
 #define WATCHD_PASS_MAX_S 600
-/* Предел ответа прохода: память выходов — десятки строк, события — по строке. */
-#define WATCHD_MSG_MAX (1 << 20)
+/* Событий за проход — не больше, чем решений у выходов: по одному-два на выход. */
+#define WATCHD_EV_MAX 64
 
 /* ---- память выходов ------------------------------------------------------------------ */
 
@@ -150,14 +148,14 @@ static void mem_put(struct fo_store *st, const char *name, const char *data, siz
 
 static const struct fo_store_ops mem_ops = { mem_open_r, mem_put };
 
-static void mem_clear(struct fo_mem *m) {
-    for (size_t i = 0; i < m->n; i++) free(m->b[i].p);
-    free(m->b);
-    m->b = NULL;
-    m->n = m->cap = 0;
-}
 
 /* ---- сторож ---------------------------------------------------------------------------- */
+
+/* Событие прохода, отложенное до его конца (см. шапку). */
+struct wev {
+    enum fo_ev_kind kind;
+    char out[48], from[48], to[48], why[24], of[16];
+};
 
 struct watchd {
     struct steerd *d;
@@ -168,18 +166,19 @@ struct watchd {
     struct loop_timer *kill_tm;   /* срок идущего прохода */
     int settling;                 /* tm стоит на успокоении, а не на периоде */
     int pending;                  /* после идущего прохода нужен ещё один */
-    pid_t pid;                    /* идущий проход; 0 — нет */
-    int pfd;
-    int reaped, status;
-    char *msg;
-    size_t msg_n;
-    int msg_over;
+    int eventful;                 /* проход идёт по событию сети или смене спеки */
+    struct fo_run *run;           /* идущий проход; NULL — нет */
+    struct spec *sp;              /* копия спеки для прохода */
+    struct wev ev[WATCHD_EV_MAX];
+    int ev_n;
+    long masq_at;                 /* когда последний раз возвращали masquerade (телефон) */
     struct fo_mem mem;
 };
 
 static void watchd_pass_start(struct watchd *w);
 
 static void watchd_settle(struct watchd *w) {
+    w->eventful = 1;
     if (w->settling) return;      /* пачка уже ждёт своего прохода — срок не отодвигаем */
     w->settling = 1;
     loop_timer_set(w->tm, WATCH_SETTLE_S * 1000L);
@@ -194,7 +193,7 @@ static void watchd_timer(struct loop *l, struct loop_timer *t, void *arg) {
     (void)l; (void)t;
     struct watchd *w = arg;
     w->settling = 0;
-    if (w->pid) return;           /* не бывает: таймер снят на время прохода */
+    if (w->run) return;           /* не бывает: таймер снят на время прохода */
     if (!w->d->have || (w->cf.enabled && !w->cf.enabled())) { watchd_period(w); return; }
     if (w->cf.busy && w->cf.busy(w->cf.busy_arg)) { watchd_settle(w); return; }
     if (w->nl >= 0) watch_nl_drain(w->nl);   /* пачка, ради которой ждали, — в этот проход */
@@ -205,7 +204,9 @@ static void watchd_nl(struct loop *l, int fd, uint32_t ev, void *arg) {
     (void)l; (void)ev;
     struct watchd *w = arg;
     if (!watch_nl_drain(fd)) return;
-    if (w->pid) {
+    /* Во время прохода: на роутере — следы его же ifdown/ifup (выбрасываются после прохода),
+     * на телефоне — настоящее событие, и после прохода нужен ещё один. */
+    if (w->run) {
         if (!plat()->netifd) w->pending = 1;
         return;
     }
@@ -214,176 +215,60 @@ static void watchd_nl(struct loop *l, int fd, uint32_t ev, void *arg) {
 
 void watchd_spec_changed(struct watchd *w) {
     if (!w) return;
-    if (w->pid) w->pending = 1;
+    if (w->run) w->pending = 1;
     else watchd_settle(w);
 }
 
-/* ---- ребёнок: проход и ответ ----------------------------------------------------------- */
+/* ---- проход ------------------------------------------------------------------------------ */
 
-/* Слово ответа: имена выходов и устройств пробелов не содержат, но строка события — это
- * слова через пробел, и чужой знак в ней не должен сдвинуть поля. */
-static void ev_word(FILE *f, const char *s) {
-    if (!s || !*s) { fputs(" -", f); return; }
-    fputc(' ', f);
-    for (; *s; s++) fputc((unsigned char)*s <= ' ' || *s == 0x7f ? '_' : *s, f);
+/* Событие прохода — в очередь до конца прохода. */
+static void watchd_ev(void *arg, const struct fo_event *e) {
+    struct watchd *w = arg;
+    if (w->ev_n >= WATCHD_EV_MAX) return;
+    struct wev *q = &w->ev[w->ev_n++];
+    q->kind = e->kind;
+    snprintf(q->out, sizeof(q->out), "%s", e->out ? e->out : "");
+    snprintf(q->from, sizeof(q->from), "%s", e->from ? e->from : "");
+    snprintf(q->to, sizeof(q->to), "%s", e->to ? e->to : "");
+    snprintf(q->why, sizeof(q->why), "%s", e->why ? e->why : "");
+    snprintf(q->of, sizeof(q->of), "%s", e->on_fail ? e->on_fail : "");
 }
 
-static void child_ev(void *arg, const struct fo_event *e) {
-    FILE *f = arg;
-    static const char *const kinds[] = { "switched", "failed", "revived" };
-    fprintf(f, "ev %s", kinds[e->kind]);
-    ev_word(f, e->out);
-    ev_word(f, e->from);
-    ev_word(f, e->to);
-    ev_word(f, e->why);
-    ev_word(f, e->on_fail);
-    fputc('\n', f);
-}
-
-/* Закрыть всё унаследованное, кроме stdin/stdout/stderr и трубы ответа. Сокеты демона —
- * слушающий и соединения — у ребёнка не должны жить: клиент, которому демон ответил и закрыл
- * соединение, иначе не увидел бы конца ответа, пока идёт проход. */
-static void child_close_fds(int keep) {
-    int fds[1024];
-    int n = 0;
-    DIR *dir = opendir("/proc/self/fd");
-    if (dir) {
-        int self = dirfd(dir);
-        struct dirent *de;
-        while ((de = readdir(dir)) != NULL && n < (int)(sizeof(fds) / sizeof(*fds))) {
-            int fd = atoi(de->d_name);
-            if (fd > 2 && fd != keep && fd != self) fds[n++] = fd;
-        }
-        closedir(dir);
-        for (int i = 0; i < n; i++) close(fds[i]);
-        return;
-    }
-    for (int fd = 3; fd < 1024; fd++) if (fd != keep) close(fd);
-}
-
-static int write_all(int fd, const char *p, size_t n) {
-    while (n) {
-        ssize_t w = write(fd, p, n);
-        if (w < 0 && errno == EINTR) continue;
-        if (w <= 0) return -1;
-        p += w;
-        n -= (size_t)w;
-    }
-    return 0;
-}
-
-static void watchd_child(struct watchd *w, int fd) __attribute__((noreturn));
-static void watchd_child(struct watchd *w, int fd) {
-    loop_child_reset();
-    child_close_fds(fd);
-    failover_pass_guard();
-    /* Проход меняет device у выходов — своя копия, а спека демона остаётся нетронутой для
-     * masquerade ниже (он смотрит на спеку так, как её прочитал бы свежий процесс). */
-    static struct spec sp;
-    memcpy(&sp, w->d->sp, sizeof(sp));
-    char *evs = NULL;
-    size_t evn = 0;
-    FILE *evf = open_memstream(&evs, &evn);
-    failover_pass(&sp, &w->mem.base, 0, evf ? child_ev : NULL, evf);
-    cleanup_probe_rule();
-    /* Как у `failover --loop`: netd при перезапуске перестраивает iptables, и masquerade
-     * правилом iptables (телефон) пропадает — вернуть (iptables_masq_ensure в apply.c). */
-    if (plat()->iptables_masq) iptables_masq_ensure(w->d->sp);
-    fflush(stdout);
-    fflush(stderr);
-    if (evf) fclose(evf);
-
-    char *msg = NULL;
-    size_t mn = 0;
-    FILE *m = open_memstream(&msg, &mn);
-    if (!m) _exit(1);
-    for (size_t i = 0; i < w->mem.n; i++) {
-        fprintf(m, "fo %s %zu\n", w->mem.b[i].name, w->mem.b[i].n);
-        if (w->mem.b[i].n) fwrite(w->mem.b[i].p, 1, w->mem.b[i].n, m);
-        fputc('\n', m);
-    }
-    if (evs && evn) fwrite(evs, 1, evn, m);
-    fputs("fo-end\n", m);
-    if (fclose(m) != 0 || write_all(fd, msg, mn) != 0) _exit(1);
-    awg_hs_send(fd);
-    _exit(0);
-}
-
-/* ---- демон: приём ответа --------------------------------------------------------------- */
-
-/* Одно событие прохода — подписчикам. Слова: вид, выход, from, to, why, on_fail («-» — нет). */
-static void watchd_emit(struct watchd *w, char *line) {
-    char *wd[7];
-    int k = 0;
-    for (char *save = NULL, *t = strtok_r(line, " ", &save); t && k < 7; t = strtok_r(NULL, " ", &save))
-        wd[k++] = t;
-    if (k != 7) return;
-    char out[96], from[96], to[96], why[48], of[32], f[512];
-    steerd_json_str(out, sizeof(out), wd[2]);
-    if (strcmp(wd[3], "-")) steerd_json_str(from, sizeof(from), wd[3]); else strcpy(from, "null");
-    if (strcmp(wd[4], "-")) steerd_json_str(to, sizeof(to), wd[4]); else strcpy(to, "null");
-    steerd_json_str(why, sizeof(why), wd[5]);
-    steerd_json_str(of, sizeof(of), wd[6]);
-    if (!strcmp(wd[1], "switched"))
+/* Одно событие прохода — подписчикам (поля — docs/ctl.md). */
+static void watchd_emit(struct watchd *w, const struct wev *q) {
+    char out[112], from[112], to[112], why[64], of[48], f[640];
+    steerd_json_str(out, sizeof(out), q->out);
+    if (q->from[0]) steerd_json_str(from, sizeof(from), q->from); else strcpy(from, "null");
+    if (q->to[0]) steerd_json_str(to, sizeof(to), q->to); else strcpy(to, "null");
+    steerd_json_str(why, sizeof(why), q->why);
+    steerd_json_str(of, sizeof(of), q->of);
+    switch (q->kind) {
+    case FO_EV_SWITCHED:
         snprintf(f, sizeof(f), ",\"out\":%s,\"from\":%s,\"to\":%s,\"why\":%s", out, from, to, why);
-    else if (!strcmp(wd[1], "failed"))
+        steerd_emit(w->d, "switched", f);
+        break;
+    case FO_EV_FAILED:
         snprintf(f, sizeof(f), ",\"out\":%s,\"from\":%s,\"on_fail\":%s,\"why\":%s", out, from, of, why);
-    else if (!strcmp(wd[1], "revived"))
+        steerd_emit(w->d, "failed", f);
+        break;
+    case FO_EV_REVIVED:
         snprintf(f, sizeof(f), ",\"out\":%s,\"dev\":%s", out, to);
-    else
-        return;
-    steerd_emit(w->d, wd[1], f);
+        steerd_emit(w->d, "revived", f);
+        break;
+    }
 }
 
-/* Разобрать ответ прохода: память выходов целиком, события, хвост — замеры awg. Ответ без
- * «fo-end» (проход умер или убит) не принимается вовсе: демон держит прежнюю память. */
-static void watchd_accept(struct watchd *w) {
-    char *p = w->msg, *end = w->msg + w->msg_n;
-    struct fo_mem nm = { { &mem_ops }, NULL, 0, 0, 0 };
-    char *evs[64];
-    int evn = 0, done = 0;
-    while (p < end) {
-        char *nl = memchr(p, '\n', (size_t)(end - p));
-        if (!nl) break;
-        *nl = '\0';
-        if (!strcmp(p, "fo-end")) { p = nl + 1; done = 1; break; }
-        if (!strncmp(p, "fo ", 3)) {
-            char name[64];
-            size_t n = 0;
-            if (sscanf(p + 3, "%63s %zu", name, &n) != 2 || n > (size_t)(end - nl - 1) ||
-                nl + 1 + n >= end || nl[1 + n] != '\n')
-                break;
-            if (mem_set(&nm, name, nl + 1, n) < 0) break;
-            p = nl + 1 + n + 1;
-            continue;
-        }
-        if (!strncmp(p, "ev ", 3) && evn < (int)(sizeof(evs) / sizeof(*evs))) evs[evn++] = p;
-        p = nl + 1;
-    }
-    if (!done) {
-        fprintf(stderr, LOG_WW "проход не договорил — память выходов прежняя\n");
-        mem_clear(&nm);
-        return;
-    }
-    nm.mirror = w->mem.mirror;
-    mem_clear(&w->mem);
-    w->mem = nm;
-    awg_hs_recv_buf(p, (size_t)(end - p));
-    for (int i = 0; i < evn; i++) watchd_emit(w, evs[i]);
-}
-
-static void watchd_pass_check(struct watchd *w) {
-    if (!w->pid || w->pfd >= 0 || !w->reaped) return;
-    w->pid = 0;
+static void watchd_after(struct watchd *w) {
+    w->run = NULL;
     loop_timer_stop(w->kill_tm);
-    if (WIFEXITED(w->status) && WEXITSTATUS(w->status) == 0 && !w->msg_over)
-        watchd_accept(w);
-    else if (WIFSIGNALED(w->status))
-        fprintf(stderr, LOG_WW "проход убит сигналом %d\n", WTERMSIG(w->status));
-    free(w->msg);
-    w->msg = NULL;
-    w->msg_n = 0;
-    w->msg_over = 0;
+    /* Память выходов уже новая — теперь события (см. шапку). */
+    int n = w->ev_n;
+    w->ev_n = 0;
+    for (int i = 0; i < n; i++) watchd_emit(w, &w->ev[i]);
+    /* masquerade правилом iptables (телефон) — см. шапку: не на каждом проходе. */
+    if (plat()->iptables_masq && w->d->have && watch_masq_due(&w->masq_at, w->eventful))
+        iptables_masq_ensure(w->d->sp);
+    w->eventful = 0;
     /* На роутере события за время прохода — следы его же ifdown/ifup (см. шапку). */
     if (plat()->netifd && w->nl >= 0) watch_nl_drain(w->nl);
     if (w->pending) {
@@ -394,75 +279,41 @@ static void watchd_pass_check(struct watchd *w) {
     }
 }
 
-static void watchd_pipe(struct loop *l, int fd, uint32_t ev, void *arg) {
-    (void)ev;
-    struct watchd *w = arg;
-    char buf[16384];
-    for (;;) {
-        ssize_t r = read(fd, buf, sizeof(buf));
-        if (r < 0 && errno == EINTR) continue;
-        if (r < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) return;
-        if (r <= 0) break;
-        if (w->msg_n + (size_t)r > WATCHD_MSG_MAX) { w->msg_over = 1; continue; }
-        char *nb = realloc(w->msg, w->msg_n + (size_t)r + 1);
-        if (!nb) { w->msg_over = 1; continue; }
-        w->msg = nb;
-        memcpy(w->msg + w->msg_n, buf, (size_t)r);
-        w->msg_n += (size_t)r;
-    }
-    loop_fd_del(l, fd);
-    close(fd);
-    w->pfd = -1;
-    watchd_pass_check(w);
-}
-
-static void watchd_child_done(struct loop *l, pid_t pid, int status, void *arg) {
-    (void)l; (void)pid;
-    struct watchd *w = arg;
-    w->reaped = 1;
-    w->status = status;
-    watchd_pass_check(w);
+static void watchd_pass_done(void *arg, int res) {
+    (void)res;
+    watchd_after(arg);
 }
 
 static void watchd_kill(struct loop *l, struct loop_timer *t, void *arg) {
     (void)l; (void)t;
     struct watchd *w = arg;
-    if (!w->pid) return;
+    if (!w->run) return;
     fprintf(stderr, LOG_WW "проход идёт дольше %d с — прерываю\n", WATCHD_PASS_MAX_S);
-    kill(w->pid, SIGKILL);
+    fo_pass_abort(w->run);
+    /* Выбор прерванного прохода не записан (active кладётся в конце) — и его события тоже не
+     * уходят: следующий проход решит заново и скажет сам. */
+    w->ev_n = 0;
+    watchd_after(w);
 }
 
 static void watchd_pass_start(struct watchd *w) {
-    int p[2];
-    if (pipe2(p, O_CLOEXEC) != 0) {
-        fprintf(stderr, LOG_WW "pipe: %s\n", strerror(errno));
+    if (!w->sp) w->sp = malloc(sizeof(*w->sp));
+    if (!w->sp) {
+        fprintf(stderr, LOG_WW "нет памяти под проход\n");
         watchd_period(w);
         return;
     }
-    fflush(NULL);                 /* буферы stdio не должны уйти дважды — из демона и из ребёнка */
-    pid_t pid = fork();
-    if (pid == 0) {
-        close(p[0]);
-        watchd_child(w, p[1]);
-    }
-    close(p[1]);
-    if (pid < 0) {
-        fprintf(stderr, LOG_WW "fork: %s\n", strerror(errno));
-        close(p[0]);
-        watchd_period(w);
-        return;
-    }
-    fcntl(p[0], F_SETFL, fcntl(p[0], F_GETFL) | O_NONBLOCK);
-    w->pid = pid;
-    w->pfd = p[0];
-    w->reaped = 0;
-    w->status = 0;
+    /* Проход меняет device у выходов — своя копия, а спека демона остаётся нетронутой для
+     * status и masquerade (они смотрят на спеку так, как её прочитал бы свежий процесс). */
+    memcpy(w->sp, w->d->sp, sizeof(*w->sp));
+    w->ev_n = 0;
     loop_timer_stop(w->tm);
-    if (loop_fd_add(w->l, w->pfd, EPOLLIN, watchd_pipe, w) != 0) {
-        close(w->pfd);
-        w->pfd = -1;
+    w->run = fo_pass_start(w->l, w->sp, &w->mem.base, 0, watchd_ev, w, watchd_pass_done, w);
+    if (!w->run) {
+        fprintf(stderr, LOG_WW "нет памяти под проход\n");
+        watchd_period(w);
+        return;
     }
-    loop_child(w->l, pid, watchd_child_done, w);
     loop_timer_set(w->kill_tm, WATCHD_PASS_MAX_S * 1000L);
 }
 
@@ -475,7 +326,6 @@ struct watchd *watchd_start(struct steerd *d, const struct watchd_conf *c) {
     w->l = d->loop;
     w->cf = *c;
     if (w->cf.period_s <= 0) w->cf.period_s = 60;
-    w->pfd = -1;
     w->mem.base.ops = &mem_ops;
     w->tm = loop_timer_new(w->l, watchd_timer, w);
     w->kill_tm = loop_timer_new(w->l, watchd_kill, w);
@@ -495,9 +345,11 @@ struct watchd *watchd_start(struct steerd *d, const struct watchd_conf *c) {
         if (n < sizeof(buf)) mem_set(&w->mem, "active", buf, n);
     }
     w->mem.mirror = 1;
-    /* Замеры awg — в памяти, как у `failover --loop`: ребёнок получает их копией и отдаёт новые
-     * хвостом ответа. */
+    /* Замеры awg — в памяти процесса, как у `failover --loop`. */
     awg_hs_memory(1);
+    /* Правило пробы, оставшееся от сторожа, убитого SIGKILL (прежний круг, прежний демон), —
+     * один раз при старте: свои правила проход снимает сам (и при отмене). */
+    cleanup_probe_rule();
     w->nl = watch_nl_open();
     if (w->nl >= 0 && loop_fd_add(w->l, w->nl, EPOLLIN, watchd_nl, w) != 0) {
         close(w->nl);
@@ -506,10 +358,14 @@ struct watchd *watchd_start(struct steerd *d, const struct watchd_conf *c) {
     if (w->nl < 0)
         fprintf(stderr, LOG_WW "события сети недоступны — проход только по периоду\n");
     d->outs = &w->mem.base;
+    w->eventful = 1;              /* первый проход — как по событию: masquerade проверить */
     loop_timer_set(w->tm, 0);
     return w;
 }
 
 void watchd_stop(struct watchd *w) {
-    if (w && w->pid) kill(w->pid, SIGTERM);
+    if (w && w->run) {
+        fo_pass_abort(w->run);
+        w->run = NULL;
+    }
 }
