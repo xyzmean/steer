@@ -30,6 +30,12 @@
 #     ноль, с выходом по реестру (или null), с состоянием TCP и счётчиками, если их вело ядро.
 #     dns-log: имена, спрошенные у резолвера по UDP и по TCP, — с каналом, выходом и счётчиком;
 #     без резолвера — "running":false; сокет журнала резолвер убирает при выходе.
+#  9. Демон (steer daemon, ctl-serve — его прежнее имя): status из памяти байт в байт совпадает
+#     с подкомандой и после apply отдаёт новую спеку; explain — тоже; subscribe получает applied
+#     после apply и reload и spec-error, когда спека не прочиталась (а status отвечает по
+#     последней годной); в тишине, с открытым подписчиком, демон не просыпается; подписчик,
+#     который не читает, отключается по переполнению очереди, а демон отвечает остальным и
+#     читающий подписчик остаётся.
 #
 # Без root пункты 4 и 8 пропускаются, без python3 — весь стенд (им шлются сырые запросы).
 set -u
@@ -47,8 +53,8 @@ tmp="$(mktemp -d)"
 # Обходить каталог сокета должен и чужой uid из пункта 4 — как /data/misc/steer (0711).
 chmod 0711 "$tmp"
 mkdir -p "$tmp/state" "$tmp/bin"
-SRV="" SUP="" DNSD=""
-trap 'kill $SRV $SUP $DNSD 2>/dev/null; rm -rf "$tmp"' EXIT
+SRV="" SUP="" DNSD="" SUB1=""
+trap 'kill $SRV $SUP $DNSD $SUB1 2>/dev/null; rm -rf "$tmp"' EXIT
 pass=0 fail=0
 check() {
     if [ "$2" = "$3" ]; then pass=$((pass + 1)); else
@@ -360,6 +366,113 @@ check "rm-file после смены спеки — удалён" "true" "$(ctl 
 serve 0
 check "брошенный временный файл убран при старте сервера" "no" \
     "$([ -e "$L/.put-stale1" ] && echo yes || echo no)"
+
+# ---- 9. демон: память, подписка, тишина, медленный подписчик ---------------------------
+# Ответ status из памяти — те же байты, что у подкоманды (поле времени приведено к нулю: они
+# собраны в разные секунды). Сравнивается весь stdout, с концом строки, а не через $(…).
+cat > "$tmp/same.py" <<'PY'
+import json, re, sys
+a = open(sys.argv[1], 'rb').read()
+b = json.loads(open(sys.argv[2], 'rb').read())["stdout"].encode()
+z = lambda x: re.sub(rb'"at":[0-9]+', b'"at":0', x)
+print("same" if a and z(a) == z(b) else "differ")
+PY
+same_status() {
+    "$BIN" status --spec "$tmp/spec.json" --state-dir "$tmp/state" > "$tmp/st.direct" 2>/dev/null
+    ctl status > "$tmp/st.mem"
+    python3 "$tmp/same.py" "$tmp/st.direct" "$tmp/st.mem"
+}
+check "status из памяти — байт в байт как у подкоманды" "same" "$(same_status)"
+
+# Подписчик, который читает (steer ctl печатает события по мере прихода). Подписка — на
+# спеке A, чтобы apply спеки B сменил отпечаток.
+ctl apply < "$tmp/A.json" >/dev/null
+"$BIN" ctl --socket "$tmp/s.sock" subscribe > "$tmp/sub1.out" 2>&1 &
+SUB1=$!
+wait_for 'grep -q "\"cmd\":\"subscribe\",\"code\":0" "$tmp/sub1.out" 2>/dev/null' 5
+check "subscribe: ответ с кодом 0 и отпечатком спеки" "1" \
+    "$(head -n 1 "$tmp/sub1.out" | grep -c '"code":0,"spec":"[0-9a-f]\{16\}"')"
+ctl apply < "$tmp/B.json" >/dev/null
+wait_for 'grep -q "\"ev\":\"applied\",\"by\":\"apply\"" "$tmp/sub1.out"' 5
+check "subscribe: после apply — событие applied (движок выключен — enabled false)" "1" \
+    "$(grep -c '^{"v":1,"ev":"applied","by":"apply","spec":"[0-9a-f]\{16\}","enabled":false}$' "$tmp/sub1.out")"
+check "  отпечаток — уже новой спеки" "yes" \
+    "$([ "$(sed -n 's/.*"by":"apply","spec":"\([0-9a-f]*\)".*/\1/p' "$tmp/sub1.out")" != \
+         "$(head -n 1 "$tmp/sub1.out" | sed -n 's/.*"spec":"\([0-9a-f]*\)".*/\1/p')" ] && echo yes || echo no)"
+check "status из памяти после apply — новая спека, байт в байт" "same" "$(same_status)"
+check "  в ответе канал новой спеки" "1" "$(ctl status | j stdout | grep -c 'p2.lst\|"lists":1')"
+check "explain из памяти — тот же ответ, что у подкоманды" \
+    "$("$BIN" explain 10.2.3.4 --spec "$tmp/spec.json" --state-dir "$tmp/state" 2>/dev/null)" \
+    "$(ctl explain 10.2.3.4 | j stdout)"
+check "explain: не адрес и не имя — тот же отказ, что у подкоманды" \
+    "2 $("$BIN" explain 1.2.3.4:5 --spec "$tmp/spec.json" --state-dir "$tmp/state" 2>&1)" \
+    "$(r="$(ctl explain 1.2.3.4:5)"; printf '%s %s' "$(printf '%s' "$r" | j code)" "$(printf '%s' "$r" | j stderr)")"
+ctl reload >/dev/null
+wait_for 'grep -q "\"by\":\"reload\"" "$tmp/sub1.out"' 5
+check "subscribe: после reload — applied от reload" "1" \
+    "$(grep -c '"ev":"applied","by":"reload"' "$tmp/sub1.out")"
+cp "$tmp/spec.json" "$tmp/spec.good"
+printf '{"schema":1,' > "$tmp/spec.json"
+r="$(ctl reload)"
+wait_for 'grep -q "spec-error" "$tmp/sub1.out"' 5
+check "reload негодной спеки: spec-error с причиной" "1" \
+    "$(grep -c '^{"v":1,"ev":"spec-error","by":"reload","message":".\+"}$' "$tmp/sub1.out")"
+check "  а status отвечает по последней годной" "0 1" \
+    "$(ctl status | j code) $(ctl status | j stdout | grep -c '"lists":1')"
+cp "$tmp/spec.good" "$tmp/spec.json"
+ctl reload >/dev/null
+
+# Тишина: подписчик подключён, запросов нет — демон спит без срока. Меряется счётчиком
+# добровольных переключений контекста, как у резолвера в dnsproxy.sh.
+sleep 1
+cs0=$(awk '/^voluntary_ctxt_switches/{print $2}' "/proc/$SRV/status")
+sleep 3
+cs1=$(awk '/^voluntary_ctxt_switches/{print $2}' "/proc/$SRV/status")
+q=$(( cs1 - cs0 )); [ "$q" -le 1 ] && q=ok
+check "в тишине демон не просыпается (с открытым подписчиком)" "ok" "$q"
+
+# Медленный подписчик: подписался и не читает. События шлёт reload; очередь подписчика
+# ограничена, и переполнение его отключает — демон пишет об этом в журнал.
+cat > "$tmp/slow.py" <<'PY'
+import socket, sys, os, time
+s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+s.connect(sys.argv[1]); s.sendall(b"subscribe\n")
+open(sys.argv[2], 'w').close()
+while not os.path.exists(sys.argv[3]): time.sleep(0.05)
+s.settimeout(3)
+try:
+    while True:
+        b = s.recv(65536)
+        if not b: print("closed"); break
+except socket.timeout:
+    print("open")
+except ConnectionResetError:
+    print("closed")
+PY
+cat > "$tmp/flood.py" <<'PY'
+import socket, sys
+for i in range(int(sys.argv[3])):
+    s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM); s.connect(sys.argv[1])
+    s.sendall(b"reload\n"); s.shutdown(socket.SHUT_WR)
+    while s.recv(65536): pass
+    s.close()
+    if i % 25 == 0 and "не забирает события" in open(sys.argv[2], errors="replace").read():
+        break
+print(i + 1)
+PY
+rm -f "$tmp/slow.ready" "$tmp/slow.stop"
+python3 "$tmp/slow.py" "$tmp/s.sock" "$tmp/slow.ready" "$tmp/slow.stop" > "$tmp/slow.out" & SLOW=$!
+wait_for '[ -e "$tmp/slow.ready" ]' 5
+sleep 0.2
+n="$(python3 "$tmp/flood.py" "$tmp/s.sock" "$tmp/serve.err" 3000)"
+check "медленный подписчик отключён по переполнению очереди" "1" \
+    "$(grep -c 'подписчик не забирает события' "$tmp/serve.err")"
+touch "$tmp/slow.stop"; wait $SLOW 2>/dev/null
+check "  и видит закрытое соединение" "closed" "$(cat "$tmp/slow.out")"
+check "  демон отвечает остальным" "0" "$(ctl version | j code)"
+check "  читающий подписчик остался и получил все события" "yes $n" \
+    "$(kill -0 $SUB1 2>/dev/null && echo yes || echo no) $(grep -c '"ev":"applied","by":"reload"' "$tmp/sub1.out" | awk '{print $1 - 2}')"
+kill $SUB1 2>/dev/null; wait $SUB1 2>/dev/null; SUB1=""
 
 # ---- 8. настоящий apply, резолвер и откат -----------------------------------------------
 if [ "${CTLMATCH_INNER:-}" = 1 ] && [ -n "$real_nft" ] && ip link set lo up 2>/dev/null &&
