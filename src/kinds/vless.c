@@ -50,7 +50,11 @@ static void vless_status(FILE *out, const struct spec *sp, const struct output *
     fprintf(out, "]");
 }
 
-/* Помощник — клиент туннеля. В подпись — файл подписки и выбор узлов (helper_sig, daemon/helpers.c). */
+/* Помощник — клиент туннеля. В подпись — файл подписки, его СОДЕРЖИМОЕ и выбор узлов (helper_sig,
+ * daemon/helpers.c). Содержимое — потому что клиент читает узлы один раз, при старте: обновлённая
+ * подписка без перезапуска не заработала бы. До демона это делал управляющий слой сигналом
+ * экземпляру procd (vless_<выход>); у демона такого экземпляра нет, и сверка по подписи — apply,
+ * reload, SIGHUP — перезапускает клиент ровно того выхода, чья подписка изменилась. */
 static int vless_helper(const struct spec *sp, const struct output *o, struct kind_helper *h) {
     (void)sp;
     snprintf(h->cmd, sizeof(h->cmd), "vless");
@@ -59,6 +63,13 @@ static int vless_helper(const struct spec *sp, const struct output *o, struct ki
     if (access(plat_etc_path(st, sizeof(st), "stats"), F_OK) == 0)
         snprintf(h->env, sizeof(h->env), "STEER_TUN_STATS=1");
     kind_sig_mix(&h->sig, o->vless.sub_file, strlen(o->vless.sub_file));
+    FILE *f = fopen(o->vless.sub_file, "r");
+    if (f) {
+        char buf[4096];
+        size_t n;
+        while ((n = fread(buf, 1, sizeof(buf), f)) > 0) kind_sig_mix(&h->sig, buf, n);
+        fclose(f);
+    }
     for (size_t i = 0; i < o->vless.nodes_n; i++)
         kind_sig_mix(&h->sig, &o->vless.nodes[i], sizeof(o->vless.nodes[i]));
     return 0;

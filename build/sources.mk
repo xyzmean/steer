@@ -23,7 +23,9 @@
 # в дереве уникальны, и стенд tests/buildmatch.sh за этим следит.
 CORE_DIRS := src/lib src/model src/platform src/compile src/daemon src/kinds src/cli src/dnsd src/tools src/proto/obfs
 EXT_DIRS  := src/tunnel src/proto/tls src/proto/vless src/proto/xsteer src/proto/tgws
-INC_DIRS  := $(CORE_DIRS) $(EXT_DIRS)
+# Клиент сокета `steer` (src/client) — отдельный бинарник, не профиль движка: CLIENT_SRC ниже.
+CLIENT_DIRS := src/client
+INC_DIRS  := $(CORE_DIRS) $(EXT_DIRS) $(CLIENT_DIRS)
 
 # Модель спеки — то, во что нарезан прежний src/model/spec.c (docs/architecture.md, «Слои и
 # каталоги»): JSON-ридер, сам разбор спеки, реестр меток/таблиц, ход перебора узлов подписки и
@@ -117,6 +119,13 @@ PROFILE_server   := $(CORE_SRC) $(XS_COMMON_SRC) $(EXT_SERVER_SRC)
 PROFILE_tgws     := $(CORE_SRC) $(EXT_TGWS_SRC)
 # Телефон: тот же состав, что расширенный роутерный (Android.bp, цель steer).
 PROFILE_android  := $(PROFILE_extended)
+
+# Два бинарника на пакет (docs/architecture.md, раздел 4а, «Бинарники»): профиль — это движок
+# steerd (демон, компилятор, apply, помощники, инструменты; ссылка steer-tools на него же), а
+# `steer` — маленький клиент сокета, один на все профили: в нём нет ни спеки, ни компилятора,
+# только разбор команды, протокол v1 и exec движка. Платформа — ради путей по умолчанию (спека,
+# сокет, каталог состояния): клиент выбирает их так же, как движок (src/platform).
+CLIENT_SRC := src/client/main.c $(PLATFORM_SRC)
 
 PROFILE_DEFS_base     :=
 PROFILE_DEFS_extended := -DSTEER_EXTENDED

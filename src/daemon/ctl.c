@@ -219,6 +219,7 @@ struct ctl_conf {
     int watch;                   /* --watch: демон — сторож выходов (watchd.c) */
     int watch_period;            /* --watch-period, секунд */
     int supervise;               /* --supervise: помощники и резолвер — дети демона (supd.c) */
+    int apply;                   /* --apply: применить спеку при старте (как reload) */
     const char *dnsd_flags[9];   /* --dnsd-flag: лишние флаги резолверу-ребёнку, NULL в конце */
     int dnsd_flag_n;
     char exe[PATH_MAX];
@@ -520,6 +521,7 @@ struct conn {
     int watch;                /* сторожу внеочередной проход */
     int committed;            /* apply-commit запускался */
     int rcode;                /* код reload */
+    int boot;                 /* применение при старте (--apply): соединения нет, итог — в журнал */
 };
 
 struct ctl_srv {
@@ -535,6 +537,7 @@ struct ctl_srv {
     int hup_pending;
     struct watchd *watch;     /* сторож выходов; NULL — без --watch */
     struct recon_state rec;   /* что демон применил сам (apply-сверка, recon.c) */
+    struct loop_timer *snap_tm;   /* освежение снимка status (с --watch), см. srv_snap */
 };
 
 static void mem_version(struct conn *c, struct cbuf *r);
@@ -983,13 +986,22 @@ static int mem_no_spec(const struct steerd *d) {
     return 2;
 }
 
+/* version — ещё и то, чью спеку демон обслуживает: spec_path и state_dir полными путями. По ним
+ * клиент steer решает, отдавать ли демону `steer status --spec X` (та же спека) или движку
+ * (чужая: стенд, ручной запуск). Поля добавлены к версии 1 — прежние не изменились. */
 static void mem_version(struct conn *c, struct cbuf *r) {
-    (void)c;
     struct mem_run m;
     FILE *f = mem_begin(&m);
     if (!f) { resp_error(r, "internal", "нет памяти под ответ"); return; }
     cli_version(f);
     mem_end(&m, r, 0);
+    /* realpath на каждый ответ, а не при старте: спеки при старте может ещё не быть (роутер без
+     * настройки), а файла нет — путь как написан. */
+    char rp[PATH_MAX];
+    cb_str(r, ",\"spec_path\":");
+    cb_jstr(r, realpath(c->srv->cf.spec, rp) ? rp : c->srv->cf.spec);
+    cb_str(r, ",\"state_dir\":");
+    cb_jstr(r, realpath(steer_state_dir(), rp) ? rp : steer_state_dir());
 }
 
 /* status из памяти: спека и группы — демона, а то, что меняется без спеки (устройство,
@@ -1055,6 +1067,33 @@ static void mem_dns_log(struct conn *c, struct cbuf *r) {
     if (!f) { resp_error(r, "internal", "нет памяти под ответ"); return; }
     int code = dlog_print(f);
     mem_end(&m, r, code);
+}
+
+/* Снимок status (status.json, его отдаёт `status --fast`) — раз в пять минут, с --watch.
+ *
+ * До демона это делал отдельный экземпляр procd (`while :; do steer status; sleep 300; done` в
+ * init.d): снимок обязан быть свежим к моменту, когда человек ОТКРЫВАЕТ окно splify2, а пока
+ * окно закрыто, полных status никто не спрашивает. Один сервис — один процесс, и круг переехал
+ * сюда. Только с --watch: это режим, в котором демон — весь движок (procd, сервис телефона);
+ * стенды и ручной запуск без сторожа лишних ответов не считают. Пока идёт изменяющая команда —
+ * пропуск до следующего раза: спека в памяти как раз меняется. */
+#define CTL_SNAP_MS (300L * 1000L)
+
+static void srv_snap(struct loop *l, struct loop_timer *t, void *arg) {
+    (void)l;
+    struct ctl_srv *s = arg;
+    struct steerd *d = &s->d;
+    if (d->have && !s->lock_owner) {
+        FILE *f = fopen("/dev/null", "w");
+        if (f) {
+            memcpy(d->view, d->sp, sizeof(*d->view));
+            outputs_adopt_active_st(d->view, d->outs ? d->outs : &fo_store_files);
+            fwcheck_reset_cache();
+            status_answer(d->view, d->gr, f);
+            fclose(f);
+        }
+    }
+    loop_timer_set(t, CTL_SNAP_MS);
 }
 
 /* ---- apply и check ---------------------------------------------------------------------- */
@@ -1529,6 +1568,14 @@ static void reload_done(struct conn *c) {
 /* Голова ответа reload: код (не 0 — ядро не приняло набор или план не прошёл, причина в
  * stderr), выключатель. Дальше — прежние шаги reload. */
 static void reload_head(struct conn *c, int enabled, struct cbuf *err) {
+    if (c->boot) {
+        if (c->rcode != 0)
+            fprintf(stderr, LOG_W "применение при старте не прошло (код %d)%s%.*s", c->rcode,
+                    err && err->n ? ":\n" : "\n", err ? (int)err->n : 0,
+                    err && err->p ? err->p : "");
+        else if (enabled)
+            fprintf(stderr, LOG_I "спека применена при старте\n");
+    }
     cb_fmt(&c->resp, ",\"code\":%d", c->rcode);
     if (c->rcode != 0) {
         cb_utf8_trim(err);
@@ -2107,7 +2154,7 @@ static void conn_free(struct conn *c) {
         if (*pp == c) { *pp = c->next; break; }
     if (s->lock_owner == c) lock_release(s);
     if (!c->hup) loop_fd_del(s->l, c->fd);
-    close(c->fd);
+    if (c->fd >= 0) close(c->fd);
     loop_timer_free(c->tm);
     loop_timer_free(c->job.tm);
     free(c->job.out.p);
@@ -2272,6 +2319,29 @@ static void srv_hup(struct loop *l, int signo, void *arg) {
     else srv_spec_changed(s, "hup", ctl_enabled(), NULL, 1, NULL);
 }
 
+/* --apply: применить спеку при старте демона — тем же reload, что по сокету, только без
+ * соединения (итог — строкой в журнал, см. reload_head). Нужен одному сервису: procd на роутере
+ * и init на телефоне держат один steerd, и отдельного `steer apply` перед ним больше нет. Через
+ * сверку, а не подкомандой apply: демон тогда помнит применённое, и первое же «Применить» из
+ * интерфейса трогает только изменившееся, а не ставит всё заново (наборы, которые наполнил
+ * резолвер, при этом не опустошаются). Идёт в очереди изменяющих команд — apply, пришедший по
+ * сокету сразу после старта, подождёт его. */
+static void boot_apply(struct ctl_srv *s) {
+    struct conn *c = calloc(1, sizeof(*c));
+    if (!c) return;
+    c->srv = s;
+    c->fd = -1;
+    c->hup = 1;          /* ответ отдавать некому: conn_reply освобождает соединение */
+    c->boot = 1;
+    c->st = C_RUN;
+    c->q.cmd = ctl_lookup("reload");
+    c->q.cf = &s->cf;
+    c->next = s->conns;
+    s->conns = c;
+    resp_begin(&c->resp, "reload");
+    conn_exec(c);
+}
+
 static void ctl_bad_flag(const char *cmd, const char *msg, const char *arg) {
     fprintf(stderr, "steer: %s: %s%s%s\n", cmd, msg, arg ? ": " : "", arg ? arg : "");
     exit(2);
@@ -2296,7 +2366,8 @@ void ctl_usage_flags(FILE *out) {
           "  --watch-period СЕК  daemon: период прохода сторожа в тишине (по умолчанию 60)\n"
           "  --supervise         daemon: держать помощников выходов и резолвер самому (вместо\n"
           "                      procd или steer supervise; оба сразу не запускать)\n"
-          "  --dnsd-flag ФЛАГ    daemon: передать резолверу ещё и этот флаг (до восьми раз)\n",
+          "  --dnsd-flag ФЛАГ    daemon: передать резолверу ещё и этот флаг (до восьми раз)\n"
+          "  --apply             daemon: применить спеку при старте (сверкой, как reload)\n",
           p->ctl_sock, p->spec_path, p->state_dir, p->lists_dir);
 }
 
@@ -2373,6 +2444,7 @@ int ctl_serve_main(int argc, char **argv) {
         }
         if (!strcmp(f, "--watch")) { cf->watch = 1; continue; }
         if (!strcmp(f, "--supervise")) { cf->supervise = 1; continue; }
+        if (!strcmp(f, "--apply")) { cf->apply = 1; continue; }
         if (!strcmp(f, "--dnsd-flag")) {
             if (!v) ctl_bad_flag("daemon", "у флага нет значения", f);
             i++;
@@ -2429,6 +2501,7 @@ int ctl_serve_main(int argc, char **argv) {
                                   srv_busy, &S };
         S.watch = watchd_start(&S.d, &wc);
         if (!S.watch) { fprintf(stderr, LOG_W "сторож: нет памяти\n"); return 1; }
+        if ((S.snap_tm = loop_timer_new(S.l, srv_snap, &S))) loop_timer_set(S.snap_tm, CTL_SNAP_MS);
     }
     if (cf->supervise) {
         struct supd_conf sc = { ctl_enabled, cf->dnsd_flags };
@@ -2436,6 +2509,10 @@ int ctl_serve_main(int argc, char **argv) {
     }
     fprintf(stderr, LOG_I "слушаю %s%s%s\n", cf->sock, cf->watch ? ", сторожу выходы" : "",
             cf->supervise ? ", держу помощников" : "");
+    if (cf->apply) {
+        if (S.d.have) boot_apply(&S);
+        else fprintf(stderr, LOG_W "спеки нет — применять при старте нечего\n");
+    }
     return loop_run(S.l);
 }
 

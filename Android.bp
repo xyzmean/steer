@@ -1,10 +1,17 @@
 // steer for the Android platform build (DerpFest 16.2 / lineage-23.2).
 //
+// Two binaries, as in the router package (docs/architecture.md, section 4a, "Бинарники"):
+// steerd — the whole engine (daemon, compiler, apply, helpers, tools; steer-tools is a symlink
+// to it and answers only the tools under that name), and steer — the small socket client that
+// sends daemon commands (status, diag, explain, conns, dns-log, apply, reload, subscribe) to
+// the daemon and hands everything else to steerd next to itself with execv.
+//
 // Two builds of the same engine, as on the router: the base one (ten sources, the Makefile's
 // build/steer target) and the extended one — the same sources plus src/tunnel and src/proto (VLESS/Reality
 // client, xsteer, tgws) and mbedtls. The owner chose the extended build for the phone from the
 // first version, so it is the module named "steer" that vendor/der/config/der.mk installs; the
-// base build stays as steer_base for trees without mbedtls.
+// base build stays as steer_base for trees without mbedtls. Both engine builds install as
+// steerd.
 //
 // Both are compiled with -DSTEER_DEFAULT_PLATFORM=android. The platform is chosen at run time
 // (src/platform/platform.c) and the code of both platforms is in every binary; the define only
@@ -23,7 +30,7 @@ cc_defaults {
     name: "steer_defaults",
     system_ext_specific: true,
     relative_install_path: "der",
-    stem: "steer",
+    stem: "steerd",
     srcs: [
         "src/lib/run.c",
         "src/lib/jsonw.c",
@@ -108,6 +115,7 @@ cc_defaults {
         "src/proto/vless",
         "src/proto/xsteer",
         "src/proto/tgws",
+        "src/client",
     ],
     cflags: [
         "-DSTEER_DEFAULT_PLATFORM=android",
@@ -121,7 +129,7 @@ cc_defaults {
     },
 }
 
-// Not installable: both modules would be /system_ext/bin/der/steer, and Kati rejects two
+// Not installable: both modules would be /system_ext/bin/der/steerd, and Kati rejects two
 // install rules for one path ("overriding commands for target") for EVERY declared module,
 // not only for those in PRODUCT_PACKAGES. Still buildable by name (m steer_base).
 cc_binary {
@@ -143,8 +151,10 @@ cc_library_static {
 }
 
 cc_binary {
-    name: "steer",
+    name: "steerd",
     defaults: ["steer_defaults"],
+    // Tools role by argv[0] (src/daemon/main.c): the same file under another name.
+    symlinks: ["steer-tools"],
     // The router role of build/build-ext.sh: XS_COMMON + EXT_ROUTER.
     srcs: [
         "src/proto/xsteer/xswire.c",
@@ -186,4 +196,30 @@ cc_binary {
         "-Wno-comment",
     ],
     static_libs: ["libsteer_mbedtls"],
+}
+
+// The socket client: CLIENT_SRC in build/sources.mk (checked by tests/buildmatch.sh). No spec,
+// no compiler — command parsing, protocol v1 and execv of steerd from the same directory
+// (/system_ext/bin/der). The platform files give it the phone's default paths (spec, socket,
+// state directory) the same way the engine chooses them.
+cc_binary {
+    name: "steer",
+    system_ext_specific: true,
+    relative_install_path: "der",
+    srcs: [
+        "src/client/main.c",
+        "src/platform/platform.c",
+        "src/platform/openwrt.c",
+        "src/platform/android.c",
+    ],
+    local_include_dirs: [
+        "src/platform",
+        "src/client",
+    ],
+    cflags: [
+        "-DSTEER_DEFAULT_PLATFORM=android",
+    ],
+    strip: {
+        all: true,
+    },
 }

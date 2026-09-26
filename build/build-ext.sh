@@ -38,6 +38,12 @@ ROLE="${5:-router}"
 # «неизвестна» лучше числа, которое ничему не соответствует, — печатает её `steer --version`
 # (R-045).
 REV="${6:-неизвестна}"
+# Клиент сокета `steer` (src/client, docs/architecture.md, раздел 4а) — седьмым аргументом, по
+# желанию: путь, куда положить второй бинарник пакета рядом с движком (OUT — это steerd). Пакеты
+# build.sh собирают клиент сами, один на оба пакета; здесь он — для сборок в образе без build.sh
+# (проверка ролей, рецепты SDK). Клиенту mbedtls не нужна, и собирается он с -Os: весь его смысл
+# в том, чтобы весить десятки килобайт.
+CLIENT_OUT="${7:-}"
 
 MBED_INC=/opt/mbedtls/include
 EXT_INC=/src/src/proto/tls
@@ -181,3 +187,10 @@ zig cc -target "$TARGET" ${MCPU:+-mcpu=$MCPU} -static $OPT -s \
     -o "$OUT" \
     $FILES \
     "$WORK"/*.o
+
+if [ -n "$CLIENT_OUT" ]; then
+    CLIENT_FILES="$(for f in $(profile_var CLIENT_SRC); do printf '/src/%s ' "$f"; done)"
+    # shellcheck disable=SC2086
+    zig cc -target "$TARGET" ${MCPU:+-mcpu=$MCPU} -static -Os -s $STEER_INC \
+        -o "$CLIENT_OUT" $CLIENT_FILES
+fi

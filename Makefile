@@ -37,11 +37,22 @@ MODEL_KINDS := $(MODEL_SRC) $(filter-out src/kinds/awg.c,$(KINDS_BASE_SRC)) src/
 override CFLAGS += $(addprefix -I,$(INC_DIRS))
 
 .PHONY: all test clean ext-syntax ext-test snapshot-record print-inc
-all: $(BUILD)/steer
+all: $(BUILD)/steerd $(BUILD)/steer
 
-$(BUILD)/steer: $(CORE_SRC) $(CORE_HDR) VERSION
+# Два бинарника, как в пакете (docs/architecture.md, раздел 4а, «Бинарники»): build/steerd — весь
+# движок, build/steer — клиент сокета. Стенды зовут ./build/steer, как звали всегда: команды,
+# которые не к демону (а без демона — любые), клиент отдаёт движку execv'ом, и steerd он берёт
+# рядом с собой. Так каждый стенд заодно проверяет и путь «клиент → движок» с тем же выводом
+# и кодом (снимок генератора — 118 вызовов apply --dry-run через клиент), а не только движок.
+$(BUILD)/steerd: $(CORE_SRC) $(CORE_HDR) VERSION
 	@mkdir -p $(BUILD)
 	$(CC) $(CFLAGS) $(DEFS) -o $@ $(CORE_SRC)
+
+# Клиенту без steerd рядом делать нечего: зависимость порядка, чтобы `make build/steer` давал
+# рабочую пару.
+$(BUILD)/steer: $(CLIENT_SRC) src/platform/platform.h | $(BUILD)/steerd
+	@mkdir -p $(BUILD)
+	$(CC) $(CFLAGS) -o $@ $(CLIENT_SRC)
 
 # Демон базовой сборки с видами vless и xsteer — только для стенда tests/supdmatch.sh: сторож демона
 # берёт здоровье выходов, чьё устройство создаёт наш процесс, у супервизора (--watch вместе с
@@ -80,6 +91,7 @@ test: all ext-syntax $(BUILD)/steer-android $(BUILD)/tgwssim $(BUILD)/dnsmatch $
 	@sh tests/ctlmatch.sh
 	@sh tests/supdmatch.sh
 	@sh tests/reconmatch.sh
+	@sh tests/daemonmatch.sh
 	@sh tests/diagmatch.sh
 	@sh tests/statusmatch.sh
 	@sh tests/buildmatch.sh
@@ -454,7 +466,7 @@ $(BUILD)/evmatch: tests/evmatch.c src/lib/evline.c src/lib/evline.h src/lib/json
 # .gitignore об этом прямо предупреждает, а clean их сносил (I-023). Удаляются
 # только артефакты: то, что здесь же и собирается, плюс упаковка из build.sh.
 clean:
-	rm -rf $(BUILD)/steer $(BUILD)/steer-* $(BUILD)/dnsmatch $(BUILD)/specmatch $(BUILD)/specmatch-ext \
+	rm -rf $(BUILD)/steer $(BUILD)/steerd $(BUILD)/steer-* $(BUILD)/dnsmatch $(BUILD)/specmatch $(BUILD)/specmatch-ext \
 	       $(BUILD)/failovermatch $(BUILD)/dcmatch $(BUILD)/msgsplitmatch $(BUILD)/warmmatch $(BUILD)/upmatch $(BUILD)/tgwsfailmatch $(BUILD)/h2match $(BUILD)/xhupmatch $(BUILD)/submatch $(BUILD)/subfetchmatch $(BUILD)/fwmatch $(BUILD)/obfsmatch \
 	       $(BUILD)/visionmatch $(BUILD)/xswirematch $(BUILD)/xsconnmatch $(BUILD)/xsstreammatch $(BUILD)/xsepochmatch $(BUILD)/tungromatch $(BUILD)/tunnamematch $(BUILD)/xsconfmatch $(BUILD)/xslinkmatch $(BUILD)/xsroutematch $(BUILD)/chellomatch $(BUILD)/hellofreeze $(BUILD)/xsloop $(BUILD)/xsbench \
 	       $(BUILD)/steer-hub $(BUILD)/steer-ext \
