@@ -54,7 +54,7 @@ $(BUILD)/steer-android: $(CORE_SRC) $(CORE_HDR) VERSION
 	@mkdir -p $(BUILD)
 	$(CC) $(CFLAGS) $(DEFS) -DSTEER_DEFAULT_PLATFORM=android -o $@ $(CORE_SRC)
 
-test: all ext-syntax $(BUILD)/steer-android $(BUILD)/tgwssim $(BUILD)/dnsmatch $(BUILD)/specmatch $(BUILD)/specmatch-ext $(BUILD)/xswirematch $(BUILD)/xsconnmatch $(BUILD)/xsstreammatch $(BUILD)/tungromatch $(BUILD)/tunnelmatch $(BUILD)/tunnamematch $(BUILD)/xsconfmatch $(BUILD)/xslinkmatch $(BUILD)/xsroutematch $(BUILD)/chellomatch $(BUILD)/failovermatch $(BUILD)/irmatch $(BUILD)/irmatch-android $(BUILD)/dcmatch $(BUILD)/msgsplitmatch $(BUILD)/warmmatch $(BUILD)/upmatch $(BUILD)/tgwsfailmatch $(BUILD)/h2match $(BUILD)/xhupmatch $(BUILD)/submatch $(BUILD)/subfetchmatch $(BUILD)/fwmatch $(BUILD)/obfsmatch $(BUILD)/visionmatch $(BUILD)/tlsprobematch $(BUILD)/diagsim $(BUILD)/hwidsum $(BUILD)/awgmatch $(BUILD)/awgmatch-android
+test: all ext-syntax $(BUILD)/steer-android $(BUILD)/tgwssim $(BUILD)/dnsmatch $(BUILD)/specmatch $(BUILD)/specmatch-ext $(BUILD)/xswirematch $(BUILD)/xsconnmatch $(BUILD)/xsstreammatch $(BUILD)/tungromatch $(BUILD)/tunnelmatch $(BUILD)/tunnamematch $(BUILD)/xsconfmatch $(BUILD)/xslinkmatch $(BUILD)/xsroutematch $(BUILD)/chellomatch $(BUILD)/failovermatch $(BUILD)/irmatch $(BUILD)/irmatch-android $(BUILD)/dcmatch $(BUILD)/msgsplitmatch $(BUILD)/warmmatch $(BUILD)/upmatch $(BUILD)/tgwsfailmatch $(BUILD)/h2match $(BUILD)/xhupmatch $(BUILD)/submatch $(BUILD)/subfetchmatch $(BUILD)/fwmatch $(BUILD)/obfsmatch $(BUILD)/visionmatch $(BUILD)/tlsprobematch $(BUILD)/diagsim $(BUILD)/hwidsum $(BUILD)/awgmatch $(BUILD)/awgmatch-android $(BUILD)/evmatch
 	@sh tests/run.sh
 	@sh tests/gen.sh
 	@sh tests/snapshot.sh
@@ -106,6 +106,7 @@ test: all ext-syntax $(BUILD)/steer-android $(BUILD)/tgwssim $(BUILD)/dnsmatch $
 	@sh tests/awgns.sh
 	@$(BUILD)/irmatch
 	@$(BUILD)/irmatch-android
+	@$(BUILD)/evmatch
 
 # Перезапись снимка генератора (tests/snapshot.sh). Только когда ruleset меняется
 # намеренно, и в том же коммите, что и изменение: иначе снимок перестаёт что-либо сторожить.
@@ -177,18 +178,18 @@ $(BUILD)/dnsmatch: tests/dnsmatch.c $(DNSD_SRC) src/lib/sindex.h src/lib/nftnl.h
 # Таблица дата-центров Telegram — см. пояснение в самом стенде. Собирается с заглушками
 # mbedtls (-Itests/stub) по той же причине, что и ext-syntax: настоящей библиотеки в `make
 # test` нет по построению.
-$(BUILD)/dcmatch: tests/dcmatch.c src/proto/tgws/tgws.c
+$(BUILD)/dcmatch: tests/dcmatch.c src/proto/tgws/tgws.c src/lib/jsonw.c src/lib/evline.c
 	@mkdir -p $(BUILD)
-	$(CC) $(CFLAGS) -Itests/stub -o $@ tests/dcmatch.c $(PLATFORM_SRC)
+	$(CC) $(CFLAGS) -Itests/stub -o $@ tests/dcmatch.c src/lib/jsonw.c src/lib/evline.c $(PLATFORM_SRC)
 
-$(BUILD)/msgsplitmatch: tests/msgsplitmatch.c src/proto/tgws/tgws.c
+$(BUILD)/msgsplitmatch: tests/msgsplitmatch.c src/proto/tgws/tgws.c src/lib/jsonw.c src/lib/evline.c
 	@mkdir -p $(BUILD)
-	$(CC) $(CFLAGS) -Itests/stub -o $@ tests/msgsplitmatch.c $(PLATFORM_SRC)
+	$(CC) $(CFLAGS) -Itests/stub -o $@ tests/msgsplitmatch.c src/lib/jsonw.c src/lib/evline.c $(PLATFORM_SRC)
 
 # Запас поднятых соединений — там же и по той же причине: warm_* статические.
-$(BUILD)/warmmatch: tests/warmmatch.c src/proto/tgws/tgws.c
+$(BUILD)/warmmatch: tests/warmmatch.c src/proto/tgws/tgws.c src/lib/jsonw.c src/lib/evline.c
 	@mkdir -p $(BUILD)
-	$(CC) $(CFLAGS) -Itests/stub -o $@ tests/warmmatch.c $(PLATFORM_SRC)
+	$(CC) $(CFLAGS) -Itests/stub -o $@ tests/warmmatch.c src/lib/jsonw.c src/lib/evline.c $(PLATFORM_SRC)
 
 # Исходы пробы браузерным рукопожатием и то, как она их называет (I-272). Там же и по той же
 # причине: bind_local и hello12_build статические. Срок пробы подменён секундой — с шестью
@@ -200,17 +201,17 @@ $(BUILD)/tlsprobematch: tests/tlsprobematch.c src/proto/tls/tlsprobe.c src/proto
 
 # Освобождение соединения наверх: чем обозначено «дескриптора нет» (I-204). Там же и по той
 # же причине: up_drop статическая.
-$(BUILD)/upmatch: tests/upmatch.c src/proto/tgws/tgws.c
+$(BUILD)/upmatch: tests/upmatch.c src/proto/tgws/tgws.c src/lib/jsonw.c src/lib/evline.c
 	@mkdir -p $(BUILD)
-	$(CC) $(CFLAGS) -Itests/stub -o $@ tests/upmatch.c $(PLATFORM_SRC)
+	$(CC) $(CFLAGS) -Itests/stub -o $@ tests/upmatch.c src/lib/jsonw.c src/lib/evline.c $(PLATFORM_SRC)
 
 # Пути отказа моста, которых прогон настоящего бинаря не достаёт: длинная строка списка
 # запасных доменов, отказ источника случайности, отказ рукопожатия после разворота ключа
 # (I-155, I-196, I-197), срок затишья сессии через веб-сокет и причины её конца. Там же и по
 # той же причине: alt_init, ws_upgrade, tls_start и pump статические.
-$(BUILD)/tgwsfailmatch: tests/tgwsfailmatch.c src/proto/tgws/tgws.c
+$(BUILD)/tgwsfailmatch: tests/tgwsfailmatch.c src/proto/tgws/tgws.c src/lib/jsonw.c src/lib/evline.c
 	@mkdir -p $(BUILD)
-	$(CC) $(CFLAGS) -Itests/stub -o $@ tests/tgwsfailmatch.c $(PLATFORM_SRC)
+	$(CC) $(CFLAGS) -Itests/stub -o $@ tests/tgwsfailmatch.c src/lib/jsonw.c src/lib/evline.c $(PLATFORM_SRC)
 
 $(BUILD)/specmatch: tests/specmatch.c $(MODEL_KINDS) src/kinds/awg.c src/model/spec.h
 	@mkdir -p $(BUILD)
@@ -231,9 +232,9 @@ $(BUILD)/specmatch-ext: tests/specmatch.c $(MODEL_KINDS) src/kinds/awg.c $(KINDS
 # Поддельный TCP проверяется в памяти: сборка и разбор сегмента, контрольные суммы и
 # арифметика номеров — чистые функции без сокетов, поэтому стенд не требует ни сети, ни
 # прав root. Циклы клиента и сервера сюда не входят намеренно — см. заголовок файла.
-$(BUILD)/obfsmatch: tests/obfsmatch.c src/proto/obfs/obfs.c src/proto/obfs/obfs.h $(MODEL_KINDS) src/model/spec.h
+$(BUILD)/obfsmatch: tests/obfsmatch.c src/proto/obfs/obfs.c src/proto/obfs/obfs.h src/lib/jsonw.c src/lib/evline.c $(MODEL_KINDS) src/model/spec.h
 	@mkdir -p $(BUILD)
-	$(CC) $(CFLAGS) -o $@ tests/obfsmatch.c $(MODEL_KINDS)
+	$(CC) $(CFLAGS) -o $@ tests/obfsmatch.c src/lib/jsonw.c src/lib/evline.c $(MODEL_KINDS)
 
 # Выход kind=awg без ядра: разбор файла awg-quick, спека, побайтная сборка сообщений netlink.
 # Модель (MODEL_SRC) линкуется отдельным объектом, src/kinds/awg.c — по-прежнему #include
@@ -339,9 +340,9 @@ $(BUILD)/xswirematch: tests/xswirematch.c src/proto/xsteer/xswire.c src/proto/xs
 # Стенд поддельного соединения: порог мёртвого пути и учёт своей незанятости. Входит в обычный
 # make test по той же причине, что xswirematch: ни сети, ни mbedtls — время приходит аргументом,
 # а сокета у соединения в стенде нет вовсе.
-$(BUILD)/xsconnmatch: tests/xsconnmatch.c src/proto/xsteer/xsconn.c src/proto/xsteer/xsconn.h src/proto/obfs/obfs.c src/proto/obfs/obfs.h
+$(BUILD)/xsconnmatch: tests/xsconnmatch.c src/proto/xsteer/xsconn.c src/proto/xsteer/xsconn.h src/proto/obfs/obfs.c src/proto/obfs/obfs.h src/lib/jsonw.c src/lib/evline.c
 	@mkdir -p $(BUILD)
-	$(CC) $(CFLAGS) -o $@ tests/xsconnmatch.c src/proto/obfs/obfs.c $(MODEL_KINDS)
+	$(CC) $(CFLAGS) -o $@ tests/xsconnmatch.c src/proto/obfs/obfs.c src/lib/jsonw.c src/lib/evline.c $(MODEL_KINDS)
 
 # Рамка записей по настоящему потоку TCP: границы записей, смещения (они же nonce) и досылка
 # недописанного хвоста. Стенд входит в обычный make test по той же причине, что xswirematch:
@@ -364,7 +365,7 @@ $(BUILD)/tungromatch: tests/tungromatch.c src/tunnel/tun.c src/tunnel/tun.h
 # включается целиком, client.c подменён, поэтому mbedtls не нужна — заголовки из tests/stub,
 # как у ext-syntax. Подробности — в шапке стенда.
 TUNNELMATCH_SRC = src/tunnel/tun.c src/tunnel/rtx.c src/proto/vless/vless_proto.c src/proto/vless/vision.c \
-                  src/proto/vless/sub.c src/lib/jsonw.c $(MODEL_KINDS) $(KINDS_EXT_SRC)
+                  src/proto/vless/sub.c src/lib/jsonw.c src/lib/evline.c $(MODEL_KINDS) $(KINDS_EXT_SRC)
 $(BUILD)/tunnelmatch: tests/tunnelmatch.c src/tunnel/tunnel.c $(TUNNELMATCH_SRC)
 	@mkdir -p $(BUILD)
 	$(CC) $(CFLAGS) -Itests/stub -DSTEER_EXTENDED -o $@ tests/tunnelmatch.c \
@@ -415,6 +416,13 @@ $(BUILD)/chellomatch: tests/chellomatch.c tests/chello-frozen.h src/proto/tls/ch
 	@mkdir -p $(BUILD)
 	$(CC) $(CFLAGS) -o $@ tests/chellomatch.c
 
+# Формат событий помощников (src/lib/evline.h): запись в трубу, разбор обратно, выключенность
+# без STEER_EVENT_FD, неблокирующая потеря на полной трубе, экранирование why. Каждый сценарий —
+# отдельный дочерний процесс (см. шапку tests/evmatch.c): fork()/waitpid() из libc, без -lpthread.
+$(BUILD)/evmatch: tests/evmatch.c src/lib/evline.c src/lib/evline.h src/lib/jsonw.c src/lib/jsonw.h
+	@mkdir -p $(BUILD)
+	$(CC) $(CFLAGS) -o $@ tests/evmatch.c src/lib/evline.c src/lib/jsonw.c
+
 # НЕ rm -rf $(BUILD): в build/ живут отслеживаемые Dockerfile, build-ext.sh и
 # лабораторные исходники, без которых ./build.sh из свежего клона не работает —
 # .gitignore об этом прямо предупреждает, а clean их сносил (I-023). Удаляются
@@ -424,5 +432,5 @@ clean:
 	       $(BUILD)/failovermatch $(BUILD)/dcmatch $(BUILD)/msgsplitmatch $(BUILD)/warmmatch $(BUILD)/upmatch $(BUILD)/tgwsfailmatch $(BUILD)/h2match $(BUILD)/xhupmatch $(BUILD)/submatch $(BUILD)/subfetchmatch $(BUILD)/fwmatch $(BUILD)/obfsmatch \
 	       $(BUILD)/visionmatch $(BUILD)/xswirematch $(BUILD)/xsconnmatch $(BUILD)/xsstreammatch $(BUILD)/xsepochmatch $(BUILD)/tungromatch $(BUILD)/tunnamematch $(BUILD)/xsconfmatch $(BUILD)/xslinkmatch $(BUILD)/xsroutematch $(BUILD)/chellomatch $(BUILD)/hellofreeze $(BUILD)/xsloop $(BUILD)/xsbench \
 	       $(BUILD)/steer-hub $(BUILD)/steer-ext \
-	       $(BUILD)/diagsim $(BUILD)/libmbed-*.a \
+	       $(BUILD)/diagsim $(BUILD)/evmatch $(BUILD)/libmbed-*.a \
 	       $(BUILD)/*.err $(BUILD)/pkg $(BUILD)/scripts out

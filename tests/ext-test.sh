@@ -213,6 +213,7 @@ $CC -O1 -g -w $STEER_INC $ASAN $MBED_INC "$PRIV" -o "$BUILD/spokematch" \
 	src/proto/xsteer/xsconn.c src/proto/xsteer/xswire.c src/proto/xsteer/xsepoch.c src/proto/xsteer/xsroute.c \
 	src/proto/xsteer/xsconf.c src/proto/xsteer/xslink.c src/proto/xsteer/xsstream.c src/proto/xsteer/xshake.c src/proto/tls/chello.c \
 	src/proto/tls/reality.c src/proto/tls/tls13.c src/proto/tls/certverify.c src/proto/tls/h2.c src/tunnel/tun.c src/proto/obfs/obfs.c \
+	src/lib/jsonw.c src/lib/evline.c \
 	$MODEL_SRC $KINDS_SRC $MBED_LIB -lpthread
 "$BUILD/spokematch"
 
@@ -277,6 +278,7 @@ $CC -O2 -w $STEER_INC $MBED_INC "$PRIV" -o "$BUILD/hubmatch" tests/hubmatch.c \
 	src/proto/xsteer/xsconn.c src/proto/xsteer/xswire.c src/proto/xsteer/xsepoch.c src/proto/xsteer/xsroute.c \
 	src/proto/xsteer/xsconf.c src/proto/xsteer/xslink.c src/proto/xsteer/xsstream.c src/proto/xsteer/xshake.c src/proto/tls/chello.c \
 	src/proto/tls/reality.c src/proto/tls/tls13.c src/proto/tls/certverify.c src/proto/tls/h2.c src/tunnel/tun.c src/proto/obfs/obfs.c \
+	src/lib/jsonw.c src/lib/evline.c \
 	$MODEL_SRC $KINDS_SRC $MBED_LIB -lpthread
 "$BUILD/hubmatch"
 
@@ -284,7 +286,7 @@ $CC -O2 -w $STEER_INC $MBED_INC "$PRIV" -o "$BUILD/hubmatch" tests/hubmatch.c \
 echo "ext-test: собираю и прогоняю devupmatch..."
 $CC -O2 -w $STEER_INC $MBED_INC "$PRIV" -o "$BUILD/devupmatch" tests/devupmatch.c \
 	src/proto/vless/client.c src/proto/vless/vless_proto.c src/proto/vless/vision.c src/proto/tls/tls13.c src/proto/tls/certverify.c \
-	src/proto/tls/reality.c src/proto/tls/h2.c src/tunnel/tun.c src/tunnel/rtx.c src/proto/vless/sub.c src/lib/jsonw.c \
+	src/proto/tls/reality.c src/proto/tls/h2.c src/tunnel/tun.c src/tunnel/rtx.c src/proto/vless/sub.c src/lib/jsonw.c src/lib/evline.c \
 	$MODEL_SRC $KINDS_SRC $MBED_LIB -lpthread
 "$BUILD/devupmatch"
 

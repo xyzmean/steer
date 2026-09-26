@@ -72,6 +72,7 @@
 #include <sys/types.h>
 #include "obfs.h"
 #include "run.h"
+#include "evline.h"
 
 #define LOG_W "steer[warn] obfs: "
 #define LOG_I "steer[info] obfs: "
@@ -843,6 +844,7 @@ static int client_connect(struct fconn *c, int *raw_fd, uint32_t daddr, int dpor
 
 int obfs_client(const char *out_name, const char *server, int server_port,
                 const char *listen_addr, int listen_port) {
+    evline_open();
     struct in_addr sa;
     if (inet_pton(AF_INET, server, &sa) != 1) {
         fprintf(stderr, LOG_W "%s: сервер обфускации задаётся адресом, а не именем: %s\n",
@@ -851,7 +853,11 @@ int obfs_client(const char *out_name, const char *server, int server_port,
     }
 
     int udp = socket(AF_INET, SOCK_DGRAM, 0);
-    if (udp < 0) { perror("steer: udp"); return 1; }
+    if (udp < 0) {
+        perror("steer: udp");
+        evline_emit("down", "why", EVLINE_STR, "сокет udp не завёлся", (const char *)NULL);
+        return 1;
+    }
     struct sockaddr_in la;
     memset(&la, 0, sizeof(la));
     la.sin_family = AF_INET;
@@ -861,6 +867,7 @@ int obfs_client(const char *out_name, const char *server, int server_port,
     if (bind(udp, (struct sockaddr *)&la, sizeof(la)) != 0) {
         fprintf(stderr, LOG_W "%s: не занять %s:%d — %s\n", out_name, listen_addr,
                 listen_port, strerror(errno));
+        evline_emit("down", "why", EVLINE_STR, "порт занят", (const char *)NULL);
         return 1;
     }
     int fl = fcntl(udp, F_GETFL, 0);
@@ -874,7 +881,10 @@ int obfs_client(const char *out_name, const char *server, int server_port,
     int raw = -1;
     /* Уходим с ошибкой, а не крутимся в цикле: подъём заново — дело procd, и его пауза
      * respawn заодно не даёт молотить сеть, которой ещё нет. */
-    if (client_connect(&c, &raw, sa.s_addr, server_port) != 0) return 1;
+    if (client_connect(&c, &raw, sa.s_addr, server_port) != 0) {
+        evline_emit("down", "why", EVLINE_STR, "сырой сокет недоступен", (const char *)NULL);
+        return 1;
+    }
     long long began = now_ms(), redial_at = 0;
     int redial_wait = REDIAL_MIN_MS;
     fprintf(stderr, LOG_I "%s: %s:%d ← udp %s:%d, порт %u\n",
@@ -986,6 +996,8 @@ int obfs_client(const char *out_name, const char *server, int server_port,
 
                     if (s.flags & TH_RST) {
                         fprintf(stderr, LOG_W "%s: сервер оборвал сессию (RST)\n", out_name);
+                        evline_emit("down", "why", EVLINE_STR, "сервер оборвал сессию (RST)",
+                                     (const char *)NULL);
                         c.state = ST_CLOSED;
                         closed = 1;
                         break;
@@ -995,6 +1007,7 @@ int obfs_client(const char *out_name, const char *server, int server_port,
                         c.state = ST_EST;
                         conn_send(raw, &c, TH_ACK, NULL, 0, 0);
                         fprintf(stderr, LOG_I "%s: сессия установлена\n", out_name);
+                        evline_emit("up", (const char *)NULL);
                         continue;
                     }
                     if (s.plen && c.state == ST_EST) {
@@ -1026,6 +1039,7 @@ int obfs_client(const char *out_name, const char *server, int server_port,
             if (c.syn_tries >= SYN_RETRIES) {
                 fprintf(stderr, LOG_W "%s: сервер не отвечает (%d попыток)\n",
                         out_name, c.syn_tries);
+                evline_emit("down", "why", EVLINE_STR, "сервер не отвечает", (const char *)NULL);
                 c.state = ST_CLOSED;
             } else {
                 c.seq -= 1;                     /* повтор SYN — тот же сегмент, тот же номер */
@@ -1046,6 +1060,7 @@ int obfs_client(const char *out_name, const char *server, int server_port,
         if (conn_dead(&c, t)) {
             fprintf(stderr, LOG_W "%s: %d с тишины при активной отправке — пересоздаю сессию\n",
                     out_name, DEAD_MS / 1000);
+            evline_emit("down", "why", EVLINE_STR, "путь молчит", (const char *)NULL);
             c.state = ST_CLOSED;
         }
         /* Закрытая сессия с открытым сокетом — только что оборвалась: сокет закрываем сразу
@@ -1061,10 +1076,15 @@ int obfs_client(const char *out_name, const char *server, int server_port,
             raw = -1;
         }
         if (c.state == ST_CLOSED && raw < 0 && t >= redial_at) {
-            if (client_connect(&c, &raw, sa.s_addr, server_port) != 0) return 1;
+            if (client_connect(&c, &raw, sa.s_addr, server_port) != 0) {
+                evline_emit("down", "why", EVLINE_STR, "сырой сокет недоступен",
+                             (const char *)NULL);
+                return 1;
+            }
             began = now_ms();
         }
     }
+    evline_emit("down", "why", EVLINE_STR, "poll отказал", (const char *)NULL);
     obfs_guard_down();
     return 1;
 }
@@ -1148,6 +1168,7 @@ static struct sess *sess_alloc(uint32_t caddr, uint16_t cport, uint32_t our_addr
 }
 
 int obfs_server(int listen_port, const char *forward, int forward_port) {
+    evline_open();
     struct in_addr fa;
     if (inet_pton(AF_INET, forward, &fa) != 1) {
         fprintf(stderr, LOG_W "адрес назначения задаётся адресом: %s\n", forward);
@@ -1158,7 +1179,11 @@ int obfs_server(int listen_port, const char *forward, int forward_port) {
     /* Приём — один сырой сокет без connect: клиентов много и заранее они неизвестны.
      * Отвечает каждому свой сокет сессии, привязанный к её адресу. */
     int rx = socket(AF_INET, SOCK_RAW, IPPROTO_TCP);
-    if (rx < 0) { perror("steer: raw"); return 1; }
+    if (rx < 0) {
+        perror("steer: raw");
+        evline_emit("down", "why", EVLINE_STR, "сырой сокет недоступен", (const char *)NULL);
+        return 1;
+    }
     int fl = fcntl(rx, F_GETFL, 0);
     fcntl(rx, F_SETFL, fl | O_NONBLOCK);
     int rcvbuf = 1 << 20;
@@ -1181,6 +1206,7 @@ int obfs_server(int listen_port, const char *forward, int forward_port) {
 
     fprintf(stderr, LOG_I "сервер: поддельный TCP :%d → udp %s:%d\n",
             listen_port, forward, forward_port);
+    evline_emit("up", (const char *)NULL);
 
     for (;;) {
         struct pollfd fds[1 + MAX_SESS];
@@ -1336,6 +1362,7 @@ int obfs_server(int listen_port, const char *forward, int forward_port) {
                 conn_send(g_sess[i].tx, &g_sess[i].c, TH_ACK, NULL, 0, 0);
         }
     }
+    evline_emit("down", "why", EVLINE_STR, "poll отказал", (const char *)NULL);
     obfs_guard_down();
     return 1;
 }

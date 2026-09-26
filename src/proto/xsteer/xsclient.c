@@ -46,6 +46,7 @@
 #include "tun.h"
 #include "reality.h"
 #include "run.h"
+#include "evline.h"
 
 #define LOG_W "steer[warn] xsteer: "
 #define LOG_I "steer[info] xsteer: "
@@ -466,6 +467,7 @@ static int do_handshake(struct spoke *s) {
     s->cool_until = 0;
     s->last_drops = s->reasm.dropped;
     s->up = 1;
+    evline_emit("up", (const char *)NULL);
     s->handshake_at = xs_now_ms();
     fprintf(stderr, LOG_I "рукопожатие с %s:%d прошло, порт %u, шифр %s\n",
             s->conf->peer[0].endpoint, s->hub_port, s->conn.sport,
@@ -620,7 +622,10 @@ static void probe_done(struct spoke *s, const char *dev, long long now) {
 static void session_down_why(struct spoke *s, const char *why) {
     /* Считаем ПАДЕНИЯ поднятой сессии, а не попытки подъёма: попытка, не дошедшая до рукопожатия,
      * ничего не роняла, и складывать её с обрывом значило бы получить число, которое ничего не
-     * означает. */
+     * означает. Событие — по той же оговорке: сессия была живой, теперь нет. */
+    if (s->up)
+        evline_emit("down", "why", EVLINE_STR, why ? why : "пересборка сессии",
+                     (const char *)NULL);
     if (s->up) s->resets++;
     if (why) s->last_down = why;
     tls13_keys_free(&s->tx);
@@ -643,6 +648,7 @@ static int cmd_xsteer_spec(const char *spec_path, const char *out_name, const ch
 
 int cmd_xsteer(const char *spec_path, const char *out_name, const char *conf_path,
                const char *device, int stream, int stream_port) {
+    evline_open();
     static struct spoke sd;
     /* Режим транспорта задаётся ключом и только здесь: дальше он едет полем spoke, потому что
      * его читает и цикл, и подъём устройства, и файл состояния.
@@ -944,7 +950,11 @@ static void spoke_frame_cb(void *ctx, const uint8_t *f, size_t n) {
  * которого здесь нет вовсе. */
 static void stream_down_why(struct spoke *s, const char *why) {
     /* Счётчик и причина — те же, что у поддельного TCP, и по тем же основаниям: снаружи режим
-     * транспорта не виден, а «сколько раз чинилось» человек спрашивает одинаково про оба. */
+     * транспорта не виден, а «сколько раз чинилось» человек спрашивает одинаково про оба.
+     * Событие — тоже по факту смены состояния (s->up был установлен). */
+    if (s->up)
+        evline_emit("down", "why", EVLINE_STR, why ? why : "пересборка потока",
+                     (const char *)NULL);
     if (s->up) s->resets++;
     if (why) s->last_down = why;
     /* Без оглядки на s->up — по той же причине, что в session_down. */
@@ -1163,6 +1173,7 @@ static int stream_handshake(struct spoke *s, const char *dev) {
     if (peer_mtu > 0 && peer_mtu < s->mtu_agreed) s->mtu_agreed = peer_mtu;
     s->mtu_confirmed = s->mtu_agreed;
     s->up = 1;
+    evline_emit("up", (const char *)NULL);
     s->handshake_at = xs_now_ms();
     s->stream_rx = s->handshake_at;
     s->batch_max = XS_BATCH_FRAMES_MAX;
