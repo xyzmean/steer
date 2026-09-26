@@ -97,10 +97,8 @@ int is_mac(const char *s);
 int group_is_local(const struct group *g);
 int check_address_lists(struct groups *gr, struct err *e);
 
-#ifdef STEER_ANDROID
 int has_local(const struct groups *gr);
 int has_local_domains(const struct groups *gr);
 int has_via(const struct spec *sp);
-#endif
 
 #endif

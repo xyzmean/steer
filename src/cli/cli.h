@@ -47,7 +47,7 @@ struct cli_cmd {
 /* Значения, собранные общим разбором. Умолчания расставляет cli_parse. */
 struct cli_args {
     const char *spec;
-    const char *state_dir;   /* NULL — оставить то, что уже стоит в g_state_dir */
+    const char *state_dir;   /* NULL — оставить то, что уже стоит в steer_state_dir() */
     const char *kind;
     /* --devices: печатать имена УСТРОЙСТВ вместо имён выходов.
      *

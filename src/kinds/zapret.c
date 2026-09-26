@@ -33,12 +33,10 @@
 #include "ir.h"
 
 static int zapret_parse(struct output *o, const struct out_keys *k, struct err *e) {
-#ifdef STEER_ANDROID
-    /* На телефоне zapret нет (решение владельца: «zapret не надо») — см. out_skips_zapret в
-     * spec.h. */
-    (void)k;
-    return err_set(e, "outputs.%s: kind zapret — в сборке под Android zapret нет", o->name);
-#else
+    /* На телефоне zapret нет (решение владельца: «zapret не надо», plat()->zapret) — см.
+     * out_skips_zapret в spec.h. */
+    if (!plat()->zapret)
+        return err_set(e, "outputs.%s: kind zapret — в сборке под Android zapret нет", o->name);
     snprintf(o->zp.opts, sizeof(o->zp.opts), "%s", k->opts_file);
     /* Устройства нет и не будет: трафик уходит обычным маршрутом, а выход меняет
      * только то, ЧТО с ним по дороге сделает nfqws. Названное устройство здесь —
@@ -51,14 +49,13 @@ static int zapret_parse(struct output *o, const struct out_keys *k, struct err *
      * имени, которым позволено разойтись, пользы не приносят. Имя уже проверено
      * name_ok, поэтому путь собирается из проверенного. */
     if (!o->zp.opts[0])
-        snprintf(o->zp.opts, sizeof(o->zp.opts), STEER_ETC_DIR "/zapret/%.200s.opts", o->name);
+        snprintf(o->zp.opts, sizeof(o->zp.opts), "%s/zapret/%.200s.opts", plat()->etc_dir, o->name);
     /* Абсолютный путь и годность к JSON: путь печатается в status и в diag, а
      * запускает процесс procd со своим рабочим каталогом — относительный «работал
      * бы из шелла» и не работал бы у службы. Тот же барьер, что у conf. */
     else if (o->zp.opts[0] != '/' || !label_ok(o->zp.opts))
         return err_set(e, "outputs.%s: opts_file должен быть абсолютным путём без кавычек", o->name);
     return 0;
-#endif
 }
 
 /* on_fail=zapret у выхода kind=zapret — это «при отказе обхода включить обход».

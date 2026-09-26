@@ -983,9 +983,9 @@ int main(void) {
         char sdir[] = "/tmp/specmatch-state-XXXXXX";
         char rdir[] = "/tmp/specmatch-rt-XXXXXX";
         if (!mkdtemp(sdir) || !mkdtemp(rdir)) { perror("mkdtemp"); return 1; }
-        const char *saved_state = g_state_dir, *saved_rt = g_rt_tables_d;
-        g_state_dir = sdir;
-        g_rt_tables_d = rdir;
+        const char *saved_state = steer_state_dir(), *saved_rt = steer_rt_tables_dir();
+        steer_set_state_dir(sdir);
+        steer_set_rt_tables_dir(rdir);
 
         reset_globals();
         const char *s2 = SPEC(
@@ -1040,8 +1040,8 @@ int main(void) {
         snprintf(path, sizeof(path), "%s/registry", sdir);
         unlink(path);
         rmdir(sdir);
-        g_state_dir = saved_state;
-        g_rt_tables_d = saved_rt;
+        steer_set_state_dir(saved_state);
+        steer_set_rt_tables_dir(saved_rt);
     }
 
     /* ---- мест под метку столько же, сколько выходов ----------------------------
@@ -1056,9 +1056,9 @@ int main(void) {
         char sdir[] = "/tmp/specmatch-slots-XXXXXX";
         char rdir[] = "/tmp/specmatch-slotsrt-XXXXXX";
         if (!mkdtemp(sdir) || !mkdtemp(rdir)) { perror("mkdtemp"); return 1; }
-        const char *saved_state = g_state_dir, *saved_rt = g_rt_tables_d;
-        g_state_dir = sdir;
-        g_rt_tables_d = rdir;
+        const char *saved_state = steer_state_dir(), *saved_rt = steer_rt_tables_dir();
+        steer_set_state_dir(sdir);
+        steer_set_rt_tables_dir(rdir);
 
         reset_globals();
         char many[4096];
@@ -1128,8 +1128,8 @@ int main(void) {
         unlink(rpath);
         rmdir(rdir);
         rmdir(sdir);
-        g_state_dir = saved_state;
-        g_rt_tables_d = saved_rt;
+        steer_set_state_dir(saved_state);
+        steer_set_rt_tables_dir(saved_rt);
     }
 
     /* ---- ход подъёма выхода: запись и чтение ------------------------------------------
@@ -1145,8 +1145,8 @@ int main(void) {
     {
         char sdir[] = "/tmp/specmatch-probe.XXXXXX";
         char *d = mkdtemp(sdir);
-        const char *saved = g_state_dir;
-        if (d) g_state_dir = d;
+        const char *saved = steer_state_dir();
+        if (d) steer_set_state_dir(d);
 
         /* Ничего не писали — «не знаем», а не отказ. Пустое место не должно красить
          * исправный выход в жёлтое. */
@@ -1188,7 +1188,7 @@ int main(void) {
          * движок другой версии, и жёлтая метка на исправном выходе тут хуже молчания. */
         {
             char path[512];
-            snprintf(path, sizeof(path), "%s/probe-vl", g_state_dir);
+            snprintf(path, sizeof(path), "%s/probe-vl", steer_state_dir());
             FILE *f = fopen(path, "w");
             if (f) { fprintf(f, "чтотонеизвестное 1 2 %ld %ld\n",
                              (long)getpid(), (long)time(NULL)); fclose(f); }
@@ -1198,7 +1198,7 @@ int main(void) {
         /* Устаревшая запись тоже «не знаем»: procd давно перестал пробовать. */
         {
             char path[512];
-            snprintf(path, sizeof(path), "%s/probe-vl", g_state_dir);
+            snprintf(path, sizeof(path), "%s/probe-vl", steer_state_dir());
             FILE *f = fopen(path, "w");
             if (f) { fprintf(f, "nonode 31 29 %ld %ld\n",
                              (long)getpid(), (long)time(NULL) - 3600); fclose(f); }
@@ -1207,7 +1207,7 @@ int main(void) {
         }
 
         if (d) { rmdir(d); }
-        g_state_dir = saved;
+        steer_set_state_dir(saved);
     }
 
     {

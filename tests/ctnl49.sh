@@ -12,7 +12,7 @@
 # Запускается на стенде tools/vm49 хаба splicicd:
 #
 #   K=/root/vm49/sysroot/kinc
-#   musl-gcc -static -idirafter $K -O2 -DSTEER_ANDROID -o OUT/steer <исходники как в Makefile>
+#   musl-gcc -static -idirafter $K -O2 -DSTEER_DEFAULT_PLATFORM=android -o OUT/steer <исходники как в Makefile>
 #   musl-gcc -static -idirafter $K -O2 -o OUT/ctnl49-tool tests/ctnl49-tool.c
 #   tools/vm49/vm49.sh run steer/tests/ctnl49.sh OUT/steer OUT/ctnl49-tool
 #

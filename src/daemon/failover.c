@@ -226,7 +226,7 @@ static int device_healthy(const char *dev) {
  * сюда разборщик ради двух слов значило бы завести вторую схему того же файла. */
 static int xs_state_read(const char *dev, int *up, int *fresh) {
     char path[320];
-    snprintf(path, sizeof(path), "%s/xsteer-%.40s.json", g_state_dir, dev);
+    snprintf(path, sizeof(path), "%s/xsteer-%.40s.json", steer_state_dir(), dev);
     struct stat sb;
     if (stat(path, &sb) != 0) return 0;
     if (fresh) *fresh = (long)(time(NULL) - sb.st_mtime) <= XS_STATE_STALE;
@@ -1073,7 +1073,7 @@ static struct route_facts route_facts_read(const struct output *o) {
 /* Что выбрано сейчас — чтобы не переписывать маршруты и не шуметь в лог, когда
  * ничего не изменилось. Файл в state_dir, рядом с реестром меток. */
 static void active_path(char *buf, size_t n) {
-    snprintf(buf, n, "%s/active", g_state_dir);
+    snprintf(buf, n, "%s/active", steer_state_dir());
 }
 
 /* Гистерезис возврата: сколько тиков подряд более предпочтительное устройство обязано быть
@@ -1116,7 +1116,7 @@ static int g_streak[MAX_OUTPUTS];
 #define LAT_INTERVAL_S   180
 
 static void lat_path(char *buf, size_t n) {
-    snprintf(buf, n, "%s/latency", g_state_dir);
+    snprintf(buf, n, "%s/latency", steer_state_dir());
 }
 
 static long mono_now(void) {
@@ -1289,7 +1289,7 @@ void outputs_adopt_active(struct spec *sp) {
 
 static int restart_allowed(const char *dev) {
     char path[256];
-    snprintf(path, sizeof(path), "%s/restart-%.32s", g_state_dir, dev);
+    snprintf(path, sizeof(path), "%s/restart-%.32s", steer_state_dir(), dev);
     FILE *f = fopen(path, "r");
     long last = 0;
     if (f) { if (fscanf(f, "%ld", &last) != 1) last = 0; fclose(f); }
@@ -1374,18 +1374,18 @@ int revive(const struct spec *sp, const struct output *o, const char *dev, int v
         return 0;
     }
 
-#ifdef STEER_ANDROID
-    /* На телефоне нет ни netifd (ifdown/ifup), ни procd с ubus: интерфейс туннеля поднимает
-     * тот, кто его завёл, — приложение VPN или наш же процесс, и перезапускать его отсюда
-     * нечем. Дело сторожа то же, что у выходов, чьё устройство заводит движок: сказать и
-     * подождать, не оживёт ли. */
-    fprintf(stderr, LOG_W "%s: не отвечает — жду, не поднимется ли\n", dev);
-    for (int i = 0; i < 10; i++) {
-        sleep(1);
-        if (device_healthy_for(sp, o, dev)) return 1;
+    /* Без netifd (телефон: ни ifdown/ifup, ни procd с ubus) интерфейс туннеля поднимает тот,
+     * кто его завёл, — приложение VPN или наш же процесс, и перезапускать его отсюда нечем.
+     * Дело сторожа то же, что у выходов, чьё устройство заводит движок: сказать и подождать,
+     * не оживёт ли. */
+    if (!plat()->netifd) {
+        fprintf(stderr, LOG_W "%s: не отвечает — жду, не поднимется ли\n", dev);
+        for (int i = 0; i < 10; i++) {
+            sleep(1);
+            if (device_healthy_for(sp, o, dev)) return 1;
+        }
+        return 0;
     }
-    return 0;
-#endif
     fprintf(stderr, LOG_W "%s: не отвечает — перезапускаю интерфейс\n", dev);
     /* Сначала помощник выхода (обфускатор), потом интерфейс, и порядок здесь — не вкусовщина.
      *

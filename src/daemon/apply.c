@@ -30,9 +30,7 @@
 #include "generate.h"
 #include "run.h"
 
-#ifdef STEER_ANDROID
-static void android_masq_drop_all(void);   /* ниже, у apply_routing */
-#endif
+static void iptables_masq_drop_all(void);   /* ниже, у apply_routing */
 /* ---- apply ---------------------------------------------------------------- */
 
 
@@ -57,7 +55,7 @@ static size_t g_oldreg_n;
 
 static void registry_snapshot(void) {
     char path[512];
-    snprintf(path, sizeof(path), "%s/registry", g_state_dir);
+    snprintf(path, sizeof(path), "%s/registry", steer_state_dir());
     FILE *f = fopen(path, "r");
     if (!f) return;
     char name[32];
@@ -97,8 +95,8 @@ static void cleanup_stale_routing(const struct spec *sp) {
  * То же, что stop_service в files/etc/init.d/steer, но командой движка. На роутере снятие —
  * это десяток строк shell; у init Android shell нет (сервис — один исполняемый файл), а
  * выдать домену steerd /system/bin/sh значило бы разрешить ему любую команду. Командой
- * движка оно и точнее: маска метки здесь STEER_MARK_MASK той сборки, что правила ставила
- * (под STEER_ANDROID она другая, 0x0fc00000), а в shell её пришлось бы повторять литералом.
+ * движка оно и точнее: маска метки здесь STEER_MARK_MASK той платформы, что правила ставила
+ * (у телефона она другая, 0x0fc00000), а в shell её пришлось бы повторять литералом.
  *
  * Зачем снимать при выключении, если перезапуск нарочно правил не трогает. Перезапуск — это
  * мгновение, после которого демоны встают снова, и открыть трафик на это мгновение хуже, чем
@@ -132,9 +130,7 @@ int cmd_down(void) {
      * сервис SIGKILL (без gentle_kill — сразу, с ним — через 200 мс), и уборка при выходе может
      * не успеть. */
     probe_rule_cleanup();
-#ifdef STEER_ANDROID
-    android_masq_drop_all();
-#endif
+    if (plat()->iptables_masq) iptables_masq_drop_all();
     /* Туннели kind=awg заводил движок — ему их и снимать; без этого интерфейс с ключами пира
      * пережил бы выключение и продолжал бы отвечать на рукопожатия. */
     awg_down_all();
@@ -144,8 +140,9 @@ int cmd_down(void) {
 /* Policy routing for interface outputs. Дубликаты правил не копятся: rule_ensure считает копии
  * в ядре и лишние снимает — но только ПОСЛЕ того, как верная стоит, а не «снять всё и
  * поставить заново» (см. table_bind в failover.c: в том промежутке трафик уходил напрямую). */
-#ifdef STEER_ANDROID
 /* ---- masquerade у выходов-интерфейсов: правилом iptables, а не nft ----------------------
+ *
+ * Только на платформе с plat()->iptables_masq (телефон, src/platform/android.c).
  *
  * ЗАЧЕМ. На роутере адрес источника у пакетов в туннель подменяет firewall (зона выхода с
  * masq). На телефоне такого firewall нет: netd делает NAT только для раздачи на её восходящий
@@ -164,7 +161,7 @@ int cmd_down(void) {
  * здесь не нужны: их устройство обслуживает наш процесс, адреса он переводит сам. Выход
  * kind=awg — нужен, как interface: туннель в ядре несёт пакет с тем адресом источника, что
  * был, а сервер WireGuard примет только адрес из своих AllowedIPs, то есть адрес туннеля. */
-static void android_masq_drop_all(void) {
+static void iptables_masq_drop_all(void) {
     char mask[24];
     snprintf(mask, sizeof(mask), "/0x%x ", STEER_MARK_MASK);
     FILE *p = popen("iptables -w -t nat -S POSTROUTING 2>/dev/null", "r");
@@ -190,7 +187,7 @@ static void android_masq_drop_all(void) {
 /* Вернуть недостающие правила masquerade, не трогая стоящие. Зовёт сторож после каждого
  * прохода: netd при (пере)запуске перестраивает iptables и наши правила пропадают, а apply
  * после этого случится, только если его позовёт init (см. steerd.rc). */
-void android_masq_ensure(const struct spec *sp) {
+void iptables_masq_ensure(const struct spec *sp) {
     for (size_t i = 0; i < sp->out_n; i++) {
         const struct output *o = &sp->out[i];
         /* masquerade — выходам с устройством, кроме тех, кто наружу ходит от своего имени
@@ -213,8 +210,8 @@ void android_masq_ensure(const struct spec *sp) {
     }
 }
 
-static void android_masq_sync(const struct spec *sp) {
-    android_masq_drop_all();
+static void iptables_masq_sync(const struct spec *sp) {
+    iptables_masq_drop_all();
     for (size_t i = 0; i < sp->out_n; i++) {
         const struct output *o = &sp->out[i];
         if (!out_has_device(o) || out_self_natting(o)) continue;
@@ -230,7 +227,6 @@ static void android_masq_sync(const struct spec *sp) {
         }
     }
 }
-#endif
 
 static void apply_routing(const struct spec *sp) {
     for (size_t i = 0; i < sp->out_n; i++) {
@@ -319,17 +315,14 @@ static void report_legacy_gaps(const struct spec *sp, const struct groups *gr) {
                         "мимо резолвера движка, и доменные каналы видят только тех, кто "
                         "спрашивает по IPv4\n");
 #endif
-#ifdef STEER_ANDROID
-    if (!(g_nftc & NFTC_IP6NAT) && has_local_domains(gr))
+    if (plat()->local_channels && !(g_nftc & NFTC_IP6NAT) && has_local_domains(gr))
         fprintf(stderr, LOG_W "ядро не умеет nat для IPv6: запросы DNS приложений телефона по "
                         "IPv6 идут мимо резолвера движка, и доменные каналы телефона их не "
                         "видят\n");
-#endif
-#ifndef STEER_ANDROID
     /* На Android таблица nat iptables есть всегда, но PREROUTING в ней у netd — пустая
-     * oem_nat_pre, и предупреждать там не о чем. Почему это вообще важно — у
-     * legacy.c (шаг 4, «почему dstnat - 1»). */
-    FILE *t = fopen("/proc/net/ip_tables_names", "r");
+     * oem_nat_pre, и предупреждать там не о чем (plat()->warn_iptables_nat). Почему это вообще
+     * важно — у legacy.c (шаг 4, «почему dstnat - 1»). */
+    FILE *t = plat()->warn_iptables_nat ? fopen("/proc/net/ip_tables_names", "r") : NULL;
     if (t) {
         char line[64];
         int nat = 0;
@@ -341,7 +334,6 @@ static void report_legacy_gaps(const struct spec *sp, const struct groups *gr) {
                             "портов) не сработают — старое ядро не даёт двум таблицам nat "
                             "поделить один хук\n");
     }
-#endif
 }
 
 /* Умеет ли ЯДРО отдавать пакеты в очередь nfqueue.
@@ -534,9 +526,7 @@ int cmd_apply(const char *spec, int dry) {
      * без устройства (blackhole при on_fail=drop), а причина уже названа в журнале. */
     awg_apply_all(&cfg);
     apply_routing(&cfg);
-#ifdef STEER_ANDROID
-    android_masq_sync(&cfg);
-#endif
+    if (plat()->iptables_masq) iptables_masq_sync(&cfg);
     cleanup_stale_routing(&cfg);
     /* Снимок состояния СНИМАЕТСЯ: он описывает то, что было применено до этой транзакции, и
      * `status --fast` отдавал бы его как нынешнее — то есть прежние выходы и прежние каналы
@@ -551,10 +541,10 @@ int cmd_apply(const char *spec, int dry) {
      * телефоне fw4 нет, трафик раздачи транслирует netd через iptables, и по дампу nftables
      * эти проверки говорили бы «устройство не упомянуто в firewall» и «нет masquerade» на
      * каждом apply — ложные тревоги, после которых настоящим перестают верить. */
-#ifndef STEER_ANDROID
-    report_output_deps(&cfg);
-    report_traceroute_dep(&cfg);
-#endif
+    if (plat()->fw4) {
+        report_output_deps(&cfg);
+        report_traceroute_dep(&cfg);
+    }
     report_mark_overlap();
     printf("steer: applied %zu channel(s), %zu output(s)\n", cfg.ch_n, cfg.out_n);
     return 0;

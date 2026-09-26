@@ -208,6 +208,27 @@ int aggregate_main(int argc, char **argv);
 
 
 int main(int argc, char **argv) {
+    /* Платформа (src/platform/platform.h) — до всего остального: от неё зависят пути по
+     * умолчанию, справка и раскладка меток. --platform понимает любая команда, в любом месте
+     * строки, поэтому он вынимается из argv здесь, до разбора: у dnsd, fit и ctl свои парсеры,
+     * и учить каждый из них этому флагу незачем. Выбор уходит и в окружение (plat_select) —
+     * процессы, которые движок запускает сам, работают на той же платформе. */
+    for (int i = 1; i < argc; i++) {
+        if (strcmp(argv[i], "--platform") != 0) continue;
+        if (i + 1 >= argc) {
+            fprintf(stderr, "steer: флаг --platform остался без значения (%s)\n", plat_names());
+            return 2;
+        }
+        if (plat_select(argv[i + 1]) != 0) {
+            fprintf(stderr, "steer: --platform %s: такой платформы нет (есть %s)\n", argv[i + 1],
+                    plat_names());
+            return 2;
+        }
+        memmove(&argv[i], &argv[i + 2], (size_t)(argc - i - 1) * sizeof *argv);
+        argc -= 2;
+        i--;
+    }
+    plat();
     if (argc < 2) {
         cli_usage_short(stderr);
         return 2;
@@ -235,8 +256,8 @@ int main(int argc, char **argv) {
      * не объясняет, что именно не так с порядком слов. */
     if (cmd[0] == '-') {
         fprintf(stderr, "steer: флаги идут после команды, а не до неё: %s\n", cmd);
-        fputs("       например: steer apply --spec " STEER_ETC_DIR "/spec.json\n"
-              "       список команд: steer help\n", stderr);
+        fprintf(stderr, "       например: steer apply --spec %s\n"
+                        "       список команд: steer help\n", plat()->spec_path);
         return 2;
     }
 
@@ -276,7 +297,7 @@ int main(int argc, char **argv) {
     static struct spec cfg;
     static struct groups gr;
     cli_parse(c, argc, argv, 2, &a);
-    if (a.state_dir) g_state_dir = a.state_dir;
+    if (a.state_dir) steer_set_state_dir(a.state_dir);
     const char *spec = a.spec, *arg = a.npos ? a.pos[0] : NULL;
 
     if (!strcmp(cmd, "apply")) return cmd_apply(spec, a.dry_run);

@@ -15,6 +15,7 @@
 
 #include "hwid.h"
 #include "jsonw.h"
+#include "platform.h"
 
 const char *steer_env_or(const char *name, const char *dflt) {
     const char *v = getenv(name);
@@ -336,16 +337,16 @@ static void hdr_clean(const char *in, char *out, size_t n) {
 }
 
 void steer_dev_os(char *out, size_t n) {
-#ifdef STEER_ANDROID
-    /* На телефоне /etc/openwrt_release нет, а «OpenWrt» в заголовке подписки было бы
-     * неправдой, по которой панель провайдера посчитала бы устройство роутером. Версию
-     * Android без libc-свойств (property_get) не прочесть, а тянуть ради заголовка bionic-
-     * зависимость незачем: имени системы панели достаточно. */
-    hdr_clean(steer_env_or("STEER_DEVICE_OS", "Android"), out, n);
-    return;
-#endif
+    const struct platform_ops *p = plat();
+    /* Платформа без файла версии (телефон: /etc/openwrt_release нет, а «OpenWrt» в заголовке
+     * подписки было бы неправдой, по которой панель провайдера посчитала бы устройство
+     * роутером) — одно имя системы, см. src/platform/android.c. */
+    if (!p->os_release) {
+        hdr_clean(steer_env_or("STEER_DEVICE_OS", p->os_name), out, n);
+        return;
+    }
     char ver[80] = "";
-    FILE *f = fopen(steer_env_or("STEER_OPENWRT_RELEASE", "/etc/openwrt_release"), "r");
+    FILE *f = fopen(steer_env_or("STEER_OPENWRT_RELEASE", p->os_release), "r");
     if (f) {
         char line[256];
         while (fgets(line, sizeof line, f)) {
@@ -363,20 +364,15 @@ void steer_dev_os(char *out, size_t n) {
         fclose(f);
     }
     char raw[176];
-    snprintf(raw, sizeof raw, "OpenWrt%s%s", ver[0] ? " " : "", ver);
+    snprintf(raw, sizeof raw, "%s%s%s", p->os_name, ver[0] ? " " : "", ver);
     hdr_clean(raw, out, n);
 }
 
 void steer_dev_model(char *out, size_t n) {
     char m[160] = "";
-#ifdef STEER_ANDROID
     /* Модель телефона ядро отдаёт из дерева устройств; /tmp/sysinfo — изобретение OpenWrt. */
-    if (!read_line(steer_env_or("STEER_SYSINFO_MODEL", "/proc/device-tree/model"), m, sizeof m))
-        snprintf(m, sizeof m, "android");
-#else
-    if (!read_line(steer_env_or("STEER_SYSINFO_MODEL", "/tmp/sysinfo/model"), m, sizeof m))
-        snprintf(m, sizeof m, "router");
-#endif
+    if (!read_line(steer_env_or("STEER_SYSINFO_MODEL", plat()->model_path), m, sizeof m))
+        snprintf(m, sizeof m, "%s", plat()->model_fallback);
     hdr_clean(m, out, n);
 }
 

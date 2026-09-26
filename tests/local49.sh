@@ -7,7 +7,7 @@
 # цепочка route прямо в inet). Бинарники — Android-сборка движка и помощник:
 #
 #   K=/root/vm49/sysroot/kinc
-#   musl-gcc -static -idirafter $K -O2 -DSTEER_ANDROID -o /tmp/steer <исходники как в Makefile>
+#   musl-gcc -static -idirafter $K -O2 -DSTEER_DEFAULT_PLATFORM=android -o /tmp/steer <исходники как в Makefile>
 #   musl-gcc -static -idirafter $K -O2 -o /tmp/local49-tool tests/local49-tool.c
 #   musl-gcc -static -idirafter $K -O2 -o /tmp/dnstool tests/legacy49-dnstool.c
 #   iptables-legacy статически (musl), под именем iptables — см. ANDROID_AGENT_TASK.md §4

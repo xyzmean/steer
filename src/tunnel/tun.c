@@ -36,7 +36,7 @@
 #include <sys/uio.h>
 
 #include "tun.h"
-#include "paths.h"
+#include "platform.h"
 
 /* Заголовок разгрузки virtio, тот самый, который принимает IFF_VNET_HDR.
  *
@@ -78,7 +78,7 @@ static int g_open_stage;      /* 1 — не открылся узел TUN, 2 —
 static char g_open_got[IFNAMSIZ];   /* имя, которое вернуло ядро при stage 3 */
 
 static int queue_open(const char *name, short flags) {
-    int fd = open(STEER_TUN_DEV, O_RDWR);
+    int fd = open(plat()->tun_dev, O_RDWR);
     if (fd < 0) {
         if (!g_open_errno) { g_open_errno = errno; g_open_stage = 1; }
         return -1;
@@ -211,8 +211,8 @@ int tun_open(struct tun_dev *d, int max_queues, const char *name) {
      * ни строки, и «туннель не поднялся» выглядело как «туннель просто не работает». */
     if (g_open_stage == 1 && (g_open_errno == ENOENT || g_open_errno == ENXIO ||
                               g_open_errno == ENODEV)) {
-        fprintf(stderr, "steer[warn] tunnel: нет " STEER_TUN_DEV " (%s) — " STEER_TUN_HINT "\n",
-                strerror(g_open_errno));
+        fprintf(stderr, "steer[warn] tunnel: нет %s (%s) — %s\n", plat()->tun_dev,
+                strerror(g_open_errno), plat()->tun_hint);
         return TUN_ENODEV;
     }
     if (g_open_stage == 3) {
@@ -222,9 +222,10 @@ int tun_open(struct tun_dev *d, int max_queues, const char *name) {
                     ? " — имя длиннее предела ядра (IFNAMSIZ, 15 значащих символов)" : "");
         return TUN_ESETUP;
     }
-    fprintf(stderr, "steer[warn] tunnel: устройство %s не создалось: %s (%s)\n", name,
+    fprintf(stderr, "steer[warn] tunnel: устройство %s не создалось: %s (%s%s)\n", name,
             strerror(g_open_errno ? g_open_errno : EINVAL),
-            g_open_stage == 1 ? "не открылся " STEER_TUN_DEV : "отказал TUNSETIFF");
+            g_open_stage == 1 ? "не открылся " : "отказал TUNSETIFF",
+            g_open_stage == 1 ? plat()->tun_dev : "");
     return TUN_ESETUP;
 }
 

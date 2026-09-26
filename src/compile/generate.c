@@ -36,14 +36,12 @@ static void sb_add(struct sbuf *b, const char *fmt, ...) {
     if (b->n > sizeof(b->s) - 1) b->n = sizeof(b->s) - 1;
 }
 
-#ifdef STEER_ANDROID
-/* Единственные оставшиеся в этом файле пользователи — builders телефона ниже (Android-построители
- * забирает platform_ops): kind_ops.emit видов zapret/tgws берёт таблицу так же, но своим вызовом
- * ir_table_find в src/kinds. */
+/* Единственные оставшиеся в этом файле пользователи — построители цепочек output для каналов
+ * на само устройство ниже (plat()->local_channels): kind_ops.emit видов zapret/tgws берёт
+ * таблицу так же, но своим вызовом ir_table_find в src/kinds. */
 static struct nft_table *inet_table(struct nft_rs *rs) {
     return ir_table_find(rs, NFT_FAM_INET, NULL);
 }
-#endif
 
 /* «Кто» одной или двумя проверками.
  *
@@ -564,7 +562,7 @@ static void build_fakeip(struct nft_table *t) {
     struct nft_set *m = ir_map_add(t, "fakeip", "ipv4_addr", "ipv4_addr");
     ir_gap(m);
     char path[512];
-    if (snprintf(path, sizeof(path), "%s/fakeip.state", g_state_dir) < (int)sizeof(path))
+    if (snprintf(path, sizeof(path), "%s/fakeip.state", steer_state_dir()) < (int)sizeof(path))
         ir_set_fakeip_state(m, path);
     struct nft_rule *r = ir_rule(ir_base_chain_add(t, "prerouting_dnat", "nat", "prerouting",
                                                    "dstnat", 0));
@@ -596,7 +594,6 @@ static void build_traceroute_raw(struct nft_table *t) {
     ir_comment(r, "steer:traceroute-hops");
 }
 
-#ifdef STEER_ANDROID
 /* ---- DNS приложений телефона — к резолверу движка -------------------------------------
  *
  * Доменный канал на сам телефон видит только те имена, что спросили через наш резолвер. DNS
@@ -666,7 +663,7 @@ static void local_dns_redirect(struct nft_chain *c, const struct spec *sp) {
 }
 
 /* Заворот DNS приложений и перевод поддельных адресов для соединений самого телефона —
- * цепочка nat на хуке output. Будущий platform_ops. */
+ * цепочка nat на хуке output. */
 void nft_emit_output_dns(struct nft_rs *rs, const struct spec *sp, const struct groups *gr) {
     struct nft_chain *c = ir_base_chain_add(inet_table(rs), "output_dns", "nat", "output",
                                             "dstnat", 0);
@@ -734,9 +731,7 @@ static int local_who(struct nft_rule *r, const struct group *g, struct err *e) {
  * IPv6. Наборы каналов — IPv4, и правило с набором IPv6 не касается. Но у группы «весь
  * трафик» набора нет, и её IPv6 ушёл бы мимо туннеля: маршруты выхода движок ставит только
  * для IPv4. Поэтому такой группе IPv6 отвечается отказом — приложения переходят на IPv4 (так
- * устроен выбор адреса у любого клиента с двумя стеками), и ничего не утекает напрямую.
- *
- * Будущий platform_ops. */
+ * устроен выбор адреса у любого клиента с двумя стеками), и ничего не утекает напрямую. */
 int nft_emit_output_mark(struct nft_rs *rs, const struct spec *sp, const struct groups *gr,
                          struct err *e) {
     struct nft_table *t = inet_table(rs);
@@ -803,7 +798,6 @@ int nft_emit_output_mark(struct nft_rs *rs, const struct spec *sp, const struct 
     }
     return 0;
 }
-#endif
 
 /* Дерево набора правил современной раскладки. Порядок объектов — порядок печати, и он
  * прежний до байта (снимок tests/golden/ruleset). */
@@ -812,9 +806,8 @@ int nft_build(struct nft_rs *rs, const struct spec *sp, const struct groups *gr,
     struct nft_table *t = ir_table_add(rs, NFT_FAM_INET, nft_table());
     build_group_sets(t, gr);
     if (build_prerouting_mark(t, sp, gr, e) != 0) return -1;
-#ifdef STEER_ANDROID
-    if (has_local(gr) && nft_emit_output_mark(rs, sp, gr, e) != 0) return -1;
-#endif
+    if (plat()->local_channels && has_local(gr) && nft_emit_output_mark(rs, sp, gr, e) != 0)
+        return -1;
     build_failopen(t, sp);
     build_postrouting_down(t, sp, gr);
     /* Построители видов (kind_ops.emit): по видам, в порядке реестра, поэтому все цепочки
@@ -830,9 +823,7 @@ int nft_build(struct nft_rs *rs, const struct spec *sp, const struct groups *gr,
      * чужой ключ от него не зависит. */
     if (has_domains(gr)) {
         if (has_fakeip(gr)) build_fakeip(t);
-#ifdef STEER_ANDROID
-        if (has_local_domains(gr)) nft_emit_output_dns(rs, sp, gr);
-#endif
+        if (plat()->local_channels && has_local_domains(gr)) nft_emit_output_dns(rs, sp, gr);
         if (sp->traceroute_hops) build_traceroute_raw(t);
     }
     if (rs->oom) return err_set(e, "out of memory building the ruleset", NULL);

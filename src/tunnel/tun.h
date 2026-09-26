@@ -6,7 +6,7 @@
 #include <stddef.h>
 #include <sys/types.h>
 
-#define TUN_ENODEV (-40)   /* нет узла TUN (STEER_TUN_DEV в paths.h) */
+#define TUN_ENODEV (-40)   /* нет узла TUN (tun_dev платформы, platform.h) */
 #define TUN_ESETUP (-41)
 
 struct flow_key {

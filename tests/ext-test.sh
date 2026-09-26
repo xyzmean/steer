@@ -53,6 +53,8 @@ STEER_INC="$(for d in $(profile_var INC_DIRS); do printf -- '-I%s ' "$d"; done)"
 # run_quiet сами, и вида awg им не нужно (реестр оставит на его месте запись отказа).
 KINDS_SRC="$(for f in $(profile_var KINDS_BASE_SRC) $(profile_var KINDS_EXT_SRC); do
     [ "$f" = src/kinds/awg.c ] || printf '%s ' "$f"; done)"
+# Модель — тоже из манифеста, вместе с платформой (src/platform): её спрашивают и разбор, и пути.
+MODEL_SRC="$(profile_var MODEL_SRC)"
 BUILD=${BUILD:-build}
 mkdir -p "$BUILD"
 
@@ -211,7 +213,7 @@ $CC -O1 -g -w $STEER_INC $ASAN $MBED_INC "$PRIV" -o "$BUILD/spokematch" \
 	src/proto/xsteer/xsconn.c src/proto/xsteer/xswire.c src/proto/xsteer/xsepoch.c src/proto/xsteer/xsroute.c \
 	src/proto/xsteer/xsconf.c src/proto/xsteer/xslink.c src/proto/xsteer/xsstream.c src/proto/xsteer/xshake.c src/proto/tls/chello.c \
 	src/proto/tls/reality.c src/proto/tls/tls13.c src/proto/tls/certverify.c src/proto/tls/h2.c src/tunnel/tun.c src/proto/obfs/obfs.c \
-	src/lib/err.c src/lib/jsonr.c src/lib/tmpfile.c src/model/parse.c src/model/registry.c src/model/probe.c src/compile/nftcompat.c $KINDS_SRC $MBED_LIB -lpthread
+	$MODEL_SRC $KINDS_SRC $MBED_LIB -lpthread
 "$BUILD/spokematch"
 
 # vlessmatch — ветви отказа vless_connect, под тем же AddressSanitizer.
@@ -252,16 +254,21 @@ echo "ext-test: собираю и прогоняю vlessmatch (ASan: ${ASAN:-н�
 $CC -O1 -g -w $STEER_INC $ASAN $MBED_INC "$PRIV" $X509W -o "$BUILD/vlessmatch" tests/vlessmatch.c \
 	src/proto/vless/vless_proto.c src/proto/vless/vision.c src/proto/tls/tls13.c src/proto/tls/certverify.c \
 	src/proto/tls/reality.c src/proto/tls/h2.c src/tunnel/tun.c src/tunnel/rtx.c src/proto/vless/sub.c \
-	src/lib/err.c src/lib/jsonr.c src/lib/tmpfile.c src/model/parse.c src/model/registry.c src/model/probe.c src/compile/nftcompat.c $KINDS_SRC $MBED_LIB -lpthread
+	$MODEL_SRC $KINDS_SRC $MBED_LIB -lpthread
 "$BUILD/vlessmatch"
 
 # androidroots — склейка каталога корней Android в файл для certverify (cert_roots в
-# client.c под STEER_ANDROID). Выпуск X.509 нужен тот же, что у случаев security=tls выше.
+# client.c на платформе с системным хранилищем корней). Платформа — телефон (умолчание сборки),
+# каталоги хранилища — свои, во временном месте (ключ STEER_ANDROID_CA_DIRS читает
+# src/platform/android.c): стенд не трогает ни /data, ни /apex. Выпуск X.509 нужен тот же, что у
+# случаев security=tls выше.
 echo "ext-test: собираю и прогоняю androidroots..."
-$CC -O1 -g -w $STEER_INC $MBED_INC "$PRIV" $X509W -o "$BUILD/androidroots" tests/androidroots.c \
+$CC -O1 -g -w $STEER_INC $MBED_INC "$PRIV" $X509W -DSTEER_DEFAULT_PLATFORM=android \
+	'-DSTEER_ANDROID_CA_DIRS="/tmp/steer-androidroots/nope","/tmp/steer-androidroots/empty","/tmp/steer-androidroots/cacerts"' \
+	-o "$BUILD/androidroots" tests/androidroots.c \
 	src/proto/vless/vless_proto.c src/proto/vless/vision.c src/proto/tls/tls13.c src/proto/tls/certverify.c \
 	src/proto/tls/reality.c src/proto/tls/h2.c src/tunnel/tun.c src/tunnel/rtx.c src/proto/vless/sub.c \
-	src/lib/err.c src/lib/jsonr.c src/lib/tmpfile.c src/model/parse.c src/model/registry.c src/model/probe.c src/compile/nftcompat.c $KINDS_SRC $MBED_LIB -lpthread
+	$MODEL_SRC $KINDS_SRC $MBED_LIB -lpthread
 "$BUILD/androidroots"
 
 # hubmatch — согласие правила набора пачки с размером строки воркера.
@@ -270,7 +277,7 @@ $CC -O2 -w $STEER_INC $MBED_INC "$PRIV" -o "$BUILD/hubmatch" tests/hubmatch.c \
 	src/proto/xsteer/xsconn.c src/proto/xsteer/xswire.c src/proto/xsteer/xsepoch.c src/proto/xsteer/xsroute.c \
 	src/proto/xsteer/xsconf.c src/proto/xsteer/xslink.c src/proto/xsteer/xsstream.c src/proto/xsteer/xshake.c src/proto/tls/chello.c \
 	src/proto/tls/reality.c src/proto/tls/tls13.c src/proto/tls/certverify.c src/proto/tls/h2.c src/tunnel/tun.c src/proto/obfs/obfs.c \
-	src/lib/err.c src/lib/jsonr.c src/lib/tmpfile.c src/model/parse.c src/model/registry.c src/model/probe.c src/compile/nftcompat.c $KINDS_SRC $MBED_LIB -lpthread
+	$MODEL_SRC $KINDS_SRC $MBED_LIB -lpthread
 "$BUILD/hubmatch"
 
 # devupmatch — подъём устройства туннеля называет свои отказы (I-114).
@@ -278,7 +285,7 @@ echo "ext-test: собираю и прогоняю devupmatch..."
 $CC -O2 -w $STEER_INC $MBED_INC "$PRIV" -o "$BUILD/devupmatch" tests/devupmatch.c \
 	src/proto/vless/client.c src/proto/vless/vless_proto.c src/proto/vless/vision.c src/proto/tls/tls13.c src/proto/tls/certverify.c \
 	src/proto/tls/reality.c src/proto/tls/h2.c src/tunnel/tun.c src/tunnel/rtx.c src/proto/vless/sub.c src/lib/jsonw.c \
-	src/lib/err.c src/lib/jsonr.c src/lib/tmpfile.c src/model/parse.c src/model/registry.c src/model/probe.c src/compile/nftcompat.c $KINDS_SRC $MBED_LIB -lpthread
+	$MODEL_SRC $KINDS_SRC $MBED_LIB -lpthread
 "$BUILD/devupmatch"
 
 # probe — активное зондирование настоящим openssl s_client. Здесь, а не отдельной целью
@@ -287,9 +294,9 @@ $CC -O2 -w $STEER_INC $MBED_INC "$PRIV" -o "$BUILD/devupmatch" tests/devupmatch.
 # пропускается, поэтому в ext-test он безопасен.
 #
 # Бинарник СЕРВЕРНЫЙ (-DSTEER_SERVER): хаб живёт только в нём, у роутерной сборки подкоманда
-# xsteer-hub — штатная заглушка «ставится из архива steer-hub». Список исходников повторяет
-# серверную половину из build/build-ext.sh; расходиться им негде — оба списка про один бинарник,
-# и стенд упадёт на неразрешённом имени, если половины разъедутся.
+# xsteer-hub — штатная заглушка «ставится из архива steer-hub». Список исходников — профиль
+# server манифеста, тот же, что у build/build-ext.sh (раньше он был переписан здесь руками — см.
+# ниже, чем это кончилось).
 #
 # И РАЗОШЛИСЬ. `src/tools/srs.c` появился в движке 5 сентября, в этот список его не внесли, и с того
 # дня `make ext-test` не собирался вовсе — падал на `undefined reference to srs_dump`. Комментарий
@@ -298,11 +305,7 @@ $CC -O2 -w $STEER_INC $MBED_INC "$PRIV" -o "$BUILD/devupmatch" tests/devupmatch.
 # test`. Урок ровно про это: барьер, который нужно ЗАПУСТИТЬ РУКАМИ, не барьер.
 echo "ext-test: собираю серверный бинарник для стенда зондирования..."
 $CC -O1 -w $STEER_INC $MBED_INC "$PRIV" -DSTEER_SERVER -o "$BUILD/steer-hub-native" \
-	src/lib/run.c src/lib/jsonw.c src/lib/err.c src/compile/groups.c src/compile/generate.c src/compile/ir.c src/compile/print.c src/compile/legacy.c src/daemon/fwcheck.c src/daemon/apply.c src/daemon/status.c src/daemon/nftquery.c src/daemon/diag.c src/daemon/explain.c src/daemon/supervise.c src/daemon/watch.c src/daemon/main.c src/lib/jsonr.c src/lib/tmpfile.c src/model/parse.c src/model/registry.c src/model/probe.c src/compile/nftcompat.c src/lib/sindex.c src/lib/nftnl.c src/lib/ctnl.c src/dnsd/rules.c src/dnsd/wire.c src/dnsd/origdst.c src/dnsd/fakeip.c src/dnsd/table.c src/dnsd/dlog.c src/dnsd/proxy.c src/dnsd/main.c src/daemon/failover.c src/tools/aggregate.c src/proto/obfs/obfs.c src/cli/cli.c \
-	src/tools/srs.c src/tools/puff.c src/tools/hwid.c src/daemon/ctl.c src/daemon/conns.c $(profile_var KINDS_BASE_SRC) \
-	src/proto/xsteer/xswire.c src/proto/xsteer/xsconf.c src/proto/xsteer/xslink.c src/proto/xsteer/xsroute.c src/proto/tls/chello.c src/proto/xsteer/xshake.c \
-	src/proto/xsteer/xsconn.c src/proto/xsteer/xsstream.c src/proto/xsteer/xsepoch.c src/proto/tls/tls13.c src/proto/tls/certverify.c src/proto/tls/reality.c \
-	src/tunnel/tun.c src/proto/tls/h2.c src/proto/xsteer/xsadmin.c src/proto/xsteer/xshub.c \
+	$(profile_src server) \
 	$MBED_LIB -lpthread
 echo "ext-test: прогоняю probe (зондирование порта хаба)..."
 BUILD="$BUILD" sh tests/probe.sh

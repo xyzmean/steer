@@ -151,9 +151,9 @@ static void split_timeout_sets(struct nft_table *t) {
  * conntrack ему не место, он живёт на пакете до цепочки route в таблице ip. */
 static int route_to_filter(struct nft_table *t) {
     int any = 0;
-#ifdef STEER_REROUTE_BIT
-    /* Бит объявлен только там, где цепочки route строятся (раскладка меток телефона, marks.h);
-     * без него и переделывать нечего. */
+    /* Бит есть только там, где цепочки route строятся (каналы на сам телефон,
+     * src/platform/android.c); без него и переделывать нечего. */
+    if (!STEER_REROUTE_BIT) return 0;
     for (struct nft_obj *o = t->objs; o; o = o->next) {
         struct nft_chain *c = ir_obj_chain(o);
         if (!c || !c->type || strcmp(c->type, "route") != 0) continue;
@@ -166,9 +166,6 @@ static int route_to_filter(struct nft_table *t) {
                            NULL);
         }
     }
-#else
-    (void)t;
-#endif
     return any;
 }
 
@@ -333,8 +330,7 @@ static void build_family(struct nft_rs *rs, struct nft_table *in, enum nft_famil
                   ir_base_chain_add(t, "output_nat", "nat", "output", "dstnat", -1), fam);
     /* Снятие бита перемаршрутизации (шаг 2) — см. STEER_REROUTE_BIT в marks.h. mangle + 2:
      * сразу после разметки (output_mark в inet, mangle + 1) и до nat на выходе. */
-#ifdef STEER_REROUTE_BIT
-    if (reroute && fam == 4) {
+    if (reroute && fam == 4 && STEER_REROUTE_BIT) {
         struct nft_rule *r = ir_rule(ir_base_chain_add(t, "output_reroute", "route", "output",
                                                        "mangle", 2));
         ir_x(r, "meta mark and 0x%08x == 0x%08x", STEER_REROUTE_BIT, STEER_REROUTE_BIT);
@@ -342,9 +338,6 @@ static void build_family(struct nft_rs *rs, struct nft_table *in, enum nft_famil
         ir_counter(r, 0, 0);
         ir_comment(r, "steer-reroute");
     }
-#else
-    (void)reroute;
-#endif
     merge_nat(in, "postrouting",
               ir_base_chain_add(t, "postrouting_nat", "nat", "postrouting", "srcnat", 1), fam);
 }

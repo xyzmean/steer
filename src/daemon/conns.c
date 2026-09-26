@@ -52,7 +52,7 @@ struct conns_reg { char name[32]; uint32_t mark; };
 struct ctnl_conns_ctx {
     FILE *out;
     int shown, total;
-    struct conns_reg reg[STEER_MARK_SLOTS * 2];
+    struct conns_reg reg[MAX_OUTPUTS * 2];   /* мест не больше MAX_OUTPUTS (STEER_MARK_SLOTS) */
     size_t reg_n;
 };
 
@@ -115,9 +115,8 @@ static int ctnl_conns_rec(const uint8_t *a, const uint8_t *end, uint8_t family, 
     struct ctnl_conns_ctx *x = vctx;
     uint32_t field = ct_mark_of(a, end) & STEER_MARK_MASK;
     if (!field) return 0;
-#ifdef STEER_SELF_MARK
-    if (field == (STEER_SELF_MARK & STEER_MARK_MASK)) return 0;
-#endif
+    /* «Сам движок» (только там, где свой трафик метится, — на телефоне) — не выход. */
+    if (STEER_SELF_MARK && field == (STEER_SELF_MARK & STEER_MARK_MASK)) return 0;
     const struct nlattr *orig = ct_attr(a, end, CTA_TUPLE_ORIG);
     const struct nlattr *tip = ct_attr_in(orig, CTA_TUPLE_IP);
     const struct nlattr *tpr = ct_attr_in(orig, CTA_TUPLE_PROTO);
@@ -182,7 +181,7 @@ static int ctnl_conns_rec(const uint8_t *a, const uint8_t *end, uint8_t family, 
  * сопоставлять её с записями conntrack нельзя. Только читается: conns ничего не раздаёт. */
 static void conns_registry(struct ctnl_conns_ctx *x) {
     char path[PATH_MAX];
-    snprintf(path, sizeof(path), "%s/registry", g_state_dir);
+    snprintf(path, sizeof(path), "%s/registry", steer_state_dir());
     FILE *f = fopen(path, "r");
     if (!f) return;
     char name[32];

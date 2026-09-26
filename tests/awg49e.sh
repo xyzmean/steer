@@ -19,7 +19,7 @@
 # Запуск на стенде tools/vm49 хаба splicicd (сборка — как у ctnl49, плюс src/kinds/awg.c):
 #
 #   K=/root/vm49/sysroot/kinc
-#   musl-gcc -static -idirafter $K -O2 -DSTEER_ANDROID -o OUT/steer <исходники как в Makefile>
+#   musl-gcc -static -idirafter $K -O2 -DSTEER_DEFAULT_PLATFORM=android -o OUT/steer <исходники как в Makefile>
 #   A=/root/vm49/awg
 #   tools/vm49/vm49.sh run steer/tests/awg49e.sh OUT/steer $A/awg $A/amneziawg.ko \
 #       $A/udp_tunnel.ko $A/ip6_udp_tunnel.ko $A/awg49-veth [$A/wireguard.ko $A/wg]
@@ -27,7 +27,7 @@
 # С wireguard.ko и wg сценарий в конце выгружает AmneziaWG и проверяет запасной путь: файл без
 # обфускации поднимается модулем wireguard, файл с обфускацией получает внятный отказ.
 #
-# Роутерную сборку (без -DSTEER_ANDROID) — тем же сценарием: метка сокета туннеля у неё 0, у
+# Роутерную сборку (без -DSTEER_DEFAULT_PLATFORM=android) — тем же сценарием: метка сокета туннеля у неё 0, у
 # Android-сборки — STEER_SELF_MARK (0x0fc00000); сценарий узнаёт сборку по полю метки выхода.
 set -u
 pass=0 fail=0

@@ -377,21 +377,13 @@ static const char *g_cert_roots;
  *
  * Корни, выключенные человеком в настройках Android (cacerts-removed), здесь не учитываются:
  * движок доверяет системному набору, а не выбору пользователя в Java-хранилище. */
-#ifdef STEER_ANDROID
 #include <dirent.h>
 #include <pthread.h>
-#include "paths.h"
+#include "platform.h"
 
 static char g_android_roots[512];
 static pthread_once_t g_android_roots_once = PTHREAD_ONCE_INIT;
 
-/* Каталоги по порядку предпочтения: первый, где нашёлся хоть один файл, и есть хранилище.
- * Макросом — чтобы стенд (tests/androidroots.c) подставил свои. */
-#ifndef STEER_ANDROID_CA_DIRS
-#define STEER_ANDROID_CA_DIRS "/apex/com.android.conscrypt/cacerts", "/system/etc/security/cacerts"
-#endif
-
-extern const char *g_state_dir;   /* spec.c: каталог состояния с учётом --state-dir */
 
 /* Склеить каталог dir в файл final. 0 — готово; -1 — каталога нет, он пуст или записать не
  * вышло (тогда времянки не остаётся). Ошибка записи — не повод отдавать certverify обрубок:
@@ -431,16 +423,18 @@ static int android_roots_glue(const char *dir, const char *final) {
     return 0;
 }
 
+/* Каталоги хранилища — у платформы (ca_dirs, src/platform/android.c), по порядку
+ * предпочтения: первый, где нашёлся хоть один файл, и есть хранилище. */
 static void android_roots_build(void) {
-    static const char *const dirs[] = { STEER_ANDROID_CA_DIRS };
+    const char *const *dirs = plat()->ca_dirs;
     /* Куда класть: каталог состояния (с --state-dir, как у всего движка), а если туда не
      * пишется — каталог времянок. Без запасного места отказ mkstemp оставлял бы процесс без
      * корней до перезапуска: склейка делается один раз (pthread_once). */
-    const char *places[] = { g_state_dir ? g_state_dir : STEER_STATE_DIR, STEER_TMP_DIR };
+    const char *places[] = { steer_state_dir(), plat()->tmp_dir };
     for (size_t w = 0; w < sizeof places / sizeof places[0]; w++) {
         char final[512];
         snprintf(final, sizeof final, "%s/ca-roots.pem", places[w]);
-        for (size_t k = 0; k < sizeof dirs / sizeof dirs[0]; k++)
+        for (size_t k = 0; dirs[k]; k++)
             if (android_roots_glue(dirs[k], final) == 0) {
                 snprintf(g_android_roots, sizeof g_android_roots, "%s", final);
                 return;
@@ -450,12 +444,11 @@ static void android_roots_build(void) {
 
 static const char *cert_roots(void) {
     if (g_cert_roots) return g_cert_roots;
+    /* Платформа без системного хранилища (роутер) — корни у certverify свои. */
+    if (!plat()->ca_dirs) return NULL;
     pthread_once(&g_android_roots_once, android_roots_build);
     return g_android_roots[0] ? g_android_roots : NULL;
 }
-#else
-static const char *cert_roots(void) { return g_cert_roots; }
-#endif
 
 /* Поднять вторую связь — под выгрузку. Тот же путь установления, что и у первой: TCP, и
  * дальше либо ничего (security=none), либо Reality, либо обычный TLS с проверкой. */

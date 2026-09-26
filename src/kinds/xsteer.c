@@ -34,7 +34,7 @@ static int xsteer_parse(struct output *o, const struct out_keys *k, struct err *
     if (!o->device[0]) snprintf(o->device, sizeof(o->device), "%.15s", o->name);
     if (!o->devices_n) snprintf(o->devices[o->devices_n++], 32, "%s", o->device);
     if (!o->xs.conf[0])
-        snprintf(o->xs.conf, sizeof(o->xs.conf), STEER_ETC_DIR "/xsteer/%.200s.conf", o->name);
+        snprintf(o->xs.conf, sizeof(o->xs.conf), "%s/xsteer/%.200s.conf", plat()->etc_dir, o->name);
     /* Абсолютный путь: процесс запускает procd со своим рабочим каталогом, а не
      * наша оболочка, — относительный «работал бы из шелла» и не работал у
      * сервиса. Годность к JSON: путь печатается в status, diag и xsteer-peers. */

@@ -138,7 +138,7 @@ void dlog_listen(void) {
     struct sockaddr_un a;
     memset(&a, 0, sizeof(a));
     a.sun_family = AF_UNIX;
-    if ((size_t)snprintf(g_dlog_path, sizeof(g_dlog_path), "%s/dnsd.sock", g_state_dir) >=
+    if ((size_t)snprintf(g_dlog_path, sizeof(g_dlog_path), "%s/dnsd.sock", steer_state_dir()) >=
             sizeof(a.sun_path)) {
         fprintf(stderr, "steer[warn] dnsd: путь сокета журнала слишком длинный — журнала не будет\n");
         g_dlog_path[0] = '\0';
@@ -232,7 +232,7 @@ int dlog_print(FILE *out) {
     struct sockaddr_un a;
     memset(&a, 0, sizeof(a));
     a.sun_family = AF_UNIX;
-    if ((size_t)snprintf(path, sizeof(path), "%s/dnsd.sock", g_state_dir) >= sizeof(a.sun_path)) {
+    if ((size_t)snprintf(path, sizeof(path), "%s/dnsd.sock", steer_state_dir()) >= sizeof(a.sun_path)) {
         fprintf(stderr, "steer[warn] dns-log: путь сокета журнала слишком длинный\n");
         return 1;
     }

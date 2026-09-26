@@ -21,13 +21,13 @@
                                 * что никто больше не пробует. */
 
 static void probe_path(char *buf, size_t n, const char *out_name) {
-    snprintf(buf, n, "%s/probe-%.32s", g_state_dir, out_name);
+    snprintf(buf, n, "%s/probe-%.32s", steer_state_dir(), out_name);
 }
 
 void probe_report(const char *out_name, enum probe_state st, int node, int total) {
     char path[256];
     probe_path(path, sizeof(path), out_name);
-    mkdir(g_state_dir, 0755);
+    mkdir(steer_state_dir(), 0755);
     FILE *f = fopen(path, "w");
     if (!f) return;
     fprintf(f, "%s %d %d %ld %ld\n",

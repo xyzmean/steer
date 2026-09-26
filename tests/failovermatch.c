@@ -120,7 +120,6 @@ unsigned sleep(unsigned n) { (void)n; g_slept++; return 0; }
  * на весь стенд, ровно как в других стендах модели. load_spec/registry_assign здесь мокнуты —
  * они его не заполняют, наполняют его сами тестовые блоки ниже, напрямую полями g_spec.out[]. */
 static struct spec g_spec;
-const char *g_state_dir = "/tmp";
 /* cmd_failover держит СВОЙ static struct spec (правило 6) и заполняет его настоящим
  * load_spec — здесь подмена копирует туда фикстуру стенда, собранную в g_spec тестовыми
  * блоками (out_set и соседи), ровно как настоящий load_spec заполнил бы её из файла. */
@@ -361,7 +360,7 @@ static int lat_probe(const struct spec *sp, const struct output *o, const char *
  * без этого второй прогон взял бы прежние числа как свежие. */
 static void unlink_lat(void) {
     char pth[288];
-    snprintf(pth, sizeof(pth), "%s/latency", g_state_dir);
+    snprintf(pth, sizeof(pth), "%s/latency", steer_state_dir());
     unlink(pth);
 }
 /* ВЛОЖЕННЫЕ ВЫХОДЫ (`via`): туннель выхода «in» идёт через выход «outer». Внутренний стоит в
@@ -424,7 +423,7 @@ int main(void) {
      * оставил кто-то другой, и оставлять следы самому. */
     snprintf(g_dir, sizeof(g_dir), "/tmp/failovermatch-XXXXXX");
     if (!mkdtemp(g_dir)) { perror("mkdtemp"); return 1; }
-    g_state_dir = g_dir;
+    steer_set_state_dir(g_dir);
 
     /* Test sig_cleanup/cleanup_probe_rule indirectly by checking rule_deleted */
     cleanup_probe_rule();
@@ -911,7 +910,7 @@ int main(void) {
         /* Приговора нет — прежнее поведение: сказать, что молчит, и подождать procd. */
         char dir[] = "/tmp/failovermatch.XXXXXX";
         char *d = mkdtemp(dir);
-        g_state_dir = d ? d : "/tmp";
+        steer_set_state_dir(d ? d : "/tmp");
         g_probe_stub = (struct probe_status){ PROBE_NONE, 0, 0 };
         g_slept = 0;
         char err[4096] = "";
@@ -948,7 +947,7 @@ int main(void) {
             }
             rmdir(d);
         }
-        g_state_dir = "/tmp";
+        steer_set_state_dir("/tmp");
     }
 
     /* ---- гистерезис возврата на предпочтительное устройство --------------------------
@@ -961,11 +960,11 @@ int main(void) {
     failover_hyst_reset_for_test();
     g_health_probe = hyst_health;
     out_set_two();
-    /* Свежий каталог состояния: предыдущий тест свой удалил и увёл g_state_dir в /tmp, а
+    /* Свежий каталог состояния: предыдущий тест свой удалил и увёл каталог состояния в /tmp, а
      * state_write пишет в g_dir. Держим оба на одном каталоге. */
     snprintf(g_dir, sizeof(g_dir), "/tmp/failovermatch-hyst-XXXXXX");
     if (!mkdtemp(g_dir)) { perror("mkdtemp"); return 1; }
-    g_state_dir = g_dir;
+    steer_set_state_dir(g_dir);
     {
         char dev[32];
         /* Старт: оба здоровы — берём предпочтение. */
@@ -1043,7 +1042,7 @@ int main(void) {
         snprintf(g_dir, sizeof(g_dir), "/tmp/failovermatch-xs-XXXXXX");
         if (!mkdtemp(g_dir)) { perror("mkdtemp"); return 1; }
         const char *xd = g_dir;
-        g_state_dir = g_dir;
+        steer_set_state_dir(g_dir);
         g_rules = "";
         g_routes = "";
         g_spec.out_n = 0;                    /* выхода kind=xsteer в спеке НЕТ — и не должно быть */
@@ -1118,7 +1117,7 @@ int main(void) {
             unlink(path);
             rmdir(xd);
         }
-        g_state_dir = "/tmp";
+        steer_set_state_dir("/tmp");
     }
 
     if (g_fail) {
@@ -1147,7 +1146,7 @@ int main(void) {
         g_spec.out[0].prefer_latency = 1;
         snprintf(g_dir, sizeof(g_dir), "/tmp/failovermatch-lat-XXXXXX");
         if (!mkdtemp(g_dir)) { perror("mkdtemp"); return 1; }
-        g_state_dir = g_dir;
+        steer_set_state_dir(g_dir);
         char dev[32];
 
         g_ms_first = 200; g_ms_second = 20;
@@ -1242,7 +1241,7 @@ int main(void) {
         g_health_probe = via_health;
         snprintf(g_dir, sizeof(g_dir), "/tmp/failovermatch-via-XXXXXX");
         if (!mkdtemp(g_dir)) { perror("mkdtemp"); return 1; }
-        g_state_dir = g_dir;
+        steer_set_state_dir(g_dir);
         /* Цель жива — оба выхода привязаны к своим устройствам. */
         g_outer_ok = 1;
         out_set_via();
@@ -1279,7 +1278,7 @@ int main(void) {
             unlink(path);
         }
         rmdir(g_dir);
-        g_state_dir = "/tmp";
+        steer_set_state_dir("/tmp");
         if (g_fail) {
             fprintf(stderr, "failovermatch: провалено проверок: %d\n", g_fail);
             return 1;

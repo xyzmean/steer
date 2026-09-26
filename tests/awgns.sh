@@ -15,7 +15,7 @@
 # Нужны root, unshare, nsenter, ip, nft, wg, ping с ключом -m (метка) и модуль wireguard.
 # Чего-то нет — стенд пропускается вслух, с кодом 0.
 #
-# Android-сборку тем же сценарием: собрать хостом с -DSTEER_ANDROID и своими каталогами
+# Android-сборку тем же сценарием: собрать хостом с -DSTEER_DEFAULT_PLATFORM=android и своими каталогами
 # (-DSTEER_TMP_DIR=... -DSTEER_STATE_DIR=... -DSTEER_ETC_DIR=..., как в шапке local49.sh) и
 # запустить с STEER=<бинарник> AWG_FWMARK=0xfc00000 — у неё метка сокета туннеля без via —
 # STEER_SELF_MARK, а не 0.

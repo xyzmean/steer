@@ -8,10 +8,6 @@
 #include "awg.h"   /* имя устройства kind=awg — static inline, без awg.c */
 #include "obfs.h"
 
-const char *g_state_dir = STEER_STATE_DIR;
-/* Имена таблиц для iproute2. Каталог, а не сам rt_tables: файл принадлежит пакету iproute2,
- * и дописывать в него значило бы править чужое; rt_tables.d для этого и существует. */
-const char *g_rt_tables_d = "/etc/iproute2/rt_tables.d";
 
 /* Состав идентификатора, пришедшего из спеки: имя выхода, имя устройства, имя канала,
  * записи lan_devices.
@@ -490,16 +486,14 @@ static int parse_outputs(struct js *j, struct spec *s, struct err *e) {
                 if (js_str(j, m, sizeof(m), e) != 0 && e->msg[0]) return -1;
                 if (!strcmp(m, "drop")) o.on_fail = FAIL_DROP;
                 else if (!strcmp(m, "direct")) o.on_fail = FAIL_DIRECT;
-#ifdef STEER_ANDROID
-                /* zapret в сборке под Android нет — см. out_skips_zapret в spec.h. */
-                else if (!strcmp(m, "zapret"))
+                /* zapret на телефоне нет — см. out_skips_zapret в spec.h. */
+                else if (!strcmp(m, "zapret") && !plat()->zapret)
                     return err_set(e, "outputs.%s: on_fail zapret — в сборке под Android zapret нет "
                         "(want drop or direct)", o.name);
-                else return err_set(e, "outputs.%s: unknown on_fail (want drop or direct)", o.name);
-#else
                 else if (!strcmp(m, "zapret")) o.on_fail = FAIL_ZAPRET;
+                else if (!plat()->zapret)
+                    return err_set(e, "outputs.%s: unknown on_fail (want drop or direct)", o.name);
                 else return err_set(e, "outputs.%s: unknown on_fail (want drop, direct or zapret)", o.name);
-#endif
             }
             /* Вторая ось сторожа. Значение по умолчанию — `order`, то есть сегодняшнее
              * поведение; см. рассуждение у поля prefer_latency в spec.h. */
@@ -1217,9 +1211,8 @@ int load_spec(const char *path, struct spec *s, struct err *e) {
         size_t local = 0;
         for (size_t k = 0; k < c->from_n; k++) if (from_is_local(c->from[k])) local++;
         if (local) {
-#ifndef STEER_ANDROID
-            return err_set(e, "канал %s: «self» и «uid:» в from — только в сборке под Android", c->name);
-#endif
+            if (!plat()->local_channels)
+                return err_set(e, "канал %s: «self» и «uid:» в from — только в сборке под Android", c->name);
             if (local != c->from_n)
                 return err_set(e, "канал %s: в «кому» смешаны сам телефон и клиенты раздачи — это разные "
                     "пути пакета, разделите на два канала", c->name);

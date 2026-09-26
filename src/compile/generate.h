@@ -17,12 +17,11 @@ int nft_build(struct nft_rs *rs, const struct spec *sp, const struct groups *gr,
  * пишется ничего. */
 int generate(const struct spec *sp, const struct groups *gr, FILE *f, struct err *e);
 
-#ifdef STEER_ANDROID
-/* Части только телефона — будущий platform_ops. */
+/* Каналы на само устройство (plat()->local_channels, src/platform/platform.h): цепочки на хуке
+ * output. Код — здесь, у компилятора; платформа только говорит, бывают ли такие каналы. */
 int nft_emit_output_mark(struct nft_rs *rs, const struct spec *sp, const struct groups *gr,
                          struct err *e);
 void nft_emit_output_dns(struct nft_rs *rs, const struct spec *sp, const struct groups *gr);
-#endif
 
 void counters_load(void);
 int counter_find(const char *name, int down, unsigned long *p, unsigned long *b);

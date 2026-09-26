@@ -11,8 +11,9 @@
  * перезапись снимка.
  *
  * Модули линкуются (Makefile: MODEL_SRC и COMPILE_SRC), не подключаются #include.
- * Собирается дважды: роутер и телефон (-DSTEER_ANDROID, цепочки на output; выходов zapret и
- * tgws в сборке телефона нет, поэтому случаи с ними — только в роутерной). */
+ * Собирается дважды: роутер и телефон (-DSTEER_DEFAULT_PLATFORM=android — платформа телефона,
+ * цепочки на output; выходов zapret и tgws у телефона нет, поэтому случаи с ними — только на
+ * роутере). Какие случаи гонять, решает выбранная платформа, а не ключ сборки. */
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -160,7 +161,6 @@ static void t_router_basic(void) {
     nft_rs_free(&rs);
 }
 
-#ifndef STEER_ANDROID
 /* ---- 2. домены, zapret, tgws: обе раскладки -------------------------------------------- */
 static int nat_chains(const struct nft_table *t) {
     int n = 0;
@@ -341,7 +341,6 @@ static void t_mixed_order(void) {
     nft_rs_free(&rs);
 }
 
-#else
 /* ---- 3. каналы на сам телефон ------------------------------------------------------------ */
 static const char *phone =
     "{ \"schema\": 2, \"lan_devices\": [\"rndis0\"],"
@@ -394,7 +393,6 @@ static void t_phone(int nftc) {
     }
     nft_rs_free(&rs);
 }
-#endif
 
 /* ---- 4. само дерево: поиск, клон, арена ------------------------------------------------- */
 static void t_tree(void) {
@@ -437,27 +435,23 @@ int main(void) {
     const char *td = getenv("TMPDIR");
     snprintf(g_tmp, sizeof(g_tmp), "%s/irmatch.XXXXXX", td ? td : "/tmp");
     if (!mkdtemp(g_tmp)) { perror("mkdtemp"); return 2; }
-    g_state_dir = g_tmp;
+    steer_set_state_dir(g_tmp);
     put("d.lst", "example.com\n");
     t_tree();
     t_router_basic();
-#ifndef STEER_ANDROID
-    t_mixed_modern();
-    t_mixed_legacy(NFTC_LEGACY);
-    t_mixed_legacy(NFTC_LEGACY | NFTC_IP6NAT | NFTC_NOTRACK);
-    t_mixed_order();
-#else
-    t_phone(0);
-    t_phone(NFTC_LEGACY);
-    t_phone(NFTC_LEGACY | NFTC_IP6NAT);
-#endif
+    if (!plat()->local_channels) {
+        t_mixed_modern();
+        t_mixed_legacy(NFTC_LEGACY);
+        t_mixed_legacy(NFTC_LEGACY | NFTC_IP6NAT | NFTC_NOTRACK);
+        t_mixed_order();
+    } else {
+        t_phone(0);
+        t_phone(NFTC_LEGACY);
+        t_phone(NFTC_LEGACY | NFTC_IP6NAT);
+    }
     groups_free(&g_gr);
     char cmd[300];
     snprintf(cmd, sizeof(cmd), "rm -rf '%s'", g_tmp);
     if (system(cmd) != 0) printf("не удалось убрать %s\n", g_tmp);
-#ifdef STEER_ANDROID
-    return unit_done("irmatch-android");
-#else
-    return unit_done("irmatch");
-#endif
+    return unit_done(plat()->local_channels ? "irmatch-android" : "irmatch");
 }

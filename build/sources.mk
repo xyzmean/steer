@@ -21,7 +21,7 @@
 # Каталоги слоёв (docs/architecture.md). Заголовки подключаются по имени (`#include "spec.h"`)
 # из любого слоя, поэтому каждая сборка получает -I на все каталоги сразу; имена заголовков
 # в дереве уникальны, и стенд tests/buildmatch.sh за этим следит.
-CORE_DIRS := src/lib src/model src/compile src/daemon src/kinds src/cli src/dnsd src/tools src/proto/obfs
+CORE_DIRS := src/lib src/model src/platform src/compile src/daemon src/kinds src/cli src/dnsd src/tools src/proto/obfs
 EXT_DIRS  := src/tunnel src/proto/tls src/proto/vless src/proto/xsteer src/proto/tgws
 INC_DIRS  := $(CORE_DIRS) $(EXT_DIRS)
 
@@ -33,7 +33,13 @@ INC_DIRS  := $(CORE_DIRS) $(EXT_DIRS)
 # отказ, а не звали die() сами, а err_set/err_prop/err_die и сам die() (для точек входа) живут
 # в этом файле. Стенды, собирающие модель отдельным списком (dnsmatch, specmatch, obfsmatch,
 # awgmatch — см. Makefile), берут его отсюда же, а не include'ом err.c по одному разу на файл.
-MODEL_SRC := src/lib/err.c src/lib/jsonr.c src/lib/tmpfile.c src/model/parse.c src/model/registry.c \
+# Платформа (src/platform, docs/architecture.md, раздел 2, правило 2): роутер или телефон,
+# выбирается при запуске, и код обеих есть в каждой сборке. Идёт вместе с моделью, потому что
+# модель её и спрашивает первой: разбор (zapret и каналы на само устройство), реестр (поле
+# метки), пути состояния. Стенды, компонующие модель, получают платформу тем же списком.
+PLATFORM_SRC := src/platform/platform.c src/platform/openwrt.c src/platform/android.c
+
+MODEL_SRC := $(PLATFORM_SRC) src/lib/err.c src/lib/jsonr.c src/lib/tmpfile.c src/model/parse.c src/model/registry.c \
              src/model/probe.c src/compile/nftcompat.c
 
 # Резолвер: src/dnsd/dnsd.c был один файл, теперь — DNSD_SRC. lib/sindex.c, lib/nftnl.c,
@@ -105,4 +111,7 @@ PROFILE_DEFS_base     :=
 PROFILE_DEFS_extended := -DSTEER_EXTENDED
 PROFILE_DEFS_server   := -DSTEER_SERVER
 PROFILE_DEFS_tgws     := -DSTEER_TGWS
-PROFILE_DEFS_android  := -DSTEER_ANDROID -DSTEER_EXTENDED
+# Телефон — не профиль, а платформа (src/platform): код обеих платформ есть в любой сборке, а
+# ключ задаёт только умолчание выбора при запуске — прошивка ведёт себя как телефон, где бы ни
+# запустилась. --platform и STEER_PLATFORM его переопределяют.
+PROFILE_DEFS_android  := -DSTEER_DEFAULT_PLATFORM=android -DSTEER_EXTENDED
