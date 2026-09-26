@@ -268,7 +268,7 @@ $(BUILD)/irmatch-android: tests/irmatch.c tests/unit.h $(COMPILE_SRC) $(MODEL_KI
 	$(CC) $(CFLAGS) -DSTEER_DEFAULT_PLATFORM=android -o $@ tests/irmatch.c $(COMPILE_SRC_NO_IR) $(MODEL_KINDS)
 
 $(BUILD)/failovermatch: tests/failovermatch.c src/daemon/failover.c src/daemon/daemon.h \
-                        src/daemon/failover_int.h src/model/spec.h src/lib/err.c $(FAILOVERMATCH_KINDS)
+                        src/daemon/failover_int.h src/daemon/fostate.h src/model/spec.h src/lib/err.c $(FAILOVERMATCH_KINDS)
 	@mkdir -p $(BUILD)
 	$(CC) $(CFLAGS) -o $@ tests/failovermatch.c src/daemon/failover.c src/lib/err.c $(FAILOVERMATCH_KINDS) $(PLATFORM_SRC)
 

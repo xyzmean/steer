@@ -73,6 +73,7 @@ cc_defaults {
         "src/daemon/conns.c",
         "src/daemon/loop.c",
         "src/daemon/state.c",
+        "src/daemon/watchd.c",
         "src/kinds/kind.c",
         "src/kinds/direct.c",
         "src/kinds/interface.c",

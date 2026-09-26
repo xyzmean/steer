@@ -1,8 +1,10 @@
 /* steer failover — выбрать живое устройство для каждого выхода.
  *
- * Не демон. Один проход по вызову, состояние — в маршрутных таблицах ядра и в
- * реестре. Так же, как apply: движок остаётся компилятором, а «раз в минуту» —
- * дело того, кто его вызывает (init-скрипт ставит таймер).
+ * Один проход по вызову (failover_pass), состояние — в маршрутных таблицах ядра, в
+ * реестре и в памяти сторожа между проходами (active, latency, restart-*). «Раз в минуту» —
+ * дело того, кто проход зовёт: init-скрипт кругом `steer failover`, `failover --loop`
+ * (watch.c) или демон с --watch (watchd.c). Где лежит память между проходами — файлы или
+ * память демона, — решает тот же вызывающий, см. fostate.h.
  *
  * Порядок devices — приоритет. Первое здоровое устройство побеждает, поэтому
  * восстановление наверх происходит само: как только основной туннель ожил, он
@@ -41,6 +43,7 @@
 #include "awg.h"
 #include "run.h"
 #include "failover_int.h"
+#include "fostate.h"
 
 /* Уровень в журнале приписывается КАЖДОЙ строке — это контракт, по которому управляющий
  * слой (splify2) раскрашивает журнал, и он разбирает именно префикс, а не текст. Базовый
@@ -1070,11 +1073,33 @@ static struct route_facts route_facts_read(const struct output *o) {
     return route_facts_of(rules, routes, o->mark, o->table);
 }
 
-/* Что выбрано сейчас — чтобы не переписывать маршруты и не шуметь в лог, когда
- * ничего не изменилось. Файл в state_dir, рядом с реестром меток. */
-static void active_path(char *buf, size_t n) {
-    snprintf(buf, n, "%s/active", steer_state_dir());
+/* ---- хранилище состояния сторожа: файлы каталога состояния ---------------------------
+ *
+ * Шов и почему он — в fostate.h. Здесь прежний путь: запись — файл <state_dir>/<имя>.
+ * Замена — через временный файл и rename: status и apply читают `active` в любой момент, и
+ * половина строк означала бы для них «сторож не проходил» у половины выходов; половина
+ * замеров `latency` хуже их отсутствия (по ней сторож переключился бы на кандидата, чей замер
+ * уцелел). */
+static FILE *files_open_r(struct fo_store *st, const char *name) {
+    (void)st;
+    char path[320];
+    snprintf(path, sizeof(path), "%s/%s", steer_state_dir(), name);
+    return fopen(path, "r");
 }
+
+static void files_put(struct fo_store *st, const char *name, const char *data, size_t n) {
+    (void)st;
+    char path[320], tmp[336];
+    snprintf(path, sizeof(path), "%s/%s", steer_state_dir(), name);
+    snprintf(tmp, sizeof(tmp), "%s.tmp", path);
+    FILE *f = fopen(tmp, "w");
+    if (!f) return;
+    size_t w = n ? fwrite(data, 1, n, f) : 0;
+    if (fclose(f) != 0 || w != n || rename(tmp, path) != 0) unlink(tmp);
+}
+
+static const struct fo_store_ops files_ops = { files_open_r, files_put };
+struct fo_store fo_store_files = { &files_ops };
 
 /* Гистерезис возврата: сколько тиков подряд более предпочтительное устройство обязано быть
  * здоровым, прежде чем пул вернётся к нему с запасного. Возврат наверх «мгновенно, как только
@@ -1098,8 +1123,8 @@ void failover_hyst_reset_for_test(void) { g_hyst_cache = -2; }
 
 /* Счётчик подряд-здоровых тиков более предпочтительного устройства — рядом с активным, третьим
  * полем в том же файле. Все читатели файла обязаны СЪЕДАТЬ три поля, иначе оставшийся на строке
- * счётчик уедет в имя следующего выхода. Старый файл без счётчика читается как ноль. */
-static int g_streak[MAX_OUTPUTS];
+ * счётчик уедет в имя следующего выхода. Старый файл без счётчика читается как ноль. Серия
+ * прохода — массив по выходам спеки у failover_pass, в хранилище она уходит с active_save. */
 
 /* ---- состояние замеров задержки -----------------------------------------------------
  *
@@ -1115,20 +1140,14 @@ static int g_streak[MAX_OUTPUTS];
 #define LAT_TOLERANCE_MS 50
 #define LAT_INTERVAL_S   180
 
-static void lat_path(char *buf, size_t n) {
-    snprintf(buf, n, "%s/latency", steer_state_dir());
-}
-
 static long mono_now(void) {
     struct timespec t;
     clock_gettime(CLOCK_MONOTONIC, &t);
     return (long)t.tv_sec;
 }
 
-static int lat_get(const char *out, const char *dev, int *ms, long *age) {
-    char path[256];
-    lat_path(path, sizeof(path));
-    FILE *f = fopen(path, "r");
+static int lat_get(struct fo_store *st, const char *out, const char *dev, int *ms, long *age) {
+    FILE *f = st->ops->open_r(st, "latency");
     if (!f) return 0;
     char o[32], d[32];
     int v = 0; long at = 0, found = 0;
@@ -1138,15 +1157,13 @@ static int lat_get(const char *out, const char *dev, int *ms, long *age) {
     return (int)found;
 }
 
-/* Записать замеры выхода, оставив записи остальных на месте. Через временный файл и rename:
- * обрыв на середине оставил бы половину строк, а половина замеров ХУЖЕ их отсутствия — по
- * ней сторож переключился бы на кандидата, чей замер уцелел. */
-static void lat_put(const char *out, char devs[][32], int *ms, size_t n) {
-    char path[256], tmp[288];
-    lat_path(path, sizeof(path));
-    snprintf(tmp, sizeof(tmp), "%s.tmp", path);
-    FILE *old = fopen(path, "r");
-    FILE *f = fopen(tmp, "w");
+/* Записать замеры выхода, оставив записи остальных на месте. Заменой целиком (у файлов —
+ * временный файл и rename, см. files_put): обрыв на середине оставил бы половину строк. */
+static void lat_put(struct fo_store *st, const char *out, char devs[][32], int *ms, size_t n) {
+    char *buf = NULL;
+    size_t bn = 0;
+    FILE *old = st->ops->open_r(st, "latency");
+    FILE *f = open_memstream(&buf, &bn);
     if (!f) { if (old) fclose(old); return; }
     if (old) {
         char o[32], d[32];
@@ -1158,38 +1175,38 @@ static void lat_put(const char *out, char devs[][32], int *ms, size_t n) {
     long now = mono_now();
     for (size_t k = 0; k < n; k++)
         if (ms[k] >= 0) fprintf(f, "%s %s %d %ld\n", out, devs[k], ms[k], now);
-    fclose(f);
-    if (rename(tmp, path) != 0) unlink(tmp);
+    if (fclose(f) == 0) st->ops->put(st, "latency", buf, bn);
+    free(buf);
 }
 
-static int active_streak_get(const char *out) {
-    char path[256];
-    active_path(path, sizeof(path));
-    FILE *f = fopen(path, "r");
+static int active_streak_get(struct fo_store *st, const char *out) {
+    FILE *f = st->ops->open_r(st, "active");
     if (!f) return 0;
     char name[32], d[32];
-    int st = 0, val = 0;
-    while (fscanf(f, "%31s %31s %d", name, d, &st) >= 2) {
-        if (!strcmp(name, out)) val = st;
-        st = 0;   /* следующая запись без третьего поля не должна унаследовать этот */
+    int sk = 0, val = 0;
+    while (fscanf(f, "%31s %31s %d", name, d, &sk) >= 2) {
+        if (!strcmp(name, out)) val = sk;
+        sk = 0;   /* следующая запись без третьего поля не должна унаследовать этот */
     }
     fclose(f);
     return val;
 }
 
-void active_get(const char *out, char *dev, size_t n) {
+static void active_get_st(struct fo_store *st, const char *out, char *dev, size_t n) {
     dev[0] = '\0';
-    char path[256];
-    active_path(path, sizeof(path));
-    FILE *f = fopen(path, "r");
+    FILE *f = st->ops->open_r(st, "active");
     if (!f) return;
     char name[32], d[32];
-    int st = 0;
-    while (fscanf(f, "%31s %31s %d", name, d, &st) >= 2) {
+    int sk = 0;
+    while (fscanf(f, "%31s %31s %d", name, d, &sk) >= 2) {
         if (!strcmp(name, out)) snprintf(dev, n, "%s", d);
-        st = 0;
+        sk = 0;
     }
     fclose(f);
+}
+
+void active_get(const char *out, char *dev, size_t n) {
+    active_get_st(&fo_store_files, out, dev, n);
 }
 
 /* Записать выбор прохода — ТОЛЬКО если он отличается от записанного.
@@ -1201,32 +1218,26 @@ void active_get(const char *out, char *dev, size_t n) {
  * батарея и сон — это исключает. Сравнивается будущий текст целиком, как у реестра меток
  * (registry_assign в spec.c): чтение не пишет ничего.
  *
- * Через временный файл и rename: status и apply читают этот файл в любой момент, и половина
- * строк означала бы для них «сторож не проходил» у половины выходов. */
-static void active_save(const struct spec *sp) {
+ * Заменой целиком (у файлов — через временный файл и rename, см. files_put): status и apply
+ * читают этот файл в любой момент. */
+static void active_save(struct fo_store *st, const struct spec *sp, const int *streak) {
     char want[MAX_OUTPUTS * 80 + 1];
     size_t wn = 0;
     for (size_t i = 0; i < sp->out_n; i++) {
         if (!out_has_device(&sp->out[i])) continue;
         int w = snprintf(want + wn, sizeof(want) - wn, "%s %s %d\n", sp->out[i].name,
-                         sp->out[i].device[0] ? sp->out[i].device : "-", g_streak[i]);
+                         sp->out[i].device[0] ? sp->out[i].device : "-", streak[i]);
         if (w < 0 || (size_t)w >= sizeof(want) - wn) break;
         wn += (size_t)w;
     }
-    char path[256], tmp[288];
-    active_path(path, sizeof(path));
-    FILE *f = fopen(path, "r");
+    FILE *f = st->ops->open_r(st, "active");
     if (f) {
         char have[sizeof(want) + 1];
         size_t hn = fread(have, 1, sizeof(have), f);
         fclose(f);
         if (hn == wn && memcmp(have, want, wn) == 0) return;
     }
-    snprintf(tmp, sizeof(tmp), "%s.tmp", path);
-    f = fopen(tmp, "w");
-    if (!f) return;
-    fwrite(want, 1, wn, f);
-    if (fclose(f) != 0 || rename(tmp, path) != 0) unlink(tmp);
+    st->ops->put(st, "active", want, wn);
 }
 
 /* Взять устройство, которое НЕСЁТ ТРАФИК СЕЙЧАС, а не первое по списку кандидатов.
@@ -1254,12 +1265,16 @@ static void active_save(const struct spec *sp) {
  * что вернули здесь, а status и diag рассказывают о том же самом. Разойдись они — и
  * интерфейс снова показывал бы не то, что применено. */
 void outputs_adopt_active(struct spec *sp) {
+    outputs_adopt_active_st(sp, &fo_store_files);
+}
+
+void outputs_adopt_active_st(struct spec *sp, struct fo_store *st) {
     for (size_t i = 0; i < sp->out_n; i++) {
         struct output *o = &sp->out[i];
         if (!out_has_device(o)) continue;
 
         char rec[32];
-        active_get(o->name, rec, sizeof(rec));   /* читает три поля — см. active_get */
+        active_get_st(st, o->name, rec, sizeof(rec));   /* читает три поля — см. active_get */
         const char *pick = NULL;
         if (rec[0] && strcmp(rec, "-") != 0 && device_present(rec))
             for (size_t k = 0; k < o->devices_n && !pick; k++)
@@ -1287,21 +1302,29 @@ void outputs_adopt_active(struct spec *sp) {
  * успевал бы завершить рукопожатие. */
 #define RESTART_COOLDOWN 300
 
-static int restart_allowed(const char *dev) {
-    char path[256];
-    snprintf(path, sizeof(path), "%s/restart-%.32s", steer_state_dir(), dev);
-    FILE *f = fopen(path, "r");
+static int restart_allowed(struct fo_store *st, const char *dev) {
+    char name[48];
+    snprintf(name, sizeof(name), "restart-%.32s", dev);
+    FILE *f = st->ops->open_r(st, name);
     long last = 0;
     if (f) { if (fscanf(f, "%ld", &last) != 1) last = 0; fclose(f); }
     long now = (long)time(NULL);
     if (last && now - last < RESTART_COOLDOWN) return 0;
-    f = fopen(path, "w");
-    if (f) { fprintf(f, "%ld\n", now); fclose(f); }
+    char txt[32];
+    int tn = snprintf(txt, sizeof(txt), "%ld\n", now);
+    if (tn > 0) st->ops->put(st, name, txt, (size_t)tn);
     return 1;
 }
 
+static int revive_st(struct fo_store *st, const struct spec *sp, const struct output *o,
+                     const char *dev, int verbose);
 int revive(const struct spec *sp, const struct output *o, const char *dev, int verbose) {
-    if (!restart_allowed(dev)) {
+    return revive_st(&fo_store_files, sp, o, dev, verbose);
+}
+
+static int revive_st(struct fo_store *st, const struct spec *sp, const struct output *o,
+                     const char *dev, int verbose) {
+    if (!restart_allowed(st, dev)) {
         if (verbose)
             fprintf(stderr, LOG_I "%s: перезапуск был недавно, пропускаю\n", dev);
         return 0;
@@ -1450,10 +1473,7 @@ static void sig_cleanup(int sig) {
     _exit(128 + sig);
 }
 
-int cmd_failover(const char *spec, int verbose) {
-    /* Спека — значение, а не глобалы (правило 6): свой экземпляр у точки входа. */
-    static struct spec cfg;
-    atexit(cleanup_probe_rule);
+void failover_pass_guard(void) {
     signal(SIGINT, sig_cleanup);
     signal(SIGTERM, sig_cleanup);
     /* Снять probe-rule, оставшийся от ПРЕЖНЕГО прохода, прежде чем ставить свой.
@@ -1462,6 +1482,13 @@ int cmd_failover(const char *spec, int verbose) {
      * чистки. Уборка в начале прохода восстанавливает состояние независимо от
      * того, как умер предыдущий процесс, и идемпотентна — нет правила, нет дела. */
     cleanup_probe_rule();
+}
+
+int cmd_failover(const char *spec, int verbose) {
+    /* Спека — значение, а не глобалы (правило 6): свой экземпляр у точки входа. */
+    static struct spec cfg;
+    atexit(cleanup_probe_rule);
+    failover_pass_guard();
 
     /* Правило 5, docs/architecture.md, раздел 2: err_die здесь довершает то, что раньше делал
      * die() изнутри load_spec/registry_assign — «конец одного прохода», как и сказано в шапке
@@ -1469,8 +1496,26 @@ int cmd_failover(const char *spec, int verbose) {
     struct err e = {0};
     if (load_spec(spec, &cfg, &e) < 0) err_die(&e);
     if (registry_assign(&cfg, &e) < 0) err_die(&e);
+    return failover_pass(&cfg, &fo_store_files, verbose, NULL, NULL);
+}
 
+static const char *on_fail_name(enum on_fail of) {
+    return of == FAIL_DROP ? "drop" : of == FAIL_ZAPRET ? "zapret" : "direct";
+}
+
+/* Сказать получателю о перемене, если он есть. */
+static void fo_emit(fo_event_fn ev, void *arg, enum fo_ev_kind kind, const struct output *o,
+                    const char *from, const char *to, const char *why) {
+    if (!ev) return;
+    struct fo_event e = { kind, o->name, from, to, why, on_fail_name(o->on_fail) };
+    ev(arg, &e);
+}
+
+/* Проход сторожа. sp — спека вызывающего (`steer failover` читает её сам, демон отдаёт копию
+ * своей), st — память между проходами, ev — получатель событий (fostate.h). */
+int failover_pass(struct spec *sp, struct fo_store *st, int verbose, fo_event_fn ev, void *arg) {
     int changed = 0;
+    int streak_new[MAX_OUTPUTS] = {0};
     /* ПОРЯДОК ОБХОДА — ПО ЗАВИСИМОСТЯМ `via`, а не по спеке.
      *
      * Выход, чей туннель идёт через другой выход (см. «вложенные выходы» в spec.h), жив только
@@ -1487,13 +1532,13 @@ int cmd_failover(const char *spec, int verbose) {
     size_t ord[MAX_OUTPUTS];
     size_t ord_n = 0;
     for (int depth = 0; depth <= MAX_VIA_DEPTH; depth++)
-        for (size_t i = 0; i < cfg.out_n; i++)
-            if (out_via_depth(&cfg, &cfg.out[i]) == depth) ord[ord_n++] = i;
+        for (size_t i = 0; i < sp->out_n; i++)
+            if (out_via_depth(sp, &sp->out[i]) == depth) ord[ord_n++] = i;
     /* Кто в ЭТОМ проходе нашёл живое устройство. */
     int alive[MAX_OUTPUTS] = {0};
     for (size_t oi = 0; oi < ord_n; oi++) {
         size_t i = ord[oi];
-        struct output *o = &cfg.out[i];
+        struct output *o = &sp->out[i];
         if (!out_has_device(o)) continue;
 
         /* Цель via лежит — внутренний выход нерабочий, что бы ни говорила его собственная проба.
@@ -1501,11 +1546,11 @@ int cmd_failover(const char *spec, int verbose) {
          * процесс, а до сервера его соединение через мёртвую цель не доедет. И пробовать, и
          * оживлять его бесполезно — поэтому ни того, ни другого, сразу ветка отказа с ЕГО
          * on_fail: каналы внутреннего выхода получают то, что человек для них выбрал. */
-        const struct output *via = out_via(&cfg, o);
-        int via_down = via && !alive[via - cfg.out];
+        const struct output *via = out_via(sp, o);
+        int via_down = via && !alive[via - sp->out];
 
         char was[32];
-        active_get(o->name, was, sizeof(was));
+        active_get_st(st, o->name, was, sizeof(was));
         /* Где в списке предпочтения стоит несущее трафик сейчас. -1 — записи нет или её
          * устройство больше не кандидат: тогда гистерезису не за что держаться, берём
          * лучшее здоровое сразу. */
@@ -1518,14 +1563,18 @@ int cmd_failover(const char *spec, int verbose) {
          * запас на каждом тике. Здоровье устройств 0..first_h тем самым известно. */
         int first_h = -1;
         for (size_t k = 0; k < o->devices_n && !via_down; k++) {
-            if (health_of(&cfg, o, o->devices[k])) { first_h = (int)k; break; }
+            if (health_of(sp, o, o->devices[k])) { first_h = (int)k; break; }
             if (verbose)
                 fprintf(stderr, LOG_W "%s: %s не отвечает\n", o->name, o->devices[k]);
         }
 
         const char *chosen = NULL;
-        int streak = active_streak_get(o->name);
+        int streak = active_streak_get(st, o->name);
         int new_streak = 0;
+        /* Для события switched: чем выбор объяснить. Устройства 0..first_h пробой уже
+         * спрошены, поэтому «текущее мертво» при cur < first_h известно без новой пробы. */
+        int by_latency = 0;
+        int cur_dead = cur >= 0 && first_h >= 0 && cur < first_h;
 
         /* ---- ВЫБОР ПО ЗАМЕРУ, если выход этого просит --------------------------------
          *
@@ -1555,7 +1604,7 @@ int cmd_failover(const char *spec, int verbose) {
             for (size_t k = 0; k < o->devices_n; k++) {
                 long age = 0;
                 ms[k] = -1;
-                if (lat_get(o->name, o->devices[k], &ms[k], &age)) {
+                if (lat_get(st, o->name, o->devices[k], &ms[k], &age)) {
                     if (age > iv || age < 0) stale = 1;
                 } else stale = 1;
             }
@@ -1563,8 +1612,8 @@ int cmd_failover(const char *spec, int verbose) {
                 /* Меряем ВСЕХ, включая тех, что ниже first_h: смысл режима ровно в том,
                  * чтобы узнать про них. */
                 for (size_t k = 0; k < o->devices_n; k++)
-                    ms[k] = device_latency(&cfg, o, o->devices[k]);
-                lat_put(o->name, o->devices, ms, o->devices_n);
+                    ms[k] = device_latency(sp, o, o->devices[k]);
+                lat_put(st, o->name, o->devices, ms, o->devices_n);
             }
             for (size_t k = 0; k < o->devices_n; k++) if (ms[k] >= 0) have++;
             if (have > 0) {
@@ -1578,12 +1627,13 @@ int cmd_failover(const char *spec, int verbose) {
                     /* Уходить с ЖИВОГО текущего только если выигрыш больше допуска. Мёртвое
                      * текущее уступает сразу: здоровье старше замера. */
                     if (cur >= 0 && cur != pick && ms[cur] >= 0 &&
-                        health_of(&cfg, o, o->devices[cur]) && ms[cur] - ms[pick] <= tol)
+                        health_of(sp, o, o->devices[cur]) && ms[cur] - ms[pick] <= tol)
                         pick = cur;
-                    if (!health_of(&cfg, o, o->devices[pick])) pick = -1;
+                    if (!health_of(sp, o, o->devices[pick])) pick = -1;
                 }
                 if (pick >= 0) {
                     chosen = o->devices[pick];
+                    by_latency = 1;
                     if (verbose)
                         fprintf(stderr, LOG_I "%s: по замеру выбран %s (%d мс, лучший %d, "
                                         "допуск %d)\n",
@@ -1605,12 +1655,13 @@ int cmd_failover(const char *spec, int verbose) {
                  * нельзя — это и есть мелькание. Держим его, пока верхнее не подтвердит
                  * здоровье STEER_FAILOVER_HYST тиков подряд. Мёртвое текущее — сразу вниз. */
                 int hyst = failover_hyst();
-                if (health_of(&cfg, o, o->devices[cur])) {
+                if (health_of(sp, o, o->devices[cur])) {
                     int s = streak + 1;
                     if (hyst > 0 && s < hyst) { chosen = o->devices[cur]; new_streak = s; }
                     else chosen = o->devices[first_h];
                 } else {
                     chosen = o->devices[first_h];
+                    cur_dead = 1;
                 }
             } else {
                 /* first_h == cur (несём лучшее доступное) либо cur < first_h (текущее
@@ -1622,10 +1673,16 @@ int cmd_failover(const char *spec, int verbose) {
 
         /* Ни одно не ответило — вот теперь можно тратить время на оживление. Порядок
          * тот же, поэтому основной туннель получает попытку первым. */
-        if (!chosen && !via_down)
+        if (!chosen && !via_down) {
+            if (cur >= 0) cur_dead = 1;   /* ни одно не ответило — и текущее тоже */
             for (size_t k = 0; k < o->devices_n; k++)
-                if (revive(&cfg, o, o->devices[k], verbose)) { chosen = o->devices[k]; break; }
-        g_streak[i] = new_streak;
+                if (revive_st(st, sp, o, o->devices[k], verbose)) {
+                    chosen = o->devices[k];
+                    fo_emit(ev, arg, FO_EV_REVIVED, o, NULL, chosen, NULL);
+                    break;
+                }
+        }
+        streak_new[i] = new_streak;
         alive[i] = chosen != NULL;
         /* Причину назвать надо: иначе «живых устройств нет» стоит у выхода, чьё устройство на
          * месте и чья проба, спроси её, ответила бы «да». Строка — на переходе в отказ (как и
@@ -1641,6 +1698,11 @@ int cmd_failover(const char *spec, int verbose) {
                 printf("steer: выход %s -> %s%s\n", o->name, chosen,
                        was[0] && strcmp(was, "-") ? " (переключение)" : "");
                 changed = 1;
+                const char *why = !was[0] ? "start" : !strcmp(was, "-") ? "recovered"
+                                : cur < 0 ? "spec" : by_latency ? "latency"
+                                : cur_dead ? "down" : "preferred";
+                fo_emit(ev, arg, FO_EV_SWITCHED, o,
+                        was[0] && strcmp(was, "-") ? was : NULL, chosen, why);
             } else {
                 /* Имя устройства то же — и это НЕ значит, что маршрутизация цела.
                  * Спрашиваем ядро, а не свою память: см. «сверка фактического
@@ -1678,6 +1740,8 @@ int cmd_failover(const char *spec, int verbose) {
             if (strcmp(was, "-") != 0) {
                 apply_failed(o, 1);         /* отказ только что случился — объявляем */
                 changed = 1;
+                fo_emit(ev, arg, FO_EV_FAILED, o, was[0] ? was : NULL, NULL,
+                        via_down ? "via" : "down");
             } else {
                 struct route_facts f = route_facts_read(o);
                 if (!f.known) {
@@ -1691,16 +1755,14 @@ int cmd_failover(const char *spec, int verbose) {
                     fprintf(stderr, LOG_W "выход %s: живых устройств по-прежнему нет, а "
                                     "маршрутизация разъехалась (%s) — возвращаю "
                                     "on_fail=%s\n",
-                            o->name, failed_why(&f, o->on_fail),
-                            o->on_fail == FAIL_DROP ? "drop" :
-                            o->on_fail == FAIL_ZAPRET ? "zapret" : "direct");
+                            o->name, failed_why(&f, o->on_fail), on_fail_name(o->on_fail));
                     apply_failed(o, 0);
                     changed = 1;
                 }
             }
         }
     }
-    active_save(&cfg);
+    active_save(st, sp, streak_new);
     if (!changed && verbose) fprintf(stderr, LOG_I "изменений нет\n");
     return 0;
 }

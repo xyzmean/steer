@@ -1271,6 +1271,15 @@ void awg_hs_recv(int fd) {
         if (r <= 0) break;
         n += (size_t)r;
     }
+    awg_hs_recv_buf(buf, n);
+}
+
+/* То же по уже прочитанному сообщению: демон читает трубу прохода сам, в своём цикле событий
+ * (src/daemon/watchd.c), и замеры приходят ему хвостом общего сообщения. */
+void awg_hs_recv_buf(const char *msg, size_t n) {
+    char buf[REG_MAX * 96 + 8];
+    if (n >= sizeof buf) return;
+    memcpy(buf, msg, n);
     buf[n] = '\0';
     if (n < 4 || strcmp(buf + n - 4, "end\n") != 0) return;   /* проход не договорил */
     struct hs_sample got[REG_MAX];
